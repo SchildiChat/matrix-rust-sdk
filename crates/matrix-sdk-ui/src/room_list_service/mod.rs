@@ -473,7 +473,7 @@ fn configure_all_or_visible_rooms_list(
     list_builder: SlidingSyncListBuilder,
 ) -> SlidingSyncListBuilder {
     list_builder
-        .sort(vec!["by_recency".to_owned(), "by_name".to_owned()])
+        .sort(vec!["by_notification_level".to_owned(), "by_recency".to_owned(), "by_name".to_owned()])
         .filters(Some(assign!(SyncRequestListFilters::default(), {
             is_invite: Some(false),
             is_tombstoned: Some(false),
