@@ -823,6 +823,8 @@ impl BaseClient {
 
             let notification_count = new_info.unread_notifications.into();
             room_info.update_notification_count(notification_count);
+            let unread_count = new_info.unread_count.map(|x| x.try_into().ok()).unwrap_or_default();
+            room_info.update_unread_count(unread_count);
 
             new_rooms.join.insert(
                 room_id,
@@ -832,6 +834,7 @@ impl BaseClient {
                     new_info.account_data.events,
                     new_info.ephemeral.events,
                     notification_count,
+                    unread_count,
                 ),
             );
 

@@ -35,7 +35,7 @@ futures-executor = "0.3.21"
 futures-util = { version = "0.3.26", default-features = false, features = ["alloc"] }
 http = "0.2.6"
 itertools = "0.12.0"
-ruma = { git = "https://github.com/SchildiChat/ruma", rev = "dc260081", features = ["client-api-c", "compat-upload-signatures", "compat-user-id", "compat-arbitrary-length-ids", "unstable-msc3401"] }
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "cf4e203a", features = ["client-api-c", "compat-upload-signatures", "compat-user-id", "compat-arbitrary-length-ids", "unstable-msc3401"] }
 ruma-common = "0.12.0"
 once_cell = "1.16.0"
 rand = "0.8.5"

@@ -100,6 +100,8 @@ impl fmt::Debug for Rooms {
 pub struct JoinedRoom {
     /// Counts of unread notifications for this room.
     pub unread_notifications: UnreadNotificationsCount,
+    /// MSC2654 unread count
+    pub unread_count: Option<u64>,
     /// The timeline of messages and state changes in the room.
     pub timeline: Timeline,
     /// Updates to the state, between the time indicated by the `since`
@@ -119,6 +121,7 @@ impl fmt::Debug for JoinedRoom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JoinedRoom")
             .field("unread_notifications", &self.unread_notifications)
+            .field("unread_count", &self.unread_count)
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
@@ -134,8 +137,9 @@ impl JoinedRoom {
         account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
         ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
         unread_notifications: UnreadNotificationsCount,
+        unread_count: Option<u64>,
     ) -> Self {
-        Self { unread_notifications, timeline, state, account_data, ephemeral }
+        Self { unread_notifications, unread_count, timeline, state, account_data, ephemeral }
     }
 }
 

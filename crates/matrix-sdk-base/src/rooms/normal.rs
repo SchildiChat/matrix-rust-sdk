@@ -187,6 +187,11 @@ impl Room {
         self.inner.read().notification_counts
     }
 
+    /// Get the unread message count.
+    pub fn unread_count(&self) -> Option<u64> {
+        self.inner.read().unread_count
+    }
+
     /// Check if the room has its members fully synced.
     ///
     /// Members might be missing if lazy member loading was enabled for the
@@ -721,6 +726,8 @@ pub struct RoomInfo {
     pub(crate) room_state: RoomState,
     /// The unread notifications counts.
     pub(crate) notification_counts: UnreadNotificationsCount,
+    /// The unread message count.
+    pub(crate) unread_count: Option<u64>,
     /// The summary of this room.
     pub(crate) summary: RoomSummary,
     /// Flag remembering if the room members are synced.
@@ -763,6 +770,7 @@ impl RoomInfo {
             room_id: room_id.into(),
             room_state,
             notification_counts: Default::default(),
+            unread_count: None,
             summary: Default::default(),
             members_synced: false,
             last_prev_batch: None,
@@ -916,6 +924,11 @@ impl RoomInfo {
     /// Update the notifications count
     pub fn update_notification_count(&mut self, notification_counts: UnreadNotificationsCount) {
         self.notification_counts = notification_counts;
+    }
+
+    /// Update the unread count
+    pub fn update_unread_count(&mut self, unread_count: Option<u64>) {
+        self.unread_count = unread_count;
     }
 
     /// Update the RoomSummary

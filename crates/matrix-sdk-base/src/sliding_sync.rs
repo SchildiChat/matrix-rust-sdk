@@ -339,6 +339,8 @@ impl BaseClient {
 
         let notification_count = room_data.unread_notifications.clone().into();
         room_info.update_notification_count(notification_count);
+        let unread_count = room_data.unread_count.map(|x| x.try_into().ok()).unwrap_or_default();
+        room_info.update_unread_count(unread_count);
 
         match room_info.state() {
             RoomState::Joined => Ok((
@@ -350,6 +352,7 @@ impl BaseClient {
                     Vec::new(), /* ephemeral events are handled later in
                                  * `Self::process_sliding_sync`. */
                     notification_count,
+                    unread_count,
                 )),
                 None,
                 None,

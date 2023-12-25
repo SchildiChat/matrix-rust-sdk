@@ -109,6 +109,13 @@ impl SlidingSyncRoom {
         inner.unread_notifications.clone()
     }
 
+    /// Get unread count.
+    pub fn unread_count(&self) -> Option<u64> {
+        let inner = self.inner.inner.read().unwrap();
+
+        inner.unread_count.map(|x| x.try_into().ok()).unwrap_or_default()
+    }
+
     /// Get the required state.
     pub fn required_state(&self) -> Vec<Raw<AnySyncStateEvent>> {
         self.inner.inner.read().unwrap().required_state.clone()
@@ -149,6 +156,7 @@ impl SlidingSyncRoom {
             limited,
             is_dm,
             unread_notifications,
+            unread_count,
             required_state,
             prev_batch,
             ..
@@ -158,6 +166,7 @@ impl SlidingSyncRoom {
             let mut inner = self.inner.inner.write().unwrap();
 
             inner.unread_notifications = unread_notifications;
+            inner.unread_count = unread_count;
 
             // The server might not send some parts of the response, because they were sent
             // before and the server wants to save bandwidth. So let's update the values

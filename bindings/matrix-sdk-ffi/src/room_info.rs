@@ -28,6 +28,7 @@ pub struct RoomInfo {
     joined_members_count: u64,
     highlight_count: u64,
     notification_count: u64,
+    unread_count: u64,
     user_defined_notification_mode: Option<RoomNotificationMode>,
     has_room_call: bool,
     active_room_call_participants: Vec<String>,
@@ -40,6 +41,7 @@ impl RoomInfo {
         latest_event: Option<Arc<EventTimelineItem>>,
     ) -> matrix_sdk::Result<Self> {
         let unread_notification_counts = room.unread_notification_counts();
+        let unread_count = room.unread_count();
 
         Ok(Self {
             id: room.room_id().to_string(),
@@ -65,6 +67,7 @@ impl RoomInfo {
             joined_members_count: room.joined_members_count(),
             highlight_count: unread_notification_counts.highlight_count,
             notification_count: unread_notification_counts.notification_count,
+            unread_count: unread_count.unwrap_or_default(),
             user_defined_notification_mode: room
                 .user_defined_notification_mode()
                 .await

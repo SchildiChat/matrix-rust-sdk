@@ -111,6 +111,7 @@ impl RoomInfoV1 {
             room_id,
             room_state: room_type,
             notification_counts,
+            unread_count: None,
             summary,
             members_synced,
             last_prev_batch,

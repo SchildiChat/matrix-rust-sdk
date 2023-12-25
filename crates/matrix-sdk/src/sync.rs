@@ -186,7 +186,7 @@ impl Client {
                 updates: room_info.clone(),
             });
 
-            let JoinedRoom { unread_notifications: _, timeline, state, account_data, ephemeral } =
+            let JoinedRoom { unread_notifications: _, unread_count: _, timeline, state, account_data, ephemeral } =
                 room_info;
 
             let room = Some(&room);
