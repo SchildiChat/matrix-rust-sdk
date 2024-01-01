@@ -494,6 +494,17 @@ impl Room {
     pub async fn typing_notice(&self, is_typing: bool) -> Result<(), ClientError> {
         Ok(self.inner.typing_notice(is_typing).await?)
     }
+
+    /// Get the content of the event of the given type out of the account data
+    /// store.
+    ///
+    /// It will be returned as a JSON string.
+    pub fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
+        RUNTIME.block_on(async move {
+            let event = self.inner.account_data(event_type.into()).await?;
+            Ok(event.map(|e| e.json().get().to_owned()))
+        })
+    }
 }
 
 #[uniffi::export(callback_interface)]
