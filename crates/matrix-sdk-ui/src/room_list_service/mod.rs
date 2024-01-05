@@ -202,6 +202,24 @@ impl RoomListService {
 
                     }))),
             )
+            .add_list(
+                SlidingSyncList::builder(ALL_SPACES_LIST_NAME)
+                    .sync_mode(
+                        // Spec says leaving away the range should return the full list,
+                        // but we don't have a SyncMode for that (yet)
+                        SlidingSyncMode::new_selective().add_range(0..=u32::MAX),
+                    )
+                    .timeline_limit(0)
+                    .required_state(vec![
+                        (StateEventType::RoomAvatar, "".to_owned()),
+                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
+                        (StateEventType::SpaceChild, "".to_owned()),
+                    ])
+                    .filters(Some(assign!(SyncRequestListFilters::default(), {
+                        is_tombstoned: Some(false),
+                        room_types: vec!["m.space".to_owned()],
+                    }))),
+            )
             .build()
             .await
             .map(Arc::new)
@@ -404,6 +422,11 @@ impl RoomListService {
     /// join.
     pub async fn invites(&self) -> Result<RoomList, Error> {
         self.list_for(INVITES_LIST_NAME).await
+    }
+
+    /// Get a [`RoomList`] for spaces
+    pub async fn all_spaces(&self) -> Result<RoomList, Error> {
+        self.list_for(ALL_SPACES_LIST_NAME).await
     }
 
     /// Pass an [`Input`] onto the state machine.
