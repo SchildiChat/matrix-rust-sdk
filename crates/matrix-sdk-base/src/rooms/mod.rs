@@ -4,7 +4,7 @@ mod members;
 pub(crate) mod normal;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, HashMap},
     fmt,
     hash::Hash,
 };
@@ -30,11 +30,12 @@ use ruma::{
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
         },
+        space::child::SpaceChildEventContent,
         AnyStrippedStateEvent, AnySyncStateEvent, EmptyStateKey, RedactContent,
         RedactedStateEventContent, StaticStateEventContent, SyncStateEvent,
     },
     room::RoomType,
-    EventId, OwnedUserId, RoomVersionId,
+    EventId, OwnedUserId, OwnedRoomId, RoomVersionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +101,9 @@ pub struct BaseRoomInfo {
     pub(crate) tombstone: Option<MinimalStateEvent<RoomTombstoneEventContent>>,
     /// The topic of this room.
     pub(crate) topic: Option<MinimalStateEvent<RoomTopicEventContent>>,
+    /// The space children of this room, if it is a space.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub(crate) space_children: HashMap<OwnedRoomId, MinimalStateEvent<SpaceChildEventContent>>,
     /// All Minimal state events that containing one or more running matrixRTC
     /// memberships.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
@@ -174,6 +178,13 @@ impl BaseRoomInfo {
             }
             AnySyncStateEvent::RoomPowerLevels(p) => {
                 self.max_power_level = p.power_levels().max().into();
+            }
+            AnySyncStateEvent::SpaceChild(s) => {
+                self.space_children.remove(s.state_key());
+                self.space_children.insert(
+                    s.state_key().clone(),
+                    s.into(),
+                );
             }
             AnySyncStateEvent::CallMember(m) => {
                 let Some(o_ev) = m.as_original() else {
@@ -281,6 +292,8 @@ impl BaseRoomInfo {
             self.tombstone.as_mut().unwrap().redact(&room_version);
         } else if self.topic.has_event_id(redacts) {
             self.topic.as_mut().unwrap().redact(&room_version);
+        } else if self.space_children.values().any(|s| s.event_id() == Some(redacts)) {
+            self.space_children.retain(|_, s| s.event_id() != Some(redacts));
         } else {
             self.rtc_member.retain(|_, member_event| member_event.event_id() != Some(redacts));
         }
@@ -316,6 +329,7 @@ impl Default for BaseRoomInfo {
             name: None,
             tombstone: None,
             topic: None,
+            space_children: Default::default(),
             rtc_member: BTreeMap::new(),
         }
     }

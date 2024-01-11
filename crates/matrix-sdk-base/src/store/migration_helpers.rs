@@ -203,6 +203,7 @@ impl BaseRoomInfoV1 {
             name,
             tombstone,
             topic,
+            space_children: Default::default(),
             rtc_member: BTreeMap::new(),
         })
     }

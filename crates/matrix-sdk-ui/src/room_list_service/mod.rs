@@ -179,6 +179,7 @@ impl RoomListService {
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
+                        (StateEventType::SpaceChild, "".to_owned()),
                     ]),
             ))
             .await
@@ -194,6 +195,7 @@ impl RoomListService {
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$ME".to_owned()),
                         (StateEventType::RoomCanonicalAlias, "".to_owned()),
+                        (StateEventType::SpaceChild, "".to_owned()),
                     ])
                     .filters(Some(assign!(SyncRequestListFilters::default(), {
                         is_invite: Some(true),
@@ -213,7 +215,8 @@ impl RoomListService {
                     .required_state(vec![
                         (StateEventType::RoomAvatar, "".to_owned()),
                         (StateEventType::RoomCanonicalAlias, "".to_owned()),
-                        (StateEventType::SpaceChild, "".to_owned()),
+                        (StateEventType::RoomCreate, "".to_owned()),
+                        (StateEventType::SpaceChild, "*".to_owned()),
                     ])
                     .filters(Some(assign!(SyncRequestListFilters::default(), {
                         is_tombstoned: Some(false),

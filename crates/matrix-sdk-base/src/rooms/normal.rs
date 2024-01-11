@@ -182,6 +182,18 @@ impl Room {
         self.inner.read().room_type().is_some_and(|t| *t == RoomType::Space)
     }
 
+    /// Space children if this is a space
+    pub fn space_children(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for (r, s) in self.inner.read().base_info.space_children.iter() {
+            // Only if event hasn't been redacted!
+            if s.as_original().is_some() {
+                result.push(r.to_string());
+            }
+        }
+        return result;
+    }
+
     /// Get the unread notification counts.
     pub fn unread_notification_counts(&self) -> UnreadNotificationsCount {
         self.inner.read().notification_counts

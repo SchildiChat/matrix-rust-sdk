@@ -2187,6 +2187,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             (StateEventType::RoomTopic, "".to_owned()),
             (StateEventType::RoomAvatar, "".to_owned()),
             (StateEventType::RoomCanonicalAlias, "".to_owned()),
+            (StateEventType::SpaceChild, "".to_owned()),
         ],
         timeline_limit: Some(uint!(30)),
     })));

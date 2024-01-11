@@ -90,6 +90,10 @@ impl Room {
         self.inner.is_space()
     }
 
+    pub fn space_children(&self) -> Vec<String> {
+        self.inner.space_children()
+    }
+
     pub fn is_tombstoned(&self) -> bool {
         self.inner.is_tombstoned()
     }
