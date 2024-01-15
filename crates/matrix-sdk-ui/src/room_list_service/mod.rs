@@ -179,7 +179,6 @@ impl RoomListService {
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
-                        (StateEventType::SpaceChild, "".to_owned()),
                     ]),
             ))
             .await
@@ -195,7 +194,6 @@ impl RoomListService {
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$ME".to_owned()),
                         (StateEventType::RoomCanonicalAlias, "".to_owned()),
-                        (StateEventType::SpaceChild, "".to_owned()),
                     ])
                     .filters(Some(assign!(SyncRequestListFilters::default(), {
                         is_invite: Some(true),
