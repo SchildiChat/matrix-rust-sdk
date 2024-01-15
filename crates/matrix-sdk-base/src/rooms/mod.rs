@@ -259,6 +259,9 @@ impl BaseRoomInfo {
             AnyStrippedStateEvent::RoomPowerLevels(p) => {
                 self.max_power_level = p.power_levels().max().into();
             }
+            AnyStrippedStateEvent::SpaceChild(s) => {
+                self.space_children.remove(&s.state_key);
+            }
             AnyStrippedStateEvent::CallMember(_) => {
                 // Ignore stripped call state events. Rooms that are not in Joined or Left state
                 // wont have call information.
@@ -292,9 +295,8 @@ impl BaseRoomInfo {
             self.tombstone.as_mut().unwrap().redact(&room_version);
         } else if self.topic.has_event_id(redacts) {
             self.topic.as_mut().unwrap().redact(&room_version);
-        } else if self.space_children.values().any(|s| s.event_id() == Some(redacts)) {
-            self.space_children.retain(|_, s| s.event_id() != Some(redacts));
         } else {
+            self.space_children.retain(|_, s| s.event_id() != Some(redacts));
             self.rtc_member.retain(|_, member_event| member_event.event_id() != Some(redacts));
         }
     }

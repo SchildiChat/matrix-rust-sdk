@@ -187,9 +187,13 @@ impl Room {
     pub fn space_children(&self) -> Vec<String> {
         let mut result = Vec::new();
         for (r, s) in self.inner.read().base_info.space_children.iter() {
-            // Only if event hasn't been redacted!
-            if s.as_original().is_some() {
-                result.push(r.to_string());
+            // Has room been removed from space again?
+            if let Some(ev) = s.as_original() {
+                // Hasn't been replaced by empty state event?
+                // The spec tells us to ignore children without `via`
+                if !ev.content.via.is_empty() {
+                    result.push(r.to_string());
+                }
             }
         }
         return result;
