@@ -104,7 +104,7 @@ pub struct BaseRoomInfo {
     /// The space children of this room, if it is a space.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub(crate) space_children: HashMap<OwnedRoomId, MinimalStateEvent<SpaceChildEventContent>>,
-    /// All Minimal state events that containing one or more running matrixRTC
+    /// All minimal state events that containing one or more running matrixRTC
     /// memberships.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub(crate) rtc_member: BTreeMap<OwnedUserId, MinimalStateEvent<CallMemberEventContent>>,

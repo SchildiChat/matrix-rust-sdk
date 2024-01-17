@@ -63,6 +63,7 @@ use super::{
 use crate::latest_event::LatestEvent;
 use crate::{
     deserialized_responses::MemberEvent,
+    read_receipts::RoomReadReceipts,
     store::{DynStateStore, Result as StoreResult, StateStoreExt},
     sync::UnreadNotificationsCount,
     MinimalStateEvent, OriginalMinimalStateEvent, RoomMemberships,
@@ -202,6 +203,31 @@ impl Room {
     /// Get the unread message count.
     pub fn unread_count(&self) -> Option<u64> {
         self.inner.read().unread_count
+    }
+
+    /// Get the number of unread messages (computed client-side).
+    ///
+    /// This might be more precise than [`Self::unread_notification_counts`] for
+    /// encrypted rooms.
+    pub fn num_unread_messages(&self) -> u64 {
+        self.inner.read().read_receipts.num_unread
+    }
+
+    /// Get the number of unread notifications (computed client-side).
+    ///
+    /// This might be more precise than [`Self::unread_notification_counts`] for
+    /// encrypted rooms.
+    pub fn num_unread_notifications(&self) -> u64 {
+        self.inner.read().read_receipts.num_notifications
+    }
+
+    /// Get the number of unread mentions (computed client-side), that is,
+    /// messages causing a highlight in a room.
+    ///
+    /// This might be more precise than [`Self::unread_notification_counts`] for
+    /// encrypted rooms.
+    pub fn num_unread_mentions(&self) -> u64 {
+        self.inner.read().read_receipts.num_mentions
     }
 
     /// Check if the room has its members fully synced.
@@ -734,25 +760,42 @@ impl Room {
 pub struct RoomInfo {
     /// The unique room id of the room.
     pub(crate) room_id: OwnedRoomId,
+
     /// The state of the room.
     pub(crate) room_state: RoomState,
-    /// The unread notifications counts.
+
+    /// The unread notifications counts, as returned by the server.
+    ///
+    /// These might be incorrect for encrypted rooms, since the server doesn't
+    /// have access to the content of the encrypted events.
     pub(crate) notification_counts: UnreadNotificationsCount,
+
     /// The unread message count.
     pub(crate) unread_count: Option<u64>,
+
     /// The summary of this room.
     pub(crate) summary: RoomSummary,
+
     /// Flag remembering if the room members are synced.
     pub(crate) members_synced: bool,
+
     /// The prev batch of this room we received during the last sync.
     pub(crate) last_prev_batch: Option<String>,
+
     /// How much we know about this room.
     pub(crate) sync_info: SyncInfo,
+
     /// Whether or not the encryption info was been synced.
     pub(crate) encryption_state_synced: bool,
+
     /// The last event send by sliding sync
     #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) latest_event: Option<Box<LatestEvent>>,
+
+    /// Information about read receipts for this room.
+    #[serde(default)]
+    pub(crate) read_receipts: RoomReadReceipts,
+
     /// Base room info which holds some basic event contents important for the
     /// room state.
     pub(crate) base_info: Box<BaseRoomInfo>,
@@ -790,6 +833,7 @@ impl RoomInfo {
             encryption_state_synced: false,
             #[cfg(feature = "experimental-sliding-sync")]
             latest_event: None,
+            read_receipts: Default::default(),
             base_info: Box::new(BaseRoomInfo::new()),
         }
     }
@@ -1276,6 +1320,7 @@ mod tests {
                 Raw::from_json_string(json!({"sender": "@u:i.uk"}).to_string()).unwrap().into(),
             ))),
             base_info: Box::new(BaseRoomInfo::new()),
+            read_receipts: Default::default(),
         };
 
         let info_json = json!({
@@ -1315,6 +1360,12 @@ mod tests {
                 "name": null,
                 "tombstone": null,
                 "topic": null,
+            },
+            "read_receipts": {
+                "num_unread": 0,
+                "num_mentions": 0,
+                "num_notifications": 0,
+                "latest_read_receipt_event_id": null,
             }
         });
 
