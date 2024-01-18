@@ -132,6 +132,14 @@ impl RoomListService {
         self.inner.apply_input(input.into()).await.map(|_| ()).map_err(Into::into)
     }
 
+    async fn apply_input_for_space(&self, input: RoomListInput) -> Result<(), RoomListError> {
+        self.inner.apply_input_for_space(input.into()).await.map(|_| ()).map_err(Into::into)
+    }
+
+    async fn apply_visible_space_filter(&self, space_ids: Option<Vec<String>>) -> Result<(), RoomListError> {
+        self.inner.apply_visible_space_filter(space_ids.into()).await.map(|_| ()).map_err(Into::into)
+    }
+
     fn sync_indicator(
         &self,
         delay_before_showing_in_ms: u32,

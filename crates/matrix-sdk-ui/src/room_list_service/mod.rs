@@ -117,6 +117,11 @@ pub struct RoomListService {
     /// This is useful to avoid resetting the ranges to the same value,
     /// which would cancel the current in-flight sync request.
     viewport_ranges: Mutex<Ranges>,
+
+    /// List of currently filtered spaces for SPACE_VISIBLE_ROOMS_LIST_NAME.
+    current_space_ids: Mutex<Option<Vec<String>>>,
+    /// Same as viewport_ranges but for SPACE_VISIBLE_ROOMS_LIST_NAME.
+    space_viewport_ranges: Mutex<Ranges>,
 }
 
 impl RoomListService {
@@ -232,6 +237,8 @@ impl RoomListService {
             state: SharedObservable::new(State::Init),
             rooms: Arc::new(RwLock::new(RingBuffer::new(Self::ROOM_OBJECT_CACHE_SIZE))),
             viewport_ranges: Mutex::new(vec![VISIBLE_ROOMS_DEFAULT_RANGE]),
+            current_space_ids: Mutex::new(None),
+            space_viewport_ranges: Mutex::new(vec![VISIBLE_ROOMS_DEFAULT_RANGE]),
         })
     }
 
@@ -458,6 +465,76 @@ impl RoomListService {
             .ok_or_else(|| Error::InputCannotBeApplied(Input::Viewport(ranges.clone())))?;
 
         *viewport_ranges = ranges;
+
+        Ok(InputResult::Applied)
+    }
+
+    /// Pass an [`Input`] onto the state machine for the space-filtered list.
+    pub async fn apply_input_for_space(&self, input: Input) -> Result<InputResult, Error> {
+        use Input::*;
+
+        match input {
+            Viewport(ranges) => self.update_viewport_for_space(ranges).await,
+        }
+    }
+
+    async fn update_viewport_for_space(&self, ranges: Ranges) -> Result<InputResult, Error> {
+        let mut space_viewport_ranges = self.space_viewport_ranges.lock().await;
+
+        // Is it worth updating the viewport?
+        // The viewport has the same ranges. Don't update it.
+        if *space_viewport_ranges == ranges {
+            return Ok(InputResult::Ignored);
+        }
+
+        self.sliding_sync
+            .on_list(SPACE_VISIBLE_ROOMS_LIST_NAME, |list| {
+                list.set_sync_mode(SlidingSyncMode::new_selective().add_ranges(ranges.clone()));
+
+                ready(())
+            })
+            .await
+            .ok_or_else(|| Error::InputCannotBeApplied(Input::Viewport(ranges.clone())))?;
+
+        *space_viewport_ranges = ranges;
+
+        Ok(InputResult::Applied)
+    }
+
+    pub async fn apply_visible_space_filter(&self, space_ids: Option<Vec<String>>) -> Result<InputResult, Error> {
+
+        let current_space_ids = self.current_space_ids.lock().await;
+
+        if *current_space_ids == space_ids {
+            return Ok(InputResult::Ignored);
+        }
+
+        // We re-use the same name for all space filters, so
+        // add_list() will remove any previous space filter which
+        // used the same name.
+        self.sliding_sync
+            .add_list(configure_all_or_visible_rooms_list(
+                SlidingSyncList::builder(SPACE_VISIBLE_ROOMS_LIST_NAME)
+                    .sync_mode(
+                        SlidingSyncMode::new_selective().add_range(VISIBLE_ROOMS_DEFAULT_RANGE),
+                    )
+                    .timeline_limit(VISIBLE_ROOMS_DEFAULT_TIMELINE_LIMIT)
+                    .required_state(vec![
+                        (StateEventType::RoomEncryption, "".to_owned()),
+                        (StateEventType::RoomMember, "$LAZY".to_owned()),
+                    ]))
+                // Set filters *after* configure_all_or_visible_rooms_list(), since it'll overwrite
+                // the filters otherwise. Apart from the spaces filter, match the filters of
+                // configure_all_or_visible_rooms_list().
+                .filters(Some(assign!(SyncRequestListFilters::default(), {
+                        is_invite: Some(false),
+                        is_tombstoned: Some(false),
+                        not_room_types: vec!["m.space".to_owned()],
+                        spaces: space_ids.unwrap_or_default(),
+                })))
+            )
+            .await
+            .map_err(Error::SlidingSync)?;
 
         Ok(InputResult::Applied)
     }

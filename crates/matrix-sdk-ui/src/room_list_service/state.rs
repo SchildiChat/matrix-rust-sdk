@@ -30,6 +30,7 @@ pub const ALL_ROOMS_LIST_NAME: &str = "all_rooms";
 pub const VISIBLE_ROOMS_LIST_NAME: &str = "visible_rooms";
 pub const INVITES_LIST_NAME: &str = "invites";
 pub const ALL_SPACES_LIST_NAME: &str = "all_spaces";
+pub const SPACE_VISIBLE_ROOMS_LIST_NAME: &str = "space_rooms";
 
 /// The state of the [`super::RoomList`]' state machine.
 #[derive(Clone, Debug, PartialEq)]
