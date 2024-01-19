@@ -21,7 +21,7 @@ use crate::{
     space_child_info::SpaceChildInfo,
     room_member::{MessageLikeEventType, RoomMember, StateEventType},
     ruma::ImageInfo,
-    timeline::{EventTimelineItem, Timeline},
+    timeline::{EventTimelineItem, ReceiptType, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -537,6 +537,38 @@ impl Room {
             let event = self.inner.account_data(event_type.into()).await?;
             Ok(event.map(|e| e.json().get().to_owned()))
         })
+    }
+
+    /// Sets a flag on the room to indicate that the user has explicitly marked
+    /// it as unread
+    pub async fn mark_as_unread(&self) -> Result<(), ClientError> {
+        Ok(self.inner.mark_unread(true).await?)
+    }
+
+    /// Reverts a previously set unread flag.
+    pub async fn mark_as_read(&self) -> Result<(), ClientError> {
+        Ok(self.inner.mark_unread(false).await?)
+    }
+
+    /// Reverts a previously set unread flag and sends a read receipt to the
+    /// latest event in the room. Sending read receipts is useful when
+    /// executing this from the room list but shouldn't be use when entering
+    /// the room, the timeline should be left to its own devices in that
+    /// case.
+    pub async fn mark_as_read_and_send_read_receipt(
+        &self,
+        receipt_type: ReceiptType,
+    ) -> Result<(), ClientError> {
+        let timeline = self.timeline().await;
+
+        if let Some(event) = timeline.latest_event().await {
+            if let Err(error) = timeline.send_read_receipt(receipt_type, event.event_id().unwrap())
+            {
+                error!("Failed to send read receipt: {error}");
+            }
+        }
+
+        self.mark_as_read().await
     }
 }
 
