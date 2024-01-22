@@ -15,7 +15,7 @@
 #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
 use std::sync::RwLock as SyncRwLock;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, HashMap},
     mem,
     sync::Arc,
 };
@@ -43,6 +43,7 @@ use ruma::{
             redaction::SyncRoomRedactionEvent,
             tombstone::RoomTombstoneEventContent,
         },
+        space::child::SpaceChildEventContent,
         tag::Tags,
         AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent,
         RoomAccountDataEventType,
@@ -184,19 +185,8 @@ impl Room {
     }
 
     /// Space children if this is a space
-    pub fn space_children(&self) -> Vec<String> {
-        let mut result = Vec::new();
-        for (r, s) in self.inner.read().base_info.space_children.iter() {
-            // Has room been removed from space again?
-            if let Some(ev) = s.as_original() {
-                // Hasn't been replaced by empty state event?
-                // The spec tells us to ignore children without `via`
-                if !ev.content.via.is_empty() {
-                    result.push(r.to_string());
-                }
-            }
-        }
-        return result;
+    pub fn space_children(&self) -> HashMap<OwnedRoomId, MinimalStateEvent<SpaceChildEventContent>> {
+        return self.inner.read().base_info.space_children.clone()
     }
 
     /// Get the unread notification counts.

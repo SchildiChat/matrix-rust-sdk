@@ -18,6 +18,7 @@ use crate::{
     chunk_iterator::ChunkIterator,
     error::{ClientError, MediaInfoError, RoomError},
     room_info::RoomInfo,
+    space_child_info::SpaceChildInfo,
     room_member::{MessageLikeEventType, RoomMember, StateEventType},
     ruma::ImageInfo,
     timeline::{EventTimelineItem, Timeline},
@@ -90,8 +91,25 @@ impl Room {
         self.inner.is_space()
     }
 
-    pub fn space_children(&self) -> Vec<String> {
-        self.inner.space_children()
+    pub fn space_children(&self) -> Vec<SpaceChildInfo> {
+        let mut space_children = Vec::new();
+        for (r, s) in self.inner.space_children().iter() {
+            // Has room been removed from space again?
+            if let Some(ev) = s.as_original() {
+                // Hasn't been replaced by empty state event?
+                // The spec tells us to ignore children without `via`
+                if !ev.content.via.is_empty() {
+                    space_children.push(
+                        SpaceChildInfo::new(
+                            r.to_string(),
+                            ev.content.order.clone(),
+                            ev.content.suggested,
+                        )
+                    );
+                }
+            }
+        }
+        return space_children;
     }
 
     pub fn is_tombstoned(&self) -> bool {

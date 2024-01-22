@@ -37,6 +37,7 @@ mod room_list;
 mod room_member;
 mod ruma;
 mod session_verification;
+mod space_child_info;
 mod sync_service;
 mod task_handle;
 mod timeline;
