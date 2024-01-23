@@ -188,6 +188,27 @@ impl RoomListService {
             ))
             .await
             .map_err(Error::SlidingSync)?
+            .add_cached_list(
+                SlidingSyncList::builder(ALL_SPACES_LIST_NAME)
+                    .sync_mode(
+                        // Spec says leaving away the range should return the full list,
+                        // but we don't have a SyncMode for that (yet)
+                        SlidingSyncMode::new_selective().add_range(0..=u32::MAX),
+                    )
+                    .timeline_limit(0)
+                    .required_state(vec![
+                        (StateEventType::RoomAvatar, "".to_owned()),
+                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
+                        (StateEventType::RoomCreate, "".to_owned()),
+                        (StateEventType::SpaceChild, "*".to_owned()),
+                    ])
+                    .filters(Some(assign!(SyncRequestListFilters::default(), {
+                        is_tombstoned: Some(false),
+                        room_types: vec!["m.space".to_owned()],
+                    }))),
+            )
+            .await
+            .map_err(Error::SlidingSync)?
             .add_list(
                 SlidingSyncList::builder(INVITES_LIST_NAME)
                     .sync_mode(
@@ -205,25 +226,6 @@ impl RoomListService {
                         is_tombstoned: Some(false),
                         not_room_types: vec!["m.space".to_owned()],
 
-                    }))),
-            )
-            .add_list(
-                SlidingSyncList::builder(ALL_SPACES_LIST_NAME)
-                    .sync_mode(
-                        // Spec says leaving away the range should return the full list,
-                        // but we don't have a SyncMode for that (yet)
-                        SlidingSyncMode::new_selective().add_range(0..=u32::MAX),
-                    )
-                    .timeline_limit(0)
-                    .required_state(vec![
-                        (StateEventType::RoomAvatar, "".to_owned()),
-                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
-                        (StateEventType::RoomCreate, "".to_owned()),
-                        (StateEventType::SpaceChild, "*".to_owned()),
-                    ])
-                    .filters(Some(assign!(SyncRequestListFilters::default(), {
-                        is_tombstoned: Some(false),
-                        room_types: vec!["m.space".to_owned()],
                     }))),
             )
             .build()
