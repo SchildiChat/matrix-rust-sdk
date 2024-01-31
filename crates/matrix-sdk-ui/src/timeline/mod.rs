@@ -56,7 +56,7 @@ use ruma::{
 };
 use thiserror::Error;
 use tokio::sync::{mpsc::Sender, Mutex, Notify};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use self::futures::SendAttachment;
 
@@ -483,6 +483,7 @@ impl Timeline {
     async fn redact_reaction(&self, event_id: &EventId) -> ReactionToggleResult {
         let room = self.room();
         if room.state() != RoomState::Joined {
+            warn!("Cannot redact a reaction in a room that is not joined");
             return ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() };
         }
 
@@ -493,7 +494,10 @@ impl Timeline {
 
         match response {
             Ok(_) => ReactionToggleResult::RedactSuccess,
-            Err(_) => ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() },
+            Err(error) => {
+                error!("Failed to redact reaction: {error}");
+                ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() }
+            }
         }
     }
 
@@ -505,6 +509,7 @@ impl Timeline {
     ) -> ReactionToggleResult {
         let room = self.room();
         if room.state() != RoomState::Joined {
+            warn!("Cannot send a reaction in a room that is not joined");
             return ReactionToggleResult::AddFailure { txn_id };
         }
 
@@ -516,7 +521,10 @@ impl Timeline {
             Ok(response) => {
                 ReactionToggleResult::AddSuccess { event_id: response.event_id, txn_id }
             }
-            Err(_) => ReactionToggleResult::AddFailure { txn_id },
+            Err(error) => {
+                error!("Failed to send reaction: {error}");
+                ReactionToggleResult::AddFailure { txn_id }
+            }
         }
     }
 
@@ -690,18 +698,25 @@ impl Timeline {
     /// This uses [`Room::send_single_receipt`] internally, but checks
     /// first if the receipt points to an event in this timeline that is more
     /// recent than the current ones, to avoid unnecessary requests.
+    ///
+    /// Returns a boolean indicating if it sent the request or not.
     #[instrument(skip(self))]
     pub async fn send_single_receipt(
         &self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
         event_id: OwnedEventId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.inner.should_send_receipt(&receipt_type, &thread, &event_id).await {
-            return Ok(());
+            trace!(
+                "not sending receipt, because we already cover the event with a previous receipt"
+            );
+            return Ok(false);
         }
 
-        self.room().send_single_receipt(receipt_type, thread, event_id).await
+        trace!("sending receipt");
+        self.room().send_single_receipt(receipt_type, thread, event_id).await?;
+        Ok(true)
     }
 
     /// Send the given receipts.

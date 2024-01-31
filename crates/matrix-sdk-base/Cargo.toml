@@ -9,7 +9,7 @@ name = "matrix-sdk-base"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version = { workspace = true }
-version = "0.6.1"
+version = "0.7.0"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -43,10 +43,10 @@ eyeball = { workspace = true }
 eyeball-im = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true, optional = true }
-matrix-sdk-common = { version = "0.6.0", path = "../matrix-sdk-common" }
-matrix-sdk-crypto = { version = "0.6.0", path = "../matrix-sdk-crypto", optional = true, default-features = false }
-matrix-sdk-store-encryption = { version = "0.2.0", path = "../matrix-sdk-store-encryption" }
-matrix-sdk-test = { version = "0.6.0", path = "../../testing/matrix-sdk-test", optional = true }
+matrix-sdk-common = { workspace = true }
+matrix-sdk-crypto = { workspace = true, optional = true }
+matrix-sdk-store-encryption = { workspace = true }
+matrix-sdk-test = { workspace = true, optional = true }
 once_cell = { workspace = true }
 ruma = { workspace = true, features = ["canonical-json", "unstable-msc3381"] }
 serde = { workspace = true, features = ["rc"] }
@@ -61,7 +61,8 @@ assert_matches2 = { workspace = true }
 assign = "1.1.1"
 futures-executor = { workspace = true }
 http = { workspace = true }
-matrix-sdk-test = { version = "0.6.0", path = "../../testing/matrix-sdk-test" }
+matrix-sdk-test = { workspace = true }
+stream_assert = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

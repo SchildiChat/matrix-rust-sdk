@@ -22,16 +22,13 @@ use std::{
 
 pub use matrix_sdk_base::sync::*;
 use matrix_sdk_base::{
-    debug::{DebugInvitedRoom, DebugListOfRawEventsNoId, DebugNotificationMap},
+    debug::{DebugInvitedRoom, DebugListOfRawEventsNoId},
     deserialized_responses::AmbiguityChanges,
     instant::Instant,
     sync::SyncResponse as BaseSyncResponse,
 };
 use ruma::{
-    api::client::{
-        push::get_notifications::v3::Notification,
-        sync::sync_events::{self, v3::InvitedRoom},
-    },
+    api::client::sync::sync_events::{self, v3::InvitedRoom},
     events::{presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyToDeviceEvent},
     serde::Raw,
     OwnedRoomId, RoomId,
@@ -92,7 +89,7 @@ impl fmt::Debug for SyncResponse {
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
             .field("to_device", &DebugListOfRawEventsNoId(&self.to_device))
             .field("ambiguity_changes", &self.ambiguity_changes)
-            .field("notifications", &DebugNotificationMap(&self.notifications))
+            .field("notifications", &self.notifications)
             .finish_non_exhaustive()
     }
 }
@@ -159,6 +156,12 @@ impl Client {
         Ok(response)
     }
 
+    /// Calls event handlers and notification handlers after a sync response has
+    /// been processed.
+    ///
+    /// At this point, the sync response's data has been taken into account and
+    /// persisted in the store, if needs be. This function is only calling
+    /// the event, room update and notification handlers.
     #[tracing::instrument(skip(self, response))]
     pub(crate) async fn handle_sync_response(&self, response: &BaseSyncResponse) -> Result<()> {
         let BaseSyncResponse {

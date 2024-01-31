@@ -60,7 +60,6 @@ use tracing::{field, info_span, Instrument as _};
 use super::traits::Decryptor;
 use super::{
     event_item::EventItemIdentifier,
-    item::timeline_item,
     pagination::PaginationTokens,
     reactions::ReactionToggleResult,
     traits::RoomDataProvider,
@@ -273,8 +272,10 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
         let related_event = {
             let items = state.items.clone();
-            let (_, item) = rfind_event_by_id(&items, &annotation.event_id)
-                .ok_or(super::Error::FailedToToggleReaction)?;
+            let Some((_, item)) = rfind_event_by_id(&items, &annotation.event_id) else {
+                warn!("Timeline item not found, can't update reaction ID");
+                return Err(super::Error::FailedToToggleReaction);
+            };
             item.to_owned()
         };
 
@@ -622,6 +623,13 @@ impl<P: RoomDataProvider> TimelineInner<P> {
             }
         };
 
+        if matches!(
+            result,
+            ReactionToggleResult::AddFailure { .. } | ReactionToggleResult::RedactFailure { .. }
+        ) {
+            return Err(super::Error::FailedToToggleReaction);
+        }
+
         Ok(follow_up_action)
     }
 
@@ -941,7 +949,7 @@ impl TimelineInner {
         &self.room_data_provider
     }
 
-    /// Get the current fully-read event.
+    /// Get the current fully-read event, from storage.
     pub(super) async fn fully_read_event(&self) -> Option<FullyReadEvent> {
         match self.room().account_data_static().await {
             Ok(Some(fully_read)) => match fully_read.deserialize() {
@@ -959,7 +967,7 @@ impl TimelineInner {
         }
     }
 
-    /// Load the current fully-read event in this inner timeline.
+    /// Load the current fully-read event in this inner timeline from storage.
     pub(super) async fn load_fully_read_event(&self) {
         if let Some(fully_read) = self.fully_read_event().await {
             self.set_fully_read_event(fully_read.content.event_id).await;
@@ -1030,7 +1038,7 @@ impl TimelineInner {
                 event,
             }),
         ));
-        state.items.set(index, timeline_item(item, internal_id));
+        state.items.set(index, TimelineItem::new(item, internal_id));
 
         Ok(())
     }
@@ -1058,9 +1066,11 @@ impl TimelineInner {
                 if let Some((old_pub_read, _)) =
                     state.user_receipt(own_user_id, ReceiptType::Read, room).await
                 {
+                    trace!(%old_pub_read, "found a previous public receipt");
                     if let Some(relative_pos) =
                         state.meta.compare_events_positions(&old_pub_read, event_id)
                     {
+                        trace!("event referred to new receipt is {relative_pos:?} the previous receipt");
                         return relative_pos == RelativePosition::After;
                     }
                 }
@@ -1071,9 +1081,11 @@ impl TimelineInner {
                 if let Some((old_priv_read, _)) =
                     state.latest_user_read_receipt(own_user_id, room).await
                 {
+                    trace!(%old_priv_read, "found a previous private receipt");
                     if let Some(relative_pos) =
                         state.meta.compare_events_positions(&old_priv_read, event_id)
                     {
+                        trace!("event referred to new receipt is {relative_pos:?} the previous receipt");
                         return relative_pos == RelativePosition::After;
                     }
                 }

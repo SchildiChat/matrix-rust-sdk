@@ -193,6 +193,12 @@ impl Room {
         Ok(Arc::new(RoomMembersIterator::new(self.inner.members(RoomMemberships::empty()).await?)))
     }
 
+    pub async fn members_no_sync(&self) -> Result<Arc<RoomMembersIterator>, ClientError> {
+        Ok(Arc::new(RoomMembersIterator::new(
+            self.inner.members_no_sync(RoomMemberships::empty()).await?,
+        )))
+    }
+
     pub async fn member(&self, user_id: String) -> Result<Arc<RoomMember>, ClientError> {
         let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
         let member = self.inner.get_member(&user_id).await?.context("No user found")?;
@@ -436,9 +442,14 @@ impl Room {
         })
     }
 
-    pub async fn can_user_redact(&self, user_id: String) -> Result<bool, ClientError> {
+    pub async fn can_user_redact_own(&self, user_id: String) -> Result<bool, ClientError> {
         let user_id = UserId::parse(&user_id)?;
-        Ok(self.inner.can_user_redact(&user_id).await?)
+        Ok(self.inner.can_user_redact_own(&user_id).await?)
+    }
+
+    pub async fn can_user_redact_other(&self, user_id: String) -> Result<bool, ClientError> {
+        let user_id = UserId::parse(&user_id)?;
+        Ok(self.inner.can_user_redact_other(&user_id).await?)
     }
 
     pub async fn can_user_ban(&self, user_id: String) -> Result<bool, ClientError> {
