@@ -206,7 +206,6 @@ impl BaseRoomInfoV1 {
             topic,
             space_children: Default::default(),
             rtc_member: BTreeMap::new(),
-            is_marked_unread: false,
         })
     }
 }
