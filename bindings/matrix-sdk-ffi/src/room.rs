@@ -1,7 +1,7 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use anyhow::{Context, Result};
-use matrix_sdk::{room::Room as SdkRoom, RoomMemberships, RoomState};
+use matrix_sdk::{room::Room as SdkRoom, RoomMemberships, RoomNotableTags, RoomState};
 use matrix_sdk_ui::timeline::RoomExt;
 use mime::Mime;
 use ruma::{
@@ -17,11 +17,12 @@ use super::RUNTIME;
 use crate::{
     chunk_iterator::ChunkIterator,
     error::{ClientError, MediaInfoError, RoomError},
+    event::{MessageLikeEventType, StateEventType},
     room_info::RoomInfo,
-    space_child_info::SpaceChildInfo,
-    room_member::{MessageLikeEventType, RoomMember, StateEventType},
+    room_member::RoomMember,
     ruma::ImageInfo,
-    timeline::{EventTimelineItem, Timeline},
+    space_child_info::SpaceChildInfo,
+    timeline::{EventTimelineItem, ReceiptType, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -161,19 +162,15 @@ impl Room {
         }
     }
 
-    pub async fn timeline(&self) -> Arc<Timeline> {
+    pub async fn timeline(&self) -> Result<Arc<Timeline>, ClientError> {
         let mut write_guard = self.timeline.write().await;
         if let Some(timeline) = &*write_guard {
-            timeline.clone()
+            Ok(timeline.clone())
         } else {
-            let timeline = Timeline::new(self.inner.timeline().await);
+            let timeline = Timeline::new(self.inner.timeline().await?);
             *write_guard = Some(timeline.clone());
-            timeline
+            Ok(timeline)
         }
-    }
-
-    pub async fn poll_history(&self) -> Arc<Timeline> {
-        Timeline::new(self.inner.poll_history().await)
     }
 
     pub fn display_name(&self) -> Result<String, ClientError> {
@@ -274,6 +271,21 @@ impl Room {
                         error!("Failed to compute new RoomInfo: {e}");
                     }
                 }
+            }
+        })))
+    }
+
+    pub fn subscribe_to_notable_tags(
+        self: Arc<Self>,
+        listener: Box<dyn RoomNotableTagsListener>,
+    ) -> Arc<TaskHandle> {
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            let (initial, mut subscriber) = self.inner.notable_tags_stream().await;
+            // Send the initial value
+            listener.call(initial);
+            // Then wait for changes
+            while let Some(notable_tags) = subscriber.next().await {
+                listener.call(notable_tags);
             }
         })))
     }
@@ -538,11 +550,48 @@ impl Room {
             Ok(event.map(|e| e.json().get().to_owned()))
         })
     }
+
+    /// Sets a flag on the room to indicate that the user has explicitly marked
+    /// it as unread
+    pub async fn mark_as_unread(&self) -> Result<(), ClientError> {
+        Ok(self.inner.mark_unread(true).await?)
+    }
+
+    /// Reverts a previously set unread flag.
+    pub async fn mark_as_read(&self) -> Result<(), ClientError> {
+        Ok(self.inner.mark_unread(false).await?)
+    }
+
+    /// Reverts a previously set unread flag and sends a read receipt to the
+    /// latest event in the room. Sending read receipts is useful when
+    /// executing this from the room list but shouldn't be use when entering
+    /// the room, the timeline should be left to its own devices in that
+    /// case.
+    pub async fn mark_as_read_and_send_read_receipt(
+        &self,
+        receipt_type: ReceiptType,
+    ) -> Result<(), ClientError> {
+        let timeline = self.timeline().await?;
+
+        if let Some(event) = timeline.latest_event().await {
+            if let Err(error) = timeline.send_read_receipt(receipt_type, event.event_id().unwrap())
+            {
+                error!("Failed to send read receipt: {error}");
+            }
+        }
+
+        self.mark_as_read().await
+    }
 }
 
 #[uniffi::export(callback_interface)]
 pub trait RoomInfoListener: Sync + Send {
     fn call(&self, room_info: RoomInfo);
+}
+
+#[uniffi::export(callback_interface)]
+pub trait RoomNotableTagsListener: Sync + Send {
+    fn call(&self, notable_tags: RoomNotableTags);
 }
 
 #[derive(uniffi::Object)]

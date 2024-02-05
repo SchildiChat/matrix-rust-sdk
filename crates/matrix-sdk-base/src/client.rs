@@ -44,15 +44,15 @@ use ruma::{
         },
         AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
         AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
-        AnySyncTimelineEvent, GlobalAccountDataEventType, StateEventType,
+        AnySyncTimelineEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
     OwnedRoomId, OwnedUserId, RoomId, RoomVersionId, UInt, UserId,
 };
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 #[cfg(feature = "e2e-encryption")]
-use tokio::sync::RwLockReadGuard;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{debug, info, instrument, trace, warn};
 
 #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
@@ -68,7 +68,7 @@ use crate::{
         StateChanges, StateStoreDataKey, StateStoreDataValue, StateStoreExt, Store, StoreConfig,
     },
     sync::{JoinedRoom, LeftRoom, Notification, Rooms, SyncResponse, Timeline},
-    RoomStateFilter, SessionMeta,
+    RoomNotableTags, RoomStateFilter, SessionMeta,
 };
 #[cfg(feature = "e2e-encryption")]
 use crate::{error::Error, RoomMemberships};
@@ -496,6 +496,7 @@ impl BaseClient {
         let mut profiles = BTreeMap::new();
 
         assert_eq!(raw_events.len(), events.len());
+
         for (raw_event, event) in iter::zip(raw_events, events) {
             room_info.handle_state_event(event);
 
@@ -539,7 +540,21 @@ impl BaseClient {
     ) {
         for raw_event in events {
             if let Ok(event) = raw_event.deserialize() {
-                changes.add_room_account_data(room_id, event, raw_event.clone());
+                changes.add_room_account_data(room_id, event.clone(), raw_event.clone());
+
+                // Rooms can either appear in the current request or already be
+                // known to the store. If neither of
+                // those are true then the room is `unknown` and we cannot
+                // process its account data
+                if let AnyRoomAccountDataEvent::MarkedUnread(e) = event {
+                    if let Some(room) = changes.room_infos.get_mut(room_id) {
+                        room.base_info.is_marked_unread = e.content.unread;
+                    } else if let Some(room) = self.store.get_room(room_id) {
+                        let mut info = room.clone_info();
+                        info.base_info.is_marked_unread = e.content.unread;
+                        changes.add_room(info);
+                    }
+                }
             }
         }
     }
@@ -679,7 +694,7 @@ impl BaseClient {
     pub async fn room_joined(&self, room_id: &RoomId) -> Result<Room> {
         let room = self.store.get_or_create_room(room_id, RoomState::Joined);
         if room.state() != RoomState::Joined {
-            let _sync_lock = self.sync_lock().read().await;
+            let _sync_lock = self.sync_lock().lock().await;
 
             let mut room_info = room.clone_info();
             room_info.mark_as_joined();
@@ -700,7 +715,7 @@ impl BaseClient {
     pub async fn room_left(&self, room_id: &RoomId) -> Result<()> {
         let room = self.store.get_or_create_room(room_id, RoomState::Left);
         if room.state() != RoomState::Left {
-            let _sync_lock = self.sync_lock().read().await;
+            let _sync_lock = self.sync_lock().lock().await;
 
             let mut room_info = room.clone_info();
             room_info.mark_as_left();
@@ -716,7 +731,7 @@ impl BaseClient {
     }
 
     /// Get access to the store's sync lock.
-    pub fn sync_lock(&self) -> &RwLock<()> {
+    pub fn sync_lock(&self) -> &Mutex<()> {
         self.store.sync_lock()
     }
 
@@ -850,6 +865,8 @@ impl BaseClient {
             let unread_count = new_info.unread_count.map(|x| x.try_into().ok()).unwrap_or_default();
             room_info.update_unread_count(unread_count);
 
+            let ambiguity_changes = ambiguity_cache.changes.remove(&room_id).unwrap_or_default();
+
             new_rooms.join.insert(
                 room_id,
                 JoinedRoom::new(
@@ -859,6 +876,7 @@ impl BaseClient {
                     new_info.ephemeral.events,
                     notification_count,
                     unread_count,
+                    ambiguity_changes,
                 ),
             );
 
@@ -903,10 +921,17 @@ impl BaseClient {
             self.handle_room_account_data(&room_id, &new_info.account_data.events, &mut changes)
                 .await;
 
+            let ambiguity_changes = ambiguity_cache.changes.remove(&room_id).unwrap_or_default();
+
             changes.add_room(room_info);
             new_rooms.leave.insert(
                 room_id,
-                LeftRoom::new(timeline, new_info.state.events, new_info.account_data.events),
+                LeftRoom::new(
+                    timeline,
+                    new_info.state.events,
+                    new_info.account_data.events,
+                    ambiguity_changes,
+                ),
             );
         }
 
@@ -949,11 +974,12 @@ impl BaseClient {
 
         changes.ambiguity_maps = ambiguity_cache.cache;
 
-        let sync_lock = self.sync_lock().write().await;
-        self.store.save_changes(&changes).await?;
-        *self.store.sync_token.write().await = Some(response.next_batch.clone());
-        self.apply_changes(&changes);
-        drop(sync_lock);
+        {
+            let _sync_lock = self.sync_lock().lock().await;
+            self.store.save_changes(&changes).await?;
+            *self.store.sync_token.write().await = Some(response.next_batch.clone());
+            self.apply_changes(&changes);
+        }
 
         info!("Processed a sync response in {:?}", now.elapsed());
 
@@ -962,7 +988,6 @@ impl BaseClient {
             presence: response.presence.events,
             account_data: response.account_data.events,
             to_device,
-            ambiguity_changes: AmbiguityChanges { changes: ambiguity_cache.changes },
             notifications,
         };
 
@@ -977,6 +1002,23 @@ impl BaseClient {
         for (room_id, room_info) in &changes.room_infos {
             if let Some(room) = self.store.get_room(room_id) {
                 room.set_room_info(room_info.clone())
+            }
+        }
+
+        for (room_id, room_account_data) in &changes.room_account_data {
+            if let Some(room) = self.store.get_room(room_id) {
+                let tags = room_account_data.get(&RoomAccountDataEventType::Tag).and_then(|r| {
+                    match r.deserialize() {
+                        Ok(AnyRoomAccountDataEvent::Tag(event)) => Some(event.content.tags),
+                        Err(e) => {
+                            warn!("Room account data tag event failed to deserialize : {e}");
+                            None
+                        }
+                        Ok(_) => None,
+                    }
+                });
+                let notable_tags = RoomNotableTags::new(tags);
+                room.set_notable_tags(notable_tags)
             }
         }
     }
@@ -1064,7 +1106,7 @@ impl BaseClient {
 
             changes.ambiguity_maps = ambiguity_cache.cache;
 
-            let _sync_lock = self.sync_lock().write().await;
+            let _sync_lock = self.sync_lock().lock().await;
             let mut room_info = room.clone_info();
             room_info.mark_members_synced();
             changes.add_room(room_info);

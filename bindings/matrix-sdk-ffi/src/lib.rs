@@ -41,6 +41,7 @@ mod space_child_info;
 mod sync_service;
 mod task_handle;
 mod timeline;
+mod timeline_event_filter;
 mod tracing;
 mod utils;
 mod widget;
