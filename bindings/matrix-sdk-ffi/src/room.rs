@@ -1,14 +1,17 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use anyhow::{Context, Result};
-use matrix_sdk::{room::Room as SdkRoom, RoomMemberships, RoomNotableTags, RoomState};
+use matrix_sdk::{
+    room::{power_levels::RoomPowerLevelChanges, Room as SdkRoom},
+    RoomMemberships, RoomState,
+};
 use matrix_sdk_ui::timeline::RoomExt;
 use mime::Mime;
 use ruma::{
     api::client::room::report_content,
     assign,
     events::room::{avatar::ImageInfo as RumaAvatarImageInfo, MediaSource},
-    EventId, UserId,
+    EventId, Int, UserId,
 };
 use tokio::sync::RwLock;
 use tracing::error;
@@ -275,19 +278,22 @@ impl Room {
         })))
     }
 
-    pub fn subscribe_to_notable_tags(
-        self: Arc<Self>,
-        listener: Box<dyn RoomNotableTagsListener>,
-    ) -> Arc<TaskHandle> {
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
-            let (initial, mut subscriber) = self.inner.notable_tags_stream().await;
-            // Send the initial value
-            listener.call(initial);
-            // Then wait for changes
-            while let Some(notable_tags) = subscriber.next().await {
-                listener.call(notable_tags);
-            }
-        })))
+    pub async fn set_is_favourite(
+        &self,
+        is_favourite: bool,
+        tag_order: Option<f64>,
+    ) -> Result<(), ClientError> {
+        self.inner.set_is_favourite(is_favourite, tag_order).await?;
+        Ok(())
+    }
+
+    pub async fn set_is_low_priority(
+        &self,
+        is_low_priority: bool,
+        tag_order: Option<f64>,
+    ) -> Result<(), ClientError> {
+        self.inner.set_is_low_priority(is_low_priority, tag_order).await?;
+        Ok(())
     }
 
     /// Redacts an event from the room.
@@ -551,36 +557,65 @@ impl Room {
         })
     }
 
-    /// Sets a flag on the room to indicate that the user has explicitly marked
-    /// it as unread
-    pub async fn mark_as_unread(&self) -> Result<(), ClientError> {
-        Ok(self.inner.mark_unread(true).await?)
+    pub async fn subscribe_to_typing_notifications(
+        self: Arc<Self>,
+        listener: Box<dyn TypingNotificationsListener>,
+    ) -> Arc<TaskHandle> {
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            let (_event_handler_drop_guard, mut subscriber) =
+                self.inner.subscribe_to_typing_notifications();
+            while let Ok(typing_user_ids) = subscriber.recv().await {
+                let typing_user_ids =
+                    typing_user_ids.into_iter().map(|user_id| user_id.to_string()).collect();
+                listener.call(typing_user_ids);
+            }
+        })))
     }
 
-    /// Reverts a previously set unread flag.
-    pub async fn mark_as_read(&self) -> Result<(), ClientError> {
-        Ok(self.inner.mark_unread(false).await?)
+    /// Set (or unset) a flag on the room to indicate that the user has
+    /// explicitly marked it as unread.
+    pub async fn set_unread_flag(&self, new_value: bool) -> Result<(), ClientError> {
+        Ok(self.inner.set_unread_flag(new_value).await?)
     }
 
-    /// Reverts a previously set unread flag and sends a read receipt to the
-    /// latest event in the room. Sending read receipts is useful when
-    /// executing this from the room list but shouldn't be use when entering
-    /// the room, the timeline should be left to its own devices in that
-    /// case.
-    pub async fn mark_as_read_and_send_read_receipt(
-        &self,
-        receipt_type: ReceiptType,
-    ) -> Result<(), ClientError> {
+    /// Mark a room as read, by attaching a read receipt on the latest event.
+    ///
+    /// Note: this does NOT unset the unread flag; it's the caller's
+    /// responsibility to do so, if needs be.
+    pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<(), ClientError> {
         let timeline = self.timeline().await?;
 
-        if let Some(event) = timeline.latest_event().await {
-            if let Err(error) = timeline.send_read_receipt(receipt_type, event.event_id().unwrap())
-            {
-                error!("Failed to send read receipt: {error}");
-            }
-        }
+        timeline.mark_as_read(receipt_type).await?;
+        Ok(())
+    }
 
-        self.mark_as_read().await
+    pub async fn build_power_level_changes_from_current(
+        &self,
+    ) -> Result<RoomPowerLevelChanges, ClientError> {
+        let power_levels = self.inner.room_power_levels().await?;
+        Ok(power_levels.into())
+    }
+
+    pub async fn apply_power_level_changes(
+        &self,
+        changes: RoomPowerLevelChanges,
+    ) -> Result<(), ClientError> {
+        self.inner.apply_power_level_changes(changes).await?;
+        Ok(())
+    }
+
+    pub async fn update_power_level_for_user(
+        &self,
+        user_id: String,
+        power_level: i64,
+    ) -> Result<(), ClientError> {
+        let user_id = UserId::parse(&user_id)?;
+        let power_level = Int::new(power_level).context("Invalid power level")?;
+        self.inner
+            .update_power_levels(vec![(&user_id, power_level)])
+            .await
+            .map_err(|e| ClientError::Generic { msg: e.to_string() })?;
+        Ok(())
     }
 }
 
@@ -590,8 +625,8 @@ pub trait RoomInfoListener: Sync + Send {
 }
 
 #[uniffi::export(callback_interface)]
-pub trait RoomNotableTagsListener: Sync + Send {
-    fn call(&self, notable_tags: RoomNotableTags);
+pub trait TypingNotificationsListener: Sync + Send {
+    fn call(&self, typing_user_ids: Vec<String>);
 }
 
 #[derive(uniffi::Object)]

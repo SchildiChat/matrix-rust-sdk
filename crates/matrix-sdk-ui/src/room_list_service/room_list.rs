@@ -25,8 +25,10 @@ use matrix_sdk::{
     executor::{spawn, JoinHandle},
     RoomListEntry, SlidingSync, SlidingSyncList,
 };
+use matrix_sdk_base::RoomInfoUpdate;
+use tokio::{select, sync::broadcast};
 
-use super::{Error, State};
+use super::{filters::Filter, Error, State};
 
 /// A `RoomList` represents a list of rooms, from a
 /// [`RoomListService`](super::RoomListService).
@@ -123,6 +125,7 @@ impl RoomList {
     pub fn entries_with_dynamic_adapters(
         &self,
         page_size: usize,
+        roominfo_update_recv: broadcast::Receiver<RoomInfoUpdate>,
     ) -> (impl Stream<Item = Vec<VectorDiff<RoomListEntry>>>, RoomListDynamicEntriesController)
     {
         let list = self.sliding_sync_list.clone();
@@ -142,8 +145,12 @@ impl RoomList {
         let stream = stream! {
             loop {
                 let filter_fn = filter_fn_cell.take().await;
-                let (values, stream) = list
-                    .room_list_stream()
+                let (raw_values, raw_stream) = list.room_list_stream();
+
+                // Combine normal stream events with other updates from rooms
+                let merged_stream = merge_stream_and_receiver(raw_values.clone(), raw_stream, roominfo_update_recv.resubscribe());
+
+                let (values, stream) = (raw_values, merged_stream)
                     .filter(filter_fn)
                     .dynamic_limit_with_initial_value(page_size, limit_stream.clone());
 
@@ -155,6 +162,54 @@ impl RoomList {
         .switch();
 
         (stream, dynamic_entries_controller)
+    }
+}
+
+/// This function remembers the current state of the unfiltered room list, so it
+/// knows where all rooms are. When the receiver is triggered, a Set operation
+/// for the room position is inserted to the stream.
+fn merge_stream_and_receiver(
+    mut raw_current_values: Vector<RoomListEntry>,
+    raw_stream: impl Stream<Item = Vec<VectorDiff<RoomListEntry>>>,
+    mut roominfo_update_recv: broadcast::Receiver<RoomInfoUpdate>,
+) -> impl Stream<Item = Vec<VectorDiff<RoomListEntry>>> {
+    stream! {
+        pin_mut!(raw_stream);
+
+        loop {
+            select! {
+                biased; // Prefer manual updates for easier test code
+
+                Ok(update) = roominfo_update_recv.recv() => {
+                    if !update.trigger_room_list_update {
+                        continue;
+                    }
+
+                    // Search list for the updated room
+                    for (index, room) in raw_current_values.iter().enumerate() {
+                        if let RoomListEntry::Filled(r) = room {
+                            if r == &update.room_id {
+                                let update = VectorDiff::Set { index, value: raw_current_values[index].clone() };
+                                yield vec![update];
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                v = raw_stream.next() => {
+                    if let Some(v) = v {
+                        for change in &v {
+                            change.clone().apply(&mut raw_current_values);
+                        }
+                        yield v;
+                    } else {
+                        // Restart immediately, don't keep on waiting for the receiver
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -199,7 +254,8 @@ pub enum RoomListLoadingState {
     },
 }
 
-type BoxedFilterFn = Box<dyn Fn(&RoomListEntry) -> bool + Send + Sync>;
+/// Type alias for a boxed filter function.
+pub type BoxedFilterFn = Box<dyn Filter + Send + Sync>;
 
 /// Controller for the [`RoomList`] dynamic entries.
 ///
@@ -226,17 +282,14 @@ impl RoomListDynamicEntriesController {
     ///
     /// If the associated stream has been dropped, returns `false` to indicate
     /// the operation didn't have an effect.
-    pub fn set_filter(
-        &self,
-        filter: impl Fn(&RoomListEntry) -> bool + Send + Sync + 'static,
-    ) -> bool {
+    pub fn set_filter(&self, filter: BoxedFilterFn) -> bool {
         if Arc::strong_count(&self.filter) == 1 {
             // there is no other reference to the boxed filter fn, setting it
             // would be pointless (no new references can be created from self,
             // either)
             false
         } else {
-            self.filter.set(Box::new(filter));
+            self.filter.set(filter);
             true
         }
     }

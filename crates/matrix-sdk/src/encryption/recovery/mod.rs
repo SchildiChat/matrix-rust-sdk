@@ -98,7 +98,7 @@ use ruma::{
         secret_storage::default_key::SecretStorageDefaultKeyEvent,
     },
 };
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 #[cfg(doc)]
 use crate::encryption::{
@@ -124,7 +124,7 @@ pub struct Recovery {
 impl Recovery {
     /// Get the current [`RecoveryState`] for this [`Client`].
     pub fn state(&self) -> RecoveryState {
-        self.client.inner.recovery_state.get()
+        self.client.inner.e2ee.recovery_state.get()
     }
 
     /// Get a stream of updates to the [`RecoveryState`].
@@ -156,7 +156,7 @@ impl Recovery {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn state_stream(&self) -> impl Stream<Item = RecoveryState> {
-        self.client.inner.recovery_state.subscribe_reset()
+        self.client.inner.e2ee.recovery_state.subscribe_reset()
     }
 
     /// Enable secret storage *and* backups.
@@ -399,31 +399,34 @@ impl Recovery {
         Ok(devices.devices().count() == 1)
     }
 
+    /// Did we correctly set up cross-signing and backups?
     async fn all_known_secrets_available(&self) -> Result<bool> {
+        // Cross-signing state is fine if we have all the private cross-signing keys, as
+        // indicated in the status.
         let cross_signing_complete = self
             .client
             .encryption()
             .cross_signing_status()
             .await
-            .map(|status| status.is_complete())
-            .unwrap_or_default();
+            .map(|status| status.is_complete());
+        if !cross_signing_complete.unwrap_or_default() {
+            return Ok(false);
+        }
 
         // The backup state is fine if we have backups enabled locally, or if backups
         // have been marked as disabled.
-        let backup_state_ok = if self.client.encryption().backups().are_enabled().await {
-            true
+        if self.client.encryption().backups().are_enabled().await {
+            Ok(true)
         } else {
-            self.are_backups_marked_as_disabled().await?
-        };
-
-        Ok(cross_signing_complete && backup_state_ok)
+            self.are_backups_marked_as_disabled().await
+        }
     }
 
     async fn should_auto_enable_backups(&self) -> Result<bool> {
         // If we didn't already enable backups, we don't see a backup version on the
         // server, and finally if backups have not been marked to be explicitly
         // disabled, then we can automatically enable them.
-        Ok(self.client.inner.encryption_settings.auto_enable_backups
+        Ok(self.client.inner.e2ee.encryption_settings.auto_enable_backups
             && !self.client.encryption().backups().are_enabled().await
             && !self.client.encryption().backups().exists_on_server().await?
             && !self.are_backups_marked_as_disabled().await?)
@@ -432,18 +435,24 @@ impl Recovery {
     pub(crate) async fn setup(&self) -> Result<()> {
         info!("Setting up account data listeners and trying to setup recovery");
 
+        self.client.add_event_handler(Self::default_key_event_handler);
+        self.client.add_event_handler(Self::secret_send_event_handler);
+
         self.update_recovery_state().await?;
 
         if self.should_auto_enable_backups().await? {
-            self.enable_backup().await?;
-        }
+            info!("Trying to automatically enable backups");
 
-        self.client.add_event_handler(Self::default_key_event_handler);
-        self.client.add_event_handler(Self::secret_send_event_handler);
+            if let Err(e) = self.enable_backup().await {
+                warn!("Could not automatically enable backups: {e:?}");
+            }
+        }
 
         Ok(())
     }
 
+    /// Run a network request to figure whether backups have been disabled at
+    /// the account level.
     async fn are_backups_marked_as_disabled(&self) -> Result<bool> {
         Ok(self
             .client
@@ -479,7 +488,7 @@ impl Recovery {
 
     async fn update_recovery_state(&self) -> Result<()> {
         let new_state = self.check_recovery_state().await?;
-        self.client.inner.recovery_state.set(new_state);
+        self.client.inner.e2ee.recovery_state.set(new_state);
 
         Ok(())
     }

@@ -704,7 +704,7 @@ impl Timeline {
     /// recent than the current ones, to avoid unnecessary requests.
     ///
     /// Returns a boolean indicating if it sent the request or not.
-    #[instrument(skip(self))]
+    #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn send_single_receipt(
         &self,
         receipt_type: ReceiptType,
@@ -770,6 +770,24 @@ impl Timeline {
         }
 
         self.room().send_multiple_receipts(receipts).await
+    }
+
+    /// Mark the room as read by sending an unthreaded read receipt on the
+    /// latest event, be it visible or not.
+    ///
+    /// This works even if the latest event belongs to a thread, as a threaded
+    /// reply also belongs to the unthreaded timeline. No threaded receipt
+    /// will be sent here (see also #3123).
+    ///
+    /// Returns a boolean indicating if we sent the request or not.
+    #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
+    pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<bool> {
+        if let Some(event_id) = self.inner.latest_event_id().await {
+            self.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
+        } else {
+            trace!("can't mark room as read because there's no latest event id");
+            Ok(false)
+        }
     }
 }
 

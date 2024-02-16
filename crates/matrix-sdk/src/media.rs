@@ -278,13 +278,17 @@ impl Media {
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
+                    let content_len = content.len();
                     let mut cursor = std::io::Cursor::new(content);
                     let mut reader = matrix_sdk_base::crypto::AttachmentDecryptor::new(
                         &mut cursor,
                         file.as_ref().clone().into(),
                     )?;
 
-                    let mut decrypted = Vec::new();
+                    // Encrypted size should be the same as the decrypted size,
+                    // rounded up to a cipher block.
+                    let mut decrypted = Vec::with_capacity(content_len);
+
                     reader.read_to_end(&mut decrypted)?;
 
                     decrypted
@@ -347,7 +351,7 @@ impl Media {
     /// * `use_cache` - If we should use the media cache for this file.
     pub async fn get_file(
         &self,
-        event_content: impl MediaEventContent,
+        event_content: &impl MediaEventContent,
         use_cache: bool,
     ) -> Result<Option<Vec<u8>>> {
         let Some(source) = event_content.source() else { return Ok(None) };
@@ -365,7 +369,7 @@ impl Media {
     /// # Arguments
     ///
     /// * `event_content` - The media event content.
-    pub async fn remove_file(&self, event_content: impl MediaEventContent) -> Result<()> {
+    pub async fn remove_file(&self, event_content: &impl MediaEventContent) -> Result<()> {
         if let Some(source) = event_content.source() {
             self.remove_media_content(&MediaRequest { source, format: MediaFormat::File }).await?;
         }
@@ -393,7 +397,7 @@ impl Media {
     /// * `use_cache` - If we should use the media cache for this thumbnail.
     pub async fn get_thumbnail(
         &self,
-        event_content: impl MediaEventContent,
+        event_content: &impl MediaEventContent,
         size: MediaThumbnailSize,
         use_cache: bool,
     ) -> Result<Option<Vec<u8>>> {
@@ -420,7 +424,7 @@ impl Media {
     ///   requested with [`get_thumbnail`](#method.get_thumbnail).
     pub async fn remove_thumbnail(
         &self,
-        event_content: impl MediaEventContent,
+        event_content: &impl MediaEventContent,
         size: MediaThumbnailSize,
     ) -> Result<()> {
         if let Some(source) = event_content.source() {

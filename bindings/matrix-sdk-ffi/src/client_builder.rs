@@ -43,7 +43,26 @@ pub struct ClientBuilder {
 impl ClientBuilder {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            base_path: None,
+            username: None,
+            server_name: None,
+            homeserver_url: None,
+            server_versions: None,
+            passphrase: Zeroizing::new(None),
+            user_agent: None,
+            sliding_sync_proxy: None,
+            proxy: None,
+            disable_ssl_verification: false,
+            disable_automatic_token_refresh: false,
+            inner: MatrixClient::builder().with_encryption_settings(EncryptionSettings {
+                auto_enable_cross_signing: false,
+                backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+                auto_enable_backups: false,
+            }),
+            cross_process_refresh_lock_id: None,
+            session_delegate: None,
+        })
     }
 
     pub fn enable_cross_process_refresh_lock(
@@ -131,11 +150,20 @@ impl ClientBuilder {
     }
 
     pub fn build(self: Arc<Self>) -> Result<Arc<Client>, ClientError> {
-        Ok(self.build_inner()?)
+        Ok(Arc::new(self.build_inner()?))
     }
 }
 
 impl ClientBuilder {
+    pub(crate) fn with_encryption_settings(
+        self: Arc<Self>,
+        settings: EncryptionSettings,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.inner = builder.inner.with_encryption_settings(settings);
+        Arc::new(builder)
+    }
+
     pub(crate) fn enable_cross_process_refresh_lock_inner(
         self: Arc<Self>,
         process_id: String,
@@ -166,7 +194,7 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub(crate) fn build_inner(self: Arc<Self>) -> anyhow::Result<Arc<Client>> {
+    pub(crate) fn build_inner(self: Arc<Self>) -> anyhow::Result<Client> {
         let builder = unwrap_or_clone_arc(self);
         let mut inner_builder = builder.inner;
 
@@ -245,33 +273,5 @@ impl ClientBuilder {
             builder.cross_process_refresh_lock_id,
             builder.session_delegate,
         )?)
-    }
-}
-
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        let encryption_settings = EncryptionSettings {
-            auto_enable_cross_signing: true,
-            auto_enable_backups: true,
-            backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
-        };
-        let inner = MatrixClient::builder().with_encryption_settings(encryption_settings);
-
-        Self {
-            base_path: None,
-            username: None,
-            server_name: None,
-            homeserver_url: None,
-            server_versions: None,
-            passphrase: Zeroizing::new(None),
-            user_agent: None,
-            sliding_sync_proxy: None,
-            proxy: None,
-            disable_ssl_verification: false,
-            disable_automatic_token_refresh: false,
-            inner,
-            cross_process_refresh_lock_id: None,
-            session_delegate: None,
-        }
     }
 }

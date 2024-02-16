@@ -44,7 +44,7 @@ use crate::{
     deserialized_responses::SyncOrStrippedState,
     rooms::{
         normal::{RoomSummary, SyncInfo},
-        BaseRoomInfo,
+        BaseRoomInfo, RoomNotableTags,
     },
     sync::UnreadNotificationsCount,
     MinimalStateEvent, OriginalMinimalStateEvent, RoomInfo, RoomState,
@@ -207,6 +207,7 @@ impl BaseRoomInfoV1 {
             space_children: Default::default(),
             rtc_member: BTreeMap::new(),
             is_marked_unread: false,
+            notable_tags: RoomNotableTags::empty(),
         })
     }
 }

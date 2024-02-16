@@ -27,8 +27,8 @@ use futures_core::Stream;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
-    store::DynStateStore, sync::Notification, BaseClient, RoomState, RoomStateFilter,
-    SendOutsideWasm, SessionMeta, SyncOutsideWasm,
+    store::DynStateStore, sync::Notification, BaseClient, RoomInfoUpdate, RoomState,
+    RoomStateFilter, SendOutsideWasm, SessionMeta, SyncOutsideWasm,
 };
 use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
@@ -87,21 +87,14 @@ use crate::{
 };
 #[cfg(feature = "e2e-encryption")]
 use crate::{
-    encryption::{
-        backups::types::BackupClientState, recovery::RecoveryState, BackupDownloadStrategy,
-        Encryption, EncryptionSettings,
-    },
+    encryption::{Encryption, EncryptionData, EncryptionSettings},
     store_locks::CrossProcessStoreLock,
 };
 
 mod builder;
 pub(crate) mod futures;
-#[cfg(feature = "e2e-encryption")]
-mod tasks;
 
 pub use self::builder::{ClientBuildError, ClientBuilder};
-#[cfg(feature = "e2e-encryption")]
-use self::tasks::{BackupDownloadTask, BackupUploadingTask, ClientTasks};
 
 #[cfg(not(target_arch = "wasm32"))]
 type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -220,43 +213,52 @@ pub(crate) struct ClientInner {
 
     /// The URL of the homeserver to connect to.
     homeserver: StdRwLock<Url>,
+
     /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
     sliding_sync_proxy: StdRwLock<Option<Url>>,
+
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
+
     /// User session data.
     base_client: BaseClient,
+
     /// The Matrix versions the server supports (well-known ones only)
     server_versions: OnceCell<Box<[MatrixVersion]>>,
+
     /// Collection of locks individual client methods might want to use, either
     /// to ensure that only a single call to a method happens at once or to
     /// deduplicate multiple calls to a method.
     locks: ClientLocks,
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) tasks: StdMutex<ClientTasks>,
+
+    /// A mapping of the times at which the current user sent typing notices,
+    /// keyed by room.
     pub(crate) typing_notice_times: StdRwLock<BTreeMap<OwnedRoomId, Instant>>,
+
     /// Event handlers. See `add_event_handler`.
     pub(crate) event_handlers: EventHandlerStore,
+
     /// Notification handlers. See `register_notification_handler`.
     notification_handlers: RwLock<Vec<NotificationHandlerFn>>,
+
+    /// The sender-side of channels used to receive room updates.
     pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
+
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
     respect_login_well_known: bool,
+
     /// An event that can be listened on to wait for a successful sync. The
     /// event will only be fired if a sync loop is running. Can be used for
     /// synchronization, e.g. if we send out a request to create a room, we can
     /// wait for the sync to get the data to fetch a room object from the state
     /// store.
     pub(crate) sync_beat: event_listener::Event,
-    /// End-to-end encryption settings.
+
+    /// End-to-end encryption related state.
     #[cfg(feature = "e2e-encryption")]
-    pub(crate) encryption_settings: EncryptionSettings,
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) backup_state: BackupClientState,
-    #[cfg(feature = "e2e-encryption")]
-    pub(crate) recovery_state: SharedObservable<RecoveryState>,
+    pub(crate) e2ee: EncryptionData,
 }
 
 impl ClientInner {
@@ -283,8 +285,6 @@ impl ClientInner {
             sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
             http_client,
             base_client,
-            #[cfg(feature = "e2e-encryption")]
-            tasks: StdMutex::new(Default::default()),
             locks: Default::default(),
             server_versions: OnceCell::new_with(server_versions),
             typing_notice_times: Default::default(),
@@ -294,30 +294,14 @@ impl ClientInner {
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             #[cfg(feature = "e2e-encryption")]
-            encryption_settings,
-            #[cfg(feature = "e2e-encryption")]
-            backup_state: Default::default(),
-            #[cfg(feature = "e2e-encryption")]
-            recovery_state: Default::default(),
+            e2ee: EncryptionData::new(encryption_settings),
         };
 
         #[allow(clippy::let_and_return)]
         let client = Arc::new(client);
 
         #[cfg(feature = "e2e-encryption")]
-        {
-            let weak_client = Arc::downgrade(&client);
-
-            let mut tasks = client.tasks.lock().unwrap();
-
-            tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
-
-            if encryption_settings.backup_download_strategy
-                == BackupDownloadStrategy::AfterDecryptionFailure
-            {
-                tasks.download_room_keys = Some(BackupDownloadTask::new(weak_client));
-            }
-        }
+        client.e2ee.initialize_room_key_tasks(&client);
 
         client
     }
@@ -442,6 +426,13 @@ impl Client {
     /// Otherwise it returns `None`.
     pub fn session_meta(&self) -> Option<&SessionMeta> {
         self.base_client().session_meta()
+    }
+
+    /// Returns a receiver that gets events for each room info update. To watch
+    /// for new events, use `receiver.resubscribe()`. Each event contains the
+    /// room and a boolean whether this event should trigger a room list update.
+    pub fn roominfo_update_receiver(&self) -> broadcast::Receiver<RoomInfoUpdate> {
+        self.base_client().roominfo_update_receiver()
     }
 
     /// Performs a search for users.
@@ -1986,7 +1977,7 @@ impl Client {
                 self.inner.server_versions.get().cloned(),
                 self.inner.respect_login_well_known,
                 #[cfg(feature = "e2e-encryption")]
-                self.inner.encryption_settings,
+                self.inner.e2ee.encryption_settings,
             ),
         };
 

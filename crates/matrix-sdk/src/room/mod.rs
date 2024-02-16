@@ -58,6 +58,7 @@ use ruma::{
         },
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
+        typing::SyncTypingEvent,
         AnyRoomAccountDataEvent, AnyStateEvent, EmptyStateKey, MessageLikeEventContent,
         MessageLikeEventType, RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
         RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
@@ -77,9 +78,10 @@ use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEven
 use crate::{
     attachment::AttachmentConfig,
     error::WrongRoomState,
-    event_handler::{EventHandler, EventHandlerHandle, SyncEvent},
+    event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
     media::{MediaFormat, MediaRequest},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
+    room::power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt},
     sync::RoomUpdate,
     utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
     BaseRoom, Client, Error, HttpError, HttpResult, Result, RoomState, TransmissionProgress,
@@ -88,6 +90,7 @@ use crate::{
 pub mod futures;
 mod member;
 mod messages;
+pub mod power_levels;
 
 pub use self::{
     member::{RoomMember, RoomMemberRole},
@@ -316,6 +319,33 @@ impl Room {
         self.client.subscribe_to_room_updates(self.room_id())
     }
 
+    /// Subscribe to typing notifications for this room.
+    ///
+    /// The returned receiver will receive a new vector of user IDs for each
+    /// sync response that contains 'm.typing' event. The current user ID will
+    /// be filtered out.
+    pub fn subscribe_to_typing_notifications(
+        &self,
+    ) -> (EventHandlerDropGuard, broadcast::Receiver<Vec<OwnedUserId>>) {
+        let (sender, receiver) = broadcast::channel(16);
+        let typing_event_handler_handle = self.client.add_room_event_handler(self.room_id(), {
+            let own_user_id = self.own_user_id().to_owned();
+            move |event: SyncTypingEvent| async move {
+                // Ignore typing notifications from own user.
+                let typing_user_ids = event
+                    .content
+                    .user_ids
+                    .into_iter()
+                    .filter(|user_id| *user_id != own_user_id)
+                    .collect();
+                // Ignore the result. It can only fail if there are no listeners.
+                let _ = sender.send(typing_user_ids);
+            }
+        });
+        let drop_guard = self.client().event_handler_drop_guard(typing_event_handler_handle);
+        (drop_guard, receiver)
+    }
+
     /// Fetch the event with the given `EventId` in this room.
     pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
         let request =
@@ -422,7 +452,7 @@ impl Room {
                 changes.add_room(room_info.clone());
 
                 self.client.store().save_changes(&changes).await?;
-                self.set_room_info(room_info);
+                self.set_room_info(room_info, false);
 
                 Ok(())
             })
@@ -936,6 +966,58 @@ impl Room {
             tag.to_string(),
         );
         self.client.send(request, None).await
+    }
+
+    /// Add or remove the `m.favourite` flag for this room.
+    ///
+    /// If `is_favourite` is `true`, and the `m.low_priority` tag is set on the
+    /// room, the tag will be removed too.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_favourite` - Whether to mark this room as favourite.
+    /// * `tag_order` - The order of the tag if any.
+    pub async fn set_is_favourite(&self, is_favourite: bool, tag_order: Option<f64>) -> Result<()> {
+        if is_favourite {
+            let tag_info = assign!(TagInfo::new(), { order: tag_order });
+
+            self.set_tag(TagName::Favorite, tag_info).await?;
+
+            if self.is_low_priority() {
+                self.remove_tag(TagName::LowPriority).await?;
+            }
+        } else {
+            self.remove_tag(TagName::Favorite).await?;
+        }
+        Ok(())
+    }
+
+    /// Add or remove the `m.lowpriority` flag for this room.
+    ///
+    /// If `is_low_priority` is `true`, and the `m.favourite` tag is set on the
+    /// room, the tag will be removed too.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_low_priority` - Whether to mark this room as low_priority or not.
+    /// * `tag_order` - The order of the tag if any.
+    pub async fn set_is_low_priority(
+        &self,
+        is_low_priority: bool,
+        tag_order: Option<f64>,
+    ) -> Result<()> {
+        if is_low_priority {
+            let tag_info = assign!(TagInfo::new(), { order: tag_order });
+
+            self.set_tag(TagName::LowPriority, tag_info).await?;
+
+            if self.is_favourite() {
+                self.remove_tag(TagName::Favorite).await?;
+            }
+        } else {
+            self.remove_tag(TagName::LowPriority).await?;
+        }
+        Ok(())
     }
 
     /// Sets whether this room is a DM.
@@ -1692,7 +1774,7 @@ impl Room {
         &self,
         updates: Vec<(&UserId, Int)>,
     ) -> Result<send_state_event::v3::Response> {
-        let mut power_levels = self.get_room_power_levels().await?;
+        let mut power_levels = self.room_power_levels().await?;
 
         for (user_id, new_level) in updates {
             if new_level == power_levels.users_default {
@@ -1705,7 +1787,19 @@ impl Room {
         self.send_state_event(RoomPowerLevelsEventContent::from(power_levels)).await
     }
 
-    async fn get_room_power_levels(&self) -> Result<RoomPowerLevels> {
+    /// Applies a set of power level changes to this room.
+    ///
+    /// Any values that are `None` in the given `RoomPowerLevelChanges` will
+    /// remain unchanged.
+    pub async fn apply_power_level_changes(&self, changes: RoomPowerLevelChanges) -> Result<()> {
+        let mut power_levels = self.room_power_levels().await?;
+        power_levels.apply(changes)?;
+        self.send_state_event(RoomPowerLevelsEventContent::from(power_levels)).await?;
+        Ok(())
+    }
+
+    /// Get the current power levels of this room.
+    pub async fn room_power_levels(&self) -> Result<RoomPowerLevels> {
         Ok(self
             .get_state_event_static::<RoomPowerLevelsEventContent>()
             .await?
@@ -1987,7 +2081,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_redact_own(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_redact_own_event(user_id))
+        Ok(self.room_power_levels().await?.user_can_redact_own_event(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to redact
@@ -1995,7 +2089,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_redact_other(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_redact_event_of_other(user_id))
+        Ok(self.room_power_levels().await?.user_can_redact_event_of_other(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to ban in the
@@ -2003,7 +2097,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_ban(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_ban(user_id))
+        Ok(self.room_power_levels().await?.user_can_ban(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to kick in the
@@ -2011,7 +2105,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_invite(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_invite(user_id))
+        Ok(self.room_power_levels().await?.user_can_invite(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to kick in the
@@ -2019,7 +2113,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_kick(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_kick(user_id))
+        Ok(self.room_power_levels().await?.user_can_kick(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to send a
@@ -2031,7 +2125,7 @@ impl Room {
         user_id: &UserId,
         state_event: StateEventType,
     ) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_send_state(user_id, state_event))
+        Ok(self.room_power_levels().await?.user_can_send_state(user_id, state_event))
     }
 
     /// Returns true if the user with the given user_id is able to send a
@@ -2043,7 +2137,7 @@ impl Room {
         user_id: &UserId,
         message: MessageLikeEventType,
     ) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_send_message(user_id, message))
+        Ok(self.room_power_levels().await?.user_can_send_message(user_id, message))
     }
 
     /// Returns true if the user with the given user_id is able to trigger a
@@ -2051,7 +2145,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_trigger_room_notification(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.get_room_power_levels().await?.user_can_trigger_room_notification(user_id))
+        Ok(self.room_power_levels().await?.user_can_trigger_room_notification(user_id))
     }
 
     /// Get a list of servers that should know this room.
@@ -2396,9 +2490,9 @@ impl Room {
         Ok(self.client.send(request, None).await?)
     }
 
-    /// Sets a flag on the room to indicate that the user has explicitly marked
-    /// it as (un)read
-    pub async fn mark_unread(&self, unread: bool) -> Result<()> {
+    /// Set a flag on the room to indicate that the user has explicitly marked
+    /// it as (un)read.
+    pub async fn set_unread_flag(&self, unread: bool) -> Result<()> {
         let user_id =
             self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
 

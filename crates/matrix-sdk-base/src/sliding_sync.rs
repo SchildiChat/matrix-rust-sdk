@@ -40,7 +40,7 @@ use crate::{
     read_receipts::{compute_unread_counts, PreviousEventsProvider},
     rooms::RoomState,
     store::{ambiguity_map::AmbiguityCache, StateChanges, Store},
-    sync::{JoinedRoom, LeftRoom, Notification, Rooms, SyncResponse},
+    sync::{JoinedRoomUpdate, LeftRoomUpdate, Notification, RoomUpdates, SyncResponse},
     Room, RoomInfo,
 };
 
@@ -96,7 +96,7 @@ impl BaseClient {
 
         trace!("ready to submit changes to store");
         self.store.save_changes(&changes).await?;
-        self.apply_changes(&changes);
+        self.apply_changes(&changes, true);
         trace!("applied changes");
 
         Ok(to_device)
@@ -149,7 +149,7 @@ impl BaseClient {
             self.handle_account_data(&account_data.global, &mut changes).await;
         }
 
-        let mut new_rooms = Rooms::default();
+        let mut new_rooms = RoomUpdates::default();
         let mut notifications = Default::default();
         let mut rooms_account_data = account_data.rooms.clone();
 
@@ -204,7 +204,7 @@ impl BaseClient {
             new_rooms
                 .join
                 .entry(room_id.to_owned())
-                .or_insert_with(JoinedRoom::default)
+                .or_insert_with(JoinedRoomUpdate::default)
                 .ephemeral
                 .push(raw.clone().cast());
         }
@@ -214,7 +214,7 @@ impl BaseClient {
             new_rooms
                 .join
                 .entry(room_id.to_owned())
-                .or_insert_with(JoinedRoom::default)
+                .or_insert_with(JoinedRoomUpdate::default)
                 .ephemeral
                 .push(raw.clone().cast());
         }
@@ -228,13 +228,13 @@ impl BaseClient {
                     RoomState::Joined => new_rooms
                         .join
                         .entry(room_id.to_owned())
-                        .or_insert_with(JoinedRoom::default)
+                        .or_insert_with(JoinedRoomUpdate::default)
                         .account_data
                         .append(&mut raw.to_vec()),
                     RoomState::Left => new_rooms
                         .leave
                         .entry(room_id.to_owned())
-                        .or_insert_with(LeftRoom::default)
+                        .or_insert_with(LeftRoomUpdate::default)
                         .account_data
                         .append(&mut raw.to_vec()),
                     RoomState::Invited => {}
@@ -292,7 +292,7 @@ impl BaseClient {
 
         trace!("ready to submit changes to store");
         store.save_changes(&changes).await?;
-        self.apply_changes(&changes);
+        self.apply_changes(&changes, false);
         trace!("applied changes");
 
         Ok(SyncResponse {
@@ -315,7 +315,8 @@ impl BaseClient {
         changes: &mut StateChanges,
         notifications: &mut BTreeMap<OwnedRoomId, Vec<Notification>>,
         ambiguity_cache: &mut AmbiguityCache,
-    ) -> Result<(RoomInfo, Option<JoinedRoom>, Option<LeftRoom>, Option<InvitedRoom>)> {
+    ) -> Result<(RoomInfo, Option<JoinedRoomUpdate>, Option<LeftRoomUpdate>, Option<InvitedRoom>)>
+    {
         let (raw_state_events, state_events): (Vec<_>, Vec<_>) = {
             let mut state_events = Vec::new();
 
@@ -419,7 +420,7 @@ impl BaseClient {
 
                 Ok((
                     room_info,
-                    Some(JoinedRoom::new(
+                    Some(JoinedRoomUpdate::new(
                         timeline,
                         raw_state_events,
                         room_account_data.unwrap_or_default(),
@@ -436,7 +437,7 @@ impl BaseClient {
             RoomState::Left => Ok((
                 room_info,
                 None,
-                Some(LeftRoom::new(
+                Some(LeftRoomUpdate::new(
                     timeline,
                     raw_state_events,
                     room_account_data.unwrap_or_default(),
@@ -462,7 +463,11 @@ impl BaseClient {
         room_id: &RoomId,
     ) -> (Room, RoomInfo, Option<InvitedRoom>) {
         if let Some(invite_state) = &room_data.invite_state {
-            let room = store.get_or_create_room(room_id, RoomState::Invited);
+            let room = store.get_or_create_room(
+                room_id,
+                RoomState::Invited,
+                self.roominfo_update_sender.clone(),
+            );
             let mut room_info = room.clone_info();
 
             // We don't actually know what events are inside invite_state. In theory, they
@@ -484,7 +489,11 @@ impl BaseClient {
                 Some(v3::InvitedRoom::from(v3::InviteState::from(invite_state.clone()))),
             )
         } else {
-            let room = store.get_or_create_room(room_id, RoomState::Joined);
+            let room = store.get_or_create_room(
+                room_id,
+                RoomState::Joined,
+                self.roominfo_update_sender.clone(),
+            );
             let mut room_info = room.clone_info();
 
             // We default to considering this room joined if it's not an invite. If it's
@@ -1379,7 +1388,7 @@ mod tests {
             rawev_id(event2.clone())
         );
 
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
         assert_eq!(
             ev_id(room.latest_event().map(|latest_event| latest_event.event().clone())),
             rawev_id(event2)
@@ -1401,7 +1410,7 @@ mod tests {
         let room = make_room();
         let mut room_info = room.clone_info();
         cache_latest_events(&room, &mut room_info, events, None, None).await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
 
         // The latest message is stored
         assert_eq!(
@@ -1428,7 +1437,7 @@ mod tests {
         let room = make_room();
         let mut room_info = room.clone_info();
         cache_latest_events(&room, &mut room_info, events, None, None).await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
 
         // The latest message is stored, ignoring the receipt
         assert_eq!(
@@ -1481,7 +1490,7 @@ mod tests {
         let room = make_room();
         let mut room_info = room.clone_info();
         cache_latest_events(&room, &mut room_info, events, None, None).await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
 
         // The latest message is stored, ignoring encrypted and receipts
         assert_eq!(
@@ -1522,7 +1531,7 @@ mod tests {
             None,
         )
         .await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
 
         // Sanity: room_info has 10 encrypted events inside it
         assert_eq!(room.latest_encrypted_events.read().unwrap().len(), 10);
@@ -1531,7 +1540,7 @@ mod tests {
         let eventa = make_encrypted_event("$a");
         let mut room_info = room.clone_info();
         cache_latest_events(&room, &mut room_info, &[eventa], None, None).await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
 
         // The oldest event is gone
         assert!(!rawevs_ids(&room.latest_encrypted_events).contains(&"$0".to_owned()));
@@ -1553,13 +1562,13 @@ mod tests {
             None,
         )
         .await;
-        room.set_room_info(room_info.clone());
+        room.set_room_info(room_info.clone(), false);
 
         // When I ask to cache an unencrypted event, and some more encrypted events
         let eventa = make_event("m.room.message", "$a");
         let eventb = make_encrypted_event("$b");
         cache_latest_events(&room, &mut room_info, &[eventa, eventb], None, None).await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
 
         // The only encrypted events stored are the ones after the decrypted one
         assert_eq!(rawevs_ids(&room.latest_encrypted_events), &["$b"]);
@@ -1572,7 +1581,7 @@ mod tests {
         let room = make_room();
         let mut room_info = room.clone_info();
         cache_latest_events(&room, &mut room_info, events, None, None).await;
-        room.set_room_info(room_info);
+        room.set_room_info(room_info, false);
         room.latest_event().map(|latest_event| latest_event.event().clone())
     }
 
@@ -1593,11 +1602,14 @@ mod tests {
     }
 
     fn make_room() -> Room {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(1);
+
         Room::new(
             user_id!("@u:e.co"),
             Arc::new(MemoryStore::new()),
             room_id!("!r:e.co"),
             RoomState::Joined,
+            sender,
         )
     }
 

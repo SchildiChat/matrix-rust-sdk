@@ -26,7 +26,7 @@ use itertools::Itertools;
 use matrix_sdk::crypto::OlmMachine;
 use matrix_sdk::{
     deserialized_responses::{SyncTimelineEvent, TimelineEvent},
-    sync::JoinedRoom,
+    sync::JoinedRoomUpdate,
     Error, Result, Room,
 };
 #[cfg(test)]
@@ -428,7 +428,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         self.state.write().await.clear();
     }
 
-    pub(super) async fn handle_joined_room_update(&self, update: JoinedRoom) {
+    pub(super) async fn handle_joined_room_update(&self, update: JoinedRoomUpdate) {
         let mut state = self.state.write().await;
         state.handle_joined_room_update(update, &self.room_data_provider, &self.settings).await;
     }
@@ -607,8 +607,8 @@ impl<P: RoomDataProvider> TimelineInner<P> {
             }
             _ => {
                 // We're done, so also update the timeline
-                state.in_flight_reaction.remove(&annotation_key);
-                state.reaction_state.remove(&annotation_key);
+                state.in_flight_reaction.swap_remove(&annotation_key);
+                state.reaction_state.swap_remove(&annotation_key);
                 state.update_timeline_reaction(user_id, annotation, result)?;
 
                 ReactionAction::None
@@ -1142,6 +1142,13 @@ impl TimelineInner {
 
         // Let the server handle unknown receipts.
         true
+    }
+
+    /// Returns the latest event identifier, even if it's not visible, or if
+    /// it's folded into another timeline item.
+    pub(crate) async fn latest_event_id(&self) -> Option<OwnedEventId> {
+        let state = self.state.read().await;
+        state.all_events.back().map(|event_meta| &event_meta.event_id).cloned()
     }
 }
 
