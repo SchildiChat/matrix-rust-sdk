@@ -27,8 +27,10 @@ use futures_core::Stream;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
-    store::DynStateStore, sync::Notification, BaseClient, RoomInfoUpdate, RoomState,
-    RoomStateFilter, SendOutsideWasm, SessionMeta, SyncOutsideWasm,
+    store::DynStateStore,
+    sync::{Notification, RoomUpdates},
+    BaseClient, RoomInfoUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
+    SyncOutsideWasm,
 };
 use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
@@ -59,8 +61,8 @@ use ruma::{
     },
     assign,
     push::Ruleset,
-    DeviceId, OwnedDeviceId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId, RoomOrAliasId,
-    ServerName, UInt, UserId,
+    DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
+    RoomOrAliasId, ServerName, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
@@ -75,6 +77,7 @@ use crate::{
     config::RequestConfig,
     deduplicating_handler::DeduplicatingHandler,
     error::{HttpError, HttpResult},
+    event_cache::EventCache,
     event_handler::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
     },
@@ -182,6 +185,11 @@ pub(crate) struct ClientLocks {
     /// Handler to ensure that only one encryption state request is running at a
     /// time, given a room.
     pub(crate) encryption_state_deduplicated_handler: DeduplicatingHandler<OwnedRoomId>,
+
+    /// Deduplicating handler for sending read receipts. The string is an
+    /// internal implementation detail, see [`Self::send_single_receipt`].
+    pub(crate) read_receipt_deduplicated_handler: DeduplicatingHandler<(String, OwnedEventId)>,
+
     #[cfg(feature = "e2e-encryption")]
     pub(crate) cross_process_crypto_store_lock:
         OnceCell<CrossProcessStoreLock<LockableCryptoStore>>,
@@ -230,7 +238,7 @@ pub(crate) struct ClientInner {
     /// Collection of locks individual client methods might want to use, either
     /// to ensure that only a single call to a method happens at once or to
     /// deduplicate multiple calls to a method.
-    locks: ClientLocks,
+    pub(crate) locks: ClientLocks,
 
     /// A mapping of the times at which the current user sent typing notices,
     /// keyed by room.
@@ -245,6 +253,10 @@ pub(crate) struct ClientInner {
     /// The sender-side of channels used to receive room updates.
     pub(crate) room_update_channels: StdMutex<BTreeMap<OwnedRoomId, broadcast::Sender<RoomUpdate>>>,
 
+    /// The sender-side of a channel used to observe all the room updates of a
+    /// sync response.
+    pub(crate) room_updates_sender: broadcast::Sender<RoomUpdates>,
+
     /// Whether the client should update its homeserver URL with the discovery
     /// information present in the login response.
     respect_login_well_known: bool,
@@ -255,6 +267,11 @@ pub(crate) struct ClientInner {
     /// wait for the sync to get the data to fetch a room object from the state
     /// store.
     pub(crate) sync_beat: event_listener::Event,
+
+    /// A central cache for events, inactive first.
+    ///
+    /// It becomes active when [`EventCache::subscribe`] is called.
+    pub(crate) event_cache: EventCache,
 
     /// End-to-end encryption related state.
     #[cfg(feature = "e2e-encryption")]
@@ -276,6 +293,7 @@ impl ClientInner {
         base_client: BaseClient,
         server_versions: Option<Box<[MatrixVersion]>>,
         respect_login_well_known: bool,
+        event_cache: EventCache,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
     ) -> Arc<Self> {
         let client = Self {
@@ -291,8 +309,12 @@ impl ClientInner {
             event_handlers: Default::default(),
             notification_handlers: Default::default(),
             room_update_channels: Default::default(),
+            // A single `RoomUpdates` is sent once per sync, so we assume that 32 is sufficient
+            // ballast for all observers to catch up.
+            room_updates_sender: broadcast::Sender::new(32),
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
+            event_cache,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
         };
@@ -330,7 +352,7 @@ impl Client {
 
     /// Returns a subscriber that publishes an event every time the ignore user
     /// list changes.
-    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<()> {
+    pub fn subscribe_to_ignore_user_list_changes(&self) -> Subscriber<Vec<String>> {
         self.inner.base_client.subscribe_to_ignore_user_list_changes()
     }
 
@@ -833,6 +855,12 @@ impl Client {
             }
             btree_map::Entry::Occupied(entry) => entry.get().subscribe(),
         }
+    }
+
+    /// Subscribe to all updates to all rooms, whenever any has been received in
+    /// a sync response.
+    pub fn subscribe_to_all_room_updates(&self) -> broadcast::Receiver<RoomUpdates> {
+        self.inner.room_updates_sender.subscribe()
     }
 
     pub(crate) async fn notification_handlers(
@@ -1976,6 +2004,7 @@ impl Client {
                 self.inner.base_client.clone_with_in_memory_state_store(),
                 self.inner.server_versions.get().cloned(),
                 self.inner.respect_login_well_known,
+                self.inner.event_cache.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,
             ),
@@ -1993,6 +2022,11 @@ impl Client {
         }
 
         Ok(client)
+    }
+
+    /// The [`EventCache`] instance for this [`Client`].
+    pub fn event_cache(&self) -> &EventCache {
+        &self.inner.event_cache
     }
 }
 

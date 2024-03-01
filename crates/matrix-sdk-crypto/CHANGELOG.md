@@ -1,5 +1,15 @@
 # UNRELEASED
 
+Breaking changes:
+
+- Rename the `OlmMachine::invalidate_group_session` method to
+  `OlmMachine::discard_room_key`
+
+- Move `OlmMachine::export_room_keys` to `matrix_sdk_crypto::store::Store`.
+  (Call it with `olm_machine.store().export_room_keys(...)`.)
+
+Additions:
+
 - Expose new methods `OlmMachine::set_room_settings` and
   `OlmMachine::get_room_settings`.
   ([#3042](https://github.com/matrix-org/matrix-rust-sdk/pull/3042))
@@ -15,6 +25,9 @@
 - Add new API `Device::encrypt_event_raw` that allows
   to encrypt an event to a specific device.
   ([#3091](https://github.com/matrix-org/matrix-rust-sdk/pull/3091))
+
+- Add new API `store::Store::export_room_keys_stream` that provides room
+  keys on demand.
 
 # 0.7.0
 

@@ -17,7 +17,11 @@ use std::{fmt, sync::Arc};
 
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use ruma::{
-    api::{client::discovery::discover_homeserver, error::FromHttpResponseError, MatrixVersion},
+    api::{
+        client::discovery::{discover_homeserver, get_supported_versions},
+        error::FromHttpResponseError,
+        MatrixVersion,
+    },
     OwnedServerName, ServerName,
 };
 use thiserror::Error;
@@ -33,8 +37,8 @@ use crate::http_client::HttpSettings;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::OidcCtx;
 use crate::{
-    authentication::AuthCtx, config::RequestConfig, error::RumaApiError, http_client::HttpClient,
-    HttpError,
+    authentication::AuthCtx, config::RequestConfig, error::RumaApiError, event_cache::EventCache,
+    http_client::HttpClient, HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -112,9 +116,12 @@ impl ClientBuilder {
 
     /// Set the homeserver URL to use.
     ///
-    /// This method is mutually exclusive with
-    /// [`server_name()`][Self::server_name], if you set both whatever was set
-    /// last will be used.
+    /// The following methods are mutually exclusive:
+    /// [`homeserver_url()`][Self::homeserver_url]
+    /// [`server_name()`][Self::server_name]
+    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
+    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// If you set more than one, then whatever was set last will be used.
     pub fn homeserver_url(mut self, url: impl AsRef<str>) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::Url(url.as_ref().to_owned()));
         self
@@ -122,10 +129,11 @@ impl ClientBuilder {
 
     /// Set the sliding-sync proxy URL to use.
     ///
-    /// This is used only if the homeserver URL was defined with
-    /// [`Self::homeserver_url`]. If the homeserver address was defined with
-    /// [`Self::server_name`], then auto-discovery via the `.well-known`
-    /// endpoint will be performed.
+    /// This value is always used no matter if the homeserver URL was defined
+    /// with [`Self::homeserver_url`] or auto-discovered via
+    /// [`Self::server_name`], [`Self::insecure_server_name_no_tls`], or
+    /// [`Self::server_name_or_homeserver_url`] - any proxy discovered via the
+    /// well-known lookup will be ignored.
     #[cfg(feature = "experimental-sliding-sync")]
     pub fn sliding_sync_proxy(mut self, url: impl AsRef<str>) -> Self {
         self.sliding_sync_proxy = Some(url.as_ref().to_owned());
@@ -137,9 +145,12 @@ impl ClientBuilder {
     /// We assume we can connect in HTTPS to that server. If that's not the
     /// case, prefer using [`Self::insecure_server_name_no_tls`].
     ///
-    /// This method is mutually exclusive with
-    /// [`homeserver_url()`][Self::homeserver_url], if you set both whatever was
-    /// set last will be used.
+    /// The following methods are mutually exclusive:
+    /// [`homeserver_url()`][Self::homeserver_url]
+    /// [`server_name()`][Self::server_name]
+    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
+    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// If you set more than one, then whatever was set last will be used.
     pub fn server_name(mut self, server_name: &ServerName) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::ServerName {
             server: server_name.to_owned(),
@@ -153,14 +164,35 @@ impl ClientBuilder {
     /// (not secured) scheme. This also relaxes OIDC discovery checks to allow
     /// HTTP schemes.
     ///
-    /// This method is mutually exclusive with
-    /// [`homeserver_url()`][Self::homeserver_url], if you set both whatever was
-    /// set last will be used.
+    /// The following methods are mutually exclusive:
+    /// [`homeserver_url()`][Self::homeserver_url]
+    /// [`server_name()`][Self::server_name]
+    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
+    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// If you set more than one, then whatever was set last will be used.
     pub fn insecure_server_name_no_tls(mut self, server_name: &ServerName) -> Self {
         self.homeserver_cfg = Some(HomeserverConfig::ServerName {
             server: server_name.to_owned(),
             protocol: UrlScheme::Http,
         });
+        self
+    }
+
+    /// Set the server name to discover the homeserver from, falling back to
+    /// using it as a homeserver URL if discovery fails. When falling back to a
+    /// homeserver URL, a check is made to ensure that the server exists (unlike
+    /// [`homeserver_url()`][Self::homeserver_url]), so you can guarantee that
+    /// the client is ready to use.
+    ///
+    /// The following methods are mutually exclusive:
+    /// [`homeserver_url()`][Self::homeserver_url]
+    /// [`server_name()`][Self::server_name]
+    /// [`insecure_server_name_no_tls()`][Self::insecure_server_name_no_tls]
+    /// [`server_name_or_homeserver_url()`][Self::server_name_or_homeserver_url],
+    /// If you set more than one, then whatever was set last will be used.
+    pub fn server_name_or_homeserver_url(mut self, server_name_or_url: impl AsRef<str>) -> Self {
+        self.homeserver_cfg =
+            Some(HomeserverConfig::ServerNameOrUrl(server_name_or_url.as_ref().to_owned()));
         self
     }
 
@@ -257,6 +289,20 @@ impl ClientBuilder {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn user_agent(mut self, user_agent: impl AsRef<str>) -> Self {
         self.http_settings().user_agent = Some(user_agent.as_ref().to_owned());
+        self
+    }
+
+    /// Add the given list of certificates to the certificate store of the HTTP
+    /// client.
+    ///
+    /// These additional certificates will be trusted and considered when
+    /// establishing a HTTP request.
+    ///
+    /// Internally this will call the
+    /// [`reqwest::ClientBuilder::add_root_certificate()`] method.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn add_root_certificates(mut self, certificates: Vec<reqwest::Certificate>) -> Self {
+        self.http_settings().additional_root_certificates = certificates;
         self
     }
 
@@ -363,71 +409,82 @@ impl ClientBuilder {
 
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
+        let (homeserver, well_known) = match homeserver_cfg {
+            HomeserverConfig::Url(url) => (url, None),
+
+            HomeserverConfig::ServerName { server: server_name, protocol } => {
+                let well_known = discover_homeserver(server_name, protocol, &http_client).await?;
+                (well_known.homeserver.base_url.clone(), Some(well_known))
+            }
+
+            HomeserverConfig::ServerNameOrUrl(server_name_or_url) => {
+                // Store the result to return at the end. If this doesn't get modified, then the
+                // supplied name is neither a server name, nor a valid URL.
+                let mut homeserver_details: Option<(
+                    String,
+                    Option<discover_homeserver::Response>,
+                )> = None;
+                let mut discovery_error: Option<ClientBuildError> = None;
+
+                // Attempt discovery as a server name first.
+                let sanitize_result = sanitize_server_name(&server_name_or_url);
+                if let Ok(server_name) = sanitize_result.as_ref() {
+                    let protocol = if server_name_or_url.starts_with("http://") {
+                        UrlScheme::Http
+                    } else {
+                        UrlScheme::Https
+                    };
+
+                    match discover_homeserver(server_name.clone(), protocol, &http_client).await {
+                        Ok(well_known) => {
+                            homeserver_details =
+                                Some((well_known.homeserver.base_url.clone(), Some(well_known)));
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "Well-known discovery failed.");
+                            discovery_error = Some(e);
+                        }
+                    }
+                }
+
+                // When discovery fails, or the input isn't a valid server name, fallback to
+                // trying a homeserver URL if supplied.
+                if homeserver_details.is_none() {
+                    if let Ok(homeserver_url) = Url::parse(&server_name_or_url) {
+                        // Make sure the URL is definitely for a homeserver.
+                        if check_is_homeserver(&homeserver_url, &http_client).await {
+                            homeserver_details = Some((homeserver_url.to_string(), None));
+                        }
+                    }
+                }
+
+                homeserver_details
+                    .ok_or(discovery_error.unwrap_or(ClientBuildError::InvalidServerName))?
+            }
+        };
+
         #[cfg(feature = "experimental-oidc")]
         let mut authentication_server_info = None;
         #[cfg(feature = "experimental-oidc")]
-        let allow_insecure_oidc;
+        let allow_insecure_oidc = homeserver.starts_with("http://");
 
         #[cfg(feature = "experimental-sliding-sync")]
-        let mut sliding_sync_proxy: Option<Url> = None;
+        let mut sliding_sync_proxy =
+            self.sliding_sync_proxy.as_ref().map(|url| Url::parse(url)).transpose()?;
 
-        let homeserver = match homeserver_cfg {
-            HomeserverConfig::Url(url) => {
-                #[cfg(feature = "experimental-sliding-sync")]
-                {
-                    sliding_sync_proxy =
-                        self.sliding_sync_proxy.as_ref().map(|url| Url::parse(url)).transpose()?;
-                }
-
-                #[cfg(feature = "experimental-oidc")]
-                {
-                    allow_insecure_oidc = url.starts_with("http://");
-                }
-
-                url
+        #[allow(unused_variables)]
+        if let Some(well_known) = well_known {
+            #[cfg(feature = "experimental-oidc")]
+            {
+                authentication_server_info = well_known.authentication;
             }
-            HomeserverConfig::ServerName { server: server_name, protocol } => {
-                debug!("Trying to discover the homeserver");
 
-                let homeserver = match protocol {
-                    UrlScheme::Http => format!("http://{server_name}"),
-                    UrlScheme::Https => format!("https://{server_name}"),
-                };
-
-                let well_known = http_client
-                    .send(
-                        discover_homeserver::Request::new(),
-                        Some(RequestConfig::short_retry()),
-                        homeserver,
-                        None,
-                        &[MatrixVersion::V1_0],
-                        Default::default(),
-                    )
-                    .await
-                    .map_err(|e| match e {
-                        HttpError::Api(err) => ClientBuildError::AutoDiscovery(err),
-                        err => ClientBuildError::Http(err),
-                    })?;
-
-                #[cfg(feature = "experimental-oidc")]
-                {
-                    authentication_server_info = well_known.authentication;
-                    allow_insecure_oidc = matches!(protocol, UrlScheme::Http);
-                }
-
-                #[cfg(feature = "experimental-sliding-sync")]
-                if let Some(proxy) = well_known.sliding_sync_proxy.map(|p| p.url) {
-                    sliding_sync_proxy = Url::parse(&proxy).ok();
-                }
-
-                debug!(
-                    homeserver_url = well_known.homeserver.base_url,
-                    "Discovered the homeserver"
-                );
-
-                well_known.homeserver.base_url
+            #[cfg(feature = "experimental-sliding-sync")]
+            if sliding_sync_proxy.is_none() {
+                sliding_sync_proxy =
+                    well_known.sliding_sync_proxy.and_then(|p| Url::parse(&p.url).ok())
             }
-        };
+        }
 
         let homeserver = Url::parse(&homeserver)?;
 
@@ -451,6 +508,7 @@ impl ClientBuilder {
             base_client,
             self.server_versions,
             self.respect_login_well_known,
+            EventCache::new(),
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
         );
@@ -458,6 +516,70 @@ impl ClientBuilder {
         debug!("Done building the Client");
 
         Ok(Client { inner })
+    }
+}
+
+/// Creates a server name from a user supplied string. The string is first
+/// sanitized by removing whitespace, the http(s) scheme and any trailing
+/// slashes before being parsed.
+fn sanitize_server_name(s: &str) -> crate::Result<OwnedServerName, IdParseError> {
+    ServerName::parse(
+        s.trim().trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/'),
+    )
+}
+
+/// Discovers a homeserver by looking up the well-known at the supplied server
+/// name.
+async fn discover_homeserver(
+    server_name: OwnedServerName,
+    protocol: UrlScheme,
+    http_client: &HttpClient,
+) -> Result<discover_homeserver::Response, ClientBuildError> {
+    debug!("Trying to discover the homeserver");
+
+    let homeserver = match protocol {
+        UrlScheme::Http => format!("http://{server_name}"),
+        UrlScheme::Https => format!("https://{server_name}"),
+    };
+
+    let well_known = http_client
+        .send(
+            discover_homeserver::Request::new(),
+            Some(RequestConfig::short_retry()),
+            homeserver,
+            None,
+            &[MatrixVersion::V1_0],
+            Default::default(),
+        )
+        .await
+        .map_err(|e| match e {
+            HttpError::Api(err) => ClientBuildError::AutoDiscovery(err),
+            err => ClientBuildError::Http(err),
+        })?;
+
+    debug!(homeserver_url = well_known.homeserver.base_url, "Discovered the homeserver");
+
+    Ok(well_known)
+}
+
+/// Checks if the given URL represents a valid homeserver.
+async fn check_is_homeserver(homeserver_url: &Url, http_client: &HttpClient) -> bool {
+    match http_client
+        .send(
+            get_supported_versions::Request::new(),
+            Some(RequestConfig::short_retry()),
+            homeserver_url.to_string(),
+            None,
+            &[MatrixVersion::V1_0],
+            Default::default(),
+        )
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            debug!(error = %e, "Checking supported versions failed.");
+            false
+        }
     }
 }
 
@@ -531,6 +653,9 @@ enum HomeserverConfig {
     Url(String),
     /// A host/port pair representing a server URL.
     ServerName { server: OwnedServerName, protocol: UrlScheme },
+    /// First attempts to build as a server name, then falls back to a URL,
+    /// failing if no valid homeserver is found.
+    ServerNameOrUrl(String),
 }
 
 #[derive(Clone, Debug)]
@@ -606,6 +731,10 @@ pub enum ClientBuildError {
     #[error("no homeserver or user ID was configured")]
     MissingHomeserver,
 
+    /// The supplied server name was invalid.
+    #[error("The supplied server name is invalid")]
+    InvalidServerName,
+
     /// Error looking up the .well-known endpoint on auto-discovery
     #[error("Error looking up the .well-known endpoint on auto-discovery")]
     AutoDiscovery(FromHttpResponseError<RumaApiError>),
@@ -639,5 +768,329 @@ impl ClientBuildError {
             ClientBuildError::Http(e) => e,
             _ => unreachable!("homeserver URL was asserted to be valid"),
         }
+    }
+}
+
+// The http mocking library is not supported for wasm32
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod tests {
+    use assert_matches::assert_matches;
+    use matrix_sdk_test::{async_test, test_json};
+    use serde_json::{json_internal, Value as JsonValue};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_sanitize_server_name() {
+        assert_eq!(sanitize_server_name("matrix.org").unwrap().as_str(), "matrix.org");
+        assert_eq!(sanitize_server_name("https://matrix.org").unwrap().as_str(), "matrix.org");
+        assert_eq!(sanitize_server_name("http://matrix.org").unwrap().as_str(), "matrix.org");
+        assert_eq!(
+            sanitize_server_name("https://matrix.server.org").unwrap().as_str(),
+            "matrix.server.org"
+        );
+        assert_eq!(
+            sanitize_server_name("https://matrix.server.org/").unwrap().as_str(),
+            "matrix.server.org"
+        );
+        assert_eq!(
+            sanitize_server_name("  https://matrix.server.org// ").unwrap().as_str(),
+            "matrix.server.org"
+        );
+        assert_matches!(sanitize_server_name("https://matrix.server.org/something"), Err(_))
+    }
+
+    // Note: Due to a limitation of the http mocking library the following tests all
+    // supply an http:// url, to `server_name_or_homeserver_url` rather than the plain server name,
+    // otherwise  the builder will prepend https:// and the request will fail. In practice, this
+    // isn't a problem as the builder first strips the scheme and then checks if the
+    // name is a valid server name, so it is a close enough approximation.
+
+    #[async_test]
+    async fn test_discovery_invalid_server() {
+        // Given a new client builder.
+        let mut builder = ClientBuilder::new();
+
+        // When building a client with an invalid server name.
+        builder = builder.server_name_or_homeserver_url("⚠️ This won't work 🚫");
+        let error = builder.build().await.unwrap_err();
+
+        // Then the operation should fail due to the invalid server name.
+        assert_matches!(error, ClientBuildError::InvalidServerName);
+    }
+
+    #[async_test]
+    async fn test_discovery_no_server() {
+        // Given a new client builder.
+        let mut builder = ClientBuilder::new();
+
+        // When building a client with a valid server name that doesn't exist.
+        builder = builder.server_name_or_homeserver_url("localhost:3456");
+        let error = builder.build().await.unwrap_err();
+
+        // Then the operation should fail with an HTTP error.
+        println!("{error}");
+        assert_matches!(error, ClientBuildError::Http(_));
+    }
+
+    #[async_test]
+    async fn test_discovery_web_server() {
+        // Given a random web server that isn't a Matrix homeserver or hosting the
+        // well-known file for one.
+        let server = MockServer::start().await;
+        let mut builder = ClientBuilder::new();
+
+        // When building a client with the server's URL.
+        builder = builder.server_name_or_homeserver_url(server.uri());
+        let error = builder.build().await.unwrap_err();
+
+        // Then the operation should fail with a server discovery error.
+        assert_matches!(error, ClientBuildError::AutoDiscovery(FromHttpResponseError::Server(_)));
+    }
+
+    #[async_test]
+    async fn test_discovery_direct_legacy() {
+        // Given a homeserver without a well-known file.
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        // When building a client with the server's URL.
+        builder = builder.server_name_or_homeserver_url(homeserver.uri());
+        let client = builder.build().await.unwrap();
+
+        // Then a client should be built without support for sliding sync or OIDC.
+        #[cfg(feature = "experimental-sliding-sync")]
+        assert!(client.sliding_sync_proxy().is_none());
+        #[cfg(feature = "experimental-oidc")]
+        assert!(client.oidc().authentication_server_info().is_none());
+    }
+
+    #[async_test]
+    async fn test_discovery_direct_legacy_custom_proxy() {
+        // Given a homeserver without a well-known file and with a custom sliding sync
+        // proxy injected.
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+        #[cfg(feature = "experimental-sliding-sync")]
+        {
+            builder = builder.sliding_sync_proxy("https://localhost:1234");
+        }
+
+        // When building a client with the server's URL.
+        builder = builder.server_name_or_homeserver_url(homeserver.uri());
+        let client = builder.build().await.unwrap();
+
+        // Then a client should be built with support for sliding sync.
+        #[cfg(feature = "experimental-sliding-sync")]
+        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+        #[cfg(feature = "experimental-oidc")]
+        assert!(client.oidc().authentication_server_info().is_none());
+    }
+
+    #[async_test]
+    async fn test_discovery_well_known_parse_error() {
+        // Given a base server with a well-known file that has errors.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        let well_known = make_well_known_json(&homeserver.uri(), None, None);
+        let bad_json = well_known.to_string().replace(',', "");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bad_json))
+            .mount(&server)
+            .await;
+
+        // When building a client with the base server.
+        builder = builder.server_name_or_homeserver_url(server.uri());
+        let error = builder.build().await.unwrap_err();
+
+        // Then the operation should fail due to the well-known file's contents.
+        assert_matches!(
+            error,
+            ClientBuildError::AutoDiscovery(FromHttpResponseError::Deserialization(_))
+        );
+    }
+
+    #[async_test]
+    async fn test_discovery_well_known_legacy() {
+        // Given a base server with a well-known file that points to a homeserver that
+        // doesn't support sliding sync.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
+                &homeserver.uri(),
+                None,
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        // When building a client with the base server.
+        builder = builder.server_name_or_homeserver_url(server.uri());
+        let client = builder.build().await.unwrap();
+
+        // Then a client should be built without support for sliding sync or OIDC.
+        #[cfg(feature = "experimental-sliding-sync")]
+        assert!(client.sliding_sync_proxy().is_none());
+        #[cfg(feature = "experimental-oidc")]
+        assert!(client.oidc().authentication_server_info().is_none());
+    }
+
+    #[async_test]
+    async fn test_discovery_well_known_with_sliding_sync() {
+        // Given a base server with a well-known file that points to a homeserver with a
+        // sliding sync proxy.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
+                &homeserver.uri(),
+                Some("https://localhost:1234"),
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        // When building a client with the base server.
+        builder = builder.server_name_or_homeserver_url(server.uri());
+        let client = builder.build().await.unwrap();
+
+        // Then a client should be built with support for sliding sync.
+        #[cfg(feature = "experimental-sliding-sync")]
+        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+        #[cfg(feature = "experimental-oidc")]
+        assert!(client.oidc().authentication_server_info().is_none());
+    }
+
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_discovery_well_known_with_sliding_sync_override() {
+        // Given a base server with a well-known file that points to a homeserver with a
+        // sliding sync proxy.
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
+                &homeserver.uri(),
+                Some("https://localhost:1234"),
+                None,
+            )))
+            .mount(&server)
+            .await;
+
+        // When building a client with the base server and a custom sliding sync proxy
+        // set.
+        builder = builder.sliding_sync_proxy("https://localhost:9012");
+        builder = builder.server_name_or_homeserver_url(server.uri());
+        let client = builder.build().await.unwrap();
+
+        // Then a client should be built and configured with the custom sliding sync
+        // proxy.
+        #[cfg(feature = "experimental-sliding-sync")]
+        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:9012".parse().unwrap()));
+        #[cfg(feature = "experimental-oidc")]
+        assert!(client.oidc().authentication_server_info().is_none());
+    }
+
+    #[async_test]
+    async fn test_discovery_well_known_matrix2point0() {
+        // Given a base server with a well-known file that points to a homeserver that
+        // is Matrix 2.0 ready (OIDC & Sliding Sync).
+        let server = MockServer::start().await;
+        let homeserver = make_mock_homeserver().await;
+        let mut builder = ClientBuilder::new();
+
+        Mock::given(method("GET"))
+            .and(path("/.well-known/matrix/client"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
+                &homeserver.uri(),
+                Some("https://localhost:1234"),
+                Some("https://localhost:5678"),
+            )))
+            .mount(&server)
+            .await;
+
+        // When building a client with the base server.
+        builder = builder.server_name_or_homeserver_url(server.uri());
+        let client = builder.build().await.unwrap();
+
+        // Then a client should be built with support for both sliding sync and OIDC.
+        #[cfg(feature = "experimental-sliding-sync")]
+        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+        #[cfg(feature = "experimental-oidc")]
+        assert_eq!(
+            client.oidc().authentication_server_info().unwrap().issuer,
+            "https://localhost:5678".to_owned()
+        );
+    }
+
+    /* Helper functions */
+
+    async fn make_mock_homeserver() -> MockServer {
+        let homeserver = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .mount(&homeserver)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/r0/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::LOGIN_TYPES))
+            .mount(&homeserver)
+            .await;
+        homeserver
+    }
+
+    fn make_well_known_json(
+        homeserver_url: &str,
+        sliding_sync_proxy_url: Option<&str>,
+        authentication_issuer: Option<&str>,
+    ) -> JsonValue {
+        ::serde_json::Value::Object({
+            let mut object = ::serde_json::Map::new();
+            let _ = object.insert(
+                "m.homeserver".into(),
+                json_internal!({
+                    "base_url": homeserver_url
+                }),
+            );
+
+            if let Some(sliding_sync_proxy_url) = sliding_sync_proxy_url {
+                let _ = object.insert(
+                    "org.matrix.msc3575.proxy".into(),
+                    json_internal!({
+                        "url": sliding_sync_proxy_url
+                    }),
+                );
+            }
+
+            if let Some(authentication_issuer) = authentication_issuer {
+                let _ = object.insert(
+                    "org.matrix.msc2965.authentication".into(),
+                    json_internal!({
+                        "issuer": authentication_issuer,
+                        "account": authentication_issuer.to_owned() + "/account"
+                    }),
+                );
+            }
+
+            object
+        })
     }
 }

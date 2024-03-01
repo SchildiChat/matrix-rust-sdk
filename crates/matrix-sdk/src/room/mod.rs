@@ -1107,6 +1107,29 @@ impl Room {
         }
     }
 
+    /// Forces the currently active room key, which is used to encrypt messages,
+    /// to be rotated.
+    ///
+    /// A new room key will be crated and shared with all the room members the
+    /// next time a message will be sent. You don't have to call this method,
+    /// room keys will be rotated automatically when necessary. This method is
+    /// still useful for debugging purposes.
+    ///
+    /// For more info please take a look a the [`encryption`] module
+    /// documentation.
+    ///
+    /// [`encryption`]: crate::encryption
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn discard_room_key(&self) -> Result<()> {
+        let machine = self.client.olm_machine().await;
+        if let Some(machine) = machine.as_ref() {
+            machine.discard_room_key(self.inner.room_id()).await?;
+            Ok(())
+        } else {
+            Err(Error::NoOlmMachine)
+        }
+    }
+
     /// Ban the user with `UserId` from this room.
     ///
     /// # Arguments
@@ -1297,12 +1320,26 @@ impl Room {
         thread: ReceiptThread,
         event_id: OwnedEventId,
     ) -> Result<()> {
-        let mut request =
-            create_receipt::v3::Request::new(self.room_id().to_owned(), receipt_type, event_id);
-        request.thread = thread;
+        // Since the receipt type and the thread aren't Hash/Ord, flatten then as a
+        // string key.
+        let request_key = format!("{}|{}", receipt_type, thread.as_str().unwrap_or("<unthreaded>"));
 
-        self.client.send(request, None).await?;
-        Ok(())
+        self.client
+            .inner
+            .locks
+            .read_receipt_deduplicated_handler
+            .run((request_key, event_id.clone()), async {
+                let mut request = create_receipt::v3::Request::new(
+                    self.room_id().to_owned(),
+                    receipt_type,
+                    event_id,
+                );
+                request.thread = thread;
+
+                self.client.send(request, None).await?;
+                Ok(())
+            })
+            .await
     }
 
     /// Send a request to set multiple receipts at once.
@@ -1418,7 +1455,7 @@ impl Room {
                 if let Err(r) = response {
                     let machine = self.client.olm_machine().await;
                     if let Some(machine) = machine.as_ref() {
-                        machine.invalidate_group_session(self.room_id()).await?;
+                        machine.discard_room_key(self.room_id()).await?;
                     }
                     return Err(r);
                 }

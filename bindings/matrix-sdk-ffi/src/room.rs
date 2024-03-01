@@ -165,6 +165,18 @@ impl Room {
         }
     }
 
+    /// Forces the currently active room key, which is used to encrypt messages,
+    /// to be rotated.
+    ///
+    /// A new room key will be crated and shared with all the room members the
+    /// next time a message will be sent. You don't have to call this method,
+    /// room keys will be rotated automatically when necessary. This method is
+    /// still useful for debugging purposes.
+    pub async fn discard_room_key(&self) -> Result<(), ClientError> {
+        self.inner.discard_room_key().await?;
+        Ok(())
+    }
+
     pub async fn timeline(&self) -> Result<Arc<Timeline>, ClientError> {
         let mut write_guard = self.timeline.write().await;
         if let Some(timeline) = &*write_guard {
@@ -363,13 +375,11 @@ impl Room {
     ///
     /// # Arguments
     ///
-    /// * `event_id` - The ID of the user to ignore.
-    pub fn ignore_user(&self, user_id: String) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let user_id = UserId::parse(user_id)?;
-            self.inner.client().account().ignore_user(&user_id).await?;
-            Ok(())
-        })
+    /// * `user_id` - The ID of the user to ignore.
+    pub async fn ignore_user(&self, user_id: String) -> Result<(), ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        self.inner.client().account().ignore_user(&user_id).await?;
+        Ok(())
     }
 
     /// Leave this room.
@@ -557,7 +567,7 @@ impl Room {
         })
     }
 
-    pub async fn subscribe_to_typing_notifications(
+    pub fn subscribe_to_typing_notifications(
         self: Arc<Self>,
         listener: Box<dyn TypingNotificationsListener>,
     ) -> Arc<TaskHandle> {
