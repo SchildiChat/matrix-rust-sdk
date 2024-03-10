@@ -37,8 +37,8 @@ use crate::http_client::HttpSettings;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::OidcCtx;
 use crate::{
-    authentication::AuthCtx, config::RequestConfig, error::RumaApiError, event_cache::EventCache,
-    http_client::HttpClient, HttpError, IdParseError,
+    authentication::AuthCtx, config::RequestConfig, error::RumaApiError, http_client::HttpClient,
+    HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -499,6 +499,7 @@ impl ClientBuilder {
             oidc: OidcCtx::new(authentication_server_info, allow_insecure_oidc),
         });
 
+        let event_cache = OnceCell::new();
         let inner = ClientInner::new(
             auth_ctx,
             homeserver,
@@ -507,11 +508,13 @@ impl ClientBuilder {
             http_client,
             base_client,
             self.server_versions,
+            None,
             self.respect_login_well_known,
-            EventCache::new(),
+            event_cache,
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
-        );
+        )
+        .await;
 
         debug!("Done building the Client");
 
@@ -860,13 +863,13 @@ pub(crate) mod tests {
 
         // When building a client with the server's URL.
         builder = builder.server_name_or_homeserver_url(homeserver.uri());
-        let client = builder.build().await.unwrap();
+        let _client = builder.build().await.unwrap();
 
         // Then a client should be built without support for sliding sync or OIDC.
         #[cfg(feature = "experimental-sliding-sync")]
-        assert!(client.sliding_sync_proxy().is_none());
+        assert!(_client.sliding_sync_proxy().is_none());
         #[cfg(feature = "experimental-oidc")]
-        assert!(client.oidc().authentication_server_info().is_none());
+        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -882,13 +885,13 @@ pub(crate) mod tests {
 
         // When building a client with the server's URL.
         builder = builder.server_name_or_homeserver_url(homeserver.uri());
-        let client = builder.build().await.unwrap();
+        let _client = builder.build().await.unwrap();
 
         // Then a client should be built with support for sliding sync.
         #[cfg(feature = "experimental-sliding-sync")]
-        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+        assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
         #[cfg(feature = "experimental-oidc")]
-        assert!(client.oidc().authentication_server_info().is_none());
+        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -937,13 +940,13 @@ pub(crate) mod tests {
 
         // When building a client with the base server.
         builder = builder.server_name_or_homeserver_url(server.uri());
-        let client = builder.build().await.unwrap();
+        let _client = builder.build().await.unwrap();
 
         // Then a client should be built without support for sliding sync or OIDC.
         #[cfg(feature = "experimental-sliding-sync")]
-        assert!(client.sliding_sync_proxy().is_none());
+        assert!(_client.sliding_sync_proxy().is_none());
         #[cfg(feature = "experimental-oidc")]
-        assert!(client.oidc().authentication_server_info().is_none());
+        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -966,13 +969,13 @@ pub(crate) mod tests {
 
         // When building a client with the base server.
         builder = builder.server_name_or_homeserver_url(server.uri());
-        let client = builder.build().await.unwrap();
+        let _client = builder.build().await.unwrap();
 
         // Then a client should be built with support for sliding sync.
         #[cfg(feature = "experimental-sliding-sync")]
-        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+        assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
         #[cfg(feature = "experimental-oidc")]
-        assert!(client.oidc().authentication_server_info().is_none());
+        assert!(_client.oidc().authentication_server_info().is_none());
     }
 
     #[async_test]
@@ -1028,14 +1031,14 @@ pub(crate) mod tests {
 
         // When building a client with the base server.
         builder = builder.server_name_or_homeserver_url(server.uri());
-        let client = builder.build().await.unwrap();
+        let _client = builder.build().await.unwrap();
 
         // Then a client should be built with support for both sliding sync and OIDC.
         #[cfg(feature = "experimental-sliding-sync")]
-        assert_eq!(client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
+        assert_eq!(_client.sliding_sync_proxy(), Some("https://localhost:1234".parse().unwrap()));
         #[cfg(feature = "experimental-oidc")]
         assert_eq!(
-            client.oidc().authentication_server_info().unwrap().issuer,
+            _client.oidc().authentication_server_info().unwrap().issuer,
             "https://localhost:5678".to_owned()
         );
     }
