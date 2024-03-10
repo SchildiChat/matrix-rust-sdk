@@ -723,6 +723,18 @@ impl Timeline {
         Ok(true)
     }
 
+    /// SC: Same as send_single_receipt(), but without the should_send_receipt()-check
+    pub async fn force_send_single_receipt(
+        &self,
+        receipt_type: ReceiptType,
+        thread: ReceiptThread,
+        event_id: OwnedEventId,
+    ) -> Result<bool> {
+        trace!("force-sending receipt");
+        self.room().send_single_receipt(receipt_type, thread, event_id).await?;
+        Ok(true)
+    }
+
     /// Send the given receipts.
     ///
     /// This uses [`Room::send_multiple_receipts`] internally, but

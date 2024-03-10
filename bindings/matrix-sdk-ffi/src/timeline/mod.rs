@@ -196,6 +196,22 @@ impl Timeline {
         })
     }
 
+    /// SC: same as send_read_receipt(), but with force_
+    pub fn force_send_read_receipt(
+        &self,
+        receipt_type: ReceiptType,
+        event_id: String,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
+                .await?;
+            Ok(())
+        })
+    }
+
     /// Mark the room as read by trying to attach an *unthreaded* read receipt
     /// to the latest room event.
     ///
