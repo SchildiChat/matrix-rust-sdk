@@ -196,6 +196,13 @@ impl Timeline {
         })
     }
 
+    /// SC: get fully_read marker ID for debugging
+    pub fn sc_dbg_fully_read_event_id(&self) -> Option<String> {
+        RUNTIME.block_on(async {
+            self.inner.sc_dbg_fully_read_event_id().await
+        })
+    }
+
     /// SC: same as send_read_receipt(), but with force_
     pub fn force_send_read_receipt(
         &self,
