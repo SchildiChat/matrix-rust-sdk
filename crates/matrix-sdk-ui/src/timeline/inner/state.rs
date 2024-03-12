@@ -897,6 +897,7 @@ impl TimelineInnerMetadata {
                 // event in the timeline items. Don't do anything, and retry on
                 // the next event we add.
                 self.has_up_to_date_read_marker_item = false;
+                trace!("SC_RM_DBG NoNo");
             }
 
             (None, Some(idx)) => {
@@ -904,10 +905,12 @@ impl TimelineInnerMetadata {
                 if idx + 1 < items.len() {
                     items.insert(idx + 1, TimelineItem::read_marker());
                     self.has_up_to_date_read_marker_item = true;
+                    trace!("SC_RM_DBG NoSo insert");
                 } else {
                     // The next event might require a read marker to be inserted at the current
                     // end.
                     self.has_up_to_date_read_marker_item = false;
+                    trace!("SC_RM_DBG NoSo end");
                 }
             }
 
@@ -915,12 +918,14 @@ impl TimelineInnerMetadata {
                 // We didn't find the timeline item containing the event referred to by the read
                 // marker. Retry next time we get a new event.
                 self.has_up_to_date_read_marker_item = false;
+                trace!("SC_RM_DBG SoNo");
             }
 
             (Some(from), Some(to)) => {
                 if from >= to {
                     // The read marker can't move backwards. Keep the current one.
                     self.has_up_to_date_read_marker_item = true;
+                    trace!("SC_RM_DBG SoSo backwards");
                     return;
                 }
 
@@ -934,8 +939,10 @@ impl TimelineInnerMetadata {
                     // read marker at its previous position, rather than that + 1
                     items.insert(to, read_marker);
                     self.has_up_to_date_read_marker_item = true;
+                    trace!("SC_RM_DBG SoSo insert");
                 } else {
                     self.has_up_to_date_read_marker_item = false;
+                    trace!("SC_RM_DBG SoSo end");
                 }
             }
         }
