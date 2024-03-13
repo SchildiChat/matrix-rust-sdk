@@ -5,6 +5,7 @@ use ruma::OwnedMxcUri;
 
 use crate::{
     notification_settings::RoomNotificationMode, room::Membership, room_member::RoomMember,
+    space_child_info::{SpaceChildInfo, space_children_info},
     timeline::EventTimelineItem,
 };
 
@@ -33,6 +34,8 @@ pub struct RoomInfo {
     user_defined_notification_mode: Option<RoomNotificationMode>,
     has_room_call: bool,
     active_room_call_participants: Vec<String>,
+    /// SC: Space-specific fields
+    space_children: Vec<SpaceChildInfo>,
     /// Whether this room has been explicitly marked as unread
     is_marked_unread: bool,
     /// "Interesting" messages received in that room, independently of the
@@ -92,6 +95,7 @@ impl RoomInfo {
                 .map(|u| u.to_string())
                 .collect(),
             is_marked_unread: room.is_marked_unread(),
+            space_children: space_children_info(&room),
             num_unread_messages: room.num_unread_messages(),
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),
