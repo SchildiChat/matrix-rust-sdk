@@ -33,6 +33,7 @@ use matrix_sdk::{
         },
         serde::Raw,
         EventEncryptionAlgorithm, TransactionId, UInt, UserId,
+        RoomId,
     },
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
@@ -474,6 +475,15 @@ impl Client {
     pub fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
         RUNTIME.block_on(async move {
             let event = self.inner.account().account_data_raw(event_type.into()).await?;
+            Ok(event.map(|e| e.json().get().to_owned()))
+        })
+    }
+
+    /// SC: get room account data event as JSON string
+    pub fn room_account_data(&self, room_id: String, event_type: String) -> Result<Option<String>, ClientError> {
+        RUNTIME.block_on(async move {
+            let room_id = RoomId::parse(room_id)?;
+            let event = self.inner.account().room_account_data_raw((&room_id).into(), event_type.into()).await?;
             Ok(event.map(|e| e.json().get().to_owned()))
         })
     }

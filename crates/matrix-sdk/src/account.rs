@@ -40,11 +40,13 @@ use ruma::{
         room::MediaSource,
         AnyGlobalAccountDataEventContent, GlobalAccountDataEventContent,
         GlobalAccountDataEventType, StaticEventContent,
+        RoomAccountDataEventType,
     },
     push::Ruleset,
     serde::Raw,
     thirdparty::Medium,
     ClientSecret, MxcUri, OwnedMxcUri, OwnedUserId, RoomId, SessionId, UInt, UserId,
+    OwnedRoomId,
 };
 use serde::Deserialize;
 use tracing::error;
@@ -693,6 +695,15 @@ impl Account {
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>> {
         get_raw_content(self.client.store().get_account_data_event(event_type).await?)
+    }
+
+    /// SC: Expose room account data same way as non-room account data
+    pub async fn room_account_data_raw(
+        &self,
+        room_id: &OwnedRoomId,
+        event_type: RoomAccountDataEventType,
+    ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>> {
+        get_raw_content(self.client.store().get_room_account_data_event(room_id, event_type).await?)
     }
 
     /// Fetch a global account data event from the server.
