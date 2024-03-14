@@ -673,6 +673,7 @@ impl TimelineInnerStateTransaction<'_> {
         // before attempting to update it for each new timeline item.
         self.has_up_to_date_read_marker_item = true;
         self.back_pagination_tokens.clear();
+        trace!("SC_RM_DBG clear");
 
         debug!(remaining_items = self.items.len(), "Timeline cleared");
     }
@@ -681,6 +682,7 @@ impl TimelineInnerStateTransaction<'_> {
     fn set_fully_read_event(&mut self, fully_read_event_id: OwnedEventId) {
         // A similar event has been handled already. We can ignore it.
         if self.fully_read_event.as_ref().is_some_and(|id| *id == fully_read_event_id) {
+            trace!("SC_RM_DBG ignore similar");
             return;
         }
 
@@ -885,7 +887,10 @@ impl TimelineInnerMetadata {
         &mut self,
         items: &mut ObservableVectorTransaction<'_, Arc<TimelineItem>>,
     ) {
-        let Some(fully_read_event) = &self.fully_read_event else { return };
+        let Some(fully_read_event) = &self.fully_read_event else {
+            trace!("SC_RM_DBG skip, no fully_read_event");
+            return
+        };
         trace!(?fully_read_event, "Updating read marker");
 
         let read_marker_idx = items.iter().rposition(|item| item.is_read_marker());
