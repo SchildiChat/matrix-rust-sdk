@@ -88,6 +88,7 @@ use crate::{
         },
         EventEncryptionAlgorithm, Signatures,
     },
+    utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
     CrossSigningKeyExport, CryptoStoreError, KeysQueryRequest, LocalTrust, ReadOnlyDevice,
     RoomKeyImportResult, SignatureError, ToDeviceRequest,
@@ -1534,7 +1535,7 @@ impl OlmMachine {
     /// * `event` - The event that should be decrypted.
     ///
     /// * `room_id` - The ID of the room where the event was sent to.
-    #[instrument(skip_all, fields(?room_id, event_id, sender, algorithm, session_id, sender_key))]
+    #[instrument(skip_all, fields(?room_id, event_id, origin_server_ts, sender, algorithm, session_id, sender_key))]
     pub async fn decrypt_room_event(
         &self,
         event: &Raw<EncryptedEvent>,
@@ -1545,6 +1546,11 @@ impl OlmMachine {
         tracing::Span::current()
             .record("sender", debug(&event.sender))
             .record("event_id", debug(&event.event_id))
+            .record(
+                "origin_server_ts",
+                timestamp_to_iso8601(event.origin_server_ts)
+                    .unwrap_or_else(|| "<out of range>".to_owned()),
+            )
             .record("algorithm", debug(event.content.algorithm()));
 
         let content: SupportedEventEncryptionSchemes<'_> = match &event.content.scheme {
@@ -1921,6 +1927,8 @@ impl OlmMachine {
             None => 0,
         };
 
+        tracing::debug!("Initialising crypto store generation at {}", gen);
+
         self.inner
             .store
             .set_custom_value(Self::CURRENT_GENERATION_STORE_KEY, gen.to_le_bytes().to_vec())
@@ -1933,19 +1941,32 @@ impl OlmMachine {
 
     /// If needs be, update the local and on-disk crypto store generation.
     ///
-    /// Returns true whether another user has modified the internal generation
-    /// counter, and as such we've incremented and updated it in the
-    /// database.
-    ///
     /// ## Requirements
     ///
     /// - This assumes that `initialize_crypto_store_generation` has been called
     /// beforehand.
     /// - This requires that the crypto store lock has been acquired.
-    pub async fn maintain_crypto_store_generation(
-        &self,
+    ///
+    /// # Arguments
+    ///
+    /// * `generation` - The in-memory generation counter (or rather, the
+    ///   `Mutex` wrapping it). This defines the "expected" generation on entry,
+    ///   and, if we determine an update is needed, is updated to hold the "new"
+    ///   generation.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    ///
+    /// * A `bool`, set to `true` if another process has updated the generation
+    ///   number in the `Store` since our expected value, and as such we've
+    ///   incremented and updated it in the database. Otherwise, `false`.
+    ///
+    /// * The (possibly updated) generation counter.
+    pub async fn maintain_crypto_store_generation<'a>(
+        &'a self,
         generation: &Mutex<Option<u64>>,
-    ) -> StoreResult<bool> {
+    ) -> StoreResult<(bool, u64)> {
         let mut gen_guard = generation.lock().await;
 
         // The database value must be there:
@@ -1967,10 +1988,10 @@ impl OlmMachine {
                 CryptoStoreError::InvalidLockGeneration("invalid format".to_owned())
             })?);
 
-        let expected_gen = match gen_guard.as_ref() {
+        let new_gen = match gen_guard.as_ref() {
             Some(expected_gen) => {
                 if actual_gen == *expected_gen {
-                    return Ok(false);
+                    return Ok((false, actual_gen));
                 }
                 // Increment the biggest, and store it everywhere.
                 actual_gen.max(*expected_gen).wrapping_add(1)
@@ -1986,22 +2007,19 @@ impl OlmMachine {
             "Crypto store generation mismatch: previously known was {:?}, actual is {:?}, next is {}",
             *gen_guard,
             actual_gen,
-            expected_gen
+            new_gen
         );
 
         // Update known value.
-        *gen_guard = Some(expected_gen);
+        *gen_guard = Some(new_gen);
 
         // Update value in database.
         self.inner
             .store
-            .set_custom_value(
-                Self::CURRENT_GENERATION_STORE_KEY,
-                expected_gen.to_le_bytes().to_vec(),
-            )
+            .set_custom_value(Self::CURRENT_GENERATION_STORE_KEY, new_gen.to_le_bytes().to_vec())
             .await?;
 
-        Ok(true)
+        Ok((true, new_gen))
     }
 
     /// Manage dehydrated devices.

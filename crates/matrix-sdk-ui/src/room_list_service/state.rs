@@ -122,6 +122,8 @@ impl Action for AddVisibleRooms {
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
                     ]),
+                #[cfg(feature = "experimental-room-list-with-unified-invites")]
+                false,
             ))
             .await
             .map_err(Error::SlidingSync)?;

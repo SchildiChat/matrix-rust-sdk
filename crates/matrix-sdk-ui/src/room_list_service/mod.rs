@@ -141,7 +141,24 @@ impl RoomListService {
     /// This won't start an encryption sync, and it's the user's responsibility
     /// to create one in this case using `EncryptionSync`.
     pub async fn new(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, false).await
+        Self::new_internal(
+            client,
+            false,
+            #[cfg(feature = "experimental-room-list-with-unified-invites")]
+            false,
+        )
+        .await
+    }
+
+    /// Create a new `RoomList` that disables encryption, and enables the
+    /// unified invites (i.e. invites are part of the `all_rooms` list; side
+    /// note: the `invites` list is still present).
+    #[cfg(feature = "experimental-room-list-with-unified-invites")]
+    pub async fn new_with_unified_invites(
+        client: Client,
+        with_unified_invites: bool,
+    ) -> Result<Self, Error> {
+        Self::new_internal(client, false, with_unified_invites).await
     }
 
     /// Create a new `RoomList` that enables encryption.
@@ -149,10 +166,20 @@ impl RoomListService {
     /// This will include syncing the encryption information, so there must not
     /// be any instance of `EncryptionSync` running in the background.
     pub async fn new_with_encryption(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, true).await
+        Self::new_internal(
+            client,
+            true,
+            #[cfg(feature = "experimental-room-list-with-unified-invites")]
+            false,
+        )
+        .await
     }
 
-    async fn new_internal(client: Client, with_encryption: bool) -> Result<Self, Error> {
+    async fn new_internal(
+        client: Client,
+        with_encryption: bool,
+        #[cfg(feature = "experimental-room-list-with-unified-invites")] with_unified_invites: bool,
+    ) -> Result<Self, Error> {
         let mut builder = client
             .sliding_sync("room-list")
             .map_err(Error::SlidingSync)?
@@ -190,6 +217,8 @@ impl RoomListService {
                         (StateEventType::RoomMember, "$ME".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
                     ]),
+                #[cfg(feature = "experimental-room-list-with-unified-invites")]
+                with_unified_invites,
             ))
             .await
             .map_err(Error::SlidingSync)?
@@ -239,7 +268,7 @@ impl RoomListService {
             .map_err(Error::SlidingSync)?;
 
         // Eagerly subscribe the event cache to sync responses.
-        client.event_cache().subscribe(&client);
+        client.event_cache().subscribe()?;
 
         Ok(Self {
             client,
@@ -582,11 +611,15 @@ impl RoomListService {
 /// properties, so that they are exactly the same.
 fn configure_all_or_visible_rooms_list(
     list_builder: SlidingSyncListBuilder,
+    #[cfg(feature = "experimental-room-list-with-unified-invites")] with_invites: bool,
 ) -> SlidingSyncListBuilder {
+    #[cfg(not(feature = "experimental-room-list-with-unified-invites"))]
+    let with_invites = false;
+
     list_builder
         .sort(vec!["by_notification_level".to_owned(), "by_recency".to_owned(), "by_name".to_owned()])
         .filters(Some(assign!(SyncRequestListFilters::default(), {
-            is_invite: Some(false),
+            is_invite: Some(with_invites),
             is_tombstoned: Some(false),
             not_room_types: vec!["m.space".to_owned()],
         })))
@@ -621,6 +654,9 @@ pub enum Error {
 
     #[error("An error occurred while initializing the timeline")]
     InitializingTimeline(#[source] EventCacheError),
+
+    #[error("The attached event cache ran into an error")]
+    EventCache(#[from] EventCacheError),
 }
 
 /// An input for the [`RoomList`]' state machine.
