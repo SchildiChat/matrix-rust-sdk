@@ -561,7 +561,10 @@ impl RoomListService {
                     .required_state(vec![
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
-                    ]))
+                    ]),
+                    #[cfg(feature = "experimental-room-list-with-unified-invites")]
+                    false,
+                    )
                 // Set filters *after* configure_all_or_visible_rooms_list(), since it'll overwrite
                 // the filters otherwise. Apart from the spaces filter, match the filters of
                 // configure_all_or_visible_rooms_list().
