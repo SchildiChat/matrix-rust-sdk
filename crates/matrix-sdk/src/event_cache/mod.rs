@@ -31,8 +31,9 @@
 //! - [ ] expose that information with a new data structure similar to the
 //!   `RoomInfo`, and that may update a `RoomListService`.
 //! - [ ] provide read receipts for each message.
-//! - [ ] backwards and forward pagination, and reconcile results with cached
-//!   timelines.
+//! - [x] backwards pagination
+//! - [ ] forward pagination
+//! - [ ] reconcile results with cached timelines.
 //! - [ ] retry decryption upon receiving new keys (from an encryption sync
 //!   service or from a key backup).
 //! - [ ] expose the latest event for a given room.
@@ -72,6 +73,7 @@ use crate::{
     client::ClientInner, event_cache::store::PaginationToken, room::MessagesOptions, Client, Room,
 };
 
+mod linked_chunk;
 mod store;
 
 /// An error observed in the [`EventCache`].
@@ -431,12 +433,12 @@ impl RoomEventCache {
     /// If a token has been provided, but it was unknown to the event cache
     /// (i.e. it's not associated to any gap in the timeline stored by the
     /// event cache), then an error result will be returned.
-    pub async fn backpaginate_with_token(
+    pub async fn backpaginate(
         &self,
         batch_size: u16,
         token: Option<PaginationToken>,
     ) -> Result<BackPaginationOutcome> {
-        self.inner.backpaginate_with_token(batch_size, token).await
+        self.inner.backpaginate(batch_size, token).await
     }
 }
 
@@ -585,7 +587,6 @@ impl RoomEventCacheInner {
 
         let _ = self.sender.send(RoomEventCacheUpdate::Append {
             events,
-            prev_batch,
             account_data,
             ephemeral,
             ambiguity_changes,
@@ -601,7 +602,7 @@ impl RoomEventCacheInner {
     ///
     /// Returns the number of messages received in this chunk.
     #[instrument(skip(self))]
-    async fn backpaginate_with_token(
+    async fn backpaginate(
         &self,
         batch_size: u16,
         token: Option<PaginationToken>,
@@ -741,8 +742,6 @@ pub enum RoomEventCacheUpdate {
     Append {
         /// All the new events that have been added to the room's timeline.
         events: Vec<SyncTimelineEvent>,
-        /// XXX: this is temporary, until prev_batch lives in the event cache
-        prev_batch: Option<String>,
         /// XXX: this is temporary, until account data lives in the event cache
         /// — or will it live there?
         account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
@@ -800,7 +799,7 @@ mod tests {
         let token = PaginationToken("old".to_owned());
 
         // Then I run into an error.
-        let res = room_event_cache.backpaginate_with_token(20, Some(token)).await;
+        let res = room_event_cache.backpaginate(20, Some(token)).await;
         assert_matches!(res.unwrap_err(), EventCacheError::UnknownBackpaginationToken);
     }
 

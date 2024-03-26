@@ -10,17 +10,16 @@ Breaking changes:
 - Replace `impl MediaEventContent` with `&impl MediaEventContent` in
   `Media::get_file`/`Media::remove_file`/`Media::get_thumbnail`/`Media::remove_thumbnail`
 - A custom sliding sync proxy set with `ClientBuilder::sliding_sync_proxy` now takes precedence over a discovered proxy.
+- `Client::get_profile` was moved to `Account` and renamed to `Account::fetch_user_profile_of`. `Account::get_profile` was renamed to `Account::fetch_user_profile`.
 
 Additions:
 
 - Add the `ClientBuilder::add_root_certificates()` method which re-exposes the
   `reqwest::ClientBuilder::add_root_certificate()` functionality.
 - Add `Room::get_user_power_level(user_id)` and `Room::get_suggested_user_role(user_id)` to be able to fetch power level info about an user without loading the room member list.
-
-Additions:
-
 - Add new method `discard_room_key` on `Room` that allows to discard the current
   outbound session for that room. Can be used by clients as a dev tool like the `/discardsession` command.
+- Add a new `LinkedChunk` data structure to represents all events per room ([#3166](https://github.com/matrix-org/matrix-rust-sdk/pull/3166)).
 
 # 0.7.0
 

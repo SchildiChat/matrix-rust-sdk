@@ -16,7 +16,7 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{ops::ControlFlow, pin::Pin, sync::Arc, task::Poll};
+use std::{pin::Pin, sync::Arc, task::Poll};
 
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
@@ -24,7 +24,7 @@ use futures_core::Stream;
 use imbl::Vector;
 use matrix_sdk::{
     attachment::AttachmentConfig,
-    event_cache::EventCacheDropHandles,
+    event_cache::{EventCacheDropHandles, RoomEventCache},
     event_handler::EventHandlerHandle,
     executor::JoinHandle,
     room::{Receipts, Room},
@@ -56,12 +56,13 @@ use ruma::{
     TransactionId, UserId,
 };
 use thiserror::Error;
-use tokio::sync::{mpsc::Sender, Mutex, Notify};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tokio::sync::mpsc::Sender;
+use tracing::{debug, error, instrument, trace, warn};
 
 use self::futures::SendAttachment;
 
 mod builder;
+mod day_dividers;
 mod error;
 mod event_handler;
 mod event_item;
@@ -116,17 +117,21 @@ use self::{
 /// messages.
 #[derive(Debug)]
 pub struct Timeline {
+    /// Clonable, inner fields of the `Timeline`, shared with some background
+    /// tasks.
     inner: TimelineInner,
 
-    /// Mutex that ensures only a single pagination is running at once
-    back_pagination_mtx: Mutex<()>,
+    /// The event cache specialized for this room's view.
+    event_cache: RoomEventCache,
+
     /// Observable for whether a pagination is currently running
     back_pagination_status: SharedObservable<BackPaginationStatus>,
 
-    /// Notifier for handled sync responses.
-    sync_response_notify: Arc<Notify>,
-
+    /// A sender to the task which responsibility is to send messages to the
+    /// current room.
     msg_sender: Sender<LocalMessage>,
+
+    /// References to long-running tasks held by the timeline.
     drop_handle: Arc<TimelineDropHandle>,
 }
 
@@ -149,7 +154,8 @@ impl Timeline {
         TimelineBuilder::new(room)
     }
 
-    fn room(&self) -> &Room {
+    /// Returns the room for this timeline.
+    pub fn room(&self) -> &Room {
         self.inner.room()
     }
 
@@ -161,37 +167,6 @@ impl Timeline {
     /// Subscribe to the back-pagination status of the timeline.
     pub fn back_pagination_status(&self) -> Subscriber<BackPaginationStatus> {
         self.back_pagination_status.subscribe()
-    }
-
-    /// Add more events to the start of the timeline.
-    #[instrument(skip_all, fields(room_id = ?self.room().room_id(), ?options))]
-    pub async fn paginate_backwards(&self, options: PaginationOptions<'_>) -> Result<()> {
-        if self.back_pagination_status.get() == BackPaginationStatus::TimelineStartReached {
-            warn!("Start of timeline reached, ignoring backwards-pagination request");
-            return Ok(());
-        }
-
-        // Ignore extra back pagination requests if one is already running.
-        let Ok(_guard) = self.back_pagination_mtx.try_lock() else {
-            info!("Couldn't acquire pack pagination mutex, another request must be running");
-            return Ok(());
-        };
-
-        loop {
-            match self.paginate_backwards_impl(options.clone()).await {
-                Ok(ControlFlow::Continue(())) => {
-                    // fall through and continue the loop
-                }
-                Ok(ControlFlow::Break(status)) => {
-                    self.back_pagination_status.set_if_not_eq(status);
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.back_pagination_status.set_if_not_eq(BackPaginationStatus::Idle);
-                    return Err(e);
-                }
-            }
-        }
     }
 
     /// Retry decryption of previously un-decryptable events given a list of
@@ -540,21 +515,22 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `url` - The url for the file to be sent
+    /// * `filename` - The filename of the file to be sent
     ///
     /// * `mime_type` - The attachment's mime type
     ///
     /// * `config` - An attachment configuration object containing details about
     ///   the attachment
+    ///
     /// like a thumbnail, its size, duration etc.
     #[instrument(skip_all)]
     pub fn send_attachment(
         &self,
-        url: String,
+        filename: String,
         mime_type: Mime,
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
-        SendAttachment::new(self, url, mime_type, config)
+        SendAttachment::new(self, filename, mime_type, config)
     }
 
     /// Retry sending a message that previously failed to send.

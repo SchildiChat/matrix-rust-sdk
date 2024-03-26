@@ -32,8 +32,7 @@ use matrix_sdk::{
             AnyInitialStateEvent, AnyToDeviceEvent, InitialStateEvent,
         },
         serde::Raw,
-        EventEncryptionAlgorithm, TransactionId, UInt, UserId,
-        RoomId,
+        EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
     },
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
@@ -59,6 +58,7 @@ use crate::{
     encryption::Encryption,
     notification::NotificationClientBuilder,
     notification_settings::NotificationSettings,
+    room_directory_search::RoomDirectorySearch,
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
     ClientError,
@@ -329,9 +329,10 @@ impl Client {
         self.inner.oidc().authentication_server_info().cloned()
     }
 
-    /// The sliding sync proxy that is trusted by the homeserver. `None` when
-    /// not configured.
-    pub fn discovered_sliding_sync_proxy(&self) -> Option<Url> {
+    /// The sliding sync proxy of the homeserver. It is either set automatically
+    /// during discovery or manually via `set_sliding_sync_proxy` or `None`
+    /// when not configured.
+    pub fn sliding_sync_proxy(&self) -> Option<Url> {
         self.inner.sliding_sync_proxy()
     }
 
@@ -617,7 +618,7 @@ impl Client {
     }
 
     /// Registers a pusher with given parameters
-    pub fn set_pusher(
+    pub async fn set_pusher(
         &self,
         identifiers: PusherIdentifiers,
         kind: PusherKind,
@@ -626,20 +627,24 @@ impl Client {
         profile_tag: Option<String>,
         lang: String,
     ) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            let ids = identifiers.into();
+        let ids = identifiers.into();
 
-            let pusher_init = PusherInit {
-                ids,
-                kind: kind.try_into()?,
-                app_display_name,
-                device_display_name,
-                profile_tag,
-                lang,
-            };
-            self.inner.set_pusher(pusher_init.into()).await?;
-            Ok(())
-        })
+        let pusher_init = PusherInit {
+            ids,
+            kind: kind.try_into()?,
+            app_display_name,
+            device_display_name,
+            profile_tag,
+            lang,
+        };
+        self.inner.pusher().set(pusher_init.into()).await?;
+        Ok(())
+    }
+
+    /// Deletes a pusher of given pusher ids
+    pub async fn delete_pusher(&self, identifiers: PusherIdentifiers) -> Result<(), ClientError> {
+        self.inner.pusher().delete(identifiers.into()).await?;
+        Ok(())
     }
 
     /// The homeserver this client is configured to use.
@@ -672,7 +677,7 @@ impl Client {
     pub fn get_profile(&self, user_id: String) -> Result<UserProfile, ClientError> {
         RUNTIME.block_on(async move {
             let owned_user_id = UserId::parse(user_id.clone())?;
-            let response = self.inner.get_profile(&owned_user_id).await?;
+            let response = self.inner.account().fetch_user_profile_of(&owned_user_id).await?;
 
             let user_profile = UserProfile {
                 user_id,
@@ -749,6 +754,18 @@ impl Client {
                 listener.call(user_ids);
             }
         })))
+    }
+
+    pub fn room_directory_search(&self) -> Arc<RoomDirectorySearch> {
+        Arc::new(RoomDirectorySearch::new(
+            matrix_sdk::room_directory_search::RoomDirectorySearch::new((*self.inner).clone()),
+        ))
+    }
+
+    pub async fn join_room_by_id(&self, room_id: String) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let room = self.inner.join_room_by_id(room_id.as_ref()).await?;
+        Ok(Arc::new(Room::new(room)))
     }
 }
 
