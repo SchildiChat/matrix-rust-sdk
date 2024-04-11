@@ -23,7 +23,7 @@ use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
     events::{
         relation::Annotation, room::redaction::RoomRedactionEventContent,
-        AnyMessageLikeEventContent, AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent,
+        AnyMessageLikeEventContent, AnySyncEphemeralRoomEvent,
     },
     push::Action,
     serde::Raw,
@@ -109,11 +109,18 @@ impl TimelineInnerState {
         handle_many_res
     }
 
+    /// Marks the given event as fully read, using the read marker received from
+    /// sync.
+    pub(super) fn handle_fully_read_marker(&mut self, fully_read_event_id: OwnedEventId) {
+        let mut txn = self.transaction();
+        txn.set_fully_read_event(fully_read_event_id);
+        txn.commit();
+    }
+
     #[instrument(skip_all)]
     pub(super) async fn handle_sync_events<P: RoomDataProvider>(
         &mut self,
         events: Vec<SyncTimelineEvent>,
-        account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
         ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
         room_data_provider: &P,
         settings: &TimelineInnerSettings,
@@ -127,20 +134,6 @@ impl TimelineInnerState {
             settings,
         )
         .await;
-
-        trace!("Handling account data");
-        for raw_event in account_data {
-            match raw_event.deserialize() {
-                Ok(AnyRoomAccountDataEvent::FullyRead(ev)) => {
-                    txn.set_fully_read_event(ev.content.event_id);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    let event_type = raw_event.get_field::<String>("type").ok().flatten();
-                    warn!(event_type, "Failed to deserialize account data: {e}");
-                }
-            }
-        }
 
         if !ephemeral.is_empty() {
             trace!("Handling ephemeral room events");
@@ -417,7 +410,7 @@ impl TimelineInnerState {
         txn.commit();
     }
 
-    fn transaction(&mut self) -> TimelineInnerStateTransaction<'_> {
+    pub(super) fn transaction(&mut self) -> TimelineInnerStateTransaction<'_> {
         let items = self.items.transaction();
         let meta = self.meta.clone();
         TimelineInnerStateTransaction { items, previous_meta: &mut self.meta, meta }
@@ -654,7 +647,7 @@ impl TimelineInnerStateTransaction<'_> {
         self.meta.update_read_marker(&mut self.items);
     }
 
-    fn commit(self) {
+    pub(super) fn commit(self) {
         let Self { items, previous_meta, meta } = self;
 
         // Replace the pointer to the previous meta with the new one.
