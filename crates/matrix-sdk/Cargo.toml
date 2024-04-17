@@ -39,9 +39,9 @@ rustls-tls = ["reqwest/rustls-tls"]
 socks = ["reqwest/socks"]
 sso-login = ["dep:hyper", "dep:rand", "dep:tower"]
 image-proc = ["dep:image"]
-image-rayon = ["image-proc", "image?/jpeg_rayon"]
+image-rayon = ["image-proc", "image?/rayon"]
 
-uniffi = ["dep:uniffi"]
+uniffi = ["dep:uniffi", "matrix-sdk-base/uniffi"]
 
 experimental-oidc = [
     "ruma/unstable-msc2967",
@@ -87,7 +87,7 @@ indexmap = "2.0.2"
 js_int = "0.2.2"
 language-tags = { version = "0.3.2", optional = true }
 mas-oidc-client = { git = "https://github.com/matrix-org/matrix-authentication-service", rev = "099eabd1371d2840a2f025a6372d6428039eb511", default-features = false, optional = true }
-matrix-sdk-base = { workspace = true, features = ["uniffi"] }
+matrix-sdk-base = { workspace = true }
 matrix-sdk-common = { workspace = true }
 matrix-sdk-indexeddb = { workspace = true, optional = true }
 matrix-sdk-sqlite = { workspace = true, optional = true }
@@ -111,23 +111,9 @@ uuid = { version = "1.4.1", features = ["serde", "v4"], optional = true }
 zeroize = { workspace = true }
 
 [dependencies.image]
-version = "0.24.2"
+version = "0.25.1"
 default-features = false
-features = [
-    "gif",
-    "jpeg",
-    "ico",
-    "png",
-    "pnm",
-    "tga",
-    "tiff",
-    "webp",
-    "bmp",
-    "hdr",
-    "dxt",
-    "dds",
-    "farbfeld",
-]
+features = ["default-formats"]
 optional = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

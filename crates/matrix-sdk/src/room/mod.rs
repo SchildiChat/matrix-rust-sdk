@@ -10,7 +10,10 @@ use std::{
 
 use eyeball::SharedObservable;
 use futures_core::Stream;
-use futures_util::stream::FuturesUnordered;
+use futures_util::{
+    future::{try_join, try_join_all},
+    stream::FuturesUnordered,
+};
 use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
@@ -65,14 +68,14 @@ use ruma::{
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
         typing::SyncTypingEvent,
-        AnyRoomAccountDataEvent, AnyStateEvent, EmptyStateKey, MessageLikeEventContent,
+        AnyRoomAccountDataEvent, AnyTimelineEvent, EmptyStateKey, MessageLikeEventContent,
         MessageLikeEventType, RedactContent, RedactedStateEventContent, RoomAccountDataEvent,
         RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
         StaticEventContent, StaticStateEventContent, SyncStateEvent,
     },
     push::{Action, PushConditionRoomCtx},
     serde::Raw,
-    uint, EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
+    EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
     OwnedTransactionId, OwnedUserId, TransactionId, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
@@ -80,7 +83,10 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::{debug, info, instrument, warn};
 
-use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent};
+use self::{
+    futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent},
+    messages::EventWithContextResponse,
+};
 pub use self::{
     member::{RoomMember, RoomMemberRole},
     messages::{Messages, MessagesOptions},
@@ -355,12 +361,12 @@ impl Room {
         (drop_guard, receiver)
     }
 
-    /// Fetch the event with the given `EventId` in this room.
-    pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
-        let request =
-            get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
-        let event = self.client.send(request, None).await?.event;
-
+    /// Returns a wrapping `TimelineEvent` for the input `AnyTimelineEvent`,
+    /// decrypted if needs be.
+    ///
+    /// Doesn't return an error `Result` when decryption failed; only logs from
+    /// the crypto crate will indicate so.
+    async fn try_decrypt_event(&self, event: Raw<AnyTimelineEvent>) -> Result<TimelineEvent> {
         #[cfg(feature = "e2e-encryption")]
         if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
             SyncMessageLikeEvent::Original(_),
@@ -376,17 +382,26 @@ impl Room {
         Ok(TimelineEvent { event, encryption_info: None, push_actions })
     }
 
+    /// Fetch the event with the given `EventId` in this room.
+    pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
+        let request =
+            get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
+        let event = self.client.send(request, None).await?.event;
+        self.try_decrypt_event(event).await
+    }
+
     /// Fetch the event with the given `EventId` in this room, using the
     /// `/context` endpoint to get more information.
     pub async fn event_with_context(
         &self,
         event_id: &EventId,
         lazy_load_members: bool,
-    ) -> Result<Option<(TimelineEvent, Vec<Raw<AnyStateEvent>>)>> {
+        context_size: UInt,
+    ) -> Result<EventWithContextResponse> {
         let mut request =
             context::get_context::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
 
-        request.limit = uint!(0);
+        request.limit = context_size;
 
         if lazy_load_members {
             request.filter.lazy_load_options =
@@ -395,23 +410,29 @@ impl Room {
 
         let response = self.client.send(request, None).await?;
 
-        let Some(event) = response.event else {
-            return Ok(None);
+        let target_event = if let Some(event) = response.event {
+            Some(self.try_decrypt_event(event).await?)
+        } else {
+            None
         };
 
-        #[cfg(feature = "e2e-encryption")]
-        if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
-            SyncMessageLikeEvent::Original(_),
-        ))) = event.deserialize_as::<AnySyncTimelineEvent>()
-        {
-            if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
-                return Ok(Some((event, response.state)));
-            }
-        }
+        // Note: the joined future will fail if any future failed, but
+        // [`Self::try_decrypt_event`] doesn't hard-fail when there's a
+        // decryption error, so we should prevent against most bad cases here.
+        let (events_before, events_after) = try_join(
+            try_join_all(response.events_before.into_iter().map(|ev| self.try_decrypt_event(ev))),
+            try_join_all(response.events_after.into_iter().map(|ev| self.try_decrypt_event(ev))),
+        )
+        .await?;
 
-        let push_actions = self.event_push_actions(&event).await?;
-
-        Ok(Some((TimelineEvent { event, encryption_info: None, push_actions }, response.state)))
+        Ok(EventWithContextResponse {
+            event: target_event,
+            events_before,
+            events_after,
+            state: response.state,
+            prev_batch_token: response.start,
+            next_batch_token: response.end,
+        })
     }
 
     pub(crate) async fn request_members(&self) -> Result<()> {
@@ -1103,29 +1124,27 @@ impl Room {
         use ruma::events::room::encrypted::EncryptedEventScheme;
 
         let machine = self.client.olm_machine().await;
-        if let Some(machine) = machine.as_ref() {
-            let mut event =
-                match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
-                    Ok(event) => event,
-                    Err(e) => {
-                        let event = event.deserialize()?;
-                        if let EncryptedEventScheme::MegolmV1AesSha2(c) = event.content.scheme {
-                            self.client
-                                .encryption()
-                                .backups()
-                                .maybe_download_room_key(self.room_id().to_owned(), c.session_id);
-                        }
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-                        return Err(e.into());
+        let mut event =
+            match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
+                Ok(event) => event,
+                Err(e) => {
+                    let event = event.deserialize()?;
+                    if let EncryptedEventScheme::MegolmV1AesSha2(c) = event.content.scheme {
+                        self.client
+                            .encryption()
+                            .backups()
+                            .maybe_download_room_key(self.room_id().to_owned(), c.session_id);
                     }
-                };
 
-            event.push_actions = self.event_push_actions(&event.event).await?;
+                    return Err(e.into());
+                }
+            };
 
-            Ok(event)
-        } else {
-            Err(Error::NoOlmMachine)
-        }
+        event.push_actions = self.event_push_actions(&event.event).await?;
+
+        Ok(event)
     }
 
     /// Forces the currently active room key, which is used to encrypt messages,
