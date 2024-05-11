@@ -39,17 +39,18 @@ futures-util = { version = "0.3.26", default-features = false, features = [
 http = "0.2.6"
 imbl = "2.0.0"
 itertools = "0.12.0"
-ruma = { git = "https://github.com/ruma/ruma", rev = "20869d3ec", features = [
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "c282d3174", features = [
     "client-api-c",
     "compat-upload-signatures",
     "compat-user-id",
     "compat-arbitrary-length-ids",
     "compat-tag-info",
     "unstable-msc3401",
+    "unstable-msc3266",
     "unstable-msc2654",
     "unstable-msc2867",
 ] }
-ruma-common = { git = "https://github.com/ruma/ruma", rev = "20869d3ec" }
+ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "c282d3174" }
 once_cell = "1.16.0"
 rand = "0.8.5"
 serde = "1.0.151"

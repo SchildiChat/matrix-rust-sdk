@@ -16,19 +16,22 @@ use async_trait::async_trait;
 use indexmap::IndexMap;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk::{deserialized_responses::TimelineEvent, Result};
-use matrix_sdk::{event_cache, Room};
+use matrix_sdk::{event_cache::paginator::PaginableRoom, Room};
 use matrix_sdk_base::latest_event::LatestEvent;
+#[cfg(feature = "e2e-encryption")]
+use ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use ruma::{
-    events::receipt::{Receipt, ReceiptThread, ReceiptType},
+    events::{
+        fully_read::FullyReadEventContent,
+        receipt::{Receipt, ReceiptThread, ReceiptType},
+    },
     push::{PushConditionRoomCtx, Ruleset},
     EventId, OwnedEventId, OwnedUserId, RoomVersionId, UserId,
 };
-#[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use tracing::{debug, error};
 
 use super::{Profile, TimelineBuilder};
-use crate::timeline::Timeline;
+use crate::timeline::{self, Timeline};
 
 #[async_trait]
 pub trait RoomExt {
@@ -39,7 +42,7 @@ pub trait RoomExt {
     /// independent events.
     ///
     /// This is the same as using `room.timeline_builder().build()`.
-    async fn timeline(&self) -> event_cache::Result<Timeline>;
+    async fn timeline(&self) -> Result<Timeline, timeline::Error>;
 
     /// Get a [`TimelineBuilder`] for this room.
     ///
@@ -54,7 +57,7 @@ pub trait RoomExt {
 
 #[async_trait]
 impl RoomExt for Room {
-    async fn timeline(&self) -> event_cache::Result<Timeline> {
+    async fn timeline(&self) -> Result<Timeline, timeline::Error> {
         self.timeline_builder().build().await
     }
 
@@ -64,7 +67,7 @@ impl RoomExt for Room {
 }
 
 #[async_trait]
-pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static {
+pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static + PaginableRoom {
     fn own_user_id(&self) -> &UserId;
     fn room_version(&self) -> RoomVersionId;
     async fn profile_from_user_id(&self, user_id: &UserId) -> Option<Profile>;
@@ -80,6 +83,9 @@ pub(super) trait RoomDataProvider: Clone + Send + Sync + 'static {
 
     /// Loads read receipts for an event from the storage backend.
     async fn load_event_receipts(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt>;
+
+    /// Load the current fully-read event id, from storage.
+    async fn load_fully_read_marker(&self) -> Option<OwnedEventId>;
 
     async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)>;
 }
@@ -186,6 +192,23 @@ impl RoomDataProvider for Room {
                 error!("Could not get push context: {e}");
                 None
             }
+        }
+    }
+
+    async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
+        match self.account_data_static::<FullyReadEventContent>().await {
+            Ok(Some(fully_read)) => match fully_read.deserialize() {
+                Ok(fully_read) => Some(fully_read.content.event_id),
+                Err(e) => {
+                    error!("Failed to deserialize fully-read account data: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                error!("Failed to get fully-read account data from the store: {e}");
+                None
+            }
+            _ => None,
         }
     }
 }

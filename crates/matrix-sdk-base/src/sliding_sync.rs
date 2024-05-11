@@ -531,7 +531,7 @@ impl BaseClient {
             if let AnySyncStateEvent::RoomMember(member) = &event {
                 // If this event updates the current user's membership, record that in the
                 // room_info.
-                if member.sender() == meta.user_id && member.state_key() == meta.user_id.as_str() {
+                if member.state_key() == meta.user_id.as_str() {
                     room_info.set_state(member.membership().into());
                     break;
                 }
@@ -787,14 +787,14 @@ mod tests {
     }
 
     #[async_test]
-    async fn can_process_empty_sliding_sync_response() {
+    async fn test_can_process_empty_sliding_sync_response() {
         let client = logged_in_base_client(None).await;
         let empty_response = v4::Response::new("5".to_owned());
         client.process_sliding_sync(&empty_response, &()).await.expect("Failed to process sync");
     }
 
     #[async_test]
-    async fn room_with_unspecified_state_is_added_to_client_and_joined_list() {
+    async fn test_room_with_unspecified_state_is_added_to_client_and_joined_list() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn room_name_is_found_when_processing_sliding_sync_response() {
+    async fn test_room_name_is_found_when_processing_sliding_sync_response() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -844,7 +844,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn invited_room_name_is_found_when_processing_sliding_sync_response() {
+    async fn test_invited_room_name_is_found_when_processing_sliding_sync_response() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn left_a_room_from_required_state_event() {
+    async fn test_left_a_room_from_required_state_event() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -900,7 +900,44 @@ mod tests {
     }
 
     #[async_test]
-    async fn left_a_room_from_timeline_state_event() {
+    async fn test_kick_or_ban_updates_room_to_left() {
+        for membership in [MembershipState::Leave, MembershipState::Ban] {
+            let room_id = room_id!("!r:e.uk");
+            let user_a_id = user_id!("@a:e.uk");
+            let user_b_id = user_id!("@b:e.uk");
+            let client = logged_in_base_client(Some(user_a_id)).await;
+
+            // When I join…
+            let mut room = v4::SlidingSyncRoom::new();
+            set_room_joined(&mut room, user_a_id);
+            let response = response_with_room(room_id, room).await;
+            client.process_sliding_sync(&response, &()).await.expect("Failed to process sync");
+            assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Joined);
+
+            // And then get kicked/banned with a `required_state` state event…
+            let mut room = v4::SlidingSyncRoom::new();
+            room.required_state.push(make_state_event(
+                user_b_id,
+                user_a_id.as_str(),
+                RoomMemberEventContent::new(membership),
+                None,
+            ));
+            let response = response_with_room(room_id, room).await;
+            let sync_resp =
+                client.process_sliding_sync(&response, &()).await.expect("Failed to process sync");
+
+            // The room is left.
+            assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
+
+            // And it is added to the list of left rooms only.
+            assert!(!sync_resp.rooms.join.contains_key(room_id));
+            assert!(sync_resp.rooms.leave.contains_key(room_id));
+            assert!(!sync_resp.rooms.invite.contains_key(room_id));
+        }
+    }
+
+    #[async_test]
+    async fn test_left_a_room_from_timeline_state_event() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -924,7 +961,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn can_be_reinvited_to_a_left_room() {
+    async fn test_can_be_reinvited_to_a_left_room() {
         // See https://github.com/matrix-org/matrix-rust-sdk/issues/1834
 
         // Given a logged-in client
@@ -959,7 +996,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn other_person_leaving_a_dm_is_reflected_in_their_membership_and_direct_targets() {
+    async fn test_other_person_leaving_a_dm_is_reflected_in_their_membership_and_direct_targets() {
         let room_id = room_id!("!r:e.uk");
         let user_a_id = user_id!("@a:e.uk");
         let user_b_id = user_id!("@b:e.uk");
@@ -983,7 +1020,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn other_person_refusing_invite_to_a_dm_is_reflected_in_their_membership_and_direct_targets(
+    async fn test_other_person_refusing_invite_to_a_dm_is_reflected_in_their_membership_and_direct_targets(
     ) {
         let room_id = room_id!("!r:e.uk");
         let user_a_id = user_id!("@a:e.uk");
@@ -1008,7 +1045,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn members_count_in_a_dm_where_other_person_has_joined() {
+    async fn test_members_count_in_a_dm_where_other_person_has_joined() {
         let room_id = room_id!("!r:bar.org");
         let user_a_id = user_id!("@a:bar.org");
         let user_b_id = user_id!("@b:bar.org");
@@ -1032,7 +1069,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn members_count_in_a_dm_where_other_person_is_invited() {
+    async fn test_members_count_in_a_dm_where_other_person_is_invited() {
         let room_id = room_id!("!r:bar.org");
         let user_a_id = user_id!("@a:bar.org");
         let user_b_id = user_id!("@b:bar.org");
@@ -1056,7 +1093,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn avatar_is_found_when_processing_sliding_sync_response() {
+    async fn test_avatar_is_found_when_processing_sliding_sync_response() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1080,7 +1117,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn avatar_can_be_unset_when_processing_sliding_sync_response() {
+    async fn test_avatar_can_be_unset_when_processing_sliding_sync_response() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1136,7 +1173,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn avatar_is_found_from_required_state_when_processing_sliding_sync_response() {
+    async fn test_avatar_is_found_from_required_state_when_processing_sliding_sync_response() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1156,7 +1193,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn invitation_room_is_added_to_client_and_invite_list() {
+    async fn test_invitation_room_is_added_to_client_and_invite_list() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1180,7 +1217,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn avatar_is_found_in_invitation_room_when_processing_sliding_sync_response() {
+    async fn test_avatar_is_found_in_invitation_room_when_processing_sliding_sync_response() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1201,7 +1238,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn canonical_alias_is_found_in_invitation_room_when_processing_sliding_sync_response() {
+    async fn test_canonical_alias_is_found_in_invitation_room_when_processing_sliding_sync_response(
+    ) {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1220,7 +1258,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn display_name_from_sliding_sync_overrides_alias() {
+    async fn test_display_name_from_sliding_sync_overrides_alias() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1243,7 +1281,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn last_event_from_sliding_sync_is_cached() {
+    async fn test_last_event_from_sliding_sync_is_cached() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1277,7 +1315,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn cached_latest_event_can_be_redacted() {
+    async fn test_cached_latest_event_can_be_redacted() {
         // Given a logged-in client
         let client = logged_in_base_client(None).await;
         let room_id = room_id!("!r:e.uk");
@@ -1330,14 +1368,14 @@ mod tests {
     }
 
     #[async_test]
-    async fn when_no_events_we_dont_cache_any() {
+    async fn test_when_no_events_we_dont_cache_any() {
         let events = &[];
         let chosen = choose_event_to_cache(events).await;
         assert!(chosen.is_none());
     }
 
     #[async_test]
-    async fn when_only_one_event_we_cache_it() {
+    async fn test_when_only_one_event_we_cache_it() {
         let event1 = make_event("m.room.message", "$1");
         let events = &[event1.clone()];
         let chosen = choose_event_to_cache(events).await;
@@ -1345,7 +1383,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn with_multiple_events_we_cache_the_last_one() {
+    async fn test_with_multiple_events_we_cache_the_last_one() {
         let event1 = make_event("m.room.message", "$1");
         let event2 = make_event("m.room.message", "$2");
         let events = &[event1, event2.clone()];
@@ -1354,7 +1392,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn cache_the_latest_relevant_event_and_ignore_irrelevant_ones_even_if_later() {
+    async fn test_cache_the_latest_relevant_event_and_ignore_irrelevant_ones_even_if_later() {
         let event1 = make_event("m.room.message", "$1");
         let event2 = make_event("m.room.message", "$2");
         let event3 = make_event("m.room.powerlevels", "$3");
@@ -1365,7 +1403,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn prefer_to_cache_nothing_rather_than_irrelevant_events() {
+    async fn test_prefer_to_cache_nothing_rather_than_irrelevant_events() {
         let event1 = make_event("m.room.power_levels", "$1");
         let events = &[event1];
         let chosen = choose_event_to_cache(events).await;
@@ -1373,7 +1411,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn cache_encrypted_events_that_are_after_latest_message() {
+    async fn test_cache_encrypted_events_that_are_after_latest_message() {
         // Given two message events followed by two encrypted
         let event1 = make_event("m.room.message", "$1");
         let event2 = make_event("m.room.message", "$2");
@@ -1403,7 +1441,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn dont_cache_encrypted_events_that_are_before_latest_message() {
+    async fn test_dont_cache_encrypted_events_that_are_before_latest_message() {
         // Given an encrypted event before and after the message
         let event1 = make_encrypted_event("$1");
         let event2 = make_event("m.room.message", "$2");
@@ -1427,7 +1465,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn skip_irrelevant_events_eg_receipts_even_if_after_message() {
+    async fn test_skip_irrelevant_events_eg_receipts_even_if_after_message() {
         // Given two message events followed by two encrypted, with a receipt in the
         // middle
         let event1 = make_event("m.room.message", "$1");
@@ -1454,7 +1492,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn only_store_the_max_number_of_encrypted_events() {
+    async fn test_only_store_the_max_number_of_encrypted_events() {
         // Given two message events followed by lots of encrypted and other irrelevant
         // events
         let evente = make_event("m.room.message", "$e");
@@ -1512,7 +1550,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn dont_overflow_capacity_if_previous_encrypted_events_exist() {
+    async fn test_dont_overflow_capacity_if_previous_encrypted_events_exist() {
         // Given a RoomInfo with lots of encrypted events already inside it
         let room = make_room();
         let mut room_info = room.clone_info();
@@ -1554,7 +1592,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn existing_encrypted_events_are_deleted_if_we_receive_unencrypted() {
+    async fn test_existing_encrypted_events_are_deleted_if_we_receive_unencrypted() {
         // Given a RoomInfo with some encrypted events already inside it
         let room = make_room();
         let mut room_info = room.clone_info();

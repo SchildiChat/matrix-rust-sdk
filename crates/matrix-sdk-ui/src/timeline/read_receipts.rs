@@ -70,7 +70,7 @@ impl ReadReceipts {
 
     /// Insert or update in the local cache the latest read receipt for the
     /// given user.
-    pub fn upsert_latest(
+    fn upsert_latest(
         &mut self,
         user_id: OwnedUserId,
         receipt_type: ReceiptType,
@@ -286,7 +286,7 @@ impl ReadReceiptTimelineUpdate {
             return;
         };
 
-        let event_item_id = event_item.internal_id;
+        let event_item_id = event_item.internal_id.to_owned();
         let mut event_item = event_item.clone();
 
         if let Some(remote_event_item) = event_item.as_remote_mut() {
@@ -321,7 +321,7 @@ impl ReadReceiptTimelineUpdate {
             return;
         };
 
-        let event_item_id = event_item.internal_id;
+        let event_item_id = event_item.internal_id.to_owned();
         let mut event_item = event_item.clone();
 
         if let Some(remote_event_item) = event_item.as_remote_mut() {
@@ -468,7 +468,7 @@ impl TimelineInnerStateTransaction<'_> {
             return;
         };
 
-        let prev_event_item_id = prev_event_item.internal_id;
+        let prev_event_item_id = prev_event_item.internal_id.to_owned();
         let mut prev_event_item = prev_event_item.clone();
 
         let Some(remote_prev_event_item) = prev_event_item.as_remote_mut() else {
@@ -493,6 +493,31 @@ impl TimelineInnerStateTransaction<'_> {
 }
 
 impl TimelineInnerState {
+    /// Populates our own latest read receipt in the in-memory by-user read
+    /// receipt cache.
+    pub(super) async fn populate_initial_user_receipt<P: RoomDataProvider>(
+        &mut self,
+        room_data_provider: &P,
+        receipt_type: ReceiptType,
+    ) {
+        let own_user_id = room_data_provider.own_user_id().to_owned();
+
+        let mut read_receipt = room_data_provider
+            .load_user_receipt(receipt_type.clone(), ReceiptThread::Unthreaded, &own_user_id)
+            .await;
+
+        // Fallback to the one in the main thread.
+        if read_receipt.is_none() {
+            read_receipt = room_data_provider
+                .load_user_receipt(receipt_type.clone(), ReceiptThread::Main, &own_user_id)
+                .await;
+        }
+
+        if let Some(read_receipt) = read_receipt {
+            self.meta.read_receipts.upsert_latest(own_user_id, receipt_type, read_receipt);
+        }
+    }
+
     /// Get the latest read receipt for the given user.
     ///
     /// Useful to get the latest read receipt, whether it's private or public.

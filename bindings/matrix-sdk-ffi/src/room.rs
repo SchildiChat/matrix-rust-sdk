@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
+    event_cache::paginator::PaginatorError,
     room::{power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole},
     RoomMemberships, RoomState,
 };
-use matrix_sdk_ui::timeline::RoomExt;
+use matrix_sdk_ui::timeline::{PaginationError, RoomExt, TimelineFocus};
 use mime::Mime;
 use ruma::{
     api::client::room::report_content,
@@ -31,7 +32,7 @@ use crate::{
     room_member::RoomMember,
     ruma::ImageInfo,
     space_child_info::{SpaceChildInfo, space_children_info},
-    timeline::{EventTimelineItem, ReceiptType, Timeline},
+    timeline::{EventTimelineItem, FocusEventError, ReceiptType, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -139,11 +140,11 @@ impl Room {
         self.inner.active_room_call_participants().iter().map(|u| u.to_string()).collect()
     }
 
-    pub fn inviter(&self) -> Option<RoomMember> {
+    /// For rooms one is invited to, retrieves the room member information for
+    /// the user who invited the logged-in user to a room.
+    pub async fn inviter(&self) -> Option<RoomMember> {
         if self.inner.state() == RoomState::Invited {
-            RUNTIME.block_on(async move {
-                self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
-            })
+            self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
         } else {
             None
         }
@@ -170,6 +171,48 @@ impl Room {
             *write_guard = Some(timeline.clone());
             Ok(timeline)
         }
+    }
+
+    /// Returns a timeline focused on the given event.
+    ///
+    /// Note: this timeline is independent from that returned with
+    /// [`Self::timeline`], and as such it is not cached.
+    pub async fn timeline_focused_on_event(
+        &self,
+        event_id: String,
+        num_context_events: u16,
+        internal_id_prefix: Option<String>,
+    ) -> Result<Arc<Timeline>, FocusEventError> {
+        let parsed_event_id = EventId::parse(&event_id).map_err(|err| {
+            FocusEventError::InvalidEventId { event_id: event_id.clone(), err: err.to_string() }
+        })?;
+
+        let room = &self.inner;
+
+        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(room);
+
+        if let Some(internal_id_prefix) = internal_id_prefix {
+            builder = builder.with_internal_id_prefix(internal_id_prefix);
+        }
+
+        let timeline = match builder
+            .with_focus(TimelineFocus::Event { target: parsed_event_id, num_context_events })
+            .build()
+            .await
+        {
+            Ok(t) => t,
+            Err(err) => {
+                if let matrix_sdk_ui::timeline::Error::PaginationError(
+                    PaginationError::Paginator(PaginatorError::EventNotFound(..)),
+                ) = err
+                {
+                    return Err(FocusEventError::EventNotFound { event_id: event_id.to_string() });
+                }
+                return Err(FocusEventError::Other { msg: err.to_string() });
+            }
+        };
+
+        Ok(Timeline::new(timeline))
     }
 
     pub fn display_name(&self) -> Result<String, ClientError> {
@@ -242,7 +285,8 @@ impl Room {
             }
         }
 
-        // Otherwise, fallback to the classical path.
+        // Otherwise, create a synthetic [`EventTimelineItem`] using the classical
+        // [`Room`] path.
         let latest_event = match self.inner.latest_event() {
             Some(latest_event) => matrix_sdk_ui::timeline::EventTimelineItem::from_latest_event(
                 self.inner.client(),
@@ -254,6 +298,7 @@ impl Room {
             .map(Arc::new),
             None => None,
         };
+
         Ok(RoomInfo::new(&self.inner, avatar_url, latest_event).await?)
     }
 

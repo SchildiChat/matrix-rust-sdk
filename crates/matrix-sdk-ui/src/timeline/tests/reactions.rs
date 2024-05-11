@@ -27,8 +27,8 @@ use ruma::{
 use stream_assert::assert_next_matches;
 
 use crate::timeline::{
-    event_item::EventItemIdentifier,
-    inner::ReactionAction,
+    event_item::RemoteEventOrigin,
+    inner::{ReactionAction, TimelineEnd},
     reactions::ReactionToggleResult,
     tests::{assert_event_is_updated, assert_no_more_updates, TestTimeline},
     TimelineItem,
@@ -141,14 +141,12 @@ async fn test_redact_reaction_failure() {
 }
 
 #[async_test]
-async fn test_redact_reaction_from_non_existent_event() {
+async fn test_redact_reaction_from_non_existing_event() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
     let reaction_id = EventId::new(server_name!("example.org")); // non existent event
 
-    timeline
-        .handle_local_redaction_event(EventItemIdentifier::EventId(reaction_id), Default::default())
-        .await;
+    timeline.handle_local_redaction_event(&reaction_id).await;
 
     assert_no_more_updates(&mut stream).await;
 }
@@ -259,7 +257,8 @@ async fn test_initial_reaction_timestamp_is_stored() {
                     RoomMessageEventContent::text_plain("A"),
                 )),
             ],
-            crate::timeline::inner::TimelineEnd::Back { from_cache: false },
+            TimelineEnd::Back,
+            RemoteEventOrigin::Sync,
         )
         .await;
 

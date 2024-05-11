@@ -25,7 +25,11 @@ use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use indexmap::IndexMap;
-use matrix_sdk::deserialized_responses::{SyncTimelineEvent, TimelineEvent};
+use matrix_sdk::{
+    deserialized_responses::{SyncTimelineEvent, TimelineEvent},
+    event_cache::paginator::{PaginableRoom, PaginatorError},
+    room::{EventWithContextResponse, Messages, MessagesOptions},
+};
 use matrix_sdk_base::latest_event::LatestEvent;
 use matrix_sdk_test::{EventBuilder, ALICE, BOB};
 use ruma::{
@@ -33,7 +37,6 @@ use ruma::{
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::Annotation,
-        room::redaction::RoomRedactionEventContent,
         AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyTimelineEvent, EmptyStateKey,
         MessageLikeEventContent, RedactedMessageLikeEventContent, RedactedStateEventContent,
         StaticStateEventContent,
@@ -44,15 +47,16 @@ use ruma::{
     room_id,
     serde::Raw,
     server_name, uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId,
-    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
 };
 
 use super::{
-    event_item::EventItemIdentifier,
+    event_handler::TimelineEventKind,
+    event_item::RemoteEventOrigin,
     inner::{ReactionAction, TimelineEnd, TimelineInnerSettings},
     reactions::ReactionToggleResult,
     traits::RoomDataProvider,
-    EventTimelineItem, Profile, TimelineInner, TimelineItem,
+    EventTimelineItem, Profile, TimelineFocus, TimelineInner, TimelineItem,
 };
 use crate::unable_to_decrypt_hook::UtdHookManager;
 
@@ -80,16 +84,33 @@ impl TestTimeline {
         Self::with_room_data_provider(TestRoomDataProvider::default())
     }
 
+    fn with_internal_id_prefix(prefix: String) -> Self {
+        Self {
+            inner: TimelineInner::new(
+                TestRoomDataProvider::default(),
+                TimelineFocus::Live,
+                Some(prefix),
+                None,
+            ),
+            event_builder: EventBuilder::new(),
+        }
+    }
+
     fn with_room_data_provider(room_data_provider: TestRoomDataProvider) -> Self {
         Self {
-            inner: TimelineInner::new(room_data_provider, None),
+            inner: TimelineInner::new(room_data_provider, TimelineFocus::Live, None, None),
             event_builder: EventBuilder::new(),
         }
     }
 
     fn with_unable_to_decrypt_hook(hook: Arc<UtdHookManager>) -> Self {
         Self {
-            inner: TimelineInner::new(TestRoomDataProvider::default(), Some(hook)),
+            inner: TimelineInner::new(
+                TestRoomDataProvider::default(),
+                TimelineFocus::Live,
+                None,
+                Some(hook),
+            ),
             event_builder: EventBuilder::new(),
         }
     }
@@ -214,17 +235,23 @@ impl TestTimeline {
 
     async fn handle_local_event(&self, content: AnyMessageLikeEventContent) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.inner.handle_local_event(txn_id.clone(), content).await;
+        self.inner
+            .handle_local_event(
+                txn_id.clone(),
+                TimelineEventKind::Message { content, relations: Default::default() },
+            )
+            .await;
         txn_id
     }
 
-    async fn handle_local_redaction_event(
-        &self,
-        redacts: EventItemIdentifier,
-        content: RoomRedactionEventContent,
-    ) -> OwnedTransactionId {
+    async fn handle_local_redaction_event(&self, redacts: &EventId) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.inner.handle_local_redaction(txn_id.clone(), redacts, content).await;
+        self.inner
+            .handle_local_event(
+                txn_id.clone(),
+                TimelineEventKind::Redaction { redacts: redacts.to_owned() },
+            )
+            .await;
         txn_id
     }
 
@@ -243,7 +270,9 @@ impl TestTimeline {
 
     async fn handle_back_paginated_custom_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
-        self.inner.add_events_at(vec![timeline_event], TimelineEnd::Front).await;
+        self.inner
+            .add_events_at(vec![timeline_event], TimelineEnd::Front, RemoteEventOrigin::Pagination)
+            .await;
     }
 
     async fn handle_read_receipts(
@@ -276,11 +305,34 @@ type ReadReceiptMap =
 #[derive(Clone, Default)]
 struct TestRoomDataProvider {
     initial_user_receipts: ReadReceiptMap,
+    fully_read_marker: Option<OwnedEventId>,
 }
 
 impl TestRoomDataProvider {
-    fn with_initial_user_receipts(initial_user_receipts: ReadReceiptMap) -> Self {
-        Self { initial_user_receipts }
+    fn with_initial_user_receipts(mut self, initial_user_receipts: ReadReceiptMap) -> Self {
+        self.initial_user_receipts = initial_user_receipts;
+        self
+    }
+    fn with_fully_read_marker(mut self, event_id: OwnedEventId) -> Self {
+        self.fully_read_marker = Some(event_id);
+        self
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl PaginableRoom for TestRoomDataProvider {
+    async fn event_with_context(
+        &self,
+        _event_id: &EventId,
+        _lazy_load_members: bool,
+        _num_events: UInt,
+    ) -> Result<EventWithContextResponse, PaginatorError> {
+        unimplemented!();
+    }
+
+    async fn messages(&self, _opts: MessagesOptions) -> Result<Messages, PaginatorError> {
+        unimplemented!();
     }
 }
 
@@ -339,6 +391,10 @@ impl RoomDataProvider for TestRoomDataProvider {
         };
 
         Some((push_rules, push_context))
+    }
+
+    async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
+        self.fully_read_marker.clone()
     }
 }
 

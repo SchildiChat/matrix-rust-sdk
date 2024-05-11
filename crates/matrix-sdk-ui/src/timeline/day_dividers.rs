@@ -291,7 +291,10 @@ impl DayDividerAdjuster {
                     }
 
                     let unique_id = replaced.unique_id();
-                    let item = TimelineItem::new(VirtualTimelineItem::DayDivider(ts), unique_id);
+                    let item = TimelineItem::new(
+                        VirtualTimelineItem::DayDivider(ts),
+                        unique_id.to_owned(),
+                    );
 
                     items.set(at, item);
                     max_i = i;
@@ -570,7 +573,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
         let timestamp_next_day =
@@ -604,7 +607,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
         let timestamp_next_day =
