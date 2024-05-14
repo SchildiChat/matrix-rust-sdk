@@ -72,7 +72,7 @@ mod tests {
         assert!(!matcher.matches(&RoomListEntry::Filled(room_id!("!r0:bar.org").to_owned())));
         assert!(!matcher.matches(&RoomListEntry::Invalidated(room_id!("!r0:bar.org").to_owned())));
 
-        // When a room has been joined, it does match (unless it's empty).
+        // When a room is an invite, it does match (unless it's empty).
         let matcher = InviteRoomMatcher { state: |_| Some(RoomState::Invited) };
         assert!(!matcher.matches(&RoomListEntry::Empty));
         assert!(matcher.matches(&RoomListEntry::Filled(room_id!("!r0:bar.org").to_owned())));

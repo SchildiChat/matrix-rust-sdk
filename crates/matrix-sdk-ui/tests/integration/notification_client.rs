@@ -45,13 +45,13 @@ async fn test_notification_client_with_context() {
         "type": "m.room.message",
     });
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id).add_timeline_event(sync_timeline_event!(event_json)),
     );
 
     // First, mock a sync that contains a text message.
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -59,8 +59,7 @@ async fn test_notification_client_with_context() {
     let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
     let process_setup =
         NotificationProcessSetup::SingleProcess { sync_service: dummy_sync_service };
-    let notification_client =
-        NotificationClient::builder(client, process_setup).await.unwrap().build();
+    let notification_client = NotificationClient::new(client, process_setup).await.unwrap();
 
     {
         // The notification client retrieves the event via `/rooms/*/context/`.
@@ -242,8 +241,7 @@ async fn test_notification_client_sliding_sync() {
     let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
     let process_setup =
         NotificationProcessSetup::SingleProcess { sync_service: dummy_sync_service };
-    let notification_client =
-        NotificationClient::builder(client, process_setup).await.unwrap().build();
+    let notification_client = NotificationClient::new(client, process_setup).await.unwrap();
     let item =
         notification_client.get_notification_with_sliding_sync(room_id, event_id).await.unwrap();
 

@@ -1093,7 +1093,7 @@ mod tests {
     impl Match for SlidingSyncMatcher {
         fn matches(&self, request: &Request) -> bool {
             request.url.path() == "/_matrix/client/unstable/org.matrix.msc3575/sync"
-                && request.method == Method::Post
+                && request.method == Method::POST
         }
     }
 
@@ -1167,7 +1167,7 @@ mod tests {
                 fn matches(&self, request: &Request) -> bool {
                     request.url.path()
                         == format!("/_matrix/client/r0/rooms/{room_id}/members", room_id = self.0)
-                        && request.method == Method::Get
+                        && request.method == Method::GET
                 }
             }
 
@@ -1388,9 +1388,7 @@ mod tests {
         let sync = client
             .sliding_sync("test-slidingsync")?
             .add_list(SlidingSyncList::builder("new_list"))
-            .with_to_device_extension(
-                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
-            )
+            .with_to_device_extension(assign!(ToDeviceConfig::default(), { enabled: Some(true)}))
             .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
             .build()
             .await?;
@@ -2418,9 +2416,7 @@ mod tests {
 
         let sliding_sync = client
             .sliding_sync("test")?
-            .with_to_device_extension(
-                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
-            )
+            .with_to_device_extension(assign!(ToDeviceConfig::default(), { enabled: Some(true)}))
             .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
             .build()
             .await?;
@@ -2483,9 +2479,7 @@ mod tests {
         let sliding_sync = client
             .sliding_sync("test")?
             .add_list(SlidingSyncList::builder("thelist"))
-            .with_to_device_extension(
-                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
-            )
+            .with_to_device_extension(assign!(ToDeviceConfig::default(), { enabled: Some(true)}))
             .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
             .build()
             .await?;
@@ -2535,9 +2529,7 @@ mod tests {
 
         let sliding_sync = client
             .sliding_sync("test")?
-            .with_to_device_extension(
-                assign!(v4::ToDeviceConfig::default(), { enabled: Some(true)}),
-            )
+            .with_to_device_extension(assign!(ToDeviceConfig::default(), { enabled: Some(true)}))
             .with_e2ee_extension(assign!(v4::E2EEConfig::default(), { enabled: Some(true)}))
             .build()
             .await?;

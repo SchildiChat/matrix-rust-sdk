@@ -26,7 +26,7 @@ async-rx = "0.1.3"
 async-stream = "0.3.3"
 async-trait = "0.1.60"
 as_variant = "1.2.0"
-base64 = "0.21.0"
+base64 = "0.22.0"
 byteorder = "1.4.3"
 eyeball = { version = "0.8.7", features = ["tracing"] }
 eyeball-im = { version = "0.4.1", features = ["tracing"] }
@@ -36,10 +36,10 @@ futures-executor = "0.3.21"
 futures-util = { version = "0.3.26", default-features = false, features = [
     "alloc",
 ] }
-http = "0.2.6"
+http = "1.1.0"
 imbl = "2.0.0"
 itertools = "0.12.0"
-ruma = { git = "https://github.com/SchildiChat/ruma", rev = "c282d3174", features = [
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "91c1021ce", features = [
     "client-api-c",
     "compat-upload-signatures",
     "compat-user-id",
@@ -50,7 +50,7 @@ ruma = { git = "https://github.com/SchildiChat/ruma", rev = "c282d3174", feature
     "unstable-msc2654",
     "unstable-msc2867",
 ] }
-ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "c282d3174" }
+ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "91c1021ce" }
 once_cell = "1.16.0"
 rand = "0.8.5"
 serde = "1.0.151"
@@ -63,10 +63,10 @@ tokio = { version = "1.30.0", default-features = false, features = ["sync"] }
 tokio-stream = "0.1.14"
 tracing = { version = "0.1.40", default-features = false, features = ["std"] }
 tracing-core = "0.1.32"
-uniffi = { git = "https://github.com/mozilla/uniffi-rs", rev = "789a9023b522562a95618443cee5a0d4f111c4c7" }
-uniffi_bindgen = { git = "https://github.com/mozilla/uniffi-rs", rev = "789a9023b522562a95618443cee5a0d4f111c4c7" }
-vodozemac = { git="https://github.com/matrix-org/vodozemac", rev = "0c75746fc8a5eda4a0e490d345d1798b4c6cbd67" }
-wiremock = "0.5.21"
+uniffi = { version = "0.27.1" }
+uniffi_bindgen = { version = "0.27.1" }
+vodozemac = { version = "0.6.0" }
+wiremock = "0.6.0"
 zeroize = "1.6.0"
 
 matrix-sdk = { path = "crates/matrix-sdk", version = "0.7.0", default-features = false }
@@ -113,3 +113,4 @@ const_panic = { git = "https://github.com/jplatte/const_panic", rev = "9024a4cb3
 
 [workspace.lints.clippy]
 assigning_clones = "allow"
+box_default = "allow"

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::{
+    convert::Infallible,
+    future::IntoFuture,
     io::{self, Write},
     ops::Range,
     path::{Path, PathBuf},
@@ -21,12 +23,16 @@ use std::{
 };
 
 use anyhow::{anyhow, bail};
+use axum::{
+    http::{Method, Request, StatusCode},
+    response::IntoResponse,
+    routing::any_service,
+};
 use futures_util::StreamExt;
-use http::{Method, StatusCode};
-use hyper::{server::conn::AddrIncoming, service::service_fn, Body, Server};
 use matrix_sdk::{
     config::SyncSettings,
     oidc::{
+        requests::account_management::AccountManagementActionFull,
         types::{
             client_credentials::ClientCredentials,
             iana::oauth::OAuthClientAuthenticationMethod,
@@ -35,21 +41,17 @@ use matrix_sdk::{
             requests::GrantType,
             scope::{Scope, ScopeToken},
         },
-        AuthorizationCode, AuthorizationResponse, OidcAccountManagementAction,
-        OidcAuthorizationData, OidcSession, UserSession,
+        AuthorizationCode, AuthorizationResponse, OidcAuthorizationData, OidcSession, UserSession,
     },
     room::Room,
-    ruma::{
-        api::client::discovery::discover_homeserver::AuthenticationServerInfo,
-        events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
-    },
-    Client, ClientBuildError, Result, RoomState, ServerName,
+    ruma::events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
+    Client, ClientBuildError, Result, RoomState,
 };
 use matrix_sdk_ui::sync_service::SyncService;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncBufReadExt as _, net::TcpListener, sync::oneshot};
-use tower::make::Shared;
+use tower::service_fn;
 use url::Url;
 
 /// A command-line tool to demonstrate the steps requiring an interaction with
@@ -57,7 +59,7 @@ use url::Url;
 /// flow.
 ///
 /// You can test this against one of the servers from the OIDC playground:
-/// <https://github.com/vector-im/oidc-playground>.
+/// <https://github.com/element-hq/oidc-playground>.
 ///
 /// To use this, just run `cargo run -p example-oidc-cli`, and everything
 /// is interactive after that. You might want to set the `RUST_LOG` environment
@@ -151,10 +153,10 @@ impl OidcCli {
     async fn new(data_dir: &Path, session_file: PathBuf) -> anyhow::Result<Self> {
         println!("No previous session found, logging in…");
 
-        let (client, client_session, issuer_info) = build_client(data_dir).await?;
+        let (client, client_session, issuer) = build_client(data_dir).await?;
         let cli = Self { client, restored: false, session_file };
 
-        let client_id = cli.register_client(issuer_info).await?;
+        let client_id = cli.register_client(issuer).await?;
         cli.login().await?;
 
         // Persist the session to reuse it later.
@@ -188,13 +190,10 @@ impl OidcCli {
     /// Register the OIDC client with the provider.
     ///
     /// Returns the ID of the client returned by the provider.
-    async fn register_client(
-        &self,
-        issuer_info: AuthenticationServerInfo,
-    ) -> anyhow::Result<String> {
+    async fn register_client(&self, issuer: String) -> anyhow::Result<String> {
         let oidc = self.client.oidc();
 
-        let provider_metadata = oidc.given_provider_metadata(&issuer_info.issuer).await?;
+        let provider_metadata = oidc.given_provider_metadata(&issuer).await?;
 
         if provider_metadata.registration_endpoint.is_none() {
             // This would require to register with the provider manually, which
@@ -212,10 +211,10 @@ impl OidcCli {
         // to update the metadata later without changing the client ID, but requires to
         // have a way to serve public keys online to validate the signature of
         // the JWT.
-        let res = oidc.register_client(&issuer_info.issuer, metadata.clone(), None).await?;
+        let res = oidc.register_client(&issuer, metadata.clone(), None).await?;
 
         oidc.restore_registered_client(
-            issuer_info,
+            issuer,
             metadata,
             ClientCredentials::None { client_id: res.client_id.clone() },
         );
@@ -281,34 +280,9 @@ impl OidcCli {
         let StoredSession { client_session, user_session, client_credentials } =
             serde_json::from_str(&serialized_session)?;
 
-        // We're using autodiscovery here too because we need to properly discover the
-        // OIDC endpoints to properly support refreshing tokens in the watch
-        // command.
-        let (homeserver, insecure) =
-            if let Some(base) = client_session.homeserver.strip_prefix("http://") {
-                (base, true)
-            } else {
-                (
-                    client_session
-                        .homeserver
-                        .strip_prefix("https://")
-                        .unwrap_or(&client_session.homeserver),
-                    false,
-                )
-            };
-        let homeserver = homeserver.strip_suffix('/').unwrap_or(homeserver);
-        let server_name = ServerName::parse(homeserver)?;
-
         // Build the client with the previous settings from the session.
-        let mut client = Client::builder();
-
-        if insecure {
-            client = client.insecure_server_name_no_tls(&server_name);
-        } else {
-            client = client.server_name(&server_name);
-        }
-
-        let client = client
+        let client = Client::builder()
+            .homeserver_url(client_session.homeserver)
             .handle_refresh_tokens()
             .sqlite_store(client_session.db_path, Some(&client_session.passphrase))
             .build()
@@ -351,13 +325,13 @@ impl OidcCli {
                     self.whoami();
                 }
                 Some("account") => {
-                    self.account(None);
+                    self.account(None).await;
                 }
                 Some("profile") => {
-                    self.account(Some(OidcAccountManagementAction::Profile));
+                    self.account(Some(AccountManagementActionFull::Profile)).await;
                 }
                 Some("sessions") => {
-                    self.account(Some(OidcAccountManagementAction::SessionsList));
+                    self.account(Some(AccountManagementActionFull::SessionsList)).await;
                 }
                 Some("watch") => match args.next() {
                     Some(sub) => {
@@ -421,8 +395,8 @@ impl OidcCli {
     }
 
     /// Get the account management URL.
-    fn account(&self, action: Option<OidcAccountManagementAction>) {
-        match self.client.oidc().account_management_url(action) {
+    async fn account(&self, action: Option<AccountManagementActionFull>) {
+        match self.client.oidc().account_management_url(action).await {
             Ok(Some(url)) => {
                 println!("\nTo manage your account, visit: {url}");
             }
@@ -662,9 +636,7 @@ impl OidcCli {
 ///
 /// Returns the client, the data required to restore the client, and the OIDC
 /// issuer advertised by the homeserver.
-async fn build_client(
-    data_dir: &Path,
-) -> anyhow::Result<(Client, ClientSession, AuthenticationServerInfo)> {
+async fn build_client(data_dir: &Path) -> anyhow::Result<(Client, ClientSession, String)> {
     let db_path = data_dir.join("db");
 
     // Generate a random passphrase.
@@ -681,33 +653,12 @@ async fn build_client(
         io::stdin().read_line(&mut homeserver).expect("Unable to read user input");
 
         let homeserver = homeserver.trim();
-        let (homeserver, insecure) = if let Some(base) = homeserver.strip_prefix("http://") {
-            (base, true)
-        } else {
-            (homeserver, false)
-        };
-
-        let server_name = match ServerName::parse(homeserver.trim()) {
-            Ok(s) => s,
-            Err(error) => {
-                println!("Error: not a valid server name: {error}");
-                continue;
-            }
-        };
 
         println!("\nChecking homeserver…");
 
-        let mut client = Client::builder();
-
-        // We need to use server autodiscovery to get the authentication issuer
-        // advertised by the homeserver.
-        if insecure {
-            client = client.insecure_server_name_no_tls(&server_name);
-        } else {
-            client = client.server_name(&server_name);
-        }
-
-        match client
+        match Client::builder()
+            // Try autodiscovery or test the URL.
+            .server_name_or_homeserver_url(homeserver)
             // Make sure to automatically refresh tokens if needs be.
             .handle_refresh_tokens()
             // We use the sqlite store, which is available by default. This is the crucial part to
@@ -718,21 +669,33 @@ async fn build_client(
             .await
         {
             Ok(client) => {
-                // Check if the homeserver advertises an OIDC Provider with auto-discovery.
+                // Check if the homeserver advertises an OIDC Provider.
                 // This can be bypassed by providing the issuer manually, but it should be the
                 // most common case for public homeservers.
-                if let Some(issuer_info) = client.oidc().authentication_server_info().cloned() {
-                    println!("Found issuer: {}", issuer_info.issuer);
+                match client.oidc().fetch_authentication_issuer().await {
+                    Ok(issuer) => {
+                        println!("Found issuer: {issuer}");
 
-                    let homeserver = client.homeserver().to_string();
-                    return Ok((
-                        client,
-                        ClientSession { homeserver, db_path, passphrase },
-                        issuer_info,
-                    ));
+                        let homeserver = client.homeserver().to_string();
+                        return Ok((
+                            client,
+                            ClientSession { homeserver, db_path, passphrase },
+                            issuer,
+                        ));
+                    }
+                    Err(error) => {
+                        if error
+                            .as_client_api_error()
+                            .is_some_and(|err| err.status_code == StatusCode::NOT_FOUND)
+                        {
+                            println!("This homeserver doesn't advertise an authentication issuer.");
+                        } else {
+                            println!("Error fetching the authentication issuer: {error:?}");
+                        }
+                        // The client already initialized the store so we need to remove it.
+                        fs::remove_dir_all(data_dir).await?;
+                    }
                 }
-                println!("This homeserver doesn't advertise an authentication issuer.");
-                println!("Please try again\n");
             }
             Err(error) => match &error {
                 ClientBuildError::AutoDiscovery(_)
@@ -742,6 +705,10 @@ async fn build_client(
                     println!("Please try again\n");
                     // The client already initialized the store so we need to remove it.
                     fs::remove_dir_all(data_dir).await?;
+                }
+                ClientBuildError::InvalidServerName => {
+                    println!("Error: not a valid server name");
+                    println!("Please try again\n");
                 }
                 _ => {
                     // Forward other errors, it's unlikely we can retry with a different outcome.
@@ -875,29 +842,31 @@ async fn spawn_local_server(
     };
 
     // Set up the server.
-    let incoming = AddrIncoming::from_listener(listener)?;
-    let server = Server::builder(incoming)
-            .serve(Shared::new(service_fn(move |request| {
-                let data_tx_mutex = data_tx_mutex.clone();
-                async move {
-                    // Reject methods others than HEAD or GET.
-                    if request.method() != Method::HEAD && request.method() != Method::GET {
-                        return http::Response::builder().status(StatusCode::METHOD_NOT_ALLOWED).body(Body::default());
-                    }
+    let router = any_service(service_fn(move |request: Request<_>| {
+        let data_tx_mutex = data_tx_mutex.clone();
+        async move {
+            // Reject methods others than HEAD or GET.
+            if request.method() != Method::HEAD && request.method() != Method::GET {
+                return Ok::<_, Infallible>(StatusCode::METHOD_NOT_ALLOWED.into_response());
+            }
 
-                    // We only need to get the first response so we consume the transmitter the first time.
-                    if let Some(data_tx) = data_tx_mutex.lock().unwrap().take() {
-                        let query_string = request.uri().query().unwrap_or_default();
+            // We only need to get the first response so we consume the transmitter the
+            // first time.
+            if let Some(data_tx) = data_tx_mutex.lock().unwrap().take() {
+                let query_string = request.uri().query().unwrap_or_default();
 
-                        data_tx.send(query_string.to_owned()).expect("The receiver is still alive");
-                    }
+                data_tx.send(query_string.to_owned()).expect("The receiver is still alive");
+            }
 
-                    Ok(http::Response::new(Body::from("The authorization step is complete. You can close this page and go back to the oidc-cli.")))
-                }
-            })))
-            .with_graceful_shutdown(async {
-                signal_rx.await.ok();
-            });
+            Ok("The authorization step is complete. You can close this page and go back to the oidc-cli.".into_response())
+        }
+    }));
+
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            signal_rx.await.ok();
+        })
+        .into_future();
 
     tokio::spawn(server);
 
@@ -912,7 +881,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
     }
     let MessageType::Text(text_content) = &event.content.msgtype else { return };
 
-    let room_name = match room.display_name().await {
+    let room_name = match room.computed_display_name().await {
         Ok(room_name) => room_name.to_string(),
         Err(error) => {
             println!("Error getting room display name: {error}");

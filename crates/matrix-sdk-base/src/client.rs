@@ -124,8 +124,7 @@ impl BaseClient {
     /// * `config` - An optional session if the user already has one from a
     /// previous login call.
     pub fn with_store_config(config: StoreConfig) -> Self {
-        let (roominfo_update_sender, _roominfo_update_receiver) =
-            tokio::sync::broadcast::channel(100);
+        let (roominfo_update_sender, _roominfo_update_receiver) = broadcast::channel(100);
 
         BaseClient {
             store: Store::new(config.state_store),
@@ -1518,9 +1517,9 @@ mod tests {
 
         let client = logged_in_base_client(Some(user_id)).await;
 
-        let mut ev_builder = SyncResponseBuilder::new();
+        let mut sync_builder = SyncResponseBuilder::new();
 
-        let response = ev_builder
+        let response = sync_builder
             .add_left_room(LeftRoomBuilder::new(room_id).add_timeline_event(sync_timeline_event!({
                 "content": {
                     "displayname": "Alice",
@@ -1536,7 +1535,7 @@ mod tests {
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
 
-        let response = ev_builder
+        let response = sync_builder
             .add_invited_room(InvitedRoomBuilder::new(room_id).add_state_event(
                 StrippedStateTestEvent::Custom(json!({
                     "content": {
@@ -1638,7 +1637,7 @@ mod tests {
         let room = client.get_room(room_id).expect("Room not found");
         assert_eq!(room.state(), RoomState::Invited);
         assert_eq!(
-            room.display_name().await.expect("fetching display name failed"),
+            room.computed_display_name().await.expect("fetching display name failed"),
             DisplayName::Calculated("Kyra".to_owned())
         );
     }
@@ -1678,8 +1677,8 @@ mod tests {
         event_id: &str,
         user_id: &UserId,
     ) -> crate::Room {
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
                 sync_timeline_event!({
                     "content": {
@@ -1805,8 +1804,8 @@ mod tests {
             .unwrap();
 
         // Preamble: let the SDK know about the room.
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
@@ -1864,8 +1863,8 @@ mod tests {
             .unwrap();
 
         // Preamble: let the SDK know about the room, and that the invited user left it.
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_state_event(
                 StateTestEvent::Custom(json!({
                     "content": {

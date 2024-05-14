@@ -48,6 +48,7 @@ use std::{
     time::Duration,
 };
 
+use eyeball::Subscriber;
 use matrix_sdk_base::{
     deserialized_responses::{AmbiguityChange, SyncTimelineEvent, TimelineEvent},
     sync::{JoinedRoomUpdate, LeftRoomUpdate, RoomUpdates, Timeline},
@@ -66,7 +67,7 @@ use tokio::{
     },
     time::timeout,
 };
-use tracing::{error, instrument, trace, warn};
+use tracing::{error, info_span, instrument, trace, warn, Instrument as _, Span};
 
 use self::{
     linked_chunk::ChunkContent,
@@ -118,6 +119,9 @@ pub type Result<T> = std::result::Result<T, EventCacheError>;
 pub struct EventCacheDropHandles {
     /// Task that listens to room updates.
     listen_updates_task: JoinHandle<()>,
+
+    /// Task that listens to updates to the user's ignored list.
+    ignore_user_list_update_task: JoinHandle<()>,
 }
 
 impl Debug for EventCacheDropHandles {
@@ -129,6 +133,7 @@ impl Debug for EventCacheDropHandles {
 impl Drop for EventCacheDropHandles {
     fn drop(&mut self) {
         self.listen_updates_task.abort();
+        self.ignore_user_list_update_task.abort();
     }
 }
 
@@ -172,14 +177,37 @@ impl EventCache {
 
         let _ = self.inner.drop_handles.get_or_init(|| {
             // Spawn the task that will listen to all the room updates at once.
-            let room_updates_feed = client.subscribe_to_all_room_updates();
-            let listen_updates_task =
-                spawn(Self::listen_task(self.inner.clone(), room_updates_feed));
+            let listen_updates_task = spawn(Self::listen_task(
+                self.inner.clone(),
+                client.subscribe_to_all_room_updates(),
+            ));
 
-            Arc::new(EventCacheDropHandles { listen_updates_task })
+            let ignore_user_list_update_task = spawn(Self::ignore_user_list_update_task(
+                self.inner.clone(),
+                client.subscribe_to_ignore_user_list_changes(),
+            ));
+
+            Arc::new(EventCacheDropHandles { listen_updates_task, ignore_user_list_update_task })
         });
 
         Ok(())
+    }
+
+    #[instrument(skip_all)]
+    async fn ignore_user_list_update_task(
+        inner: Arc<EventCacheInner>,
+        mut ignore_user_list_stream: Subscriber<Vec<String>>,
+    ) {
+        let span = info_span!(parent: Span::none(), "ignore_user_list_update_task");
+        span.follows_from(Span::current());
+
+        async move {
+            while ignore_user_list_stream.next().await.is_some() {
+                inner.clear_all_rooms().await;
+            }
+        }
+        .instrument(span)
+        .await;
     }
 
     #[instrument(skip_all)]
@@ -209,19 +237,7 @@ impl EventCache {
                     // no way to reconcile at the moment!
                     // TODO: implement Smart Matching™,
                     warn!(num_skipped, "Lagged behind room updates, clearing all rooms");
-
-                    // Note: one must NOT clear the `by_room` map, because if something subscribed
-                    // to a room update, they would never get any new update for that room, since
-                    // re-creating the `RoomEventCache` would create a new unrelated sender.
-
-                    let rooms = inner.by_room.write().await;
-                    for room in rooms.values() {
-                        // Notify all the observers that we've lost track of state. (We ignore the
-                        // error if there aren't any.)
-                        let _ = room.inner.sender.send(RoomEventCacheUpdate::Clear);
-                        // Clear all the events in memory.
-                        room.inner.events.write().await.reset();
-                    }
+                    inner.clear_all_rooms().await;
                 }
 
                 Err(RecvError::Closed) => {
@@ -298,6 +314,22 @@ struct EventCacheInner {
 impl EventCacheInner {
     fn client(&self) -> Result<Client> {
         Ok(Client { inner: self.client.upgrade().ok_or(EventCacheError::ClientDropped)? })
+    }
+
+    /// Clears all the room's data.
+    async fn clear_all_rooms(&self) {
+        // Note: one must NOT clear the `by_room` map, because if something subscribed
+        // to a room update, they would never get any new update for that room, since
+        // re-creating the `RoomEventCache` would create a new unrelated sender.
+        let rooms = self.by_room.write().await;
+
+        for room in rooms.values() {
+            // Notify all the observers that we've lost track of state. (We ignore the
+            // error if there aren't any.)
+            let _ = room.inner.sender.send(RoomEventCacheUpdate::Clear);
+            // Clear all the events in memory.
+            room.inner.events.write().await.reset();
+        }
     }
 
     /// Handles a single set of room updates at once.
@@ -761,19 +793,19 @@ impl RoomEventCacheInner {
             Some(first_event_pos) => {
                 if let Some(prev_token_gap) = prev_token {
                     room_events
-                            .insert_gap_at(prev_token_gap, first_event_pos)
-                            // SAFETY: The `first_event_pos` can only be an `Item` chunk, it's
-                            // an invariant of `LinkedChunk`. Also, it can only represent a valid
-                            // `ChunkIdentifier` as the data structure isn't modified yet.
-                            .expect("`first_event_pos` must point to a valid `Item` chunk when inserting a gap");
+                        .insert_gap_at(prev_token_gap, first_event_pos)
+                        // SAFETY: The `first_event_pos` can only be an `Item` chunk, it's
+                        // an invariant of `LinkedChunk`. Also, it can only represent a valid
+                        // `ChunkIdentifier` as the data structure isn't modified yet.
+                        .expect("`first_event_pos` must point to a valid `Item` chunk when inserting a gap");
                 }
 
                 room_events
-                        .insert_events_at(sync_events, first_event_pos)
-                        // SAFETY: The `first_event_pos` can only be an `Item` chunk, it's
-                        // an invariant of `LinkedChunk`. The chunk it points to has not been
-                        // removed.
-                        .expect("The `first_event_pos` must point to a valid `Item` chunk when inserting events");
+                    .insert_events_at(sync_events, first_event_pos)
+                    // SAFETY: The `first_event_pos` can only be an `Item` chunk, it's
+                    // an invariant of `LinkedChunk`. The chunk it points to has not been
+                    // removed.
+                    .expect("The `first_event_pos` must point to a valid `Item` chunk when inserting events");
             }
 
             // There is no first item. Let's simply push.
@@ -879,13 +911,12 @@ mod tests {
     use assert_matches2::assert_matches;
     use futures_util::FutureExt as _;
     use matrix_sdk_base::sync::JoinedRoomUpdate;
-    use matrix_sdk_common::executor::spawn;
-    use matrix_sdk_test::{async_test, sync_timeline_event};
+    use matrix_sdk_test::async_test;
     use ruma::{room_id, serde::Raw};
     use serde_json::json;
 
-    use super::{BackPaginationOutcome, EventCacheError, RoomEventCacheUpdate};
-    use crate::{event_cache::store::PaginationToken, test_utils::logged_in_client};
+    use super::{EventCacheError, RoomEventCacheUpdate};
+    use crate::test_utils::logged_in_client;
 
     #[async_test]
     async fn test_must_explicitly_subscribe() {
@@ -909,22 +940,26 @@ mod tests {
         use std::time::{Duration, Instant};
 
         use matrix_sdk_base::RoomState;
+        use matrix_sdk_test::sync_timeline_event;
         use serde_json::json;
-        use tokio::time::sleep;
+        use tokio::{spawn, time::sleep};
         use wiremock::{
             matchers::{header, method, path_regex, query_param},
             Mock, ResponseTemplate,
         };
 
         use super::{super::store::Gap, *};
-        use crate::test_utils::logged_in_client_with_server;
+        use crate::{
+            event_cache::{store::PaginationToken, BackPaginationOutcome},
+            test_utils::logged_in_client_with_server,
+        };
 
         #[async_test]
         async fn test_unknown_pagination_token() {
             let (client, server) = logged_in_client_with_server().await;
 
             let room_id = room_id!("!galette:saucisse.bzh");
-            client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+            client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
             client.event_cache().subscribe().unwrap();
 
@@ -1016,7 +1051,7 @@ mod tests {
         async fn test_wait_for_pagination_token_already_present() {
             let client = logged_in_client(None).await;
             let room_id = room_id!("!galette:saucisse.bzh");
-            client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+            client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
             let event_cache = client.event_cache();
 
@@ -1075,7 +1110,7 @@ mod tests {
         async fn test_wait_for_late_pagination_token() {
             let client = logged_in_client(None).await;
             let room_id = room_id!("!galette:saucisse.bzh");
-            client.base_client().get_or_create_room(room_id, matrix_sdk_base::RoomState::Joined);
+            client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
             let event_cache = client.event_cache();
 
