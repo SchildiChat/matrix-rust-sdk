@@ -35,14 +35,11 @@ use ruma::{
 use tracing::{debug, info, Instrument, Span};
 
 use super::Room;
+#[cfg(feature = "image-proc")]
+use crate::{attachment::generate_image_thumbnail, error::ImageError};
 use crate::{
     attachment::AttachmentConfig, utils::IntoRawMessageLikeEventContent, Result,
     TransmissionProgress,
-};
-#[cfg(feature = "image-proc")]
-use crate::{
-    attachment::{generate_image_thumbnail, Thumbnail},
-    error::ImageError,
 };
 
 /// Future returned by [`Room::send`].
@@ -216,7 +213,7 @@ impl<'a> IntoFuture for SendRawMessageLikeEvent<'a> {
 #[allow(missing_debug_implementations)]
 pub struct SendAttachment<'a> {
     room: &'a Room,
-    url: &'a str,
+    filename: &'a str,
     content_type: &'a Mime,
     data: Vec<u8>,
     config: AttachmentConfig,
@@ -227,14 +224,14 @@ pub struct SendAttachment<'a> {
 impl<'a> SendAttachment<'a> {
     pub(crate) fn new(
         room: &'a Room,
-        url: &'a str,
+        filename: &'a str,
         content_type: &'a Mime,
         data: Vec<u8>,
         config: AttachmentConfig,
     ) -> Self {
         Self {
             room,
-            url,
+            filename,
             content_type,
             data,
             config,
@@ -260,17 +257,21 @@ impl<'a> IntoFuture for SendAttachment<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, url, content_type, data, config, tracing_span, send_progress } = self;
+        let Self { room, filename, content_type, data, config, tracing_span, send_progress } = self;
         let fut = async move {
             if config.thumbnail.is_some() {
-                room.prepare_and_send_attachment(url, content_type, data, config, send_progress)
-                    .await
+                room.prepare_and_send_attachment(
+                    filename,
+                    content_type,
+                    data,
+                    config,
+                    send_progress,
+                )
+                .await
             } else {
                 #[cfg(not(feature = "image-proc"))]
                 let thumbnail = None;
 
-                #[cfg(feature = "image-proc")]
-                let data_slot;
                 #[cfg(feature = "image-proc")]
                 let (data, thumbnail) = if config.generate_thumbnail {
                     let content_type = content_type.clone();
@@ -279,6 +280,7 @@ impl<'a> IntoFuture for SendAttachment<'a> {
                             &content_type,
                             Cursor::new(&data),
                             config.thumbnail_size,
+                            config.thumbnail_format,
                         );
                         (data, res)
                     };
@@ -292,19 +294,15 @@ impl<'a> IntoFuture for SendAttachment<'a> {
                     let (data, res) = make_thumbnail(data);
 
                     let thumbnail = match res {
-                        Ok((thumbnail_data, thumbnail_info)) => {
-                            data_slot = thumbnail_data;
-                            Some(Thumbnail {
-                                data: data_slot,
-                                content_type: mime::IMAGE_JPEG,
-                                info: Some(thumbnail_info),
-                            })
+                        Ok(thumbnail) => Some(thumbnail),
+                        Err(error) => {
+                            if matches!(error, ImageError::ThumbnailBiggerThanOriginal) {
+                                debug!("Not generating thumbnail: {error}");
+                            } else {
+                                tracing::warn!("Failed to generate thumbnail: {error}");
+                            }
+                            None
                         }
-                        Err(
-                            ImageError::ThumbnailBiggerThanOriginal
-                            | ImageError::FormatNotSupported,
-                        ) => None,
-                        Err(error) => return Err(error.into()),
                     };
 
                     (data, thumbnail)
@@ -318,14 +316,23 @@ impl<'a> IntoFuture for SendAttachment<'a> {
                     thumbnail,
                     caption: config.caption,
                     formatted_caption: config.formatted_caption,
+                    mentions: config.mentions,
                     #[cfg(feature = "image-proc")]
                     generate_thumbnail: false,
                     #[cfg(feature = "image-proc")]
                     thumbnail_size: None,
+                    #[cfg(feature = "image-proc")]
+                    thumbnail_format: Default::default(),
                 };
 
-                room.prepare_and_send_attachment(url, content_type, data, config, send_progress)
-                    .await
+                room.prepare_and_send_attachment(
+                    filename,
+                    content_type,
+                    data,
+                    config,
+                    send_progress,
+                )
+                .await
             }
         };
 

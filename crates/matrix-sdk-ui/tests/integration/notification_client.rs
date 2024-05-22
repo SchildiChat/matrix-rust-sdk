@@ -255,7 +255,6 @@ async fn test_notification_client_sliding_sync() {
                         [0, 16]
                     ],
                     "required_state": [
-                        ["m.room.avatar", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
@@ -275,7 +274,6 @@ async fn test_notification_client_sliding_sync() {
             "room_subscriptions": {
                 "!a98sd12bjh:example.org": {
                     "required_state": [
-                        ["m.room.avatar", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
@@ -304,6 +302,6 @@ async fn test_notification_client_sliding_sync() {
     });
     assert_eq!(item.sender_display_name.as_deref(), Some(sender_display_name));
     assert_eq!(item.sender_avatar_url.as_deref(), Some(sender_avatar_url));
-    assert_eq!(item.room_display_name, room_name);
+    assert_eq!(item.room_computed_display_name, sender_display_name);
     assert_eq!(item.is_noisy, Some(false));
 }
