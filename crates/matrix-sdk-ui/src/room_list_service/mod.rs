@@ -204,10 +204,16 @@ impl RoomListService {
                     )
                     .timeline_limit(0)
                     .required_state(vec![
+                        (StateEventType::RoomName, "".to_owned()),
                         (StateEventType::RoomAvatar, "".to_owned()),
                         (StateEventType::RoomCanonicalAlias, "".to_owned()),
                         (StateEventType::RoomCreate, "".to_owned()),
                         (StateEventType::SpaceChild, "*".to_owned()),
+                        // Future use?
+                        (StateEventType::RoomEncryption, "".to_owned()),
+                        (StateEventType::RoomMember, "$LAZY".to_owned()),
+                        (StateEventType::RoomMember, "$ME".to_owned()),
+                        (StateEventType::RoomPowerLevels, "".to_owned()),
                     ])
                     .filters(Some(assign!(SyncRequestListFilters::default(), {
                         is_tombstoned: Some(false),
