@@ -13,6 +13,7 @@ macro_rules! cryptostore_integration_tests {
                 to_device::DeviceIdOrAllDevices, user_id, DeviceId, RoomId, TransactionId, UserId,
             };
             use serde_json::value::to_raw_value;
+            use serde_json::json;
             use $crate::{
                 olm::{
                     Account, Curve25519PublicKey, InboundGroupSession, OlmMessageHash,
@@ -35,9 +36,10 @@ macro_rules! cryptostore_integration_tests {
                         secret_send::SecretSendContent,
                         ToDeviceEvent,
                     },
+                    DeviceKeys,
                     EventEncryptionAlgorithm,
                 },
-                GossippedSecret, ReadOnlyDevice, SecretInfo, ToDeviceRequest, TrackedUser,
+                GossippedSecret, LocalTrust, ReadOnlyDevice, SecretInfo, ToDeviceRequest, TrackedUser,
             };
 
             use super::get_store;
@@ -290,8 +292,9 @@ macro_rules! cryptostore_integration_tests {
                 );
             }
 
+            /// Test that we can import an inbound group session via [`CryptoStore::save_changes`]
             #[async_test]
-            async fn save_inbound_group_session() {
+            async fn save_changes_save_inbound_group_session() {
                 let (account, store) = get_loaded_store("save_inbound_group_session").await;
 
                 let room_id = &room_id!("!test:localhost");
@@ -303,31 +306,96 @@ macro_rules! cryptostore_integration_tests {
                 store.save_changes(changes).await.expect("Can't save group session");
             }
 
+            /// Test that we can import a backed-up group session via
+            /// [`CryptoStore::save_inbound_group_sessions`]
             #[async_test]
-            async fn save_inbound_group_session_for_backup() {
+            async fn save_inbound_group_session_from_backup() {
                 let (account, store) =
-                    get_loaded_store("save_inbound_group_session_for_backup").await;
+                    get_loaded_store("save_inbound_group_session_from_backup").await;
 
                 let room_id = &room_id!("!test:localhost");
                 let (_, session) = account.create_group_session_pair_with_defaults(room_id).await;
 
-                let changes =
-                    Changes { inbound_group_sessions: vec![session.clone()], ..Default::default() };
-
-                store.save_changes(changes).await.expect("Can't save group session");
+                session.mark_as_backed_up();
+                store
+                    .save_inbound_group_sessions(vec![session.clone()], Some(&"bkpver1"))
+                    .await
+                    .expect("could not save sessions");
 
                 let loaded_session = store
                     .get_inbound_group_session(&session.room_id, session.session_id())
                     .await
-                    .unwrap()
-                    .unwrap();
+                    .expect("error when loading session")
+                    .expect("session not found in store");
+                assert_eq!(session, loaded_session);
+                assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 1);
+                assert_eq!(store.inbound_group_session_counts(None).await.unwrap().total, 1);
+
+                // It should *not* be returned by a request for backup for the same backup version
+                let to_back_up = store.inbound_group_sessions_for_backup("bkpver1", 1).await.unwrap();
+                assert_eq!(to_back_up.len(), 0, "backup was returned by backup query");
+                assert_eq!(
+                    store.inbound_group_session_counts(Some(&"bkpver1")).await.unwrap().backed_up, 1,
+                    "backed_up count",
+                );
+            }
+
+            /// Test that the behaviour of a key imported from an *old* backup is correct
+            ///
+            /// This currently only works on the MemoryStore, so is ignored. The other stores
+            /// are waiting for more work on https://github.com/element-hq/element-web/issues/26892.
+            #[ignore]
+            #[async_test]
+            async fn save_inbound_group_session_from_old_backup() {
+                let (account, store) =
+                    get_loaded_store("save_inbound_group_session_from_old_backup").await;
+
+                let room_id = &room_id!("!test:localhost");
+                let (_, session) = account.create_group_session_pair_with_defaults(room_id).await;
+
+                session.mark_as_backed_up();
+                store
+                    .save_inbound_group_sessions(vec![session.clone()], Some(&"bkpver1"))
+                    .await
+                    .expect("could not save sessions");
+
+                // The session should be returned by a request for backup from a different backup version.
+                let to_back_up = store.inbound_group_sessions_for_backup("bkpver2", 1).await.unwrap();
+                assert_eq!(to_back_up, vec![session]);
+                assert_eq!(
+                    store.inbound_group_session_counts(Some(&"bkpver2")).await.unwrap().backed_up, 0,
+                    "backed_up count for backup version 2",
+                );
+            }
+
+            /// Test that we can import a not-backed-up group session via
+            /// [`CryptoStore::save_inbound_group_sessions`]
+            #[async_test]
+            async fn save_inbound_group_session_from_import() {
+                let (account, store) =
+                    get_loaded_store("save_inbound_group_session_from_import").await;
+
+                let room_id = &room_id!("!test:localhost");
+                let (_, session) = account.create_group_session_pair_with_defaults(room_id).await;
+
+                store
+                    .save_inbound_group_sessions(vec![session.clone()], None)
+                    .await
+                    .expect("could not save sessions");
+
+                let loaded_session = store
+                    .get_inbound_group_session(&session.room_id, session.session_id())
+                    .await
+                    .expect("error when loading session")
+                    .expect("session not found in store");
                 assert_eq!(session, loaded_session);
                 assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 1);
                 assert_eq!(store.inbound_group_session_counts(None).await.unwrap().total, 1);
                 assert_eq!(store.inbound_group_session_counts(None).await.unwrap().backed_up, 0);
 
-                let to_back_up = store.inbound_group_sessions_for_backup("bkpver", 1).await.unwrap();
-                assert_eq!(to_back_up, vec![session])
+                // It should be returned by a request for backup
+                let to_back_up = store.inbound_group_sessions_for_backup("bkpver1", 1).await.unwrap();
+                assert_eq!(to_back_up, vec![session]);
             }
 
             #[async_test]
@@ -505,9 +573,28 @@ macro_rules! cryptostore_integration_tests {
                     "SECONDDEVICE".into(),
                 ));
 
+                let json = json!({
+                    "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+                    "user_id": "@bob:localhost",
+                    "device_id": "BOBDEVICE",
+                    "extra_property": "somevalue",
+                    "keys": {
+                        "curve25519:BOBDEVICE": "n0zs7qnaPLLf/OTL+dDLcI5kaPexbUeQ8jLQ2q6sO0E",
+                        "ed25519:BOBDEVICE": "RrKiu4+5EHRBWY6Qj6OtQGC0txpmEeanOz2irEZ/IN4",
+                    },
+                    "signatures": {
+                        "@bob:localhost": {
+                            "ed25519:BOBDEVICE": "9NjPewVHfB7Ah32mJ+CBx64mVoiQ8gbh+/2pc9WfAgut/H0Kqd/bbpgJq9Pn518szaXcGqEq0DxDP6CABBX8CQ",
+                        },
+                    },
+                });
+
+                let bob_device_1_keys: DeviceKeys = serde_json::from_value(json).unwrap();
+                let bob_device_1 = ReadOnlyDevice::new(bob_device_1_keys, LocalTrust::Unset);
+
                 let changes = Changes {
                     devices: DeviceChanges {
-                        new: vec![alice_device_1.clone(), alice_device_2.clone()],
+                        new: vec![alice_device_1.clone(), alice_device_2.clone(), bob_device_1.clone()],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -537,6 +624,14 @@ macro_rules! cryptostore_integration_tests {
 
                 let user_devices = store.get_user_devices(alice_device_1.user_id()).await.unwrap();
                 assert_eq!(user_devices.len(), 2);
+
+                let bob_device = store
+                    .get_device(bob_device_1.user_id(), bob_device_1.device_id())
+                    .await
+                    .unwrap();
+
+                let bob_device_json = serde_json::to_value(bob_device).unwrap();
+                assert_eq!(bob_device_json["inner"]["extra_property"], json!("somevalue"));
             }
 
             #[async_test]

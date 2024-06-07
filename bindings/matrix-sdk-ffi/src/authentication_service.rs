@@ -264,7 +264,23 @@ impl AuthenticationService {
         builder = builder.server_name_or_homeserver_url(server_name_or_homeserver_url);
 
         let client = builder.build_inner().await?;
-        let details = self.details_from_client(&client).await?;
+
+        // Compute homeserver login details.
+        let details = {
+            let supports_oidc_login =
+                client.inner.oidc().fetch_authentication_issuer().await.is_ok();
+            let supports_password_login =
+                client.supports_password_login().await.ok().unwrap_or(false);
+            let sliding_sync_proxy =
+                client.sliding_sync_proxy().map(|proxy_url| proxy_url.to_string());
+
+            HomeserverLoginDetails {
+                url: client.homeserver(),
+                sliding_sync_proxy,
+                supports_oidc_login,
+                supports_password_login,
+            }
+        };
 
         // Make sure there's a sliding sync proxy available.
         if self.custom_sliding_sync_proxy.read().unwrap().is_none()
@@ -403,10 +419,12 @@ impl AuthenticationService {
 }
 
 impl AuthenticationService {
-    /// A new client builder pre-configured with the service's base path and
-    /// user agent if specified
+    /// Create a new client builder pre-configured with the service's HTTP
+    /// configuration if needed.
+    ///
+    /// Note: this client doesn't set the base path by default.
     fn new_client_builder(&self) -> Arc<ClientBuilder> {
-        let mut builder = ClientBuilder::new().base_path(self.base_path.clone());
+        let mut builder = ClientBuilder::new();
 
         if let Some(user_agent) = self.user_agent.clone() {
             builder = builder.user_agent(user_agent);
@@ -419,24 +437,6 @@ impl AuthenticationService {
         builder = builder.add_root_certificates(self.additional_root_certificates.clone());
 
         builder
-    }
-
-    /// Get the homeserver login details from a client.
-    async fn details_from_client(
-        &self,
-        client: &Client,
-    ) -> Result<HomeserverLoginDetails, AuthenticationError> {
-        let supports_oidc_login = client.inner.oidc().fetch_authentication_issuer().await.is_ok();
-        let supports_password_login = client.supports_password_login().await.ok().unwrap_or(false);
-        let sliding_sync_proxy = client.sliding_sync_proxy().map(|proxy_url| proxy_url.to_string());
-        let url = client.homeserver();
-
-        Ok(HomeserverLoginDetails {
-            url,
-            sliding_sync_proxy,
-            supports_oidc_login,
-            supports_password_login,
-        })
     }
 
     /// Handle any necessary configuration in order for login via OIDC to
@@ -454,7 +454,7 @@ impl AuthenticationService {
             return Ok(());
         };
 
-        let oidc_metadata = self.oidc_metadata(configuration)?;
+        let oidc_metadata: VerifiedClientMetadata = configuration.try_into()?;
 
         if self.load_client_registration(oidc, issuer.clone(), oidc_metadata.clone()).await {
             tracing::info!("OIDC configuration loaded from disk.");
@@ -539,41 +539,6 @@ impl AuthenticationService {
         true
     }
 
-    /// Creates and verifies OIDC client metadata for the supplied OIDC
-    /// configuration.
-    fn oidc_metadata(
-        &self,
-        configuration: &OidcConfiguration,
-    ) -> Result<VerifiedClientMetadata, AuthenticationError> {
-        let redirect_uri = Url::parse(&configuration.redirect_uri)
-            .map_err(|_| AuthenticationError::OidcCallbackUrlInvalid)?;
-        let client_name =
-            configuration.client_name.as_ref().map(|n| Localized::new(n.to_owned(), []));
-        let client_uri = configuration.client_uri.localized_url()?;
-        let logo_uri = configuration.logo_uri.localized_url()?;
-        let policy_uri = configuration.policy_uri.localized_url()?;
-        let tos_uri = configuration.tos_uri.localized_url()?;
-        let contacts = configuration.contacts.clone();
-
-        ClientMetadata {
-            application_type: Some(ApplicationType::Native),
-            redirect_uris: Some(vec![redirect_uri]),
-            grant_types: Some(vec![GrantType::RefreshToken, GrantType::AuthorizationCode]),
-            // A native client shouldn't use authentication as the credentials could be intercepted.
-            token_endpoint_auth_method: Some(OAuthClientAuthenticationMethod::None),
-            // The server should display the following fields when getting the user's consent.
-            client_name,
-            contacts,
-            client_uri,
-            logo_uri,
-            policy_uri,
-            tos_uri,
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|_| AuthenticationError::OidcMetadataInvalid)
-    }
-
     fn oidc_static_registrations(&self) -> HashMap<Url, ClientId> {
         let registrations = self
             .oidc_configuration
@@ -625,6 +590,7 @@ impl AuthenticationService {
         // Construct the final client.
         let mut client = self
             .new_client_builder()
+            .base_path(self.base_path.clone())
             .passphrase(self.passphrase.clone())
             .homeserver_url(homeserver_url)
             .sliding_sync_proxy(sliding_sync_proxy)
@@ -632,10 +598,6 @@ impl AuthenticationService {
             .backup_download_strategy(BackupDownloadStrategy::AfterDecryptionFailure)
             .auto_enable_backups(true)
             .username(user_id.to_string());
-
-        if let Some(proxy) = &self.proxy {
-            client = client.proxy(proxy.to_owned())
-        }
 
         if let Some(id) = &self.cross_process_refresh_lock_id {
             let Some(ref session_delegate) = self.session_delegate else {
@@ -655,6 +617,43 @@ impl AuthenticationService {
         client.restore_session_inner(session).await?;
 
         Ok(Arc::new(client))
+    }
+}
+
+impl TryInto<VerifiedClientMetadata> for &OidcConfiguration {
+    type Error = AuthenticationError;
+
+    fn try_into(self) -> Result<VerifiedClientMetadata, Self::Error> {
+        let redirect_uri = Url::parse(&self.redirect_uri)
+            .map_err(|_| AuthenticationError::OidcCallbackUrlInvalid)?;
+        let client_name = self.client_name.as_ref().map(|n| Localized::new(n.to_owned(), []));
+        let client_uri = self.client_uri.localized_url()?;
+        let logo_uri = self.logo_uri.localized_url()?;
+        let policy_uri = self.policy_uri.localized_url()?;
+        let tos_uri = self.tos_uri.localized_url()?;
+        let contacts = self.contacts.clone();
+
+        ClientMetadata {
+            application_type: Some(ApplicationType::Native),
+            redirect_uris: Some(vec![redirect_uri]),
+            grant_types: Some(vec![
+                GrantType::RefreshToken,
+                GrantType::AuthorizationCode,
+                GrantType::DeviceCode,
+            ]),
+            // A native client shouldn't use authentication as the credentials could be intercepted.
+            token_endpoint_auth_method: Some(OAuthClientAuthenticationMethod::None),
+            // The server should display the following fields when getting the user's consent.
+            client_name,
+            contacts,
+            client_uri,
+            logo_uri,
+            policy_uri,
+            tos_uri,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|_| AuthenticationError::OidcMetadataInvalid)
     }
 }
 

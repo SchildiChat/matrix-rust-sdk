@@ -95,6 +95,7 @@ pub use self::{
     event_type_filter::TimelineEventTypeFilter,
     inner::default_event_filter,
     item::{TimelineItem, TimelineItemKind},
+    pagination::LiveBackPaginationStatus,
     polls::PollResult,
     reactions::ReactionSenderData,
     sliding_sync_ext::SlidingSyncRoomExt,
@@ -586,7 +587,10 @@ impl Timeline {
             | TimelineItemContent::ProfileChange(_)
             | TimelineItemContent::OtherState(_)
             | TimelineItemContent::CallInvite => {
-                error_return!("Retrying state events/call invites is not currently supported");
+                error_return!("Retrying state events/call invites is not supported");
+            }
+            TimelineItemContent::CallNotify => {
+                error_return!("Retrying call notifies is not supported");
             }
             TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. } => {

@@ -57,22 +57,20 @@ use ruma::{
 };
 use tokio::sync::RwLockReadGuard;
 use tracing::{debug, error, instrument, trace, warn};
+use vodozemac::Curve25519PublicKey;
 
 use self::{
     backups::{types::BackupClientState, Backups},
     futures::PrepareEncryptedFile,
-    identities::{DeviceUpdates, IdentityUpdates},
+    identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
     secret_storage::SecretStorage,
     tasks::{BackupDownloadTask, BackupUploadingTask, ClientTasks},
+    verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
     attachment::{AttachmentConfig, Thumbnail},
-    client::ClientInner,
-    encryption::{
-        identities::{Device, UserDevices},
-        verification::{SasVerification, Verification, VerificationRequest},
-    },
+    client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
     Client, Error, Result, Room, TransmissionProgress,
@@ -126,7 +124,7 @@ impl EncryptionData {
     }
 
     pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
-        let weak_client = Arc::downgrade(client);
+        let weak_client = WeakClient::from_inner(client);
 
         let mut tasks = self.tasks.lock().unwrap();
         tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
@@ -613,10 +611,21 @@ impl Encryption {
         self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().ed25519.to_base64())
     }
 
-    /// Get the public curve25519 key of our own device in base64. This is
-    /// usually what is called the identity key of the device.
-    pub async fn curve25519_key(&self) -> Option<String> {
-        self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519.to_base64())
+    /// Get the public Curve25519 key of our own device.
+    pub async fn curve25519_key(&self) -> Option<Curve25519PublicKey> {
+        self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519)
+    }
+
+    #[cfg(feature = "experimental-oidc")]
+    pub(crate) async fn import_secrets_bundle(
+        &self,
+        bundle: &matrix_sdk_base::crypto::types::SecretsBundle,
+    ) -> Result<(), SecretImportError> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine =
+            olm_machine.as_ref().expect("This should only be called once we have an OlmMachine");
+
+        olm_machine.store().import_secrets_bundle(bundle).await
     }
 
     /// Get the status of the private cross signing keys.
@@ -793,7 +802,13 @@ impl Encryption {
         Ok(UserDevices { inner: devices, client: self.client.clone() })
     }
 
-    /// Get a E2EE identity of an user.
+    /// Get the E2EE identity of a user from the crypto store.
+    ///
+    /// Usually, we only have the E2EE identity of a user locally if the user
+    /// is tracked, meaning that we are both members of the same encrypted room.
+    ///
+    /// To get the E2EE identity of a user even if it is not available locally
+    /// use [`Encryption::request_user_identity()`].
     ///
     /// # Arguments
     ///
@@ -825,13 +840,59 @@ impl Encryption {
     pub async fn get_user_identity(
         &self,
         user_id: &UserId,
-    ) -> Result<Option<identities::UserIdentity>, CryptoStoreError> {
-        use crate::encryption::identities::UserIdentity;
-
+    ) -> Result<Option<UserIdentity>, CryptoStoreError> {
         let olm = self.client.olm_machine().await;
         let Some(olm) = olm.as_ref() else { return Ok(None) };
         let identity = olm.get_identity(user_id, None).await?;
 
+        Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
+    }
+
+    /// Get the E2EE identity of a user from the homeserver.
+    ///
+    /// The E2EE identity returned is always guaranteed to be up-to-date. If the
+    /// E2EE identity is not found, it should mean that the user did not set
+    /// up cross-signing.
+    ///
+    /// If you want the E2EE identity of a user without making a request to the
+    /// homeserver, use [`Encryption::get_user_identity()`] instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user that the identity belongs to.
+    ///
+    /// Returns a [`UserIdentity`] if one is found. Returns an error if there
+    /// was an issue with the crypto store or with the request to the
+    /// homeserver.
+    ///
+    /// This will always return `None` if the client hasn't been logged in.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{Client, ruma::user_id};
+    /// # use url::Url;
+    /// # async {
+    /// # let alice = user_id!("@alice:example.org");
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// let user = client.encryption().request_user_identity(alice).await?;
+    ///
+    /// if let Some(user) = user {
+    ///     println!("User is verified: {:?}", user.is_verified());
+    ///
+    ///     let verification = user.request_verification().await?;
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn request_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentity>> {
+        let olm = self.client.olm_machine().await;
+        let Some(olm) = olm.as_ref() else { return Ok(None) };
+
+        let (request_id, request) = olm.query_keys_for_users(iter::once(user_id));
+        self.client.keys_query(&request_id, request.device_keys).await?;
+
+        let identity = olm.get_identity(user_id, None).await?;
         Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
     }
 
@@ -1275,7 +1336,7 @@ impl Encryption {
                 // (get rid of the reference to the current crypto store first)
                 drop(olm_machine_guard);
                 // Recreate the OlmMachine.
-                self.client.base_client().regenerate_olm().await?;
+                self.client.base_client().regenerate_olm(None).await?;
             }
             Ok(generation_number)
         } else {
@@ -1361,7 +1422,7 @@ impl Encryption {
     /// proposal (MSC3967) to remove this requirement, which would allow for
     /// the initial upload of cross-signing keys without authentication,
     /// rendering this parameter obsolete.
-    pub(crate) async fn run_initialization_tasks(&self, auth_data: Option<AuthData>) -> Result<()> {
+    pub(crate) async fn run_initialization_tasks(&self, auth_data: Option<AuthData>) {
         let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
 
         let this = self.clone();
@@ -1381,8 +1442,6 @@ impl Encryption {
 
             this.update_verification_state().await;
         }));
-
-        Ok(())
     }
 
     /// Waits for end-to-end encryption initialization tasks to finish, if any
@@ -1395,6 +1454,30 @@ impl Encryption {
                 warn!("Error when initializing backups: {err}");
             }
         }
+    }
+
+    /// Upload the device keys and initial set of one-tim keys to the server.
+    ///
+    /// This should only be called when the user logs in for the first time,
+    /// the method will ensure that other devices see our own device as an
+    /// end-to-end encryption enabled one.
+    ///
+    /// **Warning**: Do not use this method if we're already calling
+    /// [`Client::send_outgoing_request()`]. This method is intended for
+    /// explicitly uploading the device keys before starting a sync.
+    #[cfg(feature = "experimental-oidc")]
+    pub(crate) async fn ensure_device_keys_upload(&self) -> Result<()> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        if let Some((request_id, request)) = olm.upload_device_keys().await? {
+            self.client.keys_upload(&request_id, &request).await?;
+
+            let (request_id, request) = olm.query_keys_for_users([olm.user_id()]);
+            self.client.keys_query(&request_id, request.device_keys).await?;
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {

@@ -9,17 +9,18 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use super::RUNTIME;
-use crate::{error::ClientError, task_handle::TaskHandle};
+use crate::{client::Client, error::ClientError, task_handle::TaskHandle};
 
 #[derive(uniffi::Object)]
 pub struct Encryption {
-    inner: matrix_sdk::encryption::Encryption,
-}
+    pub(crate) inner: matrix_sdk::encryption::Encryption,
 
-impl From<matrix_sdk::encryption::Encryption> for Encryption {
-    fn from(value: matrix_sdk::encryption::Encryption) -> Self {
-        Self { inner: value }
-    }
+    /// A reference to the FFI client.
+    ///
+    /// Note: we do this to make it so that the FFI `NotificationClient` keeps
+    /// the FFI `Client` and thus the SDK `Client` alive. Otherwise, we
+    /// would need to repeat the hack done in the FFI `Client::drop` method.
+    pub(crate) _client: Arc<Client>,
 }
 
 #[uniffi::export(callback_interface)]
@@ -222,7 +223,7 @@ impl Encryption {
     /// Get the public curve25519 key of our own device in base64. This is
     /// usually what is called the identity key of the device.
     pub async fn curve25519_key(&self) -> Option<String> {
-        self.inner.curve25519_key().await
+        self.inner.curve25519_key().await.map(|k| k.to_base64())
     }
 
     pub fn backup_state_listener(&self, listener: Box<dyn BackupStateListener>) -> Arc<TaskHandle> {

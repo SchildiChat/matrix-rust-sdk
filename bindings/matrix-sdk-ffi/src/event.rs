@@ -5,7 +5,11 @@ use ruma::events::{
     RedactedStateEventContent, StaticStateEventContent, SyncMessageLikeEvent, SyncStateEvent,
 };
 
-use crate::{room_member::MembershipState, ruma::MessageType, ClientError};
+use crate::{
+    room_member::MembershipState,
+    ruma::{MessageType, NotifyType},
+    ClientError,
+};
 
 #[derive(uniffi::Object)]
 pub struct TimelineEvent(pub(crate) AnySyncTimelineEvent);
@@ -117,6 +121,7 @@ impl TryFrom<AnySyncStateEvent> for StateEventContent {
 pub enum MessageLikeEventContent {
     CallAnswer,
     CallInvite,
+    CallNotify { notify_type: NotifyType },
     CallHangup,
     CallCandidates,
     KeyVerificationReady,
@@ -141,6 +146,12 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
         let content = match value {
             AnySyncMessageLikeEvent::CallAnswer(_) => MessageLikeEventContent::CallAnswer,
             AnySyncMessageLikeEvent::CallInvite(_) => MessageLikeEventContent::CallInvite,
+            AnySyncMessageLikeEvent::CallNotify(content) => {
+                let original_content = get_message_like_event_original_content(content)?;
+                MessageLikeEventContent::CallNotify {
+                    notify_type: original_content.notify_type.into(),
+                }
+            }
             AnySyncMessageLikeEvent::CallHangup(_) => MessageLikeEventContent::CallHangup,
             AnySyncMessageLikeEvent::CallCandidates(_) => MessageLikeEventContent::CallCandidates,
             AnySyncMessageLikeEvent::KeyVerificationReady(_) => {
@@ -278,6 +289,7 @@ pub enum MessageLikeEventType {
     CallCandidates,
     CallHangup,
     CallInvite,
+    CallNotify,
     KeyVerificationAccept,
     KeyVerificationCancel,
     KeyVerificationDone,
@@ -303,6 +315,7 @@ impl From<MessageLikeEventType> for ruma::events::MessageLikeEventType {
         match val {
             MessageLikeEventType::CallAnswer => Self::CallAnswer,
             MessageLikeEventType::CallInvite => Self::CallInvite,
+            MessageLikeEventType::CallNotify => Self::CallNotify,
             MessageLikeEventType::CallHangup => Self::CallHangup,
             MessageLikeEventType::CallCandidates => Self::CallCandidates,
             MessageLikeEventType::KeyVerificationReady => Self::KeyVerificationReady,
