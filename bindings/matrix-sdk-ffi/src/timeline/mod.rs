@@ -208,10 +208,10 @@ impl Timeline {
         Ok(())
     }
 
-    /// SC: get fully_read marker ID for debugging
-    pub fn sc_dbg_fully_read_event_id(&self) -> Option<String> {
+    /// SC: get fully_read marker event ID
+    pub fn fully_read_event_id(&self) -> Option<String> {
         RUNTIME.block_on(async {
-            self.inner.sc_dbg_fully_read_event_id().await
+            self.inner.fully_read_event_id().await.map(Into::into)
         })
     }
 

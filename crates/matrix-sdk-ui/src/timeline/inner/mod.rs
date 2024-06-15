@@ -386,6 +386,10 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         self.state.read().await.items.clone()
     }
 
+    pub(super) async fn fully_read_event_id(&self) -> Option<OwnedEventId> {
+        self.state.read().await.meta.fully_read_event.clone()
+    }
+
     pub(super) async fn subscribe(
         &self,
     ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>) {

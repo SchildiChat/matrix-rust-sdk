@@ -727,16 +727,9 @@ impl Timeline {
         Ok(true)
     }
 
-    /// SC: get fully_read marker ID for debugging
-    pub async fn sc_dbg_fully_read_event_id(&self) -> Option<String> {
-        Some(String::from("TODO"))
-        /*
-        if let Some(fully_read) = self.inner.fully_read_event().await {
-            Some(fully_read.content.event_id.into())
-        } else  {
-            None
-        }
-        */
+    /// SC: get fully_read marker ID
+    pub async fn fully_read_event_id(&self) -> Option<OwnedEventId> {
+        self.inner.fully_read_event_id().await
     }
 
     /// SC: Same as send_single_receipt(), but without the should_send_receipt()-check
