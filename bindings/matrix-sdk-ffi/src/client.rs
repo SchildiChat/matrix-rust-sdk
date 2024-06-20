@@ -19,7 +19,6 @@ use matrix_sdk::{
     },
     ruma::{
         api::client::{
-            account::whoami,
             media::get_content_thumbnail::v3::Method,
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
@@ -147,6 +146,14 @@ pub trait ProgressWatcher: Send + Sync {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
+/// A listener to the global (client-wide) error reporter of the send queue.
+#[uniffi::export(callback_interface)]
+pub trait SendQueueRoomErrorListener: Sync + Send {
+    /// Called every time the send queue has ran into an error for a given room,
+    /// which will disable the send queue for that particular room.
+    fn on_error(&self, room_id: String, error: ClientError);
+}
+
 #[derive(Clone, Copy, uniffi::Record)]
 pub struct TransmissionProgress {
     pub current: u64,
@@ -232,9 +239,7 @@ impl Client {
                     let session_delegate = session_delegate.clone();
                     Box::new(move |client| {
                         let session_delegate = session_delegate.clone();
-                        Box::pin(
-                            async move { Ok(Self::save_session(session_delegate, client).await?) },
-                        )
+                        Ok(Self::save_session(session_delegate, client)?)
                     })
                 },
             )?;
@@ -307,6 +312,41 @@ impl Client {
 
         Ok(())
     }
+
+    /// Enables or disables all the room send queues at once.
+    ///
+    /// When connectivity is lost on a device, it is recommended to disable the
+    /// room sending queues.
+    ///
+    /// This can be controlled for individual rooms, using
+    /// [`Room::enable_send_queue`].
+    pub fn enable_all_send_queues(&self, enable: bool) {
+        self.inner.send_queue().set_enabled(enable);
+    }
+
+    /// Subscribe to the global enablement status of the send queue, at the
+    /// client-wide level.
+    ///
+    /// The given listener will be immediately called with the initial value of
+    /// the enablement status.
+    pub fn subscribe_to_send_queue_status(
+        &self,
+        listener: Box<dyn SendQueueRoomErrorListener>,
+    ) -> Arc<TaskHandle> {
+        let mut subscriber = self.inner.send_queue().subscribe_errors();
+
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            loop {
+                match subscriber.recv().await {
+                    Ok(report) => listener
+                        .on_error(report.room_id.to_string(), ClientError::new(report.error)),
+                    Err(err) => {
+                        error!("error when listening to the send queue error reporter: {err}");
+                    }
+                }
+            }
+        })))
+    }
 }
 
 impl Client {
@@ -334,11 +374,6 @@ impl Client {
             .iter()
             .any(|login_type| matches!(login_type, get_login_types::v3::LoginType::Password(_)));
         Ok(supports_password)
-    }
-
-    /// Gets information about the owner of a given access token.
-    pub(crate) async fn whoami(&self) -> anyhow::Result<whoami::v3::Response> {
-        Ok(self.inner.whoami().await?)
     }
 }
 
@@ -369,8 +404,8 @@ impl Client {
         })
     }
 
-    pub async fn session(&self) -> Result<Session, ClientError> {
-        Self::session_inner((*self.inner).clone()).await
+    pub fn session(&self) -> Result<Session, ClientError> {
+        Self::session_inner((*self.inner).clone())
     }
 
     pub async fn account_url(
@@ -931,7 +966,7 @@ impl Client {
         }
     }
 
-    async fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
+    fn session_inner(client: matrix_sdk::Client) -> Result<Session, ClientError> {
         let auth_api = client.auth_api().context("Missing authentication API")?;
 
         let homeserver_url = client.homeserver().into();
@@ -940,11 +975,11 @@ impl Client {
         Session::new(auth_api, homeserver_url, sliding_sync_proxy)
     }
 
-    async fn save_session(
+    fn save_session(
         session_delegate: Arc<dyn ClientSessionDelegate>,
         client: matrix_sdk::Client,
     ) -> anyhow::Result<()> {
-        let session = Self::session_inner(client).await?;
+        let session = Self::session_inner(client)?;
         session_delegate.save_session_in_keychain(session);
         Ok(())
     }

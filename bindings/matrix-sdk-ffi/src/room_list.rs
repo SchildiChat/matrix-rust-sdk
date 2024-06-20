@@ -125,11 +125,11 @@ impl RoomListService {
         })))
     }
 
-    async fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
+    fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
         let room_id = <&RoomId>::try_from(room_id.as_str()).map_err(RoomListError::from)?;
 
         Ok(Arc::new(RoomListItem {
-            inner: Arc::new(self.inner.room(room_id).await?),
+            inner: Arc::new(self.inner.room(room_id)?),
             utd_hook: self.utd_hook.clone(),
         }))
     }
@@ -187,7 +187,7 @@ pub struct RoomList {
     inner: Arc<matrix_sdk_ui::room_list_service::RoomList>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl RoomList {
     fn loading_state(
         &self,
@@ -248,8 +248,8 @@ impl RoomList {
         }
     }
 
-    async fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
-        self.room_list_service.room(room_id).await
+    fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
+        self.room_list_service.room(room_id)
     }
 }
 
@@ -504,7 +504,7 @@ impl RoomListItem {
     /// compute a room name based on the room's nature (DM or not) and number of
     /// members.
     fn display_name(&self) -> Option<String> {
-        RUNTIME.block_on(self.inner.computed_display_name())
+        self.inner.cached_display_name()
     }
 
     fn avatar_url(&self) -> Option<String> {
@@ -520,14 +520,13 @@ impl RoomListItem {
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        let latest_event = self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new);
-
-        Ok(RoomInfo::new(self.inner.inner_room(), latest_event).await?)
+        Ok(RoomInfo::new(self.inner.inner_room()).await?)
     }
 
-    /// Building a `Room`. If its internal timeline hasn't been initialized
-    /// it'll fail.
-    async fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
+    /// Build a full `Room` FFI object, filling its associated timeline.
+    ///
+    /// If its internal timeline hasn't been initialized, it'll fail.
+    fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
         if let Some(timeline) = self.inner.timeline() {
             Ok(Arc::new(Room::with_timeline(
                 self.inner.inner_room().clone(),

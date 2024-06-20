@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Arc, RwLock as StdRwLock},
 };
 
@@ -18,12 +19,9 @@ use matrix_sdk::{
         AuthorizationResponse, Oidc, OidcError,
     },
     reqwest::StatusCode,
-    AuthSession, ClientBuildError as MatrixClientBuildError, HttpError, RumaApiError,
+    ClientBuildError as MatrixClientBuildError, HttpError, RumaApiError,
 };
-use ruma::{
-    api::error::{DeserializationError, FromHttpResponseError},
-    OwnedUserId,
-};
+use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tokio::sync::RwLock as AsyncRwLock;
 use url::Url;
 use zeroize::Zeroize;
@@ -37,13 +35,13 @@ use crate::{
 
 #[derive(uniffi::Object)]
 pub struct AuthenticationService {
-    base_path: String,
+    session_path: String,
     passphrase: Option<String>,
     user_agent: Option<String>,
     client: AsyncRwLock<Option<Client>>,
     homeserver_details: StdRwLock<Option<Arc<HomeserverLoginDetails>>>,
     oidc_configuration: Option<OidcConfiguration>,
-    custom_sliding_sync_proxy: StdRwLock<Option<String>>,
+    custom_sliding_sync_proxy: Option<String>,
     cross_process_refresh_lock_id: Option<String>,
     session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
     additional_root_certificates: Vec<CertificateBytes>,
@@ -75,8 +73,6 @@ pub enum AuthenticationError {
 
     #[error("Login was successful but is missing a valid Session to configure the file store.")]
     SessionMissing,
-    #[error("Failed to use the supplied base path.")]
-    InvalidBasePath,
 
     #[error(
         "The homeserver doesn't provide an authentication issuer in its well-known configuration."
@@ -86,6 +82,8 @@ pub enum AuthenticationError {
     OidcMetadataMissing,
     #[error("Unable to use OIDC as the supplied client metadata is invalid.")]
     OidcMetadataInvalid,
+    #[error("Failed to use the supplied registrations file path.")]
+    OidcRegistrationsPathInvalid,
     #[error("The supplied callback URL used to complete OIDC is invalid.")]
     OidcCallbackUrlInvalid,
     #[error("The OIDC login was cancelled by the user.")]
@@ -130,7 +128,9 @@ impl From<ClientBuildError> for AuthenticationError {
 impl From<OidcRegistrationsError> for AuthenticationError {
     fn from(e: OidcRegistrationsError) -> AuthenticationError {
         match e {
-            OidcRegistrationsError::InvalidBasePath => AuthenticationError::InvalidBasePath,
+            OidcRegistrationsError::InvalidFilePath => {
+                AuthenticationError::OidcRegistrationsPathInvalid
+            }
             _ => AuthenticationError::OidcError { message: e.to_string() },
         }
     }
@@ -164,6 +164,11 @@ pub struct OidcConfiguration {
     /// Pre-configured registrations for use with issuers that don't support
     /// dynamic client registration.
     pub static_registrations: HashMap<String, String>,
+
+    /// A file path where any dynamic registrations should be stored.
+    ///
+    /// Suggested value: `{base_path}/oidc/registrations.json`
+    pub dynamic_registrations_file: String,
 }
 
 /// The data required to authenticate against an OIDC server.
@@ -219,13 +224,42 @@ impl HomeserverLoginDetails {
 #[uniffi::export(async_runtime = "tokio")]
 impl AuthenticationService {
     /// Creates a new service to authenticate a user with.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_path` - A path to the directory where the session data will
+    ///   be stored. A new directory **must** be given for each subsequent
+    ///   session as the database isn't designed to be shared.
+    ///
+    /// * `passphrase` - An optional passphrase to use to encrypt the session
+    ///   data.
+    ///
+    /// * `user_agent` - An optional user agent to use when making requests.
+    ///
+    /// * `additional_root_certificates` - Additional root certificates to trust
+    ///   when making requests when built with rustls.
+    ///
+    /// * `proxy` - An optional HTTP(S) proxy URL to use when making requests.
+    ///
+    /// * `oidc_configuration` - Configuration data about the app to use during
+    ///   OIDC authentication. This is required if OIDC authentication is to be
+    ///   used.
+    ///
+    /// * `custom_sliding_sync_proxy` - An optional sliding sync proxy URL that
+    ///   will override the proxy discovered from the homeserver's well-known.
+    ///
+    /// * `session_delegate` - A delegate that will handle token refresh etc.
+    ///   when the cross-process lock is configured.
+    ///
+    /// * `cross_process_refresh_lock_id` - A process ID to use for
+    ///   cross-process token refresh locks.
     #[uniffi::constructor]
     // TODO: This has too many arguments, even clippy agrees. Many of these methods are the same as
     // for the `ClientBuilder`. We should let people pass in a `ClientBuilder` and possibly convert
     // this to a builder pattern as well.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        base_path: String,
+        session_path: String,
         passphrase: Option<String>,
         user_agent: Option<String>,
         additional_root_certificates: Vec<Vec<u8>>,
@@ -236,13 +270,13 @@ impl AuthenticationService {
         cross_process_refresh_lock_id: Option<String>,
     ) -> Arc<Self> {
         Arc::new(AuthenticationService {
-            base_path,
+            session_path,
             passphrase,
             user_agent,
             client: AsyncRwLock::new(None),
             homeserver_details: StdRwLock::new(None),
             oidc_configuration,
-            custom_sliding_sync_proxy: StdRwLock::new(custom_sliding_sync_proxy),
+            custom_sliding_sync_proxy,
             session_delegate: session_delegate.map(Into::into),
             cross_process_refresh_lock_id,
             additional_root_certificates,
@@ -260,8 +294,8 @@ impl AuthenticationService {
         &self,
         server_name_or_homeserver_url: String,
     ) -> Result<(), AuthenticationError> {
-        let mut builder = self.new_client_builder();
-        builder = builder.server_name_or_homeserver_url(server_name_or_homeserver_url);
+        let builder =
+            self.new_client_builder()?.server_name_or_homeserver_url(server_name_or_homeserver_url);
 
         let client = builder.build_inner().await?;
 
@@ -283,9 +317,7 @@ impl AuthenticationService {
         };
 
         // Make sure there's a sliding sync proxy available.
-        if self.custom_sliding_sync_proxy.read().unwrap().is_none()
-            && details.sliding_sync_proxy().is_none()
-        {
+        if self.custom_sliding_sync_proxy.is_none() && details.sliding_sync_proxy().is_none() {
             return Err(AuthenticationError::SlidingSyncNotAvailable);
         }
 
@@ -315,12 +347,16 @@ impl AuthenticationService {
                 ClientError::Generic { msg } => AuthenticationError::Generic { message: msg },
             },
         )?;
-        let whoami = client.whoami().await?;
-        let session =
-            client.inner.matrix_auth().session().ok_or(AuthenticationError::SessionMissing)?;
 
         drop(client_guard);
-        self.finalize_client(session, whoami.user_id).await
+
+        // Now that the client is logged in we can take ownership away from the service
+        // to ensure there aren't two clients at any point later.
+        let Some(client) = self.client.write().await.take() else {
+            return Err(AuthenticationError::ClientMissing);
+        };
+
+        Ok(Arc::new(client))
     }
 
     /// Requests the URL needed for login in a web view using OIDC. Once the web
@@ -409,22 +445,29 @@ impl AuthenticationService {
             .await
             .map_err(|e| AuthenticationError::OidcError { message: e.to_string() })?;
 
-        let user_id = client.inner.user_id().unwrap().to_owned();
-        let session =
-            client.inner.oidc().full_session().ok_or(AuthenticationError::SessionMissing)?;
-
         drop(client_guard);
-        self.finalize_client(session, user_id).await
+
+        // Now that the client is logged in we can take ownership away from the service
+        // to ensure there aren't two clients at any point later.
+        let Some(client) = self.client.write().await.take() else {
+            return Err(AuthenticationError::ClientMissing);
+        };
+
+        Ok(Arc::new(client))
     }
 }
 
 impl AuthenticationService {
-    /// Create a new client builder pre-configured with the service's HTTP
-    /// configuration if needed.
-    ///
-    /// Note: this client doesn't set the base path by default.
-    fn new_client_builder(&self) -> Arc<ClientBuilder> {
-        let mut builder = ClientBuilder::new();
+    /// Create a new client builder that is pre-configured with the parameters
+    /// passed to the service along with some other sensible defaults
+    fn new_client_builder(&self) -> Result<Arc<ClientBuilder>, AuthenticationError> {
+        let mut builder = ClientBuilder::new()
+            .session_path(self.session_path.clone())
+            .passphrase(self.passphrase.clone())
+            .sliding_sync_proxy(self.custom_sliding_sync_proxy.clone())
+            .auto_enable_cross_signing(true)
+            .backup_download_strategy(BackupDownloadStrategy::AfterDecryptionFailure)
+            .auto_enable_backups(true);
 
         if let Some(user_agent) = self.user_agent.clone() {
             builder = builder.user_agent(user_agent);
@@ -436,7 +479,19 @@ impl AuthenticationService {
 
         builder = builder.add_root_certificates(self.additional_root_certificates.clone());
 
-        builder
+        if let Some(id) = &self.cross_process_refresh_lock_id {
+            let Some(ref session_delegate) = self.session_delegate else {
+                return Err(AuthenticationError::OidcError {
+                    message: "cross-process refresh lock requires session delegate".to_owned(),
+                });
+            };
+            builder = builder
+                .enable_cross_process_refresh_lock_inner(id.clone(), session_delegate.clone());
+        } else if let Some(ref session_delegate) = self.session_delegate {
+            builder = builder.set_session_delegate_inner(session_delegate.clone());
+        }
+
+        Ok(builder)
     }
 
     /// Handle any necessary configuration in order for login via OIDC to
@@ -455,8 +510,14 @@ impl AuthenticationService {
         };
 
         let oidc_metadata: VerifiedClientMetadata = configuration.try_into()?;
+        let registrations_file = Path::new(&configuration.dynamic_registrations_file);
 
-        if self.load_client_registration(oidc, issuer.clone(), oidc_metadata.clone()).await {
+        if self.load_client_registration(
+            oidc,
+            issuer.clone(),
+            oidc_metadata.clone(),
+            registrations_file,
+        ) {
             tracing::info!("OIDC configuration loaded from disk.");
             return Ok(());
         }
@@ -472,14 +533,18 @@ impl AuthenticationService {
         oidc.restore_registered_client(issuer, oidc_metadata, credentials);
 
         tracing::info!("Persisting OIDC registration data.");
-        self.store_client_registration(oidc).await?;
+        self.store_client_registration(oidc, registrations_file)?;
 
         Ok(())
     }
 
     /// Stores the current OIDC dynamic client registration so it can be re-used
     /// if we ever log in via the same issuer again.
-    async fn store_client_registration(&self, oidc: &Oidc) -> Result<(), AuthenticationError> {
+    fn store_client_registration(
+        &self,
+        oidc: &Oidc,
+        registrations_file: &Path,
+    ) -> Result<(), AuthenticationError> {
         let issuer = Url::parse(oidc.issuer().ok_or(AuthenticationError::OidcNotSupported)?)
             .map_err(|_| AuthenticationError::OidcError {
                 message: String::from("Failed to parse issuer URL."),
@@ -497,7 +562,7 @@ impl AuthenticationService {
         })?;
 
         let registrations = OidcRegistrations::new(
-            &self.base_path,
+            registrations_file,
             metadata.clone(),
             self.oidc_static_registrations(),
         )?;
@@ -508,18 +573,19 @@ impl AuthenticationService {
 
     /// Attempts to load an existing OIDC dynamic client registration for the
     /// currently configured issuer.
-    async fn load_client_registration(
+    fn load_client_registration(
         &self,
         oidc: &Oidc,
         issuer: String,
         oidc_metadata: VerifiedClientMetadata,
+        registrations_file: &Path,
     ) -> bool {
         let Ok(issuer_url) = Url::parse(&issuer) else {
             tracing::error!("Failed to parse {issuer:?}");
             return false;
         };
         let Some(registrations) = OidcRegistrations::new(
-            &self.base_path,
+            registrations_file,
             oidc_metadata.clone(),
             self.oidc_static_registrations(),
         )
@@ -555,68 +621,6 @@ impl AuthenticationService {
                 Some((issuer, ClientId(client_id.clone())))
             })
             .collect()
-    }
-
-    /// Creates a new client to setup the store path now the user ID is known.
-    async fn finalize_client(
-        &self,
-        session: impl Into<AuthSession>,
-        user_id: OwnedUserId,
-    ) -> Result<Arc<Client>, AuthenticationError> {
-        // Take ownership of the client. This means that further attempts to
-        // `finalize_client` may fail, but we want to make sure that there
-        // aren't two clients at any point later.
-        let Some(client) = self.client.write().await.take() else {
-            return Err(AuthenticationError::ClientMissing);
-        };
-
-        let homeserver_url = client.homeserver();
-
-        let sliding_sync_proxy = self
-            .custom_sliding_sync_proxy
-            .read()
-            .unwrap()
-            .clone()
-            .or_else(|| client.sliding_sync_proxy().map(|url| url.to_string()));
-
-        // Wait for the parent client to finish running its initialization tasks.
-        client.inner.encryption().wait_for_e2ee_initialization_tasks().await;
-
-        // Drop the parent client. Both clients shouldn't be alive at the same time, or
-        // it may cause issues (when trying to initialize encryption-related tasks at
-        // the same time).
-        drop(client);
-
-        // Construct the final client.
-        let mut client = self
-            .new_client_builder()
-            .base_path(self.base_path.clone())
-            .passphrase(self.passphrase.clone())
-            .homeserver_url(homeserver_url)
-            .sliding_sync_proxy(sliding_sync_proxy)
-            .auto_enable_cross_signing(true)
-            .backup_download_strategy(BackupDownloadStrategy::AfterDecryptionFailure)
-            .auto_enable_backups(true)
-            .username(user_id.to_string());
-
-        if let Some(id) = &self.cross_process_refresh_lock_id {
-            let Some(ref session_delegate) = self.session_delegate else {
-                return Err(AuthenticationError::OidcError {
-                    message: "cross-process refresh lock requires session delegate".to_owned(),
-                });
-            };
-            client = client
-                .enable_cross_process_refresh_lock_inner(id.clone(), session_delegate.clone());
-        } else if let Some(ref session_delegate) = self.session_delegate {
-            client = client.set_session_delegate_inner(session_delegate.clone());
-        }
-
-        let client = client.build_inner().await?;
-
-        // Restore the client using the session from the login request.
-        client.restore_session_inner(session).await?;
-
-        Ok(Arc::new(client))
     }
 }
 

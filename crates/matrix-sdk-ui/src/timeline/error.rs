@@ -14,7 +14,11 @@
 
 use std::fmt;
 
-use matrix_sdk::event_cache::{paginator::PaginatorError, EventCacheError};
+use matrix_sdk::{
+    event_cache::{paginator::PaginatorError, EventCacheError},
+    send_queue::RoomSendQueueError,
+};
+use ruma::OwnedTransactionId;
 use thiserror::Error;
 
 /// Errors specific to the timeline.
@@ -109,6 +113,7 @@ impl UnsupportedEditItem {
     pub(super) const MISSING_EVENT_ID: Self = Self(UnsupportedEditItemInner::MissingEventId);
     pub(super) const NOT_ROOM_MESSAGE: Self = Self(UnsupportedEditItemInner::NotRoomMessage);
     pub(super) const NOT_POLL_EVENT: Self = Self(UnsupportedEditItemInner::NotPollEvent);
+    pub(super) const NOT_OWN_EVENT: Self = Self(UnsupportedEditItemInner::NotOwnEvent);
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -126,4 +131,27 @@ enum UnsupportedEditItemInner {
     NotRoomMessage,
     #[error("tried to edit a non-poll event")]
     NotPollEvent,
+    #[error("tried to edit another user's event")]
+    NotOwnEvent,
+}
+
+#[derive(Debug, Error)]
+pub enum SendEventError {
+    #[error(transparent)]
+    UnsupportedReplyItem(#[from] UnsupportedReplyItem),
+
+    #[error(transparent)]
+    UnsupportedEditItem(#[from] UnsupportedEditItem),
+
+    #[error(transparent)]
+    SendError(#[from] RoomSendQueueError),
+}
+
+#[derive(Debug, Error)]
+pub enum RedactEventError {
+    #[error("the given local event (with transaction id {0}) doesn't support redaction")]
+    UnsupportedRedactLocal(OwnedTransactionId),
+
+    #[error(transparent)]
+    SdkError(#[from] matrix_sdk::Error),
 }

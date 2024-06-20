@@ -36,6 +36,7 @@ futures-executor = "0.3.21"
 futures-util = { version = "0.3.26", default-features = false, features = [
     "alloc",
 ] }
+growable-bloom-filter = "2.1.0"
 http = "1.1.0"
 imbl = "2.0.0"
 itertools = "0.12.0"
@@ -43,7 +44,7 @@ once_cell = "1.16.0"
 pin-project-lite = "0.2.9"
 rand = "0.8.5"
 reqwest = { version = "0.12.4", default-features = false }
-ruma = { git = "https://github.com/SchildiChat/ruma", rev = "b95affd5c", features = [
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "898366c34", features = [
     "client-api-c",
     "compat-upload-signatures",
     "compat-user-id",
@@ -56,7 +57,7 @@ ruma = { git = "https://github.com/SchildiChat/ruma", rev = "b95affd5c", feature
     "unstable-msc2867",
     "unstable-msc4075"
 ] }
-ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "b95affd5c" }
+ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "898366c34" }
 serde = "1.0.151"
 serde_html_form = "0.2.0"
 serde_json = "1.0.91"

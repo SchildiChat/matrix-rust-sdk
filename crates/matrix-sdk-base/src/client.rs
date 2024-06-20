@@ -160,25 +160,19 @@ impl BaseClient {
     }
 
     /// Get all the rooms this client knows about.
-    pub fn get_rooms(&self) -> Vec<Room> {
-        self.store.get_rooms()
+    pub fn rooms(&self) -> Vec<Room> {
+        self.store.rooms()
     }
 
     /// Get all the rooms this client knows about, filtered by room state.
-    pub fn get_rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
-        self.store.get_rooms_filtered(filter)
+    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
+        self.store.rooms_filtered(filter)
     }
 
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist
     /// yet in the store
     pub fn get_or_create_room(&self, room_id: &RoomId, room_state: RoomState) -> Room {
         self.store.get_or_create_room(room_id, room_state, self.roominfo_update_sender.clone())
-    }
-
-    /// Get all the rooms this client knows about.
-    #[deprecated = "Use get_rooms_filtered with RoomStateFilter::INVITED instead."]
-    pub fn get_stripped_rooms(&self) -> Vec<Room> {
-        self.get_rooms_filtered(RoomStateFilter::INVITED)
     }
 
     /// Get a reference to the store.
@@ -418,7 +412,6 @@ impl BaseClient {
                             room_info,
                             changes,
                         )
-                        .await;
                     } else {
                         push_context = self.get_push_room_context(room, room_info, changes).await?;
                     }
@@ -573,7 +566,7 @@ impl BaseClient {
                 on_room_info(room_info);
             }
             // The `BaseClient` has the `Room`, which has the `RoomInfo`.
-            else if let Some(room) = client.store.get_room(room_id) {
+            else if let Some(room) = client.store.room(room_id) {
                 // Clone the `RoomInfo`.
                 let mut room_info = room.clone_info();
 
@@ -638,7 +631,7 @@ impl BaseClient {
 
                         if let Some(room) = changes.room_infos.get_mut(room_id) {
                             room.base_info.dm_targets.insert(user_id.clone());
-                        } else if let Some(room) = self.store.get_room(room_id) {
+                        } else if let Some(room) = self.store.room(room_id) {
                             let mut info = room.clone_info();
                             if info.base_info.dm_targets.insert(user_id.clone()) {
                                 changes.add_room(info);
@@ -752,6 +745,7 @@ impl BaseClient {
             RoomState::Joined,
             self.roominfo_update_sender.clone(),
         );
+
         if room.state() != RoomState::Joined {
             let _sync_lock = self.sync_lock().lock().await;
 
@@ -778,6 +772,7 @@ impl BaseClient {
             RoomState::Left,
             self.roominfo_update_sender.clone(),
         );
+
         if room.state() != RoomState::Left {
             let _sync_lock = self.sync_lock().lock().await;
 
@@ -853,6 +848,7 @@ impl BaseClient {
                 RoomState::Joined,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
 
             room_info.mark_as_joined();
@@ -968,6 +964,7 @@ impl BaseClient {
                 RoomState::Left,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
             room_info.mark_as_left();
             room_info.mark_state_partially_synced();
@@ -1026,6 +1023,7 @@ impl BaseClient {
                 RoomState::Invited,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
             room_info.mark_as_invited();
             room_info.mark_state_fully_synced();
@@ -1070,6 +1068,13 @@ impl BaseClient {
             self.apply_changes(&changes, false);
         }
 
+        // Now that all the rooms information have been saved, update the display name
+        // cache (which relies on information stored in the database). This will
+        // live in memory, until the next sync which will saves the room info to
+        // disk; we do this to avoid saving that would be redundant with the
+        // above. Oh well.
+        new_rooms.update_in_memory_caches(&self.store).await;
+
         info!("Processed a sync response in {:?}", now.elapsed());
 
         let response = SyncResponse {
@@ -1103,8 +1108,8 @@ impl BaseClient {
         }
 
         for (room_id, room_info) in &changes.room_infos {
-            if let Some(room) = self.store.get_room(room_id) {
-                room.set_room_info(room_info.clone(), trigger_room_list_update);
+            if let Some(room) = self.store.room(room_id) {
+                room.set_room_info(room_info.clone(), trigger_room_list_update)
             }
         }
     }
@@ -1135,13 +1140,12 @@ impl BaseClient {
             return Err(Error::InvalidReceiveMembersParameters);
         }
 
-        let mut chunk = Vec::with_capacity(response.chunk.len());
-
-        let Some(room) = self.store.get_room(room_id) else {
+        let Some(room) = self.store.room(room_id) else {
             // The room is unknown to us: leave early.
             return Ok(());
         };
 
+        let mut chunk = Vec::with_capacity(response.chunk.len());
         let mut changes = StateChanges::default();
 
         #[cfg(feature = "e2e-encryption")]
@@ -1301,7 +1305,7 @@ impl BaseClient {
     ///
     /// * `room_id` - The id of the room that should be fetched.
     pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
-        self.store.get_room(room_id)
+        self.store.room(room_id)
     }
 
     /// Get the olm machine.
@@ -1412,7 +1416,7 @@ impl BaseClient {
     /// Update the push context for the given room.
     ///
     /// Updates the context data from `changes` or `room_info`.
-    pub async fn update_push_room_context(
+    pub fn update_push_room_context(
         &self,
         push_rules: &mut PushConditionRoomCtx,
         user_id: &UserId,
@@ -1659,7 +1663,7 @@ mod tests {
         let room = client.get_room(room_id).expect("Room not found");
         assert_eq!(room.state(), RoomState::Invited);
         assert_eq!(
-            room.computed_display_name().await.expect("fetching display name failed"),
+            room.compute_display_name().await.expect("fetching display name failed"),
             DisplayName::Calculated("Kyra".to_owned())
         );
     }

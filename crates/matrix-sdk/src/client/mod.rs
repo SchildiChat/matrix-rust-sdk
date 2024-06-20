@@ -83,7 +83,7 @@ use crate::{
     matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
     room_preview::RoomPreview,
-    send_queue::SendingQueueData,
+    send_queue::SendQueueData,
     sync::{RoomUpdate, SyncResponse},
     Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
     TransmissionProgress,
@@ -284,10 +284,10 @@ pub(crate) struct ClientInner {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) verification_state: SharedObservable<VerificationState>,
 
-    /// Data related to the [`SendingQueue`].
+    /// Data related to the [`SendQueue`].
     ///
-    /// [`SendingQueue`]: crate::send_queue::SendingQueue
-    pub(crate) sending_queue_data: Arc<SendingQueueData>,
+    /// [`SendQueue`]: crate::send_queue::SendQueue
+    pub(crate) send_queue_data: Arc<SendQueueData>,
 }
 
 impl ClientInner {
@@ -307,7 +307,7 @@ impl ClientInner {
         unstable_features: Option<BTreeMap<String, bool>>,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
-        sending_queue: Arc<SendingQueueData>,
+        send_queue: Arc<SendQueueData>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
     ) -> Arc<Self> {
         let client = Self {
@@ -330,7 +330,7 @@ impl ClientInner {
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
-            sending_queue_data: sending_queue,
+            send_queue_data: send_queue,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
             #[cfg(feature = "e2e-encryption")]
@@ -901,17 +901,13 @@ impl Client {
     ///
     /// This will return the list of joined, invited, and left rooms.
     pub fn rooms(&self) -> Vec<Room> {
-        self.base_client()
-            .get_rooms()
-            .into_iter()
-            .map(|room| Room::new(self.clone(), room))
-            .collect()
+        self.base_client().rooms().into_iter().map(|room| Room::new(self.clone(), room)).collect()
     }
 
     /// Get all the rooms the client knows about, filtered by room state.
     pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(filter)
+            .rooms_filtered(filter)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -920,7 +916,7 @@ impl Client {
     /// Returns the joined rooms this client knows about.
     pub fn joined_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::JOINED)
+            .rooms_filtered(RoomStateFilter::JOINED)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -929,7 +925,7 @@ impl Client {
     /// Returns the invited rooms this client knows about.
     pub fn invited_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::INVITED)
+            .rooms_filtered(RoomStateFilter::INVITED)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -938,7 +934,7 @@ impl Client {
     /// Returns the left rooms this client knows about.
     pub fn left_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .get_rooms_filtered(RoomStateFilter::LEFT)
+            .rooms_filtered(RoomStateFilter::LEFT)
             .into_iter()
             .map(|room| Room::new(self.clone(), room))
             .collect()
@@ -2110,7 +2106,7 @@ impl Client {
                 self.inner.unstable_features.get().cloned(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
-                self.inner.sending_queue_data.clone(),
+                self.inner.send_queue_data.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,
             )

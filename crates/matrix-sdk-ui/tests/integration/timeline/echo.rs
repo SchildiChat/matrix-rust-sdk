@@ -31,6 +31,7 @@ use ruma::{
 };
 use serde_json::json;
 use stream_assert::assert_next_matches;
+use tokio::task::yield_now;
 use wiremock::{
     matchers::{header, method, path_regex},
     Mock, ResponseTemplate,
@@ -87,7 +88,7 @@ async fn test_echo() {
     assert_eq!(text.body, "Hello, World!");
 
     // Wait for the sending to finish and assert everything was successful
-    send_hdl.await.unwrap();
+    send_hdl.await.unwrap().unwrap();
 
     assert_let!(
         Some(VectorDiff::Set { index: 1, value: sent_confirmation }) = timeline_stream.next().await
@@ -137,27 +138,51 @@ async fn test_retry_failed() {
 
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
 
-    mock_encryption_state(&server, false).await;
+    client.send_queue().set_enabled(true);
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await;
+    // When trying to send an event, return with a 500 error, which is interpreted
+    // as a transient error.
+    server.reset().await;
+    mock_encryption_state(&server, false).await;
+    let scoped_faulty_send = Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(3)
+        .mount_as_scoped(&server)
+        .await;
 
-    // First, local echo is added
+    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
+
+    // First, local echo is added.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
         assert_matches!(value.send_state(), Some(EventSendState::NotSentYet));
     });
 
-    // Sending fails, the mock server has no matching route yet
+    // Sending fails, because the error is a transient one that's recoverable,
+    // indicating something's wrong on the client side.
     assert_let!(Some(VectorDiff::Set { index: 0, value: item }) = timeline_stream.next().await);
-    assert_matches!(item.send_state(), Some(EventSendState::SendingFailed { .. }));
-    let txn_id = item.transaction_id().unwrap().to_owned();
+    assert_matches!(
+        item.send_state(),
+        Some(EventSendState::SendingFailed { is_recoverable: true, .. })
+    );
 
+    // This doesn't disable the send queue at the global level…
+    assert!(client.send_queue().is_enabled());
+    // …but does so at the local level.
+    assert!(!room.send_queue().is_enabled());
+
+    // Have the endpoint return a success result, and re-enable the queue.
+    drop(scoped_faulty_send);
     Mock::given(method("PUT"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
         .and(header("authorization", "Bearer 1234"))
@@ -168,16 +193,12 @@ async fn test_retry_failed() {
         .mount(&server)
         .await;
 
-    timeline.retry_send(&txn_id).await.unwrap();
+    room.send_queue().set_enabled(true);
 
-    // After mocking the endpoint and retrying, it first transitions back out of
-    // the error state
-    assert_next_matches!(timeline_stream, VectorDiff::Remove { index: 0 });
-    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
-        assert_matches!(value.send_state(), Some(EventSendState::NotSentYet));
-    });
+    // Let the send queue handle the event.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // … before succeeding.
+    // After mocking the endpoint and retrying, it succeeds.
     assert_let!(Some(VectorDiff::Set { index: 0, value }) = timeline_stream.next().await);
     assert_matches!(value.send_state(), Some(EventSendState::Sent { .. }));
 }
@@ -216,7 +237,7 @@ async fn test_dedup_by_event_id_late() {
         .mount(&server)
         .await;
 
-    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
 
     assert_let!(Some(VectorDiff::PushBack { value: local_echo }) = timeline_stream.next().await);
     let item = local_echo.as_event().unwrap();
@@ -275,12 +296,15 @@ async fn test_cancel_failed() {
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await;
+    let handle =
+        timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
 
     // Local echo is added (immediately)
-    let txn_id = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
+    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
         assert_matches!(value.send_state(), Some(EventSendState::NotSentYet));
-        value.transaction_id().unwrap().to_owned()
     });
 
     // Sending fails, the mock server has no matching route
@@ -288,7 +312,7 @@ async fn test_cancel_failed() {
     assert_matches!(value.send_state(), Some(EventSendState::SendingFailed { .. }));
 
     // Discard, assert the local echo is found
-    assert!(timeline.cancel_send(&txn_id).await);
+    assert!(handle.abort().await);
 
     // Observable local echo being removed
     assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 0 }));

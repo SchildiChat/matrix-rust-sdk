@@ -252,7 +252,7 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             // ourselves see us as verified and the recovery/backup states will
             // be known. If we did receive all the secrets in the secrets
             // bundle, then backups will be enabled after this step as well.
-            self.client.encryption().run_initialization_tasks(None).await;
+            self.client.encryption().spawn_initialization_task(None);
             self.client.encryption().wait_for_e2ee_initialization_tasks().await;
 
             trace!("successfully logged in and enabled E2EE.");
@@ -715,12 +715,10 @@ mod test {
             .await
             .expect("Alice should be able to create a secure channel.");
 
-        assert_let!(
-            QrCodeModeData::Reciprocate { homeserver_url } = &alice.qr_code_data().mode_data
-        );
+        assert_let!(QrCodeModeData::Reciprocate { server_name } = &alice.qr_code_data().mode_data);
 
         let bob = Client::builder()
-            .homeserver_url(homeserver_url)
+            .server_name_or_homeserver_url(server_name)
             .request_config(RequestConfig::new().disable_retry())
             .build()
             .await
@@ -796,12 +794,10 @@ mod test {
             .await
             .expect("Alice should be able to create a secure channel.");
 
-        assert_let!(
-            QrCodeModeData::Reciprocate { homeserver_url } = &alice.qr_code_data().mode_data
-        );
+        assert_let!(QrCodeModeData::Reciprocate { server_name } = &alice.qr_code_data().mode_data);
 
         let bob = Client::builder()
-            .homeserver_url(homeserver_url)
+            .server_name_or_homeserver_url(server_name)
             .request_config(RequestConfig::new().disable_retry())
             .build()
             .await

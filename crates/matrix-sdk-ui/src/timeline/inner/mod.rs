@@ -27,6 +27,7 @@ use matrix_sdk::crypto::OlmMachine;
 use matrix_sdk::{
     deserialized_responses::SyncTimelineEvent,
     event_cache::{paginator::Paginator, RoomEventCache},
+    send_queue::AbortSendHandle,
     Result, Room,
 };
 #[cfg(test)]
@@ -298,7 +299,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
                 let has_events = !events.is_empty();
 
-                self.replace_with_initial_events(events, RemoteEventOrigin::Cache).await;
+                self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
 
                 Ok(has_events)
             }
@@ -314,7 +315,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
                 let has_events = !start_from_result.events.is_empty();
 
-                self.replace_with_initial_events(
+                self.replace_with_initial_remote_events(
                     start_from_result.events.into_iter().map(Into::into).collect(),
                     RemoteEventOrigin::Pagination,
                 )
@@ -428,8 +429,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         let user_id = self.room_data_provider.own_user_id();
 
         let related_event = {
-            let items = state.items.clone();
-            let Some((_, item)) = rfind_event_by_id(&items, &annotation.event_id) else {
+            let Some((_, item)) = rfind_event_by_id(&state.items, &annotation.event_id) else {
                 warn!("Timeline item not found, can't update reaction ID");
                 return Err(Error::FailedToToggleReaction);
             };
@@ -470,15 +470,18 @@ impl<P: RoomDataProvider> TimelineInner<P> {
                 let event_content = AnyMessageLikeEventContent::Reaction(
                     ReactionEventContent::from(annotation.clone()),
                 );
-                state.handle_local_event(
-                    sender,
-                    sender_profile,
-                    txn_id.clone(),
-                    TimelineEventKind::Message {
-                        content: event_content.clone(),
-                        relations: Default::default(),
-                    },
-                );
+                state
+                    .handle_local_event(
+                        sender,
+                        sender_profile,
+                        txn_id.clone(),
+                        None,
+                        TimelineEventKind::Message {
+                            content: event_content.clone(),
+                            relations: Default::default(),
+                        },
+                    )
+                    .await;
 
                 ReactionState::Sending(txn_id)
             }
@@ -493,7 +496,9 @@ impl<P: RoomDataProvider> TimelineInner<P> {
                     unreachable!("the None/None case has been handled above")
                 };
 
-                state.handle_local_event(sender, sender_profile, TransactionId::new(), content);
+                state
+                    .handle_local_event(sender, sender_profile, TransactionId::new(), None, content)
+                    .await;
 
                 // Remember the remote echo to redact on the homeserver.
                 ReactionState::Redacting(remote_echo_event_id.cloned())
@@ -554,7 +559,13 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
         let mut state = self.state.write().await;
         state
-            .add_events_at(events, position, origin, &self.room_data_provider, &self.settings)
+            .add_remote_events_at(
+                events,
+                position,
+                origin,
+                &self.room_data_provider,
+                &self.settings,
+            )
             .await
     }
 
@@ -569,7 +580,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
     ///
     /// This is all done with a single lock guard, since we don't want the state
     /// to be modified between the clear and re-insertion of new events.
-    pub(super) async fn replace_with_initial_events(
+    pub(super) async fn replace_with_initial_remote_events(
         &self,
         events: Vec<SyncTimelineEvent>,
         origin: RemoteEventOrigin,
@@ -588,7 +599,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
         if !events.is_empty() {
             state
-                .add_events_at(
+                .add_remote_events_at(
                     events,
                     TimelineEnd::Back,
                     origin,
@@ -623,7 +634,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
     pub(super) async fn handle_live_event(&self, event: SyncTimelineEvent) {
         let mut state = self.state.write().await;
         state
-            .add_events_at(
+            .add_remote_events_at(
                 vec![event],
                 TimelineEnd::Back,
                 RemoteEventOrigin::Sync,
@@ -639,12 +650,13 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         &self,
         txn_id: OwnedTransactionId,
         content: TimelineEventKind,
+        abort_handle: Option<AbortSendHandle>,
     ) {
         let sender = self.room_data_provider.own_user_id().to_owned();
         let profile = self.room_data_provider.profile_from_user_id(&sender).await;
 
         let mut state = self.state.write().await;
-        state.handle_local_event(sender, profile, txn_id, content);
+        state.handle_local_event(sender, profile, txn_id, abort_handle, content).await;
     }
 
     /// Update the send state of a local event represented by a transaction ID.
@@ -717,34 +729,8 @@ impl<P: RoomDataProvider> TimelineInner<P> {
             error!(?existing_event_id, ?new_event_id, "Local echo already marked as sent");
         }
 
-        let is_error = matches!(send_state, EventSendState::SendingFailed { .. });
-
         let new_item = item.with_inner_kind(local_item.with_send_state(send_state));
         txn.items.set(idx, new_item);
-
-        if is_error {
-            // When there is an error, sending further messages is paused. This should be
-            // reflected in the timeline, so we set all other pending events to
-            // cancelled.
-            //
-            // TODO(bnjbvr): spooky action at a distance here^. The sending task is the one
-            // deciding to clear the sending queue, so we're updating based on that implicit
-            // knowledge here. Instead, the sending queue should notify the timeline that
-            // it's deciding to not send those messages, and then only the
-            // timeline should mark these items as cancelled.
-            let items = &mut txn.items;
-            let num_items = items.len();
-            for idx in 0..num_items {
-                let item = &items[idx];
-                let Some(event_item) = item.as_event() else { continue };
-                let Some(local_item) = event_item.as_local() else { continue };
-                if matches!(&local_item.send_state, EventSendState::NotSentYet) {
-                    let new_event_item =
-                        event_item.with_kind(local_item.with_send_state(EventSendState::Cancelled));
-                    items.set(idx, item.with_kind(new_event_item));
-                }
-            }
-        }
 
         txn.commit();
     }
@@ -806,42 +792,6 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         }
 
         Ok(follow_up_action)
-    }
-
-    /// Attempts to find a local echo item for some event to be sent.
-    ///
-    /// If it's found, it's moved back to the end of the timeline, then its
-    /// content is returned by this function.
-    pub(super) async fn prepare_retry(
-        &self,
-        txn_id: &TransactionId,
-    ) -> Option<TimelineItemContent> {
-        let mut state = self.state.write().await;
-
-        let (idx, item) = rfind_event_item(&state.items, |it| it.transaction_id() == Some(txn_id))?;
-        let local_item = item.as_local()?;
-
-        match &local_item.send_state {
-            EventSendState::NotSentYet => {
-                warn!("Attempted to retry the sending of an item that is already pending");
-                return None;
-            }
-            EventSendState::Sent { .. } => {
-                warn!("Attempted to retry the sending of an item that has already succeeded");
-                return None;
-            }
-            EventSendState::SendingFailed { .. } | EventSendState::Cancelled => {}
-        }
-
-        let new_item = item.with_inner_kind(local_item.with_send_state(EventSendState::NotSentYet));
-        let content = item.content.clone();
-
-        let mut txn = state.items.transaction();
-        txn.remove(idx);
-        txn.push_back(new_item);
-        txn.commit();
-
-        Some(content)
     }
 
     pub(super) async fn discard_local_echo(&self, txn_id: &TransactionId) -> bool {
@@ -974,7 +924,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
 
                             // Notify observers that we managed to eventually decrypt an event.
                             if let Some(hook) = unable_to_decrypt_hook {
-                                hook.on_late_decrypt(&remote_event.event_id, cause);
+                                hook.on_late_decrypt(&remote_event.event_id, cause).await;
                             }
 
                             Some(event)

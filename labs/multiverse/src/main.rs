@@ -227,7 +227,7 @@ impl App {
                     all_rooms.into_iter().filter(|room_id| !previous_ui_rooms.contains_key(room_id))
                 {
                     // Retrieve the room list service's Room.
-                    let Ok(ui_room) = sync_service.room_list_service().room(&room_id).await else {
+                    let Ok(ui_room) = sync_service.room_list_service().room(&room_id) else {
                         error!("error when retrieving room after an update");
                         continue;
                     };
@@ -272,7 +272,7 @@ impl App {
 
                 for (room_id, room) in &new_ui_rooms {
                     let raw_name = room.name();
-                    let display_name = room.computed_display_name().await;
+                    let display_name = room.cached_display_name();
                     room_infos
                         .lock()
                         .unwrap()
@@ -351,7 +351,7 @@ impl App {
 
     /// Run a small back-pagination (expect a batch of 20 events, continue until
     /// we get 10 timeline items or hit the timeline start).
-    async fn back_paginate(&mut self) {
+    fn back_paginate(&mut self) {
         let Some(sdk_timeline) = self.get_selected_room_id(None).and_then(|room_id| {
             self.timelines.lock().unwrap().get(&room_id).map(|timeline| timeline.timeline.clone())
         }) else {
@@ -436,13 +436,9 @@ impl App {
                             Char('S') => self.sync_service.stop().await?,
 
                             Char('Q') => {
-                                let q = self.client.sending_queue();
+                                let q = self.client.send_queue();
                                 let enabled = q.is_enabled();
-                                if enabled {
-                                    q.disable();
-                                } else {
-                                    q.enable();
-                                }
+                                q.set_enabled(!enabled);
                             }
 
                             Char('M') => {
@@ -455,7 +451,7 @@ impl App {
                                             .map(|timeline| timeline.timeline.clone())
                                     })
                                 {
-                                    sdk_timeline
+                                    match sdk_timeline
                                         .send(
                                             RoomMessageEventContent::text_plain(format!(
                                                 "hey {}",
@@ -463,9 +459,17 @@ impl App {
                                             ))
                                             .into(),
                                         )
-                                        .await;
-
-                                    self.set_status_message("message sent!".to_owned());
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            self.set_status_message("message sent!".to_owned());
+                                        }
+                                        Err(err) => {
+                                            self.set_status_message(format!(
+                                                "error when sending event: {err}"
+                                            ));
+                                        }
+                                    }
                                 } else {
                                     self.set_status_message("missing timeline for room".to_owned());
                                 };
@@ -475,7 +479,7 @@ impl App {
                             Char('t') => self.details_mode = DetailsMode::TimelineItems,
 
                             Char('b') if self.details_mode == DetailsMode::TimelineItems => {
-                                self.back_paginate().await;
+                                self.back_paginate();
                             }
 
                             Char('m') if self.details_mode == DetailsMode::ReadReceipts => {
@@ -810,7 +814,7 @@ impl App {
                     "\nUse j/k to move, s/S to start/stop the sync service, m to mark as read, t to show the timeline.".to_owned()
                 }
                 DetailsMode::TimelineItems => {
-                    "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, Q to enable/disable the sending queue, M to send a message.".to_owned()
+                    "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, Q to enable/disable the send queue, M to send a message.".to_owned()
                 }
             }
         };

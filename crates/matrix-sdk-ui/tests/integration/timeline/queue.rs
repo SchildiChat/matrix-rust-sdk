@@ -26,9 +26,9 @@ use ruma::{
 };
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
-use tokio::time::sleep;
+use tokio::{task::yield_now, time::sleep};
 use wiremock::{
-    matchers::{body_string_contains, method, path_regex},
+    matchers::{body_string_contains, header, method, path_regex},
     Mock, ResponseTemplate,
 };
 
@@ -79,30 +79,39 @@ async fn test_message_order() {
         .mount(&server)
         .await;
 
-    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await;
-    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await.unwrap();
+    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await.unwrap();
 
-    // Local echoes are available as soon as `timeline.send` returns
+    // Let the send queue handle the event.
+    yield_now().await;
+
+    // Local echoes are available after the send queue has processed these.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
+        assert!(!value.is_editable(), "local echo for first can't be edited");
         assert_eq!(value.content().as_message().unwrap().body(), "First!");
     });
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
+        assert!(!value.is_editable(), "local echo for second can't be edited");
         assert_eq!(value.content().as_message().unwrap().body(), "Second.");
     });
 
-    // Wait 200ms for the first msg, 100ms for the second, 200ms for overhead
+    // Wait 200ms for the first msg, 100ms for the second, 200ms for overhead.
     sleep(Duration::from_millis(500)).await;
 
-    // The first item should be updated first
+    // The first item should be updated first.
     assert_next_matches!(timeline_stream, VectorDiff::Set { index: 0, value } => {
+        assert!(value.is_editable(), "remote echo of first can be edited");
         assert_eq!(value.content().as_message().unwrap().body(), "First!");
         assert_eq!(value.event_id().unwrap(), "$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP");
     });
-    // Then the second one
+
+    // Then the second one.
     assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => {
+        assert!(value.is_editable(), "remote echo of second can be edited");
         assert_eq!(value.content().as_message().unwrap().body(), "Second.");
         assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
     });
+
     assert_pending!(timeline_stream);
 }
 
@@ -117,21 +126,33 @@ async fn test_retry_order() {
 
     mock_sync(&server, sync_response_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    // Send two messages without mocking the server response.
-    // It will respond with a 404, resulting in a failed-to-send state.
-    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await;
-    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await;
+    // When trying to send an event, return with a 500 error, which is interpreted
+    // as a transient error.
+    server.reset().await;
+    mock_encryption_state(&server, false).await;
+    let scoped_faulty_send = Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(3)
+        .mount_as_scoped(&server)
+        .await;
 
-    // Local echoes are available as soon as `timeline.send` returns
+    // Send two messages without mocking the server response.
+    // It will respond with a 500, resulting in a failed-to-send state.
+    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await.unwrap();
+    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
+
+    // Local echoes are available after the send queue has processed these.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
         assert_eq!(value.content().as_message().unwrap().body(), "First!");
     });
@@ -140,18 +161,12 @@ async fn test_retry_order() {
     });
 
     // Local echoes are updated with the failed send state as soon as
-    // the 404 response is received
+    // the 404 response is received.
     assert_let!(Some(VectorDiff::Set { index: 0, value: first }) = timeline_stream.next().await);
     assert_matches!(first.send_state().unwrap(), EventSendState::SendingFailed { .. });
-    let txn_id_1 = first.transaction_id().unwrap().to_owned();
-
-    // The second one is cancelled without an extra delay
-    let second =
-        assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => value);
-    assert_matches!(second.send_state().unwrap(), EventSendState::Cancelled);
-    let txn_id_2 = second.transaction_id().unwrap().to_owned();
 
     // Response for first message takes 100ms to respond
+    drop(scoped_faulty_send);
     Mock::given(method("PUT"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
         .and(body_string_contains("First!"))
@@ -177,38 +192,26 @@ async fn test_retry_order() {
         .await;
 
     // Retry the second message first
-    timeline.retry_send(&txn_id_2).await.unwrap();
-    timeline.retry_send(&txn_id_1).await.unwrap();
-
-    // Both items are immediately updated and moved to the bottom in the order
-    // of the function calls to indicate they are being sent
-    assert_next_matches!(timeline_stream, VectorDiff::Remove { index: 1 });
-    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
-        assert_matches!(value.send_state().unwrap(), EventSendState::NotSentYet);
-        assert_eq!(value.content().as_message().unwrap().body(), "Second.");
-    });
-    assert_next_matches!(timeline_stream, VectorDiff::Remove { index: 0 });
-    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
-        assert_matches!(value.send_state().unwrap(), EventSendState::NotSentYet);
-        assert_eq!(value.content().as_message().unwrap().body(), "First!");
-    });
+    client.send_queue().set_enabled(true);
 
     // Wait 200ms for the first msg, 100ms for the second, 300ms for overhead
     sleep(Duration::from_millis(600)).await;
 
-    // The second item (now at index 0) should be updated first, since it was
-    // retried first
+    // With the send queue, sending is retried in the same order as the events
+    // were sent. So we first see the first message.
     assert_next_matches!(timeline_stream, VectorDiff::Set { index: 0, value } => {
-        assert_eq!(value.content().as_message().unwrap().body(), "Second.");
-        assert_matches!(value.send_state().unwrap(), EventSendState::Sent { .. });
-        assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
-    });
-    // Then the first one
-    assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => {
         assert_eq!(value.content().as_message().unwrap().body(), "First!");
         assert_matches!(value.send_state().unwrap(), EventSendState::Sent { .. });
         assert_eq!(value.event_id().unwrap(), "$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP");
     });
+
+    // Then the second.
+    assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => {
+        assert_eq!(value.content().as_message().unwrap().body(), "Second.");
+        assert_matches!(value.send_state().unwrap(), EventSendState::Sent { .. });
+        assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
+    });
+
     assert_pending!(timeline_stream);
 }
 
@@ -235,7 +238,7 @@ async fn test_clear_with_echoes() {
     {
         let (_, mut timeline_stream) = timeline.subscribe().await;
 
-        timeline.send(RoomMessageEventContent::text_plain("Send failure").into()).await;
+        timeline.send(RoomMessageEventContent::text_plain("Send failure").into()).await.unwrap();
 
         // Wait for the first message to fail. Don't use time, but listen for the first
         // timeline item diff to get back signalling the error.
@@ -256,7 +259,7 @@ async fn test_clear_with_echoes() {
         .await;
 
     // (this one)
-    timeline.send(RoomMessageEventContent::text_plain("Pending").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("Pending").into()).await.unwrap();
 
     // Another message comes in.
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
@@ -340,8 +343,11 @@ async fn test_no_duplicate_day_divider() {
         .mount(&server)
         .await;
 
-    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await;
-    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await;
+    timeline.send(RoomMessageEventContent::text_plain("First!").into()).await.unwrap();
+    timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
 
     // Local echoes are available as soon as `timeline.send` returns.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {

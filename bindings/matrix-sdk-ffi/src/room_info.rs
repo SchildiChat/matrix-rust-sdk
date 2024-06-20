@@ -1,11 +1,12 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use matrix_sdk::RoomState;
 
 use crate::{
-    notification_settings::RoomNotificationMode, room::Membership, room_member::RoomMember,
+    notification_settings::RoomNotificationMode,
+    room::{Membership, RoomHero},
+    room_member::RoomMember,
     space_child_info::{SpaceChildInfo, space_children_info},
-    timeline::EventTimelineItem,
 };
 
 #[derive(uniffi::Record)]
@@ -27,13 +28,13 @@ pub struct RoomInfo {
     canonical_alias: Option<String>,
     alternative_aliases: Vec<String>,
     membership: Membership,
-    latest_event: Option<Arc<EventTimelineItem>>,
     /// Member who invited the current user to a room that's in the invited
     /// state.
     ///
     /// Can be missing if the room membership invite event is missing from the
     /// store.
     inviter: Option<RoomMember>,
+    heroes: Vec<RoomHero>,
     active_members_count: u64,
     invited_members_count: u64,
     joined_members_count: u64,
@@ -60,10 +61,7 @@ pub struct RoomInfo {
 }
 
 impl RoomInfo {
-    pub(crate) async fn new(
-        room: &matrix_sdk::Room,
-        latest_event: Option<Arc<EventTimelineItem>>,
-    ) -> matrix_sdk::Result<Self> {
+    pub(crate) async fn new(room: &matrix_sdk::Room) -> matrix_sdk::Result<Self> {
         let unread_notification_counts = room.unread_notification_counts();
         let unread_count = room.unread_count();
 
@@ -75,7 +73,7 @@ impl RoomInfo {
 
         Ok(Self {
             id: room.room_id().to_string(),
-            display_name: room.computed_display_name().await.ok().map(|name| name.to_string()),
+            display_name: room.cached_display_name().map(|name| name.to_string()),
             raw_name: room.name(),
             topic: room.topic(),
             avatar_url: room.avatar_url().map(Into::into),
@@ -88,7 +86,6 @@ impl RoomInfo {
             canonical_alias: room.canonical_alias().map(Into::into),
             alternative_aliases: room.alt_aliases().into_iter().map(Into::into).collect(),
             membership: room.state().into(),
-            latest_event,
             inviter: match room.state() {
                 RoomState::Invited => room
                     .invite_details()
@@ -98,6 +95,7 @@ impl RoomInfo {
                     .map(Into::into),
                 _ => None,
             },
+            heroes: room.heroes().into_iter().map(Into::into).collect(),
             active_members_count: room.active_members_count(),
             invited_members_count: room.invited_members_count(),
             joined_members_count: room.joined_members_count(),
