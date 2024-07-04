@@ -37,7 +37,7 @@ use ruma::{
         error::ErrorKind,
     },
     events::{
-        room::encrypted::{EncryptedEventScheme, SyncRoomEncryptedEvent},
+        room::encrypted::OriginalSyncRoomEncryptedEvent,
         secret::{request::SecretName, send::ToDeviceSecretSendEvent},
     },
     serde::Raw,
@@ -423,8 +423,12 @@ impl Backups {
     }
 
     /// Set the state of the backup.
-    fn set_state(&self, state: BackupState) {
-        self.client.inner.e2ee.backup_state.global_state.set(state);
+    fn set_state(&self, new_state: BackupState) {
+        let old_state = self.client.inner.e2ee.backup_state.global_state.set(new_state);
+
+        if old_state != new_state {
+            info!("Backup state changed from {old_state:?} to {new_state:?}");
+        }
     }
 
     /// Set the backup state to the `Enabled` variant and insert the backup key
@@ -860,6 +864,7 @@ impl Backups {
 
     /// Listen for `m.secret.send` to-device messages and check the secret inbox
     /// if we do receive one.
+    #[instrument(skip_all)]
     pub(crate) async fn secret_send_event_handler(_: ToDeviceSecretSendEvent, client: Client) {
         let olm_machine = client.olm_machine().await;
 
@@ -878,27 +883,32 @@ impl Backups {
         }
     }
 
+    /// Handle UTD events by triggering download from key backup.
+    ///
+    /// This function is registered as an event handler; it exists to deal
+    /// with cases where [`Room::decrypt_event`] is not called and instead the
+    /// event should be decrypted by the time this crate sees the event, such as
+    /// for events received via `/sync` (as opposed to via `/messages`,
+    /// `/context`, etc.)
     #[allow(clippy::unused_async)] // Because it's used as an event handler, which must be async.
     pub(crate) async fn utd_event_handler(
-        event: SyncRoomEncryptedEvent,
+        event: Raw<OriginalSyncRoomEncryptedEvent>,
         room: Room,
         client: Client,
     ) {
-        if let Some(event) = event.as_original() {
-            if let EncryptedEventScheme::MegolmV1AesSha2(c) = &event.content.scheme {
-                client
-                    .encryption()
-                    .backups()
-                    .maybe_download_room_key(room.room_id().to_owned(), c.session_id.to_owned());
-            }
-        }
+        client.encryption().backups().maybe_download_room_key(room.room_id().to_owned(), event);
     }
 
-    pub(crate) fn maybe_download_room_key(&self, room_id: OwnedRoomId, session_id: String) {
+    /// Send a notification to the task responsible for key backup downloads
+    /// that it should attempt to download the keys for the given event.
+    pub(crate) fn maybe_download_room_key(
+        &self,
+        room_id: OwnedRoomId,
+        event: Raw<OriginalSyncRoomEncryptedEvent>,
+    ) {
         let tasks = self.client.inner.e2ee.tasks.lock().unwrap();
-
         if let Some(task) = tasks.download_room_keys.as_ref() {
-            task.trigger_download((room_id, session_id))
+            task.trigger_download_for_utd_event(room_id, event);
         }
     }
 
@@ -916,7 +926,6 @@ impl Backups {
     /// removed on the homeserver.
     async fn handle_deleted_backup_version(&self, olm_machine: &OlmMachine) -> Result<(), Error> {
         olm_machine.backup_machine().disable_backup().await?;
-        self.client.encryption().recovery().update_state_after_backup_disabling().await;
         self.set_state(BackupState::Unknown);
 
         Ok(())

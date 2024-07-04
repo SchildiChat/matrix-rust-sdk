@@ -17,12 +17,12 @@ use std::time::Duration;
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
     async_test, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder, ALICE, BOB,
 };
-use matrix_sdk_ui::timeline::{RoomExt, TimelineDetails, TimelineItemContent};
+use matrix_sdk_ui::timeline::{EventSendState, RoomExt, TimelineDetails, TimelineItemContent};
 use ruma::{
     assign, event_id,
     events::{
@@ -42,7 +42,7 @@ use serde_json::json;
 use stream_assert::assert_next_matches;
 use tokio::{task::yield_now, time::sleep};
 use wiremock::{
-    matchers::{method, path_regex},
+    matchers::{header, method, path_regex},
     Mock, ResponseTemplate,
 };
 
@@ -154,6 +154,117 @@ async fn test_edit() {
 }
 
 #[async_test]
+async fn test_edit_local_echo() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    mock_encryption_state(&server, false).await;
+    let mounted_send = Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(413).set_body_json(json!({
+            "errcode": "M_TOO_LARGE",
+        })))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    // Redacting a local event works.
+    timeline.send(RoomMessageEventContent::text_plain("hello, just you").into()).await.unwrap();
+
+    assert_let!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next().await);
+
+    let internal_id = item.unique_id();
+
+    let item = item.as_event().unwrap();
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+
+    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
+    assert!(day_divider.is_day_divider());
+
+    // We haven't set a route for sending events, so this will fail.
+
+    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+
+    let item = item.as_event().unwrap();
+    assert!(item.is_local_echo());
+    assert!(item.is_editable());
+
+    assert_matches!(
+        item.send_state(),
+        Some(EventSendState::SendingFailed { is_recoverable: false, .. })
+    );
+
+    assert!(timeline_stream.next().now_or_never().is_none());
+
+    // Set up the success response before editing, since edit causes an immediate
+    // retry (the room's send queue is not blocked, since the one event it couldn't
+    // send failed in an unrecoverable way).
+    drop(mounted_send);
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Let's edit the local echo.
+    let edit_info = item.edit_info().expect("getting the edit info for the local echo");
+
+    let did_edit = timeline
+        .edit(RoomMessageEventContent::text_plain("hello, world").into(), edit_info)
+        .await
+        .unwrap();
+
+    // We could edit the local echo, since it was in the failed state.
+    assert!(did_edit);
+
+    // Observe local echo being replaced.
+    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+
+    assert_eq!(item.unique_id(), internal_id);
+
+    let item = item.as_event().unwrap();
+    assert!(item.is_local_echo());
+
+    // The send state has been reset.
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+
+    let edit_message = item.content().as_message().unwrap();
+    assert_eq!(edit_message.body(), "hello, world");
+
+    // Observe the event being sent, and replacing the local echo.
+    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+
+    let item = item.as_event().unwrap();
+    assert!(item.is_local_echo());
+
+    let edit_message = item.content().as_message().unwrap();
+    assert_eq!(edit_message.body(), "hello, world");
+
+    // No new updates.
+    assert!(timeline_stream.next().now_or_never().is_none());
+}
+
+#[async_test]
 async fn test_send_edit() {
     let room_id = room_id!("!a98sd12bjh:example.org");
     let (client, server) = logged_in_client_with_server().await;
@@ -201,8 +312,9 @@ async fn test_send_edit() {
         .mount(&server)
         .await;
 
+    let edit_info = hello_world_item.edit_info().unwrap();
     timeline
-        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), &hello_world_item)
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), edit_info)
         .await
         .unwrap();
 
@@ -291,8 +403,9 @@ async fn test_send_reply_edit() {
         .mount(&server)
         .await;
 
+    let edit_info = reply_item.edit_info().unwrap();
     timeline
-        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), &reply_item)
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), edit_info)
         .await
         .unwrap();
 
@@ -402,6 +515,92 @@ async fn test_send_edit_poll() {
     assert_eq!(edited_poll_results.question, "Edited Test");
     assert_eq!(edited_poll_results.answers.len(), 3);
     assert!(edited_poll_results.has_been_edited);
+
+    // The response to the mocked endpoint does not generate further timeline
+    // updates, so just wait for a bit before verifying that the endpoint was
+    // called.
+    sleep(Duration::from_millis(200)).await;
+
+    server.verify().await;
+}
+
+#[async_test]
+async fn test_send_edit_when_timeline_is_clear() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let event_builder = EventBuilder::new();
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) =
+        timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
+
+    let raw_original_event = event_builder.make_sync_message_event_with_id(
+        // Same user as the logged_in_client
+        user_id!("@example:localhost"),
+        event_id!("$original_event"),
+        RoomMessageEventContent::text_plain("Hello, World!"),
+    );
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id).add_timeline_event(raw_original_event.clone()),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let hello_world_item =
+        assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
+    let hello_world_message = hello_world_item.content().as_message().unwrap();
+    assert!(!hello_world_message.is_edited());
+    assert!(hello_world_item.is_editable());
+
+    // Clear the timeline to make sure the old item does not need to be
+    // available in it for the edit to work.
+    timeline.clear().await;
+    assert_next_matches!(timeline_stream, VectorDiff::Clear);
+
+    mock_encryption_state(&server, false).await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$edit_event" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Since we assume we can't use the timeline item directly in this use case, the
+    // API will fetch the event from the server directly so we need to mock the
+    // response.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/event/"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(raw_original_event.json()))
+        .expect(1)
+        .named("event_1")
+        .mount(&server)
+        .await;
+
+    let edit_info =
+        timeline.edit_info_from_event_id(hello_world_item.event_id().unwrap()).await.unwrap();
+    timeline
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), edit_info)
+        .await
+        .unwrap();
+
+    // Since verifying the content would mean mocking the sliding sync response with
+    // what we are already expecting, because this test would require to paginate
+    // again the timeline, testing the content change would not be meaningful.
+    // Use an integration test for the full case.
 
     // The response to the mocked endpoint does not generate further timeline
     // updates, so just wait for a bit before verifying that the endpoint was
