@@ -1,3 +1,34 @@
+/// A macro which will run the CryptoStore integration test suite.
+///
+/// You need to provide a `async fn get_store() -> StoreResult<impl StateStore>`
+/// providing a fresh store on the same level you invoke the macro.
+///
+/// ## Usage Example:
+/// ```no_run
+/// # use matrix_sdk_crypto::store::{
+/// #    MemoryStore as MyCryptoStore,
+/// # };
+///
+/// #[cfg(test)]
+/// mod tests {
+///     use super::MyCryptoStore;
+///
+///     async fn get_store(
+///         name: &str,
+///         passphrase: Option<&str>,
+///         clear_data: bool,
+///     ) -> MyCryptoStore {
+///         let store = MyCryptoStore::new();
+///         if clear_data {
+///             store.clear();
+///         }
+///         store
+///     }
+///
+///     cryptostore_integration_tests!();
+/// }
+/// ```
+
 #[allow(unused_macros)]
 #[macro_export]
 macro_rules! cryptostore_integration_tests {
@@ -39,7 +70,7 @@ macro_rules! cryptostore_integration_tests {
                     DeviceKeys,
                     EventEncryptionAlgorithm,
                 },
-                GossippedSecret, LocalTrust, ReadOnlyDevice, SecretInfo, ToDeviceRequest, TrackedUser,
+                GossippedSecret, LocalTrust, DeviceData, SecretInfo, ToDeviceRequest, TrackedUser,
             };
 
             use super::get_store;
@@ -61,7 +92,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             pub async fn get_loaded_store(name: &str) -> (Account, impl CryptoStore) {
-                let store = get_store(name, None).await;
+                let store = get_store(name, None, true).await;
                 let account = get_account();
 
                 store.save_pending_changes(PendingChanges { account: Some(account.deep_clone()), }).await.expect("Can't save account");
@@ -93,7 +124,7 @@ macro_rules! cryptostore_integration_tests {
 
             #[async_test]
             async fn save_account_via_generic_save() {
-                let store = get_store("save_account_via_generic", None).await;
+                let store = get_store("save_account_via_generic", None, true).await;
                 assert!(store.get_static_account().is_none());
                 assert!(store.load_account().await.unwrap().is_none());
                 let account = get_account();
@@ -107,7 +138,7 @@ macro_rules! cryptostore_integration_tests {
 
             #[async_test]
             async fn save_account() {
-                let store = get_store("save_account", None).await;
+                let store = get_store("save_account", None, true).await;
                 assert!(store.get_static_account().is_none());
                 assert!(store.load_account().await.unwrap().is_none());
                 let account = get_account();
@@ -121,7 +152,7 @@ macro_rules! cryptostore_integration_tests {
 
             #[async_test]
             async fn load_account() {
-                let store = get_store("load_account", None).await;
+                let store = get_store("load_account", None, true).await;
                 let account = get_account();
 
                 store
@@ -137,8 +168,8 @@ macro_rules! cryptostore_integration_tests {
 
             #[async_test]
             async fn load_account_with_passphrase() {
-                let store =
-                    get_store("load_account_with_passphrase", Some("secret_passphrase")).await;
+                let passphrase = Some("secret_passphrase");
+                let store = get_store("load_account_with_passphrase", passphrase, true).await;
                 let account = get_account();
 
                 store
@@ -154,7 +185,7 @@ macro_rules! cryptostore_integration_tests {
 
             #[async_test]
             async fn save_and_share_account() {
-                let store = get_store("save_and_share_account", None).await;
+                let store = get_store("save_and_share_account", None, true).await;
                 let mut account = get_account();
 
                 store
@@ -179,7 +210,7 @@ macro_rules! cryptostore_integration_tests {
 
             #[async_test]
             async fn load_sessions() {
-                let store = get_store("load_sessions", None).await;
+                let store = get_store("load_sessions", None, true).await;
                 let (account, session) = get_account_and_session().await;
                 store
                     .save_pending_changes(PendingChanges { account: Some(account.deep_clone()) })
@@ -206,7 +237,7 @@ macro_rules! cryptostore_integration_tests {
 
                 // Given we created a session and saved it in the store
                 let (session_id, account, sender_key) = {
-                    let store = get_store(store_name, None).await;
+                    let store = get_store(store_name, None, true).await;
                     let (account, session) = get_account_and_session().await;
                     let sender_key = session.sender_key.to_base64();
                     let session_id = session.session_id().to_owned();
@@ -220,7 +251,7 @@ macro_rules! cryptostore_integration_tests {
                     store
                         .save_changes(Changes {
                             devices: DeviceChanges {
-                                new: vec![ReadOnlyDevice::from_account(&account)],
+                                new: vec![DeviceData::from_account(&account)],
                                 ..Default::default()
                             },
                             ..Default::default()
@@ -241,7 +272,7 @@ macro_rules! cryptostore_integration_tests {
                 };
 
                 // When we reload the store
-                let store = get_store(store_name, None).await;
+                let store = get_store(store_name, None, false).await;
 
                 // Then the same account and session info was reloaded
                 let loaded_account = store.load_account().await.unwrap().unwrap();
@@ -293,7 +324,7 @@ macro_rules! cryptostore_integration_tests {
                 }
 
                 // When we reload the account
-                let store = get_store(dir, None).await;
+                let store = get_store(dir, None, false).await;
                 store.load_account().await.unwrap();
 
                 // Then the saved session is restored
@@ -512,7 +543,7 @@ macro_rules! cryptostore_integration_tests {
 
                 drop(store);
 
-                let store = get_store(dir, None).await;
+                let store = get_store(dir, None, false).await;
 
                 store.load_account().await.unwrap();
 
@@ -564,7 +595,7 @@ macro_rules! cryptostore_integration_tests {
 
                 drop(store);
 
-                let store = get_store(dir.clone(), None).await;
+                let name = dir.clone();let store = get_store(name, None, false).await;
                 let loaded = store.load_tracked_users().await.unwrap();
                 check_loaded_users(loaded);
             }
@@ -574,12 +605,12 @@ macro_rules! cryptostore_integration_tests {
                 let dir = "device_saving";
                 let (_account, store) = get_loaded_store(dir.clone()).await;
 
-                let alice_device_1 = ReadOnlyDevice::from_account(&Account::with_device_id(
+                let alice_device_1 = DeviceData::from_account(&Account::with_device_id(
                     "@alice:localhost".try_into().unwrap(),
                     "FIRSTDEVICE".into(),
                 ));
 
-                let alice_device_2 = ReadOnlyDevice::from_account(&Account::with_device_id(
+                let alice_device_2 = DeviceData::from_account(&Account::with_device_id(
                     "@alice:localhost".try_into().unwrap(),
                     "SECONDDEVICE".into(),
                 ));
@@ -601,7 +632,7 @@ macro_rules! cryptostore_integration_tests {
                 });
 
                 let bob_device_1_keys: DeviceKeys = serde_json::from_value(json).unwrap();
-                let bob_device_1 = ReadOnlyDevice::new(bob_device_1_keys, LocalTrust::Unset);
+                let bob_device_1 = DeviceData::new(bob_device_1_keys, LocalTrust::Unset);
 
                 let changes = Changes {
                     devices: DeviceChanges {
@@ -615,7 +646,7 @@ macro_rules! cryptostore_integration_tests {
 
                 drop(store);
 
-                let store = get_store(dir, None).await;
+                let store = get_store(dir, None, false).await;
 
                 store.load_account().await.unwrap();
 
@@ -642,7 +673,7 @@ macro_rules! cryptostore_integration_tests {
                     .unwrap();
 
                 let bob_device_json = serde_json::to_value(bob_device).unwrap();
-                assert_eq!(bob_device_json["inner"]["extra_property"], json!("somevalue"));
+                assert_eq!(bob_device_json["device_keys"]["extra_property"], json!("somevalue"));
             }
 
             #[async_test]
@@ -666,7 +697,7 @@ macro_rules! cryptostore_integration_tests {
                 store.save_changes(changes).await.unwrap();
                 drop(store);
 
-                let store = get_store(dir, None).await;
+                let store = get_store(dir, None, false).await;
 
                 store.load_account().await.unwrap();
 
@@ -683,7 +714,7 @@ macro_rules! cryptostore_integration_tests {
                 let user_id = user_id!("@example:localhost");
                 let device_id: &DeviceId = "WSKKLTJZCL".into();
 
-                let store = get_store(dir, None).await;
+                let store = get_store(dir, None, true).await;
 
                 let account = Account::with_device_id(&user_id, device_id);
 
@@ -705,7 +736,7 @@ macro_rules! cryptostore_integration_tests {
 
                 drop(store);
 
-                let store = get_store(dir, None).await;
+                let store = get_store(dir, None, false).await;
 
                 store.load_account().await.unwrap();
 
@@ -874,6 +905,7 @@ macro_rules! cryptostore_integration_tests {
                     recipient_keys: OlmV1Keys {
                         ed25519: account.identity_keys().ed25519,
                     },
+                    device_keys: None,
                     content: SecretSendContent::new(id.to_owned(), secret.to_owned()),
                 };
 

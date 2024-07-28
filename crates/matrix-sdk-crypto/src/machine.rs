@@ -66,7 +66,8 @@ use crate::{
     identities::{user::UserIdentities, Device, IdentityManager, UserDevices},
     olm::{
         Account, CrossSigningStatus, EncryptionSettings, IdentityKeys, InboundGroupSession,
-        OlmDecryptionInfo, PrivateCrossSigningIdentity, SenderData, SessionType, StaticAccountData,
+        OlmDecryptionInfo, PrivateCrossSigningIdentity, SenderDataFinder, SessionType,
+        StaticAccountData,
     },
     requests::{IncomingResponse, OutgoingRequest, UploadSigningKeysRequest},
     session_manager::{GroupSessionManager, SessionManager},
@@ -92,7 +93,7 @@ use crate::{
     },
     utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
-    CrossSigningKeyExport, CryptoStoreError, KeysQueryRequest, LocalTrust, ReadOnlyDevice,
+    CrossSigningKeyExport, CryptoStoreError, DeviceData, KeysQueryRequest, LocalTrust,
     SignatureError, ToDeviceRequest,
 };
 
@@ -173,7 +174,7 @@ impl OlmMachine {
         let static_account = account.static_data().clone();
 
         let store = Arc::new(CryptoStoreWrapper::new(self.user_id(), MemoryStore::new()));
-        let device = ReadOnlyDevice::from_account(&account);
+        let device = DeviceData::from_account(&account);
         store.save_pending_changes(PendingChanges { account: Some(account) }).await?;
         store
             .save_changes(Changes {
@@ -304,7 +305,7 @@ impl OlmMachine {
                     .record("ed25519_key", display(account.identity_keys().ed25519))
                     .record("curve25519_key", display(account.identity_keys().curve25519));
 
-                let device = ReadOnlyDevice::from_account(&account);
+                let device = DeviceData::from_account(&account);
 
                 // We just created this device from our own Olm `Account`. Since we are the
                 // owners of the private keys of this device we can safely mark
@@ -721,8 +722,7 @@ impl OlmMachine {
 
     /// Receive a successful `/keys/query` response.
     ///
-    /// Returns a list of devices newly discovered devices and devices that
-    /// changed.
+    /// Returns a list of newly discovered devices and devices that changed.
     ///
     /// # Arguments
     ///
@@ -816,7 +816,8 @@ impl OlmMachine {
         event: &DecryptedRoomKeyEvent,
         content: &MegolmV1AesSha2Content,
     ) -> OlmResult<Option<InboundGroupSession>> {
-        let sender_data = SenderData::unknown();
+        let sender_data =
+            SenderDataFinder::find_using_event(self.store(), sender_key, event).await?;
 
         let session = InboundGroupSession::new(
             sender_key,
@@ -897,10 +898,16 @@ impl OlmMachine {
         &self,
         room_id: &RoomId,
     ) -> OlmResult<()> {
+        use crate::olm::SenderData;
+
         let (_, session) = self
             .inner
             .group_session_manager
-            .create_outbound_group_session(room_id, EncryptionSettings::default())
+            .create_outbound_group_session(
+                room_id,
+                EncryptionSettings::default(),
+                SenderData::unknown(),
+            )
             .await?;
 
         self.store().save_inbound_group_sessions(&[session]).await?;
@@ -914,10 +921,16 @@ impl OlmMachine {
         &self,
         room_id: &RoomId,
     ) -> OlmResult<InboundGroupSession> {
+        use crate::olm::SenderData;
+
         let (_, session) = self
             .inner
             .group_session_manager
-            .create_outbound_group_session(room_id, EncryptionSettings::default())
+            .create_outbound_group_session(
+                room_id,
+                EncryptionSettings::default(),
+                SenderData::unknown(),
+            )
             .await?;
 
         Ok(session)
@@ -2372,7 +2385,7 @@ pub(crate) mod tests {
     };
 
     use assert_matches2::{assert_let, assert_matches};
-    use futures_util::{FutureExt, StreamExt};
+    use futures_util::{pin_mut, FutureExt, StreamExt};
     use itertools::Itertools;
     use matrix_sdk_common::deserialized_responses::{
         DeviceLinkProblem, ShieldState, UnableToDecryptInfo, UnsignedDecryptionResult,
@@ -2428,15 +2441,17 @@ pub(crate) mod tests {
         types::{
             events::{
                 room::encrypted::{EncryptedToDeviceEvent, ToDeviceEncryptedEventContent},
-                room_key_withheld::{RoomKeyWithheldContent, WithheldCode},
+                room_key_withheld::{
+                    MegolmV1AesSha2WithheldContent, RoomKeyWithheldContent, WithheldCode,
+                },
                 ToDeviceEvent,
             },
             CrossSigningKey, DeviceKeys, EventEncryptionAlgorithm, SignedKey, SigningKeys,
         },
         utilities::json_convert,
         verification::tests::{bob_id, outgoing_request_to_event, request_to_event},
-        Account, EncryptionSettings, LocalTrust, MegolmError, OlmError, OutgoingRequests,
-        ReadOnlyDevice, ToDeviceRequest, UserIdentities,
+        Account, DeviceData, EncryptionSettings, LocalTrust, MegolmError, OlmError,
+        OutgoingRequests, ToDeviceRequest, UserIdentities,
     };
 
     /// These keys need to be periodically uploaded to the server.
@@ -2537,10 +2552,10 @@ pub(crate) mod tests {
         let alice_device = alice_device_id();
         let alice = OlmMachine::new(alice, alice_device).await;
 
-        let alice_device = ReadOnlyDevice::from_machine_test_helper(&alice).await.unwrap();
-        let bob_device = ReadOnlyDevice::from_machine_test_helper(&bob).await.unwrap();
-        alice.store().save_devices(&[bob_device]).await.unwrap();
-        bob.store().save_devices(&[alice_device]).await.unwrap();
+        let alice_device = DeviceData::from_machine_test_helper(&alice).await.unwrap();
+        let bob_device = DeviceData::from_machine_test_helper(&bob).await.unwrap();
+        alice.store().save_device_data(&[bob_device]).await.unwrap();
+        bob.store().save_device_data(&[alice_device]).await.unwrap();
 
         (alice, bob, otk)
     }
@@ -3241,6 +3256,9 @@ pub(crate) mod tests {
             get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
         let room_id = room_id!("!test:example.org");
 
+        let room_keys_withheld_received_stream = bob.store().room_keys_withheld_received_stream();
+        pin_mut!(room_keys_withheld_received_stream);
+
         let encryption_settings = EncryptionSettings::default();
         let encryption_settings = EncryptionSettings {
             sharing_strategy: CollectStrategy::new_device_based(true),
@@ -3279,6 +3297,23 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
+
+        // We should receive a notification on the room_keys_withheld_received_stream
+        let withheld_received = room_keys_withheld_received_stream
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("We should have received a notification of room key being withheld");
+        assert_eq!(withheld_received.len(), 1);
+
+        assert_eq!(&withheld_received[0].room_id, room_id);
+        assert_matches!(
+            &withheld_received[0].withheld_event.content,
+            RoomKeyWithheldContent::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::Unverified(
+                unverified_withheld_content
+            ))
+        );
+        assert_eq!(unverified_withheld_content.room_id, room_id);
 
         let plaintext = "You shouldn't be able to decrypt that message";
 
@@ -3479,7 +3514,7 @@ pub(crate) mod tests {
         );
     }
 
-    async fn setup_cross_signing_for_machine_test_helper(alice: &OlmMachine, bob: &OlmMachine) {
+    pub async fn setup_cross_signing_for_machine_test_helper(alice: &OlmMachine, bob: &OlmMachine) {
         let CrossSigningBootstrapRequests { upload_signing_keys_req: alice_upload_signing, .. } =
             alice.bootstrap_cross_signing(false).await.expect("Expect Alice x-signing key request");
 
@@ -3600,7 +3635,7 @@ pub(crate) mod tests {
         bob.receive_keys_query_response(&TransactionId::new(), &kq_response).await.unwrap();
     }
 
-    async fn mark_alice_identity_as_verified_test_helper(alice: &OlmMachine, bob: &OlmMachine) {
+    pub async fn mark_alice_identity_as_verified_test_helper(alice: &OlmMachine, bob: &OlmMachine) {
         let alice_device =
             bob.get_device(alice.user_id(), alice.device_id(), None).await.unwrap().unwrap();
 
@@ -3759,8 +3794,8 @@ pub(crate) mod tests {
         let bob_other_device = device_id!("OTHERBOB");
         let bob_other_machine = OlmMachine::new(bob_id, bob_other_device).await;
         let bob_other_device =
-            ReadOnlyDevice::from_machine_test_helper(&bob_other_machine).await.unwrap();
-        bob.store().save_devices(&[bob_other_device]).await.unwrap();
+            DeviceData::from_machine_test_helper(&bob_other_machine).await.unwrap();
+        bob.store().save_device_data(&[bob_other_device]).await.unwrap();
         bob.get_device(bob_id, device_id!("OTHERBOB"), None)
             .await
             .unwrap()
@@ -4163,13 +4198,13 @@ pub(crate) mod tests {
         let room_id = room_id!("!test:localhost");
         let (alice, _) =
             get_machine_pair_with_setup_sessions_test_helper(alice_id(), user_id(), false).await;
-        let device = ReadOnlyDevice::from_machine_test_helper(&alice).await.unwrap();
-        alice.store().save_devices(&[device]).await.unwrap();
+        let device = DeviceData::from_machine_test_helper(&alice).await.unwrap();
+        alice.store().save_device_data(&[device]).await.unwrap();
 
         let (outbound, mut inbound) = alice
             .store()
             .static_account()
-            .create_group_session_pair(room_id, Default::default())
+            .create_group_session_pair(room_id, Default::default(), SenderData::unknown())
             .await
             .unwrap();
 
@@ -4214,7 +4249,7 @@ pub(crate) mod tests {
 
             let mut changes = Changes::default();
             identity.mark_as_unverified();
-            changes.identities.new.push(crate::ReadOnlyUserIdentities::Own(identity.inner));
+            changes.identities.new.push(crate::UserIdentityData::Own(identity.inner));
 
             second_machine.store().save_changes(changes).await.unwrap();
 
