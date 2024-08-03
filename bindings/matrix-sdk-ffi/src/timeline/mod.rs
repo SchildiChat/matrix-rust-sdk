@@ -604,7 +604,7 @@ impl Timeline {
         let transaction_id: OwnedTransactionId = transaction_id.into();
         let item = self
             .inner
-            .item_by_transaction_id(&transaction_id)
+            .local_item_by_transaction_id(&transaction_id)
             .await
             .context("Item with given transaction ID not found")?;
         Ok(Arc::new(EventTimelineItem(item)))
@@ -673,6 +673,26 @@ impl Timeline {
                 RepliedToEventDetails::Error { message: e.to_string() },
             )),
         }
+    }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event containing the new event id.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event was already
+    /// pinned.
+    async fn pin_event(&self, event_id: String) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
+        self.inner.pin_event(&event_id).await.map_err(ClientError::from)
+    }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event without the event id we want to remove.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event wasn't
+    /// pinned
+    async fn unpin_event(&self, event_id: String) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
+        self.inner.unpin_event(&event_id).await.map_err(ClientError::from)
     }
 }
 
@@ -1001,12 +1021,11 @@ impl EventTimelineItem {
             .iter()
             .map(|(k, v)| Reaction {
                 key: k.to_owned(),
-                count: v.len().try_into().unwrap(),
                 senders: v
-                    .senders()
-                    .map(|v| ReactionSenderData {
-                        sender_id: v.sender_id.to_string(),
-                        timestamp: v.timestamp.0.into(),
+                    .iter()
+                    .map(|(sender_id, info)| ReactionSenderData {
+                        sender_id: sender_id.to_string(),
+                        timestamp: info.timestamp.0.into(),
                     })
                     .collect(),
             })
