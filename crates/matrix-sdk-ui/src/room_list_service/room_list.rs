@@ -44,6 +44,7 @@ pub struct RoomList {
     sliding_sync_list: SlidingSyncList,
     loading_state: SharedObservable<RoomListLoadingState>,
     loading_state_task: JoinHandle<()>,
+    filter_spaces: Option<bool>, // SC
 }
 
 impl Drop for RoomList {
@@ -57,6 +58,7 @@ impl RoomList {
         client: &Client,
         sliding_sync: &Arc<SlidingSync>,
         sliding_sync_list_name: &str,
+        filter_spaces: Option<bool>, // SC
         room_list_service_state: Subscriber<State>,
     ) -> Result<Self, Error> {
         let sliding_sync_list = sliding_sync
@@ -76,6 +78,7 @@ impl RoomList {
             client: client.clone(),
             sliding_sync: sliding_sync.clone(),
             sliding_sync_list: sliding_sync_list.clone(),
+            filter_spaces, // SC
             loading_state: loading_state.clone(),
             loading_state_task: spawn(async move {
                 pin_mut!(room_list_service_state);
@@ -117,7 +120,15 @@ impl RoomList {
 
     /// Get all previous rooms, in addition to a [`Stream`] to rooms' updates.
     pub fn entries(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
-        let (rooms, stream) = self.client.rooms_stream();
+        let (rooms, stream) = self.client.rooms_stream().filter(|room|
+            match self.filter_spaces { // SC: check spaces filter
+                Some(spaces) => match room.room_type() {
+                    Some(ruma::room::RoomType::Space) => spaces,
+                    _ => !spaces
+                },
+                None => true
+            },
+        );
 
         let map_room = |room| Room::new(room, &self.sliding_sync);
 
