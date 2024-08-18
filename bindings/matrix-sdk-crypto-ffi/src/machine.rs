@@ -285,10 +285,7 @@ impl OlmMachine {
             if let Some(identity) =
                 self.runtime.block_on(self.inner.get_identity(&user_id, None))?
             {
-                match identity {
-                    UserIdentities::Own(i) => i.is_verified(),
-                    UserIdentities::Other(i) => i.is_verified(),
-                }
+                identity.is_verified()
             } else {
                 false
             },
@@ -1527,17 +1524,6 @@ impl OlmMachine {
             runtime: self.runtime.handle().to_owned(),
         }
         .into()
-    }
-
-    /// Clear any in-memory caches because they may be out of sync with the
-    /// underlying data store.
-    ///
-    /// The crypto store layer is caching olm sessions for a given device.
-    /// When used in a multi-process context this cache will get outdated.
-    /// If the machine is used by another process, the cache must be
-    /// invalidating when the main process is resumed.
-    pub async fn clear_crypto_cache(&self) {
-        self.inner.clear_crypto_cache().await
     }
 }
 

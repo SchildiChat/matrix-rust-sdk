@@ -29,11 +29,10 @@ use ruma::{
     },
     DeviceId, EventId, OwnedDeviceId, OwnedUserId, RoomId, UserId,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::error;
 
-use super::{atomic_bool_deserializer, atomic_bool_serializer};
 use crate::{
     error::SignatureError,
     store::{Changes, IdentityChanges, Store},
@@ -85,6 +84,52 @@ impl UserIdentities {
             UserIdentityData::Other(i) => {
                 Self::Other(UserIdentity { inner: i, own_identity, verification_machine })
             }
+        }
+    }
+
+    /// Check if this user identity is verified.
+    ///
+    /// For our own identity, this means either that we have checked the public
+    /// keys in the identity against the private keys; or that the identity
+    /// has been manually marked as verified via
+    /// [`OwnUserIdentity::verify`].
+    ///
+    /// For another user's identity, it means that we have verified our own
+    /// identity as above, *and* that the other user's identity has been signed
+    /// by our own user-signing key.
+    pub fn is_verified(&self) -> bool {
+        match self {
+            UserIdentities::Own(u) => u.is_verified(),
+            UserIdentities::Other(u) => u.is_verified(),
+        }
+    }
+
+    /// True if we verified this identity at some point in the past.
+    ///
+    /// To reset this latch back to `false`, one must call
+    /// [`UserIdentities::withdraw_verification()`].
+    pub fn was_previously_verified(&self) -> bool {
+        match self {
+            UserIdentities::Own(u) => u.was_previously_verified(),
+            UserIdentities::Other(u) => u.was_previously_verified(),
+        }
+    }
+
+    /// Reset the flag that records that the identity has been verified, thus
+    /// clearing [`Self::was_previously_verified`] and
+    /// [`Self::has_verification_violation`].
+    pub async fn withdraw_verification(&self) -> Result<(), CryptoStoreError> {
+        match self {
+            UserIdentities::Own(u) => u.withdraw_verification().await,
+            UserIdentities::Other(u) => u.withdraw_verification().await,
+        }
+    }
+
+    /// Was this identity previously verified, and is no longer?
+    pub fn has_verification_violation(&self) -> bool {
+        match self {
+            UserIdentities::Own(u) => u.has_verification_violation(),
+            UserIdentities::Other(u) => u.has_verification_violation(),
         }
     }
 }
@@ -200,6 +245,18 @@ impl OwnUserIdentity {
             methods,
         ))
     }
+
+    /// Remove the requirement for this identity to be verified.
+    pub async fn withdraw_verification(&self) -> Result<(), CryptoStoreError> {
+        self.inner.withdraw_verification();
+        let to_save = UserIdentityData::Own(self.inner.clone());
+        let changes = Changes {
+            identities: IdentityChanges { changed: vec![to_save], ..Default::default() },
+            ..Default::default()
+        };
+        self.verification_machine.store.inner().save_changes(changes).await?;
+        Ok(())
+    }
 }
 
 /// Struct representing a cross signing identity of a user.
@@ -228,11 +285,9 @@ impl Deref for UserIdentity {
 impl UserIdentity {
     /// Is this user identity verified.
     pub fn is_verified(&self) -> bool {
-        self.own_identity.as_ref().is_some_and(|own_identity| {
-            // The identity of another user is verified iff our own identity is verified and
-            // if our own identity has signed the other user's identity.
-            own_identity.is_verified() && own_identity.is_identity_signed(&self.inner).is_ok()
-        })
+        self.own_identity
+            .as_ref()
+            .is_some_and(|own_identity| own_identity.is_identity_verified(&self.inner))
     }
 
     /// Manually verify this user.
@@ -332,6 +387,48 @@ impl UserIdentity {
         // higher priority than pinning.
         self.inner.has_pin_violation()
     }
+
+    /// Remove the requirement for this identity to be verified.
+    pub async fn withdraw_verification(&self) -> Result<(), CryptoStoreError> {
+        self.inner.withdraw_verification();
+        let to_save = UserIdentityData::Other(self.inner.clone());
+        let changes = Changes {
+            identities: IdentityChanges { changed: vec![to_save], ..Default::default() },
+            ..Default::default()
+        };
+        self.verification_machine.store.inner().save_changes(changes).await?;
+        Ok(())
+    }
+
+    // Test helper
+    #[cfg(test)]
+    pub async fn mark_as_previously_verified(&self) -> Result<(), CryptoStoreError> {
+        self.inner.mark_as_previously_verified();
+        let to_save = UserIdentityData::Other(self.inner.clone());
+        let changes = Changes {
+            identities: IdentityChanges { changed: vec![to_save], ..Default::default() },
+            ..Default::default()
+        };
+        self.verification_machine.store.inner().save_changes(changes).await?;
+        Ok(())
+    }
+
+    /// Was this identity verified since initial observation and is not anymore?
+    ///
+    /// Such a violation should be reported to the local user by the
+    /// application, and resolved by
+    ///
+    /// - Verifying the new identity with [`UserIdentity::request_verification`]
+    /// - Or by withdrawing the verification requirement
+    ///   [`UserIdentity::withdraw_verification`].
+    pub fn has_verification_violation(&self) -> bool {
+        if !self.inner.was_previously_verified() {
+            // If that identity has never been verified it cannot be in violation.
+            return false;
+        };
+
+        !self.is_verified()
+    }
 }
 
 /// Enum over the different user identity types we can have.
@@ -415,7 +512,8 @@ impl UserIdentityData {
 /// signatures can be checked with this identity.
 ///
 /// This struct also contains the currently pinned user identity (public master
-/// key) for that user.
+/// key) for that user and a local flag that serves as a latch to remember if an
+/// identity was verified once.
 ///
 /// The first time a cryptographic user identity is seen for a given user, it
 /// will be associated with that user ("pinned"). Future interactions
@@ -424,6 +522,12 @@ impl UserIdentityData {
 ///
 /// The user can explicitly pin the new identity to allow for legitimate
 /// identity changes (for example, in case of key material or device loss).
+///
+/// As soon as the cryptographic identity is verified (i.e. signed by our own
+/// trusted identity), a flag is set to remember it (`previously_verified`).
+/// Future interactions will expect this user to stay verified, in case of
+/// violation the user should be notified with a blocking warning when sending a
+/// message.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(try_from = "OtherUserIdentityDataSerializer", into = "OtherUserIdentityDataSerializer")]
 pub struct OtherUserIdentityData {
@@ -431,6 +535,11 @@ pub struct OtherUserIdentityData {
     pub(crate) master_key: Arc<MasterPubkey>,
     self_signing_key: Arc<SelfSigningPubkey>,
     pinned_master_key: Arc<RwLock<MasterPubkey>>,
+    /// This tracks whether this olm machine has already seen this user as
+    /// verified. To use it in the future to detect cases where the user has
+    /// become unverified for any reason. This can be reset using
+    /// [`OtherUserIdentityData::withdraw_verification()`].
+    previously_verified: Arc<AtomicBool>,
 }
 
 /// Intermediate struct to help serialize OtherUserIdentityData and support
@@ -460,6 +569,15 @@ struct OtherUserIdentityDataSerializerV1 {
     pinned_master_key: MasterPubkey,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct OtherUserIdentityDataSerializerV2 {
+    user_id: OwnedUserId,
+    master_key: MasterPubkey,
+    self_signing_key: SelfSigningPubkey,
+    pinned_master_key: MasterPubkey,
+    previously_verified: bool,
+}
+
 impl TryFrom<OtherUserIdentityDataSerializer> for OtherUserIdentityData {
     type Error = serde_json::Error;
     fn try_from(
@@ -475,6 +593,7 @@ impl TryFrom<OtherUserIdentityDataSerializer> for OtherUserIdentityData {
                     self_signing_key: Arc::new(v0.self_signing_key),
                     // We migrate by pinning the current master key
                     pinned_master_key: Arc::new(RwLock::new(v0.master_key)),
+                    previously_verified: Arc::new(false.into()),
                 })
             }
             Some(v) if v == "1" => {
@@ -484,6 +603,19 @@ impl TryFrom<OtherUserIdentityDataSerializer> for OtherUserIdentityData {
                     master_key: Arc::new(v1.master_key.clone()),
                     self_signing_key: Arc::new(v1.self_signing_key),
                     pinned_master_key: Arc::new(RwLock::new(v1.pinned_master_key)),
+                    // Put it to false. There will be a migration to mark all users as dirty, so we
+                    // will receive an update for the identity that will correctly set up the value.
+                    previously_verified: Arc::new(false.into()),
+                })
+            }
+            Some(v) if v == "2" => {
+                let v2: OtherUserIdentityDataSerializerV2 = serde_json::from_value(value.other)?;
+                Ok(OtherUserIdentityData {
+                    user_id: v2.user_id,
+                    master_key: Arc::new(v2.master_key.clone()),
+                    self_signing_key: Arc::new(v2.self_signing_key),
+                    pinned_master_key: Arc::new(RwLock::new(v2.pinned_master_key)),
+                    previously_verified: Arc::new(v2.previously_verified.into()),
                 })
             }
             _ => Err(serde::de::Error::custom(format!("Unsupported Version {:?}", value.version))),
@@ -493,15 +625,16 @@ impl TryFrom<OtherUserIdentityDataSerializer> for OtherUserIdentityData {
 
 impl From<OtherUserIdentityData> for OtherUserIdentityDataSerializer {
     fn from(value: OtherUserIdentityData) -> Self {
-        let v1 = OtherUserIdentityDataSerializerV1 {
+        let v2 = OtherUserIdentityDataSerializerV2 {
             user_id: value.user_id.clone(),
             master_key: value.master_key().to_owned(),
             self_signing_key: value.self_signing_key().to_owned(),
             pinned_master_key: value.pinned_master_key.read().unwrap().clone(),
+            previously_verified: value.previously_verified.load(Ordering::SeqCst),
         };
         OtherUserIdentityDataSerializer {
-            version: Some("1".to_owned()),
-            other: serde_json::to_value(v1).unwrap(),
+            version: Some("2".to_owned()),
+            other: serde_json::to_value(v2).unwrap(),
         }
     }
 }
@@ -549,6 +682,7 @@ impl OtherUserIdentityData {
             master_key: master_key.clone().into(),
             self_signing_key: self_signing_key.into(),
             pinned_master_key: RwLock::new(master_key).into(),
+            previously_verified: Arc::new(false.into()),
         })
     }
 
@@ -563,6 +697,7 @@ impl OtherUserIdentityData {
             master_key: Arc::new(master_key.clone()),
             self_signing_key,
             pinned_master_key: Arc::new(RwLock::new(master_key.clone())),
+            previously_verified: Arc::new(false.into()),
         }
     }
 
@@ -587,6 +722,29 @@ impl OtherUserIdentityData {
         *m = self.master_key.as_ref().clone()
     }
 
+    /// Remember that this identity used to be verified at some point.
+    pub(crate) fn mark_as_previously_verified(&self) {
+        self.previously_verified.store(true, Ordering::SeqCst)
+    }
+
+    /// True if we verified this identity (with any own identity, at any
+    /// point).
+    ///
+    /// To pass this latch back to false, one must call
+    /// [`OtherUserIdentityData::withdraw_verification()`].
+    pub fn was_previously_verified(&self) -> bool {
+        self.previously_verified.load(Ordering::SeqCst)
+    }
+
+    /// Remove the requirement for this identity to be verified.
+    ///
+    /// If an identity was previously verified and is not anymore it will be
+    /// reported to the user. In order to remove this notice users have to
+    /// verify again or to withdraw the verification requirement.
+    pub fn withdraw_verification(&self) {
+        self.previously_verified.store(false, Ordering::SeqCst)
+    }
+
     /// Returns true if the identity has changed since we last pinned it.
     ///
     /// Key pinning acts as a trust on first use mechanism, the first time an
@@ -609,6 +767,9 @@ impl OtherUserIdentityData {
     ///
     /// * `self_signing_key` - The new self signing key of user identity.
     ///
+    /// * `maybe_verified_own_user_signing_key` - Our own user_signing_key if it
+    ///   is verified to check the identity trust status after update.
+    ///
     /// Returns a `SignatureError` if we failed to update the identity.
     /// Otherwise, returns `true` if there was a change to the identity and
     /// `false` if the identity is unchanged.
@@ -616,6 +777,7 @@ impl OtherUserIdentityData {
         &mut self,
         master_key: MasterPubkey,
         self_signing_key: SelfSigningPubkey,
+        maybe_verified_own_user_signing_key: Option<&UserSigningPubkey>,
     ) -> Result<bool, SignatureError> {
         master_key.verify_subkey(&self_signing_key)?;
 
@@ -625,11 +787,21 @@ impl OtherUserIdentityData {
         // (see `has_pin_violation()`).
         let pinned_master_key = self.pinned_master_key.read().unwrap().clone();
 
+        // Check if the new master_key is signed by our own **verified**
+        // user_signing_key. If the identity was verified we remember it.
+        let updated_is_verified = maybe_verified_own_user_signing_key
+            .map_or(false, |own_user_signing_key| {
+                own_user_signing_key.verify_master_key(&master_key).is_ok()
+            });
+
         let new = Self {
             user_id: master_key.user_id().into(),
             master_key: master_key.clone().into(),
             self_signing_key: self_signing_key.into(),
             pinned_master_key: RwLock::new(pinned_master_key).into(),
+            previously_verified: Arc::new(
+                (self.was_previously_verified() || updated_is_verified).into(),
+            ),
         };
         let changed = new != *self;
 
@@ -647,14 +819,9 @@ impl OtherUserIdentityData {
     ///
     /// * `device` - The device that should be checked for a valid signature.
     ///
-    /// Returns an empty result if the signature check succeeded, otherwise a
-    /// SignatureError indicating why the check failed.
-    pub(crate) fn is_device_signed(&self, device: &DeviceData) -> Result<(), SignatureError> {
-        if self.user_id() != device.user_id() {
-            return Err(SignatureError::UserIdMismatch);
-        }
-
-        self.self_signing_key.verify_device(device)
+    /// Returns `true` if the signature check succeeded, otherwise `false`.
+    pub(crate) fn is_device_signed(&self, device: &DeviceData) -> bool {
+        self.user_id() == device.user_id() && self.self_signing_key.verify_device(device).is_ok()
     }
 }
 
@@ -671,11 +838,21 @@ pub struct OwnUserIdentityData {
     master_key: Arc<MasterPubkey>,
     self_signing_key: Arc<SelfSigningPubkey>,
     user_signing_key: Arc<UserSigningPubkey>,
-    #[serde(
-        serialize_with = "atomic_bool_serializer",
-        deserialize_with = "atomic_bool_deserializer"
-    )]
-    verified: Arc<AtomicBool>,
+    #[serde(deserialize_with = "deserialize_own_user_identity_data_verified")]
+    verified: Arc<RwLock<OwnUserIdentityVerifiedState>>,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum OwnUserIdentityVerifiedState {
+    /// We have never verified our own identity
+    #[default]
+    NeverVerified,
+
+    /// We previously verified this identity, but it has changed.
+    PreviouslyVerifiedButNoLonger,
+
+    /// We have verified the current identity.
+    Verified,
 }
 
 impl PartialEq for OwnUserIdentityData {
@@ -696,7 +873,7 @@ impl PartialEq for OwnUserIdentityData {
             && self.master_key == other.master_key
             && self.self_signing_key == other.self_signing_key
             && self.user_signing_key == other.user_signing_key
-            && self.is_verified() == other.is_verified()
+            && *self.verified.read().unwrap() == *other.verified.read().unwrap()
             && self.master_key.signatures() == other.master_key.signatures()
     }
 }
@@ -728,7 +905,7 @@ impl OwnUserIdentityData {
             master_key: master_key.into(),
             self_signing_key: self_signing_key.into(),
             user_signing_key: user_signing_key.into(),
-            verified: Arc::new(AtomicBool::new(false)),
+            verified: Default::default(),
         })
     }
 
@@ -745,7 +922,7 @@ impl OwnUserIdentityData {
             master_key: master_key.into(),
             self_signing_key: self_signing_key.into(),
             user_signing_key: user_signing_key.into(),
-            verified: Arc::new(AtomicBool::new(false)),
+            verified: Default::default(),
         }
     }
 
@@ -769,55 +946,105 @@ impl OwnUserIdentityData {
         &self.user_signing_key
     }
 
+    /// Check if the given user identity has been verified.
+    ///
+    /// The identity of another user is verified iff our own identity is
+    /// verified and if our own identity has signed the other user's
+    /// identity.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The identity of another user which we want to check has
+    ///   been verified.
+    pub fn is_identity_verified(&self, identity: &OtherUserIdentityData) -> bool {
+        self.is_verified() && self.is_identity_signed(identity)
+    }
+
     /// Check if the given identity has been signed by this identity.
+    ///
+    /// Note that, normally, you'll also want to check that the
+    /// `OwnUserIdentityData` has been verified; for that,
+    /// [`Self::is_identity_verified`] is more appropriate.
     ///
     /// # Arguments
     ///
     /// * `identity` - The identity of another user that we want to check if it
     ///   has been signed.
     ///
-    /// Returns an empty result if the signature check succeeded, otherwise a
-    /// SignatureError indicating why the check failed.
-    pub(crate) fn is_identity_signed(
-        &self,
-        identity: &OtherUserIdentityData,
-    ) -> Result<(), SignatureError> {
-        self.user_signing_key.verify_master_key(&identity.master_key)
+    /// Returns `true` if the signature check succeeded, otherwise `false`.
+    pub(crate) fn is_identity_signed(&self, identity: &OtherUserIdentityData) -> bool {
+        self.user_signing_key.verify_master_key(&identity.master_key).is_ok()
     }
 
     /// Check if the given device has been signed by this identity.
     ///
-    /// Only devices of our own user should be checked with this method, if a
-    /// device of a different user is given the signature check will always fail
-    /// even if a valid signature exists.
+    /// Only devices of our own user should be checked with this method. If a
+    /// device of a different user is given, the signature check will always
+    /// fail even if a valid signature exists.
     ///
     /// # Arguments
     ///
     /// * `device` - The device that should be checked for a valid signature.
     ///
-    /// Returns an empty result if the signature check succeeded, otherwise a
-    /// SignatureError indicating why the check failed.
-    pub(crate) fn is_device_signed(&self, device: &DeviceData) -> Result<(), SignatureError> {
-        if self.user_id() != device.user_id() {
-            return Err(SignatureError::UserIdMismatch);
-        }
-
-        self.self_signing_key.verify_device(device)
+    /// Returns `true` if the signature check succeeded, otherwise `false`.
+    pub(crate) fn is_device_signed(&self, device: &DeviceData) -> bool {
+        self.user_id() == device.user_id() && self.self_signing_key.verify_device(device).is_ok()
     }
 
     /// Mark our identity as verified.
     pub fn mark_as_verified(&self) {
-        self.verified.store(true, Ordering::SeqCst)
+        *self.verified.write().unwrap() = OwnUserIdentityVerifiedState::Verified;
     }
 
-    #[cfg(test)]
-    pub fn mark_as_unverified(&self) {
-        self.verified.store(false, Ordering::SeqCst)
+    /// Mark our identity as unverified.
+    pub(crate) fn mark_as_unverified(&self) {
+        let mut guard = self.verified.write().unwrap();
+        if *guard == OwnUserIdentityVerifiedState::Verified {
+            *guard = OwnUserIdentityVerifiedState::PreviouslyVerifiedButNoLonger;
+        }
     }
 
     /// Check if our identity is verified.
     pub fn is_verified(&self) -> bool {
-        self.verified.load(Ordering::SeqCst)
+        *self.verified.read().unwrap() == OwnUserIdentityVerifiedState::Verified
+    }
+
+    /// True if we verified our own identity at some point in the past.
+    ///
+    /// To reset this latch back to `false`, one must call
+    /// [`OwnUserIdentityData::withdraw_verification()`].
+    pub fn was_previously_verified(&self) -> bool {
+        matches!(
+            *self.verified.read().unwrap(),
+            OwnUserIdentityVerifiedState::Verified
+                | OwnUserIdentityVerifiedState::PreviouslyVerifiedButNoLonger
+        )
+    }
+
+    /// Remove the requirement for this identity to be verified.
+    ///
+    /// If an identity was previously verified and is not any more it will be
+    /// reported to the user. In order to remove this notice users have to
+    /// verify again or to withdraw the verification requirement.
+    pub fn withdraw_verification(&self) {
+        let mut guard = self.verified.write().unwrap();
+        if *guard == OwnUserIdentityVerifiedState::PreviouslyVerifiedButNoLonger {
+            *guard = OwnUserIdentityVerifiedState::NeverVerified;
+        }
+    }
+
+    /// Was this identity previously verified, and is no longer?
+    ///
+    /// Such a violation should be reported to the local user by the
+    /// application, and resolved by
+    ///
+    /// - Verifying the new identity with
+    ///   [`OwnUserIdentity::request_verification`]
+    /// - Or by withdrawing the verification requirement
+    ///   [`OwnUserIdentity::withdraw_verification`].
+    pub fn has_verification_violation(&self) -> bool {
+        *self.verified.read().unwrap()
+            == OwnUserIdentityVerifiedState::PreviouslyVerifiedButNoLonger
     }
 
     /// Update the identity with a new master key and self signing key.
@@ -850,7 +1077,7 @@ impl OwnUserIdentityData {
         self.user_signing_key = user_signing_key.into();
 
         if self.master_key.as_ref() != &master_key {
-            self.verified.store(false, Ordering::SeqCst);
+            self.mark_as_unverified()
         }
 
         self.master_key = master_key.into();
@@ -866,11 +1093,35 @@ impl OwnUserIdentityData {
         devices
             .into_iter()
             .filter_map(|(device_id, device)| {
-                (device_id != own_device_id && self.is_device_signed(&device).is_ok())
-                    .then_some(device_id)
+                (device_id != own_device_id && self.is_device_signed(&device)).then_some(device_id)
             })
             .collect()
     }
+}
+
+/// Custom deserializer for [`OwnUserIdentityData::verified`].
+///
+/// This used to be a bool, so we need to handle that.
+fn deserialize_own_user_identity_data_verified<'de, D>(
+    de: D,
+) -> Result<Arc<RwLock<OwnUserIdentityVerifiedState>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum VerifiedStateOrBool {
+        VerifiedState(OwnUserIdentityVerifiedState),
+        Bool(bool),
+    }
+
+    let verified_state = match VerifiedStateOrBool::deserialize(de)? {
+        VerifiedStateOrBool::Bool(true) => OwnUserIdentityVerifiedState::Verified,
+        VerifiedStateOrBool::Bool(false) => OwnUserIdentityVerifiedState::NeverVerified,
+        VerifiedStateOrBool::VerifiedState(x) => x,
+    };
+
+    Ok(Arc::new(RwLock::new(verified_state)))
 }
 
 /// Testing Facilities
@@ -951,29 +1202,28 @@ pub(crate) mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use assert_matches::assert_matches;
-    use matrix_sdk_test::{async_test, response_from_file, test_json};
+    use matrix_sdk_test::{async_test, ruma_response_from_json, test_json};
     use ruma::{
-        api::{client::keys::get_keys::v3::Response as KeyQueryResponse, IncomingResponse},
-        device_id, user_id, TransactionId,
+        api::client::keys::get_keys::v3::Response as KeyQueryResponse, device_id, user_id,
+        TransactionId,
     };
     use serde_json::{json, Value};
     use tokio::sync::Mutex;
 
     use super::{
         testing::{device, get_other_identity, get_own_identity},
-        OwnUserIdentityData, UserIdentityData,
+        OtherUserIdentityDataSerializerV2, OwnUserIdentityData, OwnUserIdentityVerifiedState,
+        UserIdentityData,
     };
     use crate::{
         identities::{
-            manager::testing::own_key_query,
-            user::{OtherUserIdentityDataSerializer, OtherUserIdentityDataSerializerV1},
-            Device,
+            manager::testing::own_key_query, user::OtherUserIdentityDataSerializer, Device,
         },
         olm::{Account, PrivateCrossSigningIdentity},
         store::{CryptoStoreWrapper, MemoryStore},
         types::{CrossSigningKey, MasterPubkey, SelfSigningPubkey, Signatures, UserSigningPubkey},
         verification::VerificationMachine,
-        OlmMachine, OtherUserIdentityData,
+        CrossSigningKeyExport, OlmMachine, OtherUserIdentityData,
     };
 
     #[test]
@@ -1076,12 +1326,45 @@ pub(crate) mod tests {
         let value = serde_json::to_value(migrated.clone()).unwrap();
 
         // Should be serialized with latest version
-        let _: OtherUserIdentityDataSerializerV1 =
-            serde_json::from_value(value.clone()).expect("Should deserialize as version 1");
+        let _: OtherUserIdentityDataSerializerV2 =
+            serde_json::from_value(value.clone()).expect("Should deserialize as version 2");
 
         let with_serializer: OtherUserIdentityDataSerializer =
             serde_json::from_value(value).unwrap();
-        assert_eq!("1", with_serializer.version.unwrap());
+        assert_eq!("2", with_serializer.version.unwrap());
+    }
+
+    /// [`OwnUserIdentityData::verified`] was previously an AtomicBool. Check
+    /// that we can deserialize boolean values.
+    #[test]
+    fn test_deserialize_own_user_identity_bool_verified() {
+        let mut json = json!({
+            "user_id": "@example:localhost",
+            "master_key": {
+                "user_id":"@example:localhost",
+                "usage":["master"],
+                "keys":{"ed25519:rJ2TAGkEOP6dX41Ksll6cl8K3J48l8s/59zaXyvl2p0":"rJ2TAGkEOP6dX41Ksll6cl8K3J48l8s/59zaXyvl2p0"},
+            },
+            "self_signing_key": {
+                "user_id":"@example:localhost",
+                "usage":["self_signing"],
+                "keys":{"ed25519:0C8lCBxrvrv/O7BQfsKnkYogHZX3zAgw3RfJuyiq210":"0C8lCBxrvrv/O7BQfsKnkYogHZX3zAgw3RfJuyiq210"}
+            },
+            "user_signing_key": {
+                "user_id":"@example:localhost",
+                "usage":["user_signing"],
+                "keys":{"ed25519:DU9z4gBFKFKCk7a13sW9wjT0Iyg7Hqv5f0BPM7DEhPo":"DU9z4gBFKFKCk7a13sW9wjT0Iyg7Hqv5f0BPM7DEhPo"}
+            },
+            "verified": false
+        });
+
+        let id: OwnUserIdentityData = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(*id.verified.read().unwrap(), OwnUserIdentityVerifiedState::NeverVerified);
+
+        // Tweak the json to have `"verified": true`, and repeat
+        *json.get_mut("verified").unwrap() = true.into();
+        let id: OwnUserIdentityData = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(*id.verified.read().unwrap(), OwnUserIdentityVerifiedState::Verified);
     }
 
     #[test]
@@ -1090,15 +1373,19 @@ pub(crate) mod tests {
         let identity = get_own_identity();
         let (first, second) = device(&response);
 
-        identity.is_device_signed(&first).unwrap_err();
-        identity.is_device_signed(&second).unwrap();
+        assert!(!identity.is_device_signed(&first));
+        assert!(identity.is_device_signed(&second));
 
         let private_identity =
             Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(second.user_id())));
         let verification_machine = VerificationMachine::new(
             Account::with_device_id(second.user_id(), second.device_id()).static_data,
             private_identity,
-            Arc::new(CryptoStoreWrapper::new(second.user_id(), MemoryStore::new())),
+            Arc::new(CryptoStoreWrapper::new(
+                second.user_id(),
+                second.device_id(),
+                MemoryStore::new(),
+            )),
         );
 
         let first = Device {
@@ -1139,7 +1426,11 @@ pub(crate) mod tests {
         let verification_machine = VerificationMachine::new(
             Account::with_device_id(device.user_id(), device.device_id()).static_data,
             id.clone(),
-            Arc::new(CryptoStoreWrapper::new(device.user_id(), MemoryStore::new())),
+            Arc::new(CryptoStoreWrapper::new(
+                device.user_id(),
+                device.device_id(),
+                MemoryStore::new(),
+            )),
         );
 
         let public_identity = identity.to_public_identity().await.unwrap();
@@ -1296,8 +1587,7 @@ pub(crate) mod tests {
                 "self_signing_keys": DataSet::ssk_b(),
             });
 
-        let kq_response = KeyQueryResponse::try_from_http_response(response_from_file(&data))
-            .expect("Can't parse the `/keys/upload` response");
+        let kq_response: KeyQueryResponse = ruma_response_from_json(&data);
         machine.mark_request_as_sent(&TransactionId::new(), &kq_response).await.unwrap();
 
         // The identity should not need any user approval now
@@ -1306,5 +1596,131 @@ pub(crate) mod tests {
         assert!(!other_identity.identity_needs_user_approval());
         // But there is still a pin violation
         assert!(other_identity.inner.has_pin_violation());
+    }
+
+    #[async_test]
+    async fn resolve_identity_verification_violation_with_withdraw() {
+        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+
+        let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
+
+        let keys_query = DataSet::own_keys_query_response_1();
+        let txn_id = TransactionId::new();
+        machine.mark_request_as_sent(&txn_id, &keys_query).await.unwrap();
+
+        machine
+            .import_cross_signing_keys(CrossSigningKeyExport {
+                master_key: DataSet::MASTER_KEY_PRIVATE_EXPORT.to_owned().into(),
+                self_signing_key: DataSet::SELF_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+                user_signing_key: DataSet::USER_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+            })
+            .await
+            .unwrap();
+
+        let keys_query = DataSet::bob_keys_query_response_rotated();
+        let txn_id = TransactionId::new();
+        machine.mark_request_as_sent(&txn_id, &keys_query).await.unwrap();
+
+        let bob_identity =
+            machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap().other().unwrap();
+
+        // For testing purpose mark it as previously verified
+        bob_identity.mark_as_previously_verified().await.unwrap();
+
+        assert!(bob_identity.has_verification_violation());
+
+        // withdraw
+        bob_identity.withdraw_verification().await.unwrap();
+
+        let bob_identity =
+            machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap().other().unwrap();
+
+        assert!(!bob_identity.has_verification_violation());
+    }
+
+    #[async_test]
+    async fn reset_own_keys_creates_verification_violation() {
+        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+
+        let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
+
+        let keys_query = DataSet::own_keys_query_response_1();
+        let txn_id = TransactionId::new();
+        machine.mark_request_as_sent(&txn_id, &keys_query).await.unwrap();
+
+        machine
+            .import_cross_signing_keys(CrossSigningKeyExport {
+                master_key: DataSet::MASTER_KEY_PRIVATE_EXPORT.to_owned().into(),
+                self_signing_key: DataSet::SELF_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+                user_signing_key: DataSet::USER_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+            })
+            .await
+            .unwrap();
+
+        let keys_query = DataSet::bob_keys_query_response_signed();
+        let txn_id = TransactionId::new();
+        machine.mark_request_as_sent(&txn_id, &keys_query).await.unwrap();
+
+        let bob_identity =
+            machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap().other().unwrap();
+
+        // For testing purpose mark it as previously verified
+        bob_identity.mark_as_previously_verified().await.unwrap();
+
+        assert!(!bob_identity.has_verification_violation());
+
+        let _ = machine.bootstrap_cross_signing(true).await.unwrap();
+
+        let bob_identity =
+            machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap().other().unwrap();
+
+        assert!(bob_identity.has_verification_violation());
+    }
+
+    /// Test that receiving new public keys for our own identity causes a
+    /// verification violation on our own identity.
+    #[async_test]
+    async fn own_keys_update_creates_own_identity_verification_violation() {
+        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+
+        let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
+
+        // Start with our own identity verified
+        let own_keys = DataSet::own_keys_query_response_1();
+        machine.mark_request_as_sent(&TransactionId::new(), &own_keys).await.unwrap();
+
+        machine
+            .import_cross_signing_keys(CrossSigningKeyExport {
+                master_key: DataSet::MASTER_KEY_PRIVATE_EXPORT.to_owned().into(),
+                self_signing_key: DataSet::SELF_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+                user_signing_key: DataSet::USER_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+            })
+            .await
+            .unwrap();
+
+        // Double-check that we have a verified identity
+        let own_identity = machine.get_identity(DataSet::own_id(), None).await.unwrap().unwrap();
+        assert!(own_identity.is_verified());
+        assert!(own_identity.was_previously_verified());
+        assert!(!own_identity.has_verification_violation());
+
+        // Now, we receive a *different* set of public keys
+        let own_keys = DataSet::own_keys_query_response_2();
+        machine.mark_request_as_sent(&TransactionId::new(), &own_keys).await.unwrap();
+
+        // That should give an identity that is no longer verified, with a verification
+        // violation.
+        let own_identity = machine.get_identity(DataSet::own_id(), None).await.unwrap().unwrap();
+        assert!(!own_identity.is_verified());
+        assert!(own_identity.was_previously_verified());
+        assert!(own_identity.has_verification_violation());
+
+        // Now check that we can withdraw verification for our own identity, and that it
+        // becomes valid again.
+        own_identity.withdraw_verification().await.unwrap();
+
+        assert!(!own_identity.is_verified());
+        assert!(!own_identity.was_previously_verified());
+        assert!(!own_identity.has_verification_violation());
     }
 }

@@ -166,8 +166,41 @@ async fn test_max_events_to_load_is_honored() {
         .await;
 
     let room = test_helper.client.get_room(&room_id).unwrap();
-    let timeline = Timeline::builder(&room)
+    let ret = Timeline::builder(&room)
         .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 1 })
+        .build()
+        .await;
+
+    // We're only taking the last event id, `$2`, and it's not available so the
+    // timeline fails to initialise.
+    assert!(ret.is_err());
+
+    test_helper.server.reset().await;
+}
+
+#[async_test]
+async fn test_cached_events_are_kept_for_different_room_instances() {
+    let mut test_helper = TestHelper::new().await;
+
+    // Subscribe to the event cache.
+    test_helper.client.event_cache().subscribe().unwrap();
+
+    let room_id = test_helper.room_id.clone();
+
+    // Join the room
+    let _ = test_helper.setup_initial_sync_response().await;
+    test_helper.server.reset().await;
+
+    // Load initial timeline items: a text message and a `m.room.pinned_events`
+    // with event $1 and $2 pinned
+    let _ = test_helper
+        .setup_sync_response(vec![("$1", "in the end", false)], Some(vec!["$1", "$2"]))
+        .await;
+
+    let room = test_helper.client.get_room(&room_id).unwrap();
+    let (room_cache, _drop_handles) = room.event_cache().await.unwrap();
+    let timeline = Timeline::builder(&room)
+        .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 2 })
         .build()
         .await
         .unwrap();
@@ -179,8 +212,110 @@ async fn test_max_events_to_load_is_honored() {
 
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
-    assert!(items.is_empty()); // We're only taking the last event id, `$2`, and it's not available
+    assert!(!items.is_empty()); // We just loaded some events
     assert_pending!(timeline_stream);
+
+    assert!(room_cache.event(event_id!("$1")).await.is_some());
+
+    // Drop the existing room and timeline instances
+    test_helper.server.reset().await;
+    drop(timeline_stream);
+    drop(timeline);
+    drop(room);
+
+    // Set up a sync response with only the pinned event ids and no events, so if
+    // they exist later we know they come from the cache
+    let _ = test_helper.setup_sync_response(Vec::new(), Some(vec!["$1", "$2"])).await;
+
+    // Get a new room instance
+    let room = test_helper.client.get_room(&room_id).unwrap();
+
+    // And a new timeline one
+    let timeline = Timeline::builder(&room)
+        .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 2 })
+        .build()
+        .await
+        .unwrap();
+
+    let (items, _) = timeline.subscribe().await;
+    assert!(!items.is_empty()); // These events came from the cache
+    assert!(room_cache.event(event_id!("$1")).await.is_some());
+
+    // Drop the existing room and timeline instances
+    test_helper.server.reset().await;
+    drop(timeline);
+    drop(room);
+
+    // Now remove the pinned events from the cache and try again
+    test_helper.client.event_cache().empty_immutable_cache().await;
+
+    let _ = test_helper.setup_sync_response(Vec::new(), Some(vec!["$1", "$2"])).await;
+
+    // Get a new room instance
+    let room = test_helper.client.get_room(&room_id).unwrap();
+
+    // And a new timeline one
+    let ret = Timeline::builder(&room)
+        .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 2 })
+        .build()
+        .await;
+
+    // Since the events are no longer in the cache the timeline couldn't load them
+    // and can't be initialised.
+    assert!(ret.is_err());
+
+    test_helper.server.reset().await;
+}
+
+#[async_test]
+async fn test_pinned_timeline_with_pinned_event_ids_and_empty_result_fails() {
+    let mut test_helper = TestHelper::new().await;
+    let room_id = test_helper.room_id.clone();
+
+    // Join the room
+    let _ = test_helper.setup_initial_sync_response().await;
+    test_helper.server.reset().await;
+
+    // Load initial timeline items: a `m.room.pinned_events` with event $1 and $2
+    // pinned, but they're not available neither in the cache nor in the HS
+    let _ = test_helper.setup_sync_response(Vec::new(), Some(vec!["$1", "$2"])).await;
+
+    let room = test_helper.client.get_room(&room_id).unwrap();
+    let ret = Timeline::builder(&room)
+        .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 1 })
+        .build()
+        .await;
+
+    // The timeline couldn't load any events so it fails to initialise
+    assert!(ret.is_err());
+
+    test_helper.server.reset().await;
+}
+
+#[async_test]
+async fn test_pinned_timeline_with_no_pinned_event_ids_is_just_empty() {
+    let mut test_helper = TestHelper::new().await;
+    let room_id = test_helper.room_id.clone();
+
+    // Join the room
+    let _ = test_helper.setup_initial_sync_response().await;
+    test_helper.server.reset().await;
+
+    // Load initial timeline items: an empty `m.room.pinned_events` event
+    let _ = test_helper.setup_sync_response(Vec::new(), Some(Vec::new())).await;
+
+    let room = test_helper.client.get_room(&room_id).unwrap();
+    let timeline = Timeline::builder(&room)
+        .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 1 })
+        .build()
+        .await
+        .unwrap();
+
+    // The timeline couldn't load any events, but it expected none, so it just
+    // returns an empty list
+    let (items, _) = timeline.subscribe().await;
+    assert!(items.is_empty());
+
     test_helper.server.reset().await;
 }
 

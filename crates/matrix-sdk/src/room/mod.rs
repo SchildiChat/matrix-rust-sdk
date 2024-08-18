@@ -388,11 +388,26 @@ impl Room {
     }
 
     /// Fetch the event with the given `EventId` in this room.
-    pub async fn event(&self, event_id: &EventId) -> Result<TimelineEvent> {
+    ///
+    /// It uses the given [`RequestConfig`] if provided, or the client's default
+    /// one otherwise.
+    pub async fn event(
+        &self,
+        event_id: &EventId,
+        request_config: Option<RequestConfig>,
+    ) -> Result<TimelineEvent> {
         let request =
             get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
-        let event = self.client.send(request, None).await?.event;
-        self.try_decrypt_event(event).await
+
+        let raw_event = self.client.send(request, request_config).await?.event;
+        let event = self.try_decrypt_event(raw_event).await?;
+
+        // Save the event into the event cache, if it's set up.
+        if let Ok((cache, _handles)) = self.event_cache().await {
+            cache.save_event(event.clone().into()).await;
+        }
+
+        Ok(event)
     }
 
     /// Fetch the event with the given `EventId` in this room, using the
@@ -2624,16 +2639,18 @@ impl Room {
         }
     }
 
-    /// Get the notification mode
+    /// Get the notification mode.
     pub async fn notification_mode(&self) -> Option<RoomNotificationMode> {
         if !matches!(self.state(), RoomState::Joined) {
             return None;
         }
+
         let notification_settings = self.client().notification_settings().await;
 
         // Get the user-defined mode if available
         let notification_mode =
             notification_settings.get_user_defined_room_notification_mode(self.room_id()).await;
+
         if notification_mode.is_some() {
             notification_mode
         } else if let Ok(is_encrypted) = self.is_encrypted().await {
@@ -2651,15 +2668,32 @@ impl Room {
         }
     }
 
-    /// Get the user-defined notification mode
+    /// Get the user-defined notification mode.
+    ///
+    /// The result is cached for fast and non-async call. To read the cached
+    /// result, use
+    /// [`matrix_sdk_base::Room::cached_user_defined_notification_mode`].
+    //
+    // Note for maintainers:
+    //
+    // The fact the result is cached is an important property. If you change that in
+    // the future, please review all calls to this method.
     pub async fn user_defined_notification_mode(&self) -> Option<RoomNotificationMode> {
         if !matches!(self.state(), RoomState::Joined) {
             return None;
         }
+
         let notification_settings = self.client().notification_settings().await;
 
         // Get the user-defined mode if available
-        notification_settings.get_user_defined_room_notification_mode(self.room_id()).await
+        let mode =
+            notification_settings.get_user_defined_room_notification_mode(self.room_id()).await;
+
+        if let Some(mode) = mode {
+            self.update_cached_user_defined_notification_mode(mode);
+        }
+
+        mode
     }
 
     /// Report an event as inappropriate to the homeserver's administrator.

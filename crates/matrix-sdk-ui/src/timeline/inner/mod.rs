@@ -249,7 +249,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
             TimelineFocus::PinnedEvents { max_events_to_load } => (
                 TimelineFocusData::PinnedEvents {
                     loader: PinnedEventsLoader::new(
-                        Box::new(room_data_provider.clone()),
+                        Arc::new(room_data_provider.clone()),
                         max_events_to_load as usize,
                     ),
                 },
@@ -336,7 +336,7 @@ impl<P: RoomDataProvider> TimelineInner<P> {
         }
     }
 
-    pub(crate) async fn pinned_events_load_events(
+    pub(crate) async fn reload_pinned_events(
         &self,
     ) -> Result<Vec<SyncTimelineEvent>, PinnedEventsLoaderError> {
         let focus_guard = self.focus.read().await;
@@ -1456,7 +1456,7 @@ async fn fetch_replied_to_event(
     drop(state);
 
     trace!("Fetching replied-to event");
-    let res = match room.event(in_reply_to).await {
+    let res = match room.event(in_reply_to, None).await {
         Ok(timeline_event) => TimelineDetails::Ready(Box::new(
             RepliedToEvent::try_from_timeline_event(timeline_event, room).await?,
         )),

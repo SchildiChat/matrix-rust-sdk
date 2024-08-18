@@ -65,6 +65,7 @@ use super::{
 use crate::latest_event::LatestEvent;
 use crate::{
     deserialized_responses::MemberEvent,
+    notification_settings::RoomNotificationMode,
     read_receipts::RoomReadReceipts,
     store::{DynStateStore, Result as StoreResult, StateStoreExt},
     sync::UnreadNotificationsCount,
@@ -104,6 +105,9 @@ bitflags! {
 
         /// The user-controlled unread marker value has changed.
         const UNREAD_MARKER = 0b0000_1000;
+
+        /// A membership change happened for the current user.
+        const MEMBERSHIP = 0b0001_0000;
     }
 }
 
@@ -668,6 +672,31 @@ impl Room {
         self.inner.read().cached_display_name.clone()
     }
 
+    /// Update the cached user defined notification mode.
+    ///
+    /// This is automatically recomputed on every successful sync, and the
+    /// cached result can be retrieved in
+    /// [`Self::cached_user_defined_notification_mode`].
+    pub fn update_cached_user_defined_notification_mode(&self, mode: RoomNotificationMode) {
+        self.inner.update_if(|info| {
+            if info.cached_user_defined_notification_mode.as_ref() != Some(&mode) {
+                info.cached_user_defined_notification_mode = Some(mode);
+
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Returns the cached user defined notification mode, if available.
+    ///
+    /// This cache is refilled every time we call
+    /// [`Self::update_cached_user_defined_notification_mode`].
+    pub fn cached_user_defined_notification_mode(&self) -> Option<RoomNotificationMode> {
+        self.inner.read().cached_user_defined_notification_mode
+    }
+
     /// Return the last event in this room, if one has been cached during
     /// sliding sync.
     #[cfg(feature = "experimental-sliding-sync")]
@@ -1029,10 +1058,14 @@ pub struct RoomInfo {
 
     /// Cached display name, useful for sync access.
     ///
-    /// Filled by calling [`Self::compute_display_name`]. It's automatically
+    /// Filled by calling [`Room::compute_display_name`]. It's automatically
     /// filled at start when creating a room, or on every successful sync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_display_name: Option<DisplayName>,
+
+    /// Cached user defined notification mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cached_user_defined_notification_mode: Option<RoomNotificationMode>,
 
     /// The recency stamp of this room.
     ///
@@ -1081,6 +1114,7 @@ impl RoomInfo {
             base_info: Box::new(BaseRoomInfo::new()),
             warned_about_unknown_room_version: Arc::new(false.into()),
             cached_display_name: None,
+            cached_user_defined_notification_mode: None,
             #[cfg(feature = "experimental-sliding-sync")]
             recency_stamp: None,
         }
@@ -1680,9 +1714,7 @@ mod tests {
     use stream_assert::{assert_pending, assert_ready};
     use web_time::{Duration, SystemTime};
 
-    #[cfg(feature = "experimental-sliding-sync")]
-    use super::SyncInfo;
-    use super::{compute_display_name_from_heroes, Room, RoomHero, RoomInfo, RoomState};
+    use super::{compute_display_name_from_heroes, Room, RoomHero, RoomInfo, RoomState, SyncInfo};
     #[cfg(any(feature = "experimental-sliding-sync", feature = "e2e-encryption"))]
     use crate::latest_event::LatestEvent;
     use crate::{
@@ -1730,6 +1762,7 @@ mod tests {
             read_receipts: Default::default(),
             warned_about_unknown_room_version: Arc::new(false.into()),
             cached_display_name: None,
+            cached_user_defined_notification_mode: None,
             recency_stamp: Some(42),
         };
 
@@ -1792,16 +1825,18 @@ mod tests {
         assert_eq!(serde_json::to_value(info).unwrap(), info_json);
     }
 
+    // Ensure we can still deserialize RoomInfos before we added things to its
+    // schema
+    //
+    // In an ideal world, we must not change this test. Please see
+    // [`test_room_info_serialization`] if you want to test a “recent” `RoomInfo`
+    // deserialization.
     #[test]
-    #[cfg(feature = "experimental-sliding-sync")]
     fn test_room_info_deserialization_without_optional_items() {
-        // Ensure we can still deserialize RoomInfos before we added things to its
-        // schema
+        use ruma::{owned_mxc_uri, owned_user_id};
 
         // The following JSON should never change if we want to be able to read in old
         // cached state
-
-        use ruma::{owned_mxc_uri, owned_user_id};
         let info_json = json!({
             "room_id": "!gda78o:server.tld",
             "room_state": "Invited",
@@ -1836,7 +1871,86 @@ mod tests {
                 "tombstone": null,
                 "topic": null,
             },
-            "cached_display_name": { "Calculated": "lol" }
+        });
+
+        let info: RoomInfo = serde_json::from_value(info_json).unwrap();
+
+        assert_eq!(info.room_id, room_id!("!gda78o:server.tld"));
+        assert_eq!(info.room_state, RoomState::Invited);
+        assert_eq!(info.notification_counts.highlight_count, 1);
+        assert_eq!(info.notification_counts.notification_count, 2);
+        assert_eq!(
+            info.summary.room_heroes,
+            vec![RoomHero {
+                user_id: owned_user_id!("@somebody:example.org"),
+                display_name: Some("Somebody".to_owned()),
+                avatar_url: Some(owned_mxc_uri!("mxc://example.org/abc")),
+            }]
+        );
+        assert_eq!(info.summary.joined_member_count, 5);
+        assert_eq!(info.summary.invited_member_count, 0);
+        assert!(info.members_synced);
+        assert_eq!(info.last_prev_batch, Some("pb".to_owned()));
+        assert_eq!(info.sync_info, SyncInfo::FullySynced);
+        assert!(info.encryption_state_synced);
+        assert!(info.base_info.avatar.is_none());
+        assert!(info.base_info.canonical_alias.is_none());
+        assert!(info.base_info.create.is_none());
+        assert_eq!(info.base_info.dm_targets.len(), 0);
+        assert!(info.base_info.encryption.is_none());
+        assert!(info.base_info.guest_access.is_none());
+        assert!(info.base_info.history_visibility.is_none());
+        assert!(info.base_info.join_rules.is_none());
+        assert_eq!(info.base_info.max_power_level, 100);
+        assert!(info.base_info.name.is_none());
+        assert!(info.base_info.tombstone.is_none());
+        assert!(info.base_info.topic.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    fn test_room_info_deserialization() {
+        use ruma::{owned_mxc_uri, owned_user_id};
+
+        use crate::notification_settings::RoomNotificationMode;
+
+        let info_json = json!({
+            "room_id": "!gda78o:server.tld",
+            "room_state": "Invited",
+            "notification_counts": {
+                "highlight_count": 1,
+                "notification_count": 2,
+            },
+            "summary": {
+                "room_heroes": [{
+                    "user_id": "@somebody:example.org",
+                    "display_name": "Somebody",
+                    "avatar_url": "mxc://example.org/abc"
+                }],
+                "joined_member_count": 5,
+                "invited_member_count": 0,
+            },
+            "members_synced": true,
+            "last_prev_batch": "pb",
+            "sync_info": "FullySynced",
+            "encryption_state_synced": true,
+            "base_info": {
+                "avatar": null,
+                "canonical_alias": null,
+                "create": null,
+                "dm_targets": [],
+                "encryption": null,
+                "guest_access": null,
+                "history_visibility": null,
+                "join_rules": null,
+                "max_power_level": 100,
+                "name": null,
+                "tombstone": null,
+                "topic": null,
+            },
+            "cached_display_name": { "Calculated": "lol" },
+            "cached_user_defined_notification_mode": "Mute",
+            "recency_stamp": 42,
         });
 
         let info: RoomInfo = serde_json::from_value(info_json).unwrap();
@@ -1875,8 +1989,13 @@ mod tests {
 
         assert_eq!(
             info.cached_display_name.as_ref(),
-            Some(&DisplayName::Calculated("lol".to_owned()))
-        )
+            Some(&DisplayName::Calculated("lol".to_owned())),
+        );
+        assert_eq!(
+            info.cached_user_defined_notification_mode.as_ref(),
+            Some(&RoomNotificationMode::Mute)
+        );
+        assert_eq!(info.recency_stamp.as_ref(), Some(&42));
     }
 
     #[async_test]
@@ -1923,18 +2042,10 @@ mod tests {
 
         // When the new tag is handled and applied.
         let mut changes = StateChanges::default();
-        let mut notable_reasons_updates = Default::default();
         client
-            .handle_room_account_data(
-                room_id,
-                &[tag_raw],
-                &mut changes,
-                &mut notable_reasons_updates,
-            )
+            .handle_room_account_data(room_id, &[tag_raw], &mut changes, &mut Default::default())
             .await;
-
-        assert!(notable_reasons_updates.is_empty());
-        client.apply_changes(&changes, notable_reasons_updates);
+        client.apply_changes(&changes, Default::default());
 
         // The `RoomInfo` is getting notified.
         assert_ready!(room_info_subscriber);
@@ -1952,18 +2063,9 @@ mod tests {
         }))
         .unwrap()
         .cast();
-
-        let mut notable_reasons_updates = Default::default();
         client
-            .handle_room_account_data(
-                room_id,
-                &[tag_raw],
-                &mut changes,
-                &mut notable_reasons_updates,
-            )
+            .handle_room_account_data(room_id, &[tag_raw], &mut changes, &mut Default::default())
             .await;
-
-        assert!(notable_reasons_updates.is_empty());
         client.apply_changes(&changes, Default::default());
 
         // The `RoomInfo` is getting notified.
@@ -2018,18 +2120,10 @@ mod tests {
 
         // When the new tag is handled and applied.
         let mut changes = StateChanges::default();
-        let mut notable_reasons_updates = Default::default();
         client
-            .handle_room_account_data(
-                room_id,
-                &[tag_raw],
-                &mut changes,
-                &mut notable_reasons_updates,
-            )
+            .handle_room_account_data(room_id, &[tag_raw], &mut changes, &mut Default::default())
             .await;
-
-        assert!(notable_reasons_updates.is_empty());
-        client.apply_changes(&changes, notable_reasons_updates);
+        client.apply_changes(&changes, Default::default());
 
         // The `RoomInfo` is getting notified.
         assert_ready!(room_info_subscriber);
@@ -2047,19 +2141,10 @@ mod tests {
         }))
         .unwrap()
         .cast();
-
-        let mut notable_reasons_updates = Default::default();
         client
-            .handle_room_account_data(
-                room_id,
-                &[tag_raw],
-                &mut changes,
-                &mut notable_reasons_updates,
-            )
+            .handle_room_account_data(room_id, &[tag_raw], &mut changes, &mut Default::default())
             .await;
-
-        assert!(notable_reasons_updates.is_empty());
-        client.apply_changes(&changes, notable_reasons_updates);
+        client.apply_changes(&changes, Default::default());
 
         // The `RoomInfo` is getting notified.
         assert_ready!(room_info_subscriber);
@@ -2644,7 +2729,7 @@ mod tests {
             // we can simply use now here since this will be dropped when using a MinimalStateEvent
             // in the roomInfo
             origin_server_ts: timestamp(0),
-            state_key: user_id.to_owned(),
+            state_key: user_id.to_string(),
             unsigned: StateUnsigned::new(),
         }))
     }

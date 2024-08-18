@@ -33,7 +33,7 @@ pub use error::{
 use js_int::UInt;
 pub use logger::{set_logger, Logger};
 pub use machine::{KeyRequestPair, OlmMachine, SignatureVerification};
-use matrix_sdk_common::deserialized_responses::ShieldState as RustShieldState;
+use matrix_sdk_common::deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode};
 use matrix_sdk_crypto::{
     olm::{IdentityKeys, InboundGroupSession, SenderData, Session},
     store::{Changes, CryptoStore, PendingChanges, RoomSettings as RustRoomSettings},
@@ -337,10 +337,6 @@ async fn save_changes(
 
     processed_steps += 1;
     listener(processed_steps, total_steps);
-
-    // The Sessions were created with incorrect device keys, so clear the cache
-    // so that they'll get recreated with correct ones.
-    store.clear_caches().await;
 
     Ok(())
 }
@@ -672,6 +668,8 @@ pub struct EncryptionSettings {
     /// Should untrusted devices receive the room key, or should they be
     /// excluded from the conversation.
     pub only_allow_trusted_devices: bool,
+    /// Should fail to send when a verified user has unverified devices.
+    pub error_on_verified_user_problem: bool,
 }
 
 impl From<EncryptionSettings> for RustEncryptionSettings {
@@ -681,7 +679,10 @@ impl From<EncryptionSettings> for RustEncryptionSettings {
             rotation_period: Duration::from_secs(v.rotation_period),
             rotation_period_msgs: v.rotation_period_msgs,
             history_visibility: v.history_visibility.into(),
-            sharing_strategy: CollectStrategy::new_device_based(v.only_allow_trusted_devices),
+            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
+                only_allow_trusted_devices: v.only_allow_trusted_devices,
+                error_on_verified_user_problem: v.error_on_verified_user_problem,
+            },
         }
     }
 }
@@ -726,19 +727,24 @@ pub enum ShieldColor {
 #[allow(missing_docs)]
 pub struct ShieldState {
     color: ShieldColor,
+    code: Option<ShieldStateCode>,
     message: Option<String>,
 }
 
 impl From<RustShieldState> for ShieldState {
     fn from(value: RustShieldState) -> Self {
         match value {
-            RustShieldState::Red { message } => {
-                Self { color: ShieldColor::Red, message: Some(message.to_owned()) }
-            }
-            RustShieldState::Grey { message } => {
-                Self { color: ShieldColor::Grey, message: Some(message.to_owned()) }
-            }
-            RustShieldState::None => Self { color: ShieldColor::None, message: None },
+            RustShieldState::Red { code, message } => Self {
+                color: ShieldColor::Red,
+                code: Some(code),
+                message: Some(message.to_owned()),
+            },
+            RustShieldState::Grey { code, message } => Self {
+                color: ShieldColor::Grey,
+                code: Some(code),
+                message: Some(message.to_owned()),
+            },
+            RustShieldState::None => Self { color: ShieldColor::None, code: None, message: None },
         }
     }
 }

@@ -122,7 +122,8 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
     let (client, server) = runtime.block_on(logged_in_client_with_server());
 
     let mut sync_response_builder = SyncResponseBuilder::new();
-    let mut joined_room_builder = JoinedRoomBuilder::new(&room_id);
+    let mut joined_room_builder =
+        JoinedRoomBuilder::new(&room_id).add_state_event(StateTestEvent::Encryption);
 
     let pinned_event_ids: Vec<OwnedEventId> = (0..PINNED_EVENTS_COUNT)
         .map(|i| EventId::parse(format!("${i}")).expect("Invalid event id"))
@@ -171,6 +172,8 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
     );
     // runtime.block_on(server.reset());
 
+    client.event_cache().subscribe().unwrap();
+
     let room = client.get_room(&room_id).expect("Room not found");
     assert!(!room.pinned_event_ids().is_empty());
     assert_eq!(room.pinned_event_ids().len(), PINNED_EVENTS_COUNT);
@@ -185,6 +188,9 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
         b.to_async(&runtime).iter(|| async {
             assert!(!room.pinned_event_ids().is_empty());
             assert_eq!(room.pinned_event_ids().len(), PINNED_EVENTS_COUNT);
+
+            // Reset cache so it always loads the events from the mocked endpoint
+            client.event_cache().empty_immutable_cache().await;
 
             let timeline = Timeline::builder(&room)
                 .with_focus(TimelineFocus::PinnedEvents { max_events_to_load: 100 })

@@ -30,7 +30,6 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
 use tracing::{instrument, trace, warn};
 use vodozemac::{olm::SessionConfig, Curve25519PublicKey, Ed25519PublicKey};
 
@@ -298,9 +297,7 @@ impl Device {
         self.device_owner_identity.as_ref().is_some_and(|id| match id {
             UserIdentityData::Own(own_identity) => own_identity.is_verified(),
             UserIdentityData::Other(other_identity) => {
-                self.own_identity.as_ref().is_some_and(|oi| {
-                    oi.is_verified() && oi.is_identity_signed(other_identity).is_ok()
-                })
+                self.own_identity.as_ref().is_some_and(|oi| oi.is_identity_verified(other_identity))
             }
         })
     }
@@ -339,13 +336,7 @@ impl Device {
         )
     }
 
-    /// Get the Olm sessions that belong to this device.
-    pub(crate) async fn get_sessions(&self) -> StoreResult<Option<Arc<Mutex<Vec<Session>>>>> {
-        let Some(k) = self.curve25519_key() else { return Ok(None) };
-        self.verification_machine.store.get_sessions(&k.to_base64()).await
-    }
-
-    #[cfg(test)]
+    /// Get the most recently created session that belongs to this device.
     pub(crate) async fn get_most_recent_session(&self) -> OlmResult<Option<Session>> {
         self.inner.get_most_recent_session(self.verification_machine.store.inner()).await
     }
@@ -693,9 +684,8 @@ impl DeviceData {
         store: &CryptoStoreWrapper,
     ) -> OlmResult<Option<Session>> {
         if let Some(sender_key) = self.curve25519_key() {
-            if let Some(s) = store.get_sessions(&sender_key.to_base64()).await? {
-                let mut sessions = s.lock().await;
-
+            if let Some(sessions) = store.get_sessions(&sender_key.to_base64()).await? {
+                let mut sessions = sessions.lock().await;
                 sessions.sort_by_key(|s| s.creation_time);
 
                 Ok(sessions.last().cloned())
@@ -752,21 +742,19 @@ impl DeviceData {
     ) -> bool {
         own_identity.as_ref().zip(device_owner.as_ref()).is_some_and(
             |(own_identity, device_identity)| {
-                // Our own identity needs to be marked as verified.
-                own_identity.is_verified()
-                    && match device_identity {
-                        // If it's one of our own devices, just check that
-                        // we signed the device.
-                        UserIdentityData::Own(_) => own_identity.is_device_signed(self).is_ok(),
-
-                        // If it's a device from someone else, first check
-                        // that our user has signed the other user and then
-                        // check if the other user has signed this device.
-                        UserIdentityData::Other(device_identity) => {
-                            own_identity.is_identity_signed(device_identity).is_ok()
-                                && device_identity.is_device_signed(self).is_ok()
-                        }
+                match device_identity {
+                    UserIdentityData::Own(_) => {
+                        own_identity.is_verified() && own_identity.is_device_signed(self)
                     }
+
+                    // If it's a device from someone else, first check
+                    // that our user has verified the other user and then
+                    // check if the other user has signed this device.
+                    UserIdentityData::Other(device_identity) => {
+                        own_identity.is_identity_verified(device_identity)
+                            && device_identity.is_device_signed(self)
+                    }
+                }
             },
         )
     }
@@ -778,12 +766,10 @@ impl DeviceData {
         match device_owner_identity {
             // If it's one of our own devices, just check that
             // we signed the device.
-            UserIdentityData::Own(identity) => identity.is_device_signed(self).is_ok(),
+            UserIdentityData::Own(identity) => identity.is_device_signed(self),
             // If it's a device from someone else, check
             // if the other user has signed this device.
-            UserIdentityData::Other(device_identity) => {
-                device_identity.is_device_signed(self).is_ok()
-            }
+            UserIdentityData::Other(device_identity) => device_identity.is_device_signed(self),
         }
     }
 

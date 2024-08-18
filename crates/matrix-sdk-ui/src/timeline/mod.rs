@@ -94,7 +94,8 @@ pub use self::{
         AnyOtherFullStateEventContent, EncryptedMessage, EventItemOrigin, EventSendState,
         EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange, Message,
         OtherState, Profile, ReactionInfo, ReactionsByKeyBySender, RepliedToEvent,
-        RoomMembershipChange, Sticker, TimelineDetails, TimelineEventItemId, TimelineItemContent,
+        RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineDetails,
+        TimelineEventItemId, TimelineItemContent,
     },
     event_type_filter::TimelineEventTypeFilter,
     inner::default_event_filter,
@@ -414,7 +415,7 @@ impl Timeline {
             return timeline_item.replied_to_info();
         }
 
-        let event = self.room().event(event_id).await.map_err(|error| {
+        let event = self.room().event(event_id, None).await.map_err(|error| {
             error!("Failed to fetch event with ID {event_id} with error: {error}");
             UnsupportedReplyItem::MissingEvent
         })?;

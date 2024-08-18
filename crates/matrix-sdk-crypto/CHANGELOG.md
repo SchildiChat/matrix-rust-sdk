@@ -32,6 +32,31 @@ Changes:
 
 Breaking changes:
 
+- Expose new methods `OwnUserIdentity::was_previously_verified`,
+  `OwnUserIdentity::withdraw_verification`, and
+  `OwnUserIdentity::has_verification_violation`, which track whether our own
+  identity was previously verified.
+  ([#3846](https://github.com/matrix-org/matrix-rust-sdk/pull/3846))
+
+  **NOTE**: this causes changes to the format of the serialised data in the
+  CryptoStore, meaning that, once upgraded, it will not be possible to roll
+  back applications to earlier versions without breaking user sessions.
+
+- Add a new `error_on_verified_user_problem` property to
+  `CollectStrategy::DeviceBasedStrategy`, which, when set, causes
+  `OlmMachine::share_room_key` to fail with an error if any verified users on
+  the recipient list have unsigned devices.
+
+  Also remove `CollectStrategy::new_device_based`: callers should construct a
+  `CollectStrategy::DeviceBasedStrategy` directly.
+
+  `EncryptionSettings::new` now takes a `CollectStrategy` argument, instead of
+  a list of booleans.
+  ([#3810](https://github.com/matrix-org/matrix-rust-sdk/pull/3810))
+
+- Remove the method `OlmMachine::clear_crypto_cache()`, crypto stores are not
+  supposed to have any caches anymore.
+
 - Add a `custom_account` argument to the `OlmMachine::with_store()` method, this
   allows users to learn their identity keys before they get access to the user
   and device ID.
