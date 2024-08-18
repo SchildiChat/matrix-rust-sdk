@@ -148,6 +148,8 @@ pub(crate) struct Store {
     pub(super) sync_token: Arc<RwLock<Option<String>>>,
     /// All rooms the store knows about.
     rooms: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
+    /// SC: All spaces the store knows about.
+    spaces: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
     /// A lock to synchronize access to the store, such that data by the sync is
     /// never overwritten.
     sync_lock: Arc<Mutex<()>>,
@@ -161,6 +163,7 @@ impl Store {
             session_meta: Default::default(),
             sync_token: Default::default(),
             rooms: Arc::new(StdRwLock::new(ObservableMap::new())),
+            spaces: Arc::new(StdRwLock::new(ObservableMap::new())),
             sync_lock: Default::default(),
         }
     }
@@ -185,6 +188,7 @@ impl Store {
             let room_infos = self.inner.get_room_infos().await?;
 
             let mut rooms = self.rooms.write().unwrap();
+            let mut spaces = self.spaces.write().unwrap();
 
             for room_info in room_infos {
                 let new_room = Room::restore(
@@ -194,6 +198,11 @@ impl Store {
                     room_info_notable_update_sender.clone(),
                 );
                 let new_room_id = new_room.room_id().to_owned();
+
+                // SC: Also insert into spaces list
+                if Some(ruma::room::RoomType::Space) == new_room.room_type() {
+                     spaces.insert(new_room_id.clone(), new_room.clone());
+                }
 
                 rooms.insert(new_room_id, new_room);
             }
@@ -232,8 +241,12 @@ impl Store {
     /// Get a stream of all the rooms changes, in addition to the existing
     /// rooms.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
-        self.rooms.read().unwrap().stream()
+    pub fn rooms_stream(&self, spaces: bool) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
+        if spaces {
+            self.spaces.read()
+       } else {
+            self.rooms.read()
+        }.unwrap().stream()
     }
 
     /// Get the room with the given room id.
@@ -258,7 +271,7 @@ impl Store {
         let user_id =
             &self.session_meta.get().expect("Creating room while not being logged in").user_id;
 
-        self.rooms
+        let result = self.rooms
             .write()
             .unwrap()
             .get_or_create(room_id, || {
@@ -270,7 +283,11 @@ impl Store {
                     room_info_notable_update_sender,
                 )
             })
-            .clone()
+            .clone();
+        if result.room_type() == Some(ruma::room::RoomType::Space) {
+            self.spaces.write().unwrap().get_or_create(room_id, || result.clone());
+        }
+        result
     }
 }
 

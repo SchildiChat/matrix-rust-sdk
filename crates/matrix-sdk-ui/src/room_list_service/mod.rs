@@ -384,18 +384,19 @@ impl RoomListService {
         self.state.subscribe()
     }
 
-    async fn list_for(&self, sliding_sync_list_name: &str) -> Result<RoomList, Error> {
-        RoomList::new(&self.client, &self.sliding_sync, sliding_sync_list_name, self.state()).await
+    async fn list_for(&self, sliding_sync_list_name: &str, is_space_list: bool) -> Result<RoomList, Error> {
+        RoomList::new(&self.client, &self.sliding_sync, sliding_sync_list_name, self.state(), is_space_list).await
     }
 
     /// Get a [`RoomList`] for all rooms.
     pub async fn all_rooms(&self) -> Result<RoomList, Error> {
-        self.list_for(ALL_ROOMS_LIST_NAME).await
+        //self.list_for(ALL_ROOMS_LIST_NAME).await
+        self.list_for(ALL_ROOMS_LIST_NAME, false).await
     }
 
     /// Get a [`RoomList`] for spaces
     pub async fn all_spaces(&self) -> Result<RoomList, Error> {
-        self.list_for(ALL_SPACES_LIST_NAME).await
+        self.list_for(ALL_SPACES_LIST_NAME, true).await
     }
 
     /// Get a [`Room`] if it exists.

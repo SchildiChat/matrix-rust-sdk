@@ -180,8 +180,8 @@ impl BaseClient {
     /// Get a stream of all the rooms changes, in addition to the existing
     /// rooms.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
-        self.store.rooms_stream()
+    pub fn rooms_stream(&self, spaces: bool) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>>) {
+        self.store.rooms_stream(spaces)
     }
 
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist

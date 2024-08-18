@@ -44,6 +44,7 @@ pub struct RoomList {
     sliding_sync_list: SlidingSyncList,
     loading_state: SharedObservable<RoomListLoadingState>,
     loading_state_task: JoinHandle<()>,
+    is_space_list: bool,
 }
 
 impl Drop for RoomList {
@@ -58,6 +59,7 @@ impl RoomList {
         sliding_sync: &Arc<SlidingSync>,
         sliding_sync_list_name: &str,
         room_list_service_state: Subscriber<State>,
+        is_space_list: bool,
     ) -> Result<Self, Error> {
         let sliding_sync_list = sliding_sync
             .on_list(sliding_sync_list_name, |list| ready(list.clone()))
@@ -107,6 +109,7 @@ impl RoomList {
                     loading_state.set(RoomListLoadingState::Loaded { maximum_number_of_rooms });
                 }
             }),
+            is_space_list,
         })
     }
 
@@ -117,7 +120,7 @@ impl RoomList {
 
     /// Get all previous rooms, in addition to a [`Stream`] to rooms' updates.
     pub fn entries(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
-        let (rooms, stream) = self.client.rooms_stream();
+        let (rooms, stream) = self.client.rooms_stream(self.is_space_list);
 
         let map_room = |room| Room::new(room, &self.sliding_sync);
 

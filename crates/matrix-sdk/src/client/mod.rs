@@ -937,8 +937,8 @@ impl Client {
 
     /// Get a stream of all the rooms, in addition to the existing rooms.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn rooms_stream(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
-        let (rooms, stream) = self.base_client().rooms_stream();
+    pub fn rooms_stream(&self, spaces: bool) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
+        let (rooms, stream) = self.base_client().rooms_stream(spaces);
 
         let map_room = |room| Room::new(self.clone(), room);
 
