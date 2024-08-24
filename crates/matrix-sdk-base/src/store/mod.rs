@@ -150,6 +150,7 @@ pub(crate) struct Store {
     rooms: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
     /// SC: All spaces the store knows about.
     spaces: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
+    non_spaces: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
     /// A lock to synchronize access to the store, such that data by the sync is
     /// never overwritten.
     sync_lock: Arc<Mutex<()>>,
@@ -164,6 +165,7 @@ impl Store {
             sync_token: Default::default(),
             rooms: Arc::new(StdRwLock::new(ObservableMap::new())),
             spaces: Arc::new(StdRwLock::new(ObservableMap::new())),
+            non_spaces: Arc::new(StdRwLock::new(ObservableMap::new())),
             sync_lock: Default::default(),
         }
     }
@@ -189,6 +191,7 @@ impl Store {
 
             let mut rooms = self.rooms.write().unwrap();
             let mut spaces = self.spaces.write().unwrap();
+            let mut non_spaces = self.non_spaces.write().unwrap();
 
             for room_info in room_infos {
                 let new_room = Room::restore(
@@ -202,6 +205,8 @@ impl Store {
                 // SC: Also insert into spaces list
                 if Some(ruma::room::RoomType::Space) == new_room.room_type() {
                      spaces.insert(new_room_id.clone(), new_room.clone());
+                } else {
+                     non_spaces.insert(new_room_id.clone(), new_room.clone());
                 }
 
                 rooms.insert(new_room_id, new_room);
@@ -245,7 +250,7 @@ impl Store {
         if spaces {
             self.spaces.read()
        } else {
-            self.rooms.read()
+            self.non_spaces.read()
         }.unwrap().stream()
     }
 
@@ -286,6 +291,8 @@ impl Store {
             .clone();
         if result.room_type() == Some(ruma::room::RoomType::Space) {
             self.spaces.write().unwrap().get_or_create(room_id, || result.clone());
+        } else {
+            self.non_spaces.write().unwrap().get_or_create(room_id, || result.clone());
         }
         result
     }
