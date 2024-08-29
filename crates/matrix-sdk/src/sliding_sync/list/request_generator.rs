@@ -8,26 +8,25 @@
 //! * There is a set of ranges,
 //! * Each request asks to load the particular ranges.
 //!
-//! In [`SlidingSyncMode::PagingFullSync`]:
+//! In [`SlidingSyncMode::Paging`]:
 //!
 //! * There is a `batch_size`,
 //! * Each request asks to load a new successive range containing exactly
 //!   `batch_size` rooms.
 //!
-//! In [`SlidingSyncMode::GrowingFullSync]:
+//! In [`SlidingSyncMode::Growing]:
 //!
 //! * There is a `batch_size`,
 //! * Each request asks to load a new range, always starting from 0, but where
 //!   the end is incremented by `batch_size` every time.
 //!
-//! The number of rooms to load is capped by the
-//! [`SlidingSyncList::maximum_number_of_rooms`], i.e. the real number of
-//! rooms it is possible to load. This value comes from the server.
+//! The number of rooms to load is capped by a `maximum_number_of_rooms`, i.e.
+//! the real number of rooms it is possible to load. This value comes from the
+//! server.
 //!
 //! The number of rooms to load can _also_ be capped by the
-//! [`SlidingSyncList::full_sync_maximum_number_of_rooms_to_fetch`], i.e. a
-//! user-specified limit representing the maximum number of rooms the user
-//! actually wants to load.
+//! `maximum_number_of_rooms_to_fetch`, i.e. a user-specified limit representing
+//! the maximum number of rooms the user actually wants to load.
 
 use std::cmp::min;
 
@@ -80,7 +79,7 @@ pub(in super::super) struct SlidingSyncListRequestGenerator {
     ranges: Ranges,
 
     /// The kind of request generator.
-    pub(super) kind: SlidingSyncListRequestGeneratorKind,
+    kind: SlidingSyncListRequestGeneratorKind,
 }
 
 impl SlidingSyncListRequestGenerator {
@@ -113,6 +112,12 @@ impl SlidingSyncListRequestGenerator {
                 Self { ranges, kind: SlidingSyncListRequestGeneratorKind::Selective }
             }
         }
+    }
+
+    /// Check whether this request generator is of kind
+    /// [`SlidingSyncListRequestGeneratorKind::Selective`].
+    pub(super) fn is_selective(&self) -> bool {
+        matches!(self.kind, SlidingSyncListRequestGeneratorKind::Selective)
     }
 
     /// Return a view on the ranges requested by this generator.
@@ -326,7 +331,7 @@ fn create_range(
 
 #[cfg(test)]
 mod tests {
-    use std::ops::RangeInclusive;
+    use std::ops::{Not, RangeInclusive};
 
     use assert_matches::assert_matches;
 
@@ -389,6 +394,7 @@ mod tests {
 
         assert!(request_generator.ranges.is_empty());
         assert_eq!(request_generator.kind, SlidingSyncListRequestGeneratorKind::Selective);
+        assert!(request_generator.is_selective());
     }
 
     #[test]
@@ -407,6 +413,7 @@ mod tests {
                 requested_end: None,
             }
         );
+        assert!(request_generator.is_selective().not());
     }
 
     #[test]
@@ -425,5 +432,6 @@ mod tests {
                 requested_end: None,
             }
         );
+        assert!(request_generator.is_selective().not());
     }
 }

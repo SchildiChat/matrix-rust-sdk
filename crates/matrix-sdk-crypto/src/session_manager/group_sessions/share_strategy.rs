@@ -24,18 +24,19 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, trace};
 
 use super::OutboundGroupSession;
-#[cfg(doc)]
-use crate::Device;
 use crate::{
     error::{OlmResult, SessionRecipientCollectionError},
     store::Store,
     types::events::room_key_withheld::WithheldCode,
     DeviceData, EncryptionSettings, LocalTrust, OlmError, OwnUserIdentityData, UserIdentityData,
 };
+#[cfg(doc)]
+use crate::{Device, UserIdentities};
 
 /// Strategy to collect the devices that should receive room keys for the
 /// current discussion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum CollectStrategy {
     /// Device based sharing strategy.
     DeviceBasedStrategy {
@@ -51,6 +52,11 @@ pub enum CollectStrategy {
         /// If `true`, and a verified user has an unsigned device, key sharing
         /// will fail with a
         /// [`SessionRecipientCollectionError::VerifiedUserHasUnsignedDevice`].
+        ///
+        /// If `true`, and a verified user has replaced their identity, key
+        /// sharing will fail with a
+        /// [`SessionRecipientCollectionError::VerifiedUserChangedIdentity`].
+        ///
         /// Otherwise, keys are shared with unsigned devices as normal.
         ///
         /// Once the problematic devices are blacklisted or whitelisted the
@@ -116,6 +122,7 @@ pub(crate) async fn collect_session_recipients(
     let mut withheld_devices: Vec<(DeviceData, WithheldCode)> = Default::default();
     let mut unsigned_devices_of_verified_users: BTreeMap<OwnedUserId, Vec<OwnedDeviceId>> =
         Default::default();
+    let mut verified_users_with_new_identities: Vec<OwnedUserId> = Default::default();
 
     trace!(?users, ?settings, "Calculating group session recipients");
 
@@ -160,6 +167,18 @@ pub(crate) async fn collect_session_recipients(
                     } else {
                         None
                     };
+
+                if error_on_verified_user_problem
+                    && has_identity_verification_violation(
+                        own_identity.as_ref(),
+                        device_owner_identity.as_ref(),
+                    )
+                {
+                    verified_users_with_new_identities.push(user_id.to_owned());
+                    // No point considering the individual devices of this user.
+                    continue;
+                }
+
                 split_devices_for_user(
                     user_devices,
                     &own_identity,
@@ -215,6 +234,16 @@ pub(crate) async fn collect_session_recipients(
         return Err(OlmError::SessionRecipientCollectionError(
             SessionRecipientCollectionError::VerifiedUserHasUnsignedDevice(
                 unsigned_devices_of_verified_users,
+            ),
+        ));
+    }
+
+    // Alternatively, we may have encountered previously-verified users who have
+    // changed their identities. We bail out for that, too.
+    if !verified_users_with_new_identities.is_empty() {
+        return Err(OlmError::SessionRecipientCollectionError(
+            SessionRecipientCollectionError::VerifiedUserChangedIdentity(
+                verified_users_with_new_identities,
             ),
         ));
     }
@@ -392,6 +421,22 @@ fn is_unsigned_device_of_verified_user(
     device_owner_identity.is_some_and(|device_owner_identity| {
         is_user_verified(own_identity, device_owner_identity)
             && !device_data.is_cross_signed_by_owner(device_owner_identity)
+    })
+}
+
+/// Check if the user was previously verified, but they have now changed their
+/// identity so that they are no longer verified.
+///
+/// This is much the same as [`UserIdentities::has_verification_violation`], but
+/// works with a low-level [`UserIdentityData`] rather than higher-level
+/// [`UserIdentities`].
+fn has_identity_verification_violation(
+    own_identity: Option<&OwnUserIdentityData>,
+    device_owner_identity: Option<&UserIdentityData>,
+) -> bool {
+    device_owner_identity.is_some_and(|device_owner_identity| {
+        device_owner_identity.was_previously_verified()
+            && !is_user_verified(own_identity, device_owner_identity)
     })
 }
 
@@ -624,13 +669,7 @@ mod tests {
         assert!(!carol_unsigned_device.is_verified());
 
         // Sharing an OutboundGroupSession should fail.
-        let encryption_settings = EncryptionSettings {
-            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
-                only_allow_trusted_devices: false,
-                error_on_verified_user_problem: true,
-            },
-            ..Default::default()
-        };
+        let encryption_settings = error_on_verification_problem_encryption_settings();
         let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
         let share_result = collect_session_recipients(
             machine.store(),
@@ -678,14 +717,7 @@ mod tests {
             .await
             .unwrap();
 
-        let encryption_settings = EncryptionSettings {
-            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
-                only_allow_trusted_devices: false,
-                error_on_verified_user_problem: true,
-            },
-            ..Default::default()
-        };
-
+        let encryption_settings = error_on_verification_problem_encryption_settings();
         let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
 
         // We should be able to share a key, and it should include the unsigned device.
@@ -721,14 +753,7 @@ mod tests {
             .await
             .unwrap();
 
-        let encryption_settings = EncryptionSettings {
-            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
-                only_allow_trusted_devices: false,
-                error_on_verified_user_problem: true,
-            },
-            ..Default::default()
-        };
-
+        let encryption_settings = error_on_verification_problem_encryption_settings();
         let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
 
         // We should be able to share a key, and it should exclude the unsigned device.
@@ -773,16 +798,8 @@ mod tests {
         );
         machine.mark_request_as_sent(&TransactionId::new(), &own_keys).await.unwrap();
 
-        let encryption_settings = EncryptionSettings {
-            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
-                only_allow_trusted_devices: false,
-                error_on_verified_user_problem: true,
-            },
-            ..Default::default()
-        };
-
+        let encryption_settings = error_on_verification_problem_encryption_settings();
         let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
-
         let share_result = collect_session_recipients(
             machine.store(),
             iter::once(DataSet::own_id()),
@@ -805,59 +822,6 @@ mod tests {
                 vec![DataSet::own_unsigned_device_id()]
             ),])
         );
-    }
-
-    /// Common setup for tests which require a verified user to have unsigned
-    /// devices.
-    ///
-    /// Returns an `OlmMachine` which is properly configured with trusted
-    /// cross-signing keys. Also imports a set of keys for
-    /// Bob ([`PreviouslyVerifiedTestData::bob_id`]), where Bob is verified and
-    /// has 2 devices, one signed and the other not.
-    async fn unsigned_of_verified_setup() -> OlmMachine {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
-
-        let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
-
-        // Tell the OlmMachine about our own public keys.
-        let own_keys = DataSet::own_keys_query_response_1();
-        machine.mark_request_as_sent(&TransactionId::new(), &own_keys).await.unwrap();
-
-        // Import the secret parts of our own cross-signing keys.
-        machine
-            .import_cross_signing_keys(CrossSigningKeyExport {
-                master_key: DataSet::MASTER_KEY_PRIVATE_EXPORT.to_owned().into(),
-                self_signing_key: DataSet::SELF_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
-                user_signing_key: DataSet::USER_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
-            })
-            .await
-            .unwrap();
-
-        // Tell the OlmMachine about Bob's keys.
-        let bob_keys = DataSet::bob_keys_query_response_signed();
-        machine.mark_request_as_sent(&TransactionId::new(), &bob_keys).await.unwrap();
-
-        // Double-check the state of Bob: he should be verified, and should have one
-        // signed and one unsigned device.
-        let bob_identity = machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap();
-        assert!(bob_identity.other().unwrap().is_verified());
-
-        let bob_signed_device = machine
-            .get_device(DataSet::bob_id(), DataSet::bob_device_1_id(), None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(bob_signed_device.is_verified());
-        assert!(bob_signed_device.device_owner_identity.is_some());
-
-        let bob_unsigned_device = machine
-            .get_device(DataSet::bob_id(), DataSet::bob_device_2_id(), None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!bob_unsigned_device.is_verified());
-
-        machine
     }
 
     /// Test that an unsigned device of an unverified user doesn't cause an
@@ -898,16 +862,8 @@ mod tests {
             .unwrap();
         assert!(!bob_unsigned_device.is_cross_signed_by_owner());
 
-        let encryption_settings = EncryptionSettings {
-            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
-                only_allow_trusted_devices: false,
-                error_on_verified_user_problem: true,
-            },
-            ..Default::default()
-        };
-
+        let encryption_settings = error_on_verification_problem_encryption_settings();
         let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
-
         collect_session_recipients(
             machine.store(),
             iter::once(DataSet::bob_id()),
@@ -953,19 +909,111 @@ mod tests {
         assert!(!bob_unsigned_device.is_cross_signed_by_owner());
 
         // Share a session, and ensure that it doesn't error.
-        let encryption_settings = EncryptionSettings {
-            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
-                only_allow_trusted_devices: false,
-                error_on_verified_user_problem: true,
-            },
-            ..Default::default()
-        };
-
+        let encryption_settings = error_on_verification_problem_encryption_settings();
         let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
+        collect_session_recipients(
+            machine.store(),
+            iter::once(DataSet::bob_id()),
+            &encryption_settings,
+            &group_session,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Test that a verified user changing their identity causes an error in
+    /// `collect_session_recipients`, and that it can be resolved by
+    /// withdrawing verification
+    #[async_test]
+    async fn test_verified_user_changed_identity() {
+        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+
+        // We start with Bob, who is verified and has one unsigned device. We have also
+        // verified our own identity.
+        let machine = unsigned_of_verified_setup().await;
+
+        // Bob then rotates his identity
+        let bob_keys = DataSet::bob_keys_query_response_rotated();
+        machine.mark_request_as_sent(&TransactionId::new(), &bob_keys).await.unwrap();
+
+        // Double-check the state of Bob
+        let bob_identity = machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap();
+        assert!(bob_identity.has_verification_violation());
+
+        // Sharing an OutboundGroupSession should fail.
+        let encryption_settings = error_on_verification_problem_encryption_settings();
+        let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
+        let share_result = collect_session_recipients(
+            machine.store(),
+            iter::once(DataSet::bob_id()),
+            &encryption_settings,
+            &group_session,
+        )
+        .await;
+
+        assert_let!(
+            Err(OlmError::SessionRecipientCollectionError(
+                SessionRecipientCollectionError::VerifiedUserChangedIdentity(violating_users)
+            )) = share_result
+        );
+        assert_eq!(violating_users, vec![DataSet::bob_id()]);
+
+        // Resolve by calling withdraw_verification
+        bob_identity.withdraw_verification().await.unwrap();
 
         collect_session_recipients(
             machine.store(),
             iter::once(DataSet::bob_id()),
+            &encryption_settings,
+            &group_session,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Test that our own identity being changed causes an error in
+    /// `collect_session_recipients`, and that it can be resolved by
+    /// withdrawing verification
+    #[async_test]
+    async fn test_own_verified_identity_changed() {
+        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+
+        // We start with a verified identity.
+        let machine = unsigned_of_verified_setup().await;
+        let own_identity = machine.get_identity(DataSet::own_id(), None).await.unwrap().unwrap();
+        assert!(own_identity.own().unwrap().is_verified());
+
+        // Another device rotates our own identity.
+        let own_keys = DataSet::own_keys_query_response_2();
+        machine.mark_request_as_sent(&TransactionId::new(), &own_keys).await.unwrap();
+
+        let own_identity = machine.get_identity(DataSet::own_id(), None).await.unwrap().unwrap();
+        assert!(!own_identity.is_verified());
+
+        // Sharing an OutboundGroupSession should fail.
+        let encryption_settings = error_on_verification_problem_encryption_settings();
+        let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
+        let share_result = collect_session_recipients(
+            machine.store(),
+            iter::once(DataSet::own_id()),
+            &encryption_settings,
+            &group_session,
+        )
+        .await;
+
+        assert_let!(
+            Err(OlmError::SessionRecipientCollectionError(
+                SessionRecipientCollectionError::VerifiedUserChangedIdentity(violating_users)
+            )) = share_result
+        );
+        assert_eq!(violating_users, vec![DataSet::own_id()]);
+
+        // Resolve by calling withdraw_verification
+        own_identity.withdraw_verification().await.unwrap();
+
+        collect_session_recipients(
+            machine.store(),
+            iter::once(DataSet::own_id()),
             &encryption_settings,
             &group_session,
         )
@@ -1136,6 +1184,70 @@ mod tests {
         .unwrap();
 
         assert!(share_result.should_rotate);
+    }
+
+    /// Common setup for tests which require a verified user to have unsigned
+    /// devices.
+    ///
+    /// Returns an `OlmMachine` which is properly configured with trusted
+    /// cross-signing keys. Also imports a set of keys for
+    /// Bob ([`PreviouslyVerifiedTestData::bob_id`]), where Bob is verified and
+    /// has 2 devices, one signed and the other not.
+    async fn unsigned_of_verified_setup() -> OlmMachine {
+        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+
+        let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
+
+        // Tell the OlmMachine about our own public keys.
+        let own_keys = DataSet::own_keys_query_response_1();
+        machine.mark_request_as_sent(&TransactionId::new(), &own_keys).await.unwrap();
+
+        // Import the secret parts of our own cross-signing keys.
+        machine
+            .import_cross_signing_keys(CrossSigningKeyExport {
+                master_key: DataSet::MASTER_KEY_PRIVATE_EXPORT.to_owned().into(),
+                self_signing_key: DataSet::SELF_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+                user_signing_key: DataSet::USER_SIGNING_KEY_PRIVATE_EXPORT.to_owned().into(),
+            })
+            .await
+            .unwrap();
+
+        // Tell the OlmMachine about Bob's keys.
+        let bob_keys = DataSet::bob_keys_query_response_signed();
+        machine.mark_request_as_sent(&TransactionId::new(), &bob_keys).await.unwrap();
+
+        // Double-check the state of Bob: he should be verified, and should have one
+        // signed and one unsigned device.
+        let bob_identity = machine.get_identity(DataSet::bob_id(), None).await.unwrap().unwrap();
+        assert!(bob_identity.other().unwrap().is_verified());
+
+        let bob_signed_device = machine
+            .get_device(DataSet::bob_id(), DataSet::bob_device_1_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bob_signed_device.is_verified());
+        assert!(bob_signed_device.device_owner_identity.is_some());
+
+        let bob_unsigned_device = machine
+            .get_device(DataSet::bob_id(), DataSet::bob_device_2_id(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!bob_unsigned_device.is_verified());
+
+        machine
+    }
+
+    /// [`EncryptionSettings`] with `error_on_verified_user_problem` set
+    fn error_on_verification_problem_encryption_settings() -> EncryptionSettings {
+        EncryptionSettings {
+            sharing_strategy: CollectStrategy::DeviceBasedStrategy {
+                only_allow_trusted_devices: false,
+                error_on_verified_user_problem: true,
+            },
+            ..Default::default()
+        }
     }
 
     /// Create an [`OutboundGroupSession`], backed by the given olm machine,

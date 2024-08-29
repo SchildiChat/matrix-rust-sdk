@@ -31,6 +31,8 @@ use url::Url;
 
 use super::{Client, ClientInner};
 #[cfg(feature = "e2e-encryption")]
+use crate::crypto::CollectStrategy;
+#[cfg(feature = "e2e-encryption")]
 use crate::encryption::EncryptionSettings;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::http_client::HttpSettings;
@@ -99,6 +101,8 @@ pub struct ClientBuilder {
     base_client: Option<BaseClient>,
     #[cfg(feature = "e2e-encryption")]
     encryption_settings: EncryptionSettings,
+    #[cfg(feature = "e2e-encryption")]
+    room_key_recipient_strategy: CollectStrategy,
 }
 
 impl ClientBuilder {
@@ -121,6 +125,8 @@ impl ClientBuilder {
             base_client: None,
             #[cfg(feature = "e2e-encryption")]
             encryption_settings: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
+            room_key_recipient_strategy: Default::default(),
         }
     }
 
@@ -234,6 +240,24 @@ impl ClientBuilder {
     ) -> Self {
         self.store_config = BuilderStoreConfig::Sqlite {
             path: path.as_ref().to_owned(),
+            cache_path: None,
+            passphrase: passphrase.map(ToOwned::to_owned),
+        };
+        self
+    }
+
+    /// Set up the store configuration for a SQLite store with cached data
+    /// separated out from state/crypto data.
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite_store_with_cache_path(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+        cache_path: impl AsRef<std::path::Path>,
+        passphrase: Option<&str>,
+    ) -> Self {
+        self.store_config = BuilderStoreConfig::Sqlite {
+            path: path.as_ref().to_owned(),
+            cache_path: Some(cache_path.as_ref().to_owned()),
             passphrase: passphrase.map(ToOwned::to_owned),
         };
         self
@@ -413,6 +437,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the strategy to be used for picking recipient devices, when sending
+    /// an encrypted message.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_room_key_recipient_strategy(mut self, strategy: CollectStrategy) -> Self {
+        self.room_key_recipient_strategy = strategy;
+        self
+    }
+
     /// Create a [`Client`] with the options set on this builder.
     ///
     /// # Errors
@@ -445,7 +477,12 @@ impl ClientBuilder {
         let base_client = if let Some(base_client) = self.base_client {
             base_client
         } else {
-            BaseClient::with_store_config(build_store_config(self.store_config).await?)
+            #[allow(unused_mut)]
+            let mut client =
+                BaseClient::with_store_config(build_store_config(self.store_config).await?);
+            #[cfg(feature = "e2e-encryption")]
+            (client.room_key_recipient_strategy = self.room_key_recipient_strategy.clone());
+            client
         };
 
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
@@ -657,10 +694,18 @@ async fn build_store_config(
     #[allow(clippy::infallible_destructuring_match)]
     let store_config = match builder_config {
         #[cfg(feature = "sqlite")]
-        BuilderStoreConfig::Sqlite { path, passphrase } => {
-            let store_config = StoreConfig::new().state_store(
-                matrix_sdk_sqlite::SqliteStateStore::open(&path, passphrase.as_deref()).await?,
-            );
+        BuilderStoreConfig::Sqlite { path, cache_path, passphrase } => {
+            let store_config = StoreConfig::new()
+                .state_store(
+                    matrix_sdk_sqlite::SqliteStateStore::open(&path, passphrase.as_deref()).await?,
+                )
+                .event_cache_store(
+                    matrix_sdk_sqlite::SqliteEventCacheStore::open(
+                        cache_path.as_ref().unwrap_or(&path),
+                        passphrase.as_deref(),
+                    )
+                    .await?,
+                );
 
             #[cfg(feature = "e2e-encryption")]
             let store_config = store_config.crypto_store(
@@ -688,17 +733,24 @@ async fn build_indexeddb_store_config(
     passphrase: Option<&str>,
 ) -> Result<StoreConfig, ClientBuildError> {
     #[cfg(feature = "e2e-encryption")]
-    {
+    let store_config = {
         let (state_store, crypto_store) =
             matrix_sdk_indexeddb::open_stores_with_name(name, passphrase).await?;
-        Ok(StoreConfig::new().state_store(state_store).crypto_store(crypto_store))
-    }
+        StoreConfig::new().state_store(state_store).crypto_store(crypto_store)
+    };
 
     #[cfg(not(feature = "e2e-encryption"))]
-    {
+    let store_config = {
         let state_store = matrix_sdk_indexeddb::open_state_store(name, passphrase).await?;
-        Ok(StoreConfig::new().state_store(state_store))
-    }
+        StoreConfig::new().state_store(state_store)
+    };
+
+    let store_config = {
+        tracing::warn!("The IndexedDB backend does not implement an event cache store, falling back to the in-memory event cache store…");
+        store_config.event_cache_store(matrix_sdk_base::event_cache_store::MemoryStore::new())
+    };
+
+    Ok(store_config)
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "indexeddb"))]
@@ -764,6 +816,7 @@ enum BuilderStoreConfig {
     #[cfg(feature = "sqlite")]
     Sqlite {
         path: std::path::PathBuf,
+        cache_path: Option<std::path::PathBuf>,
         passphrase: Option<String>,
     },
     #[cfg(feature = "indexeddb")]

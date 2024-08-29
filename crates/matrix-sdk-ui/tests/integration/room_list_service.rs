@@ -10,7 +10,7 @@ use matrix_sdk::{test_utils::logged_in_client_with_server, Client};
 use matrix_sdk_base::{
     sliding_sync::http::request::RoomSubscription, sync::UnreadNotificationsCount,
 };
-use matrix_sdk_test::async_test;
+use matrix_sdk_test::{async_test, mocks::mock_encryption_state};
 use matrix_sdk_ui::{
     room_list_service::{
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
@@ -29,10 +29,7 @@ use stream_assert::{assert_next_matches, assert_pending};
 use tokio::{spawn, sync::mpsc::channel, task::yield_now};
 use wiremock::MockServer;
 
-use crate::{
-    mock_encryption_state,
-    timeline::sliding_sync::{assert_timeline_stream, timeline_event},
-};
+use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
 
 async fn new_room_list_service() -> Result<(Client, MockServer, RoomListService), Error> {
     let (client, server) = logged_in_client_with_server().await;
@@ -2195,16 +2192,6 @@ async fn test_room_subscription() -> Result<(), Error> {
                 },
             },
             "room_subscriptions": {
-                room_id_1: {
-                    "required_state": [
-                        ["m.room.name", ""],
-                        ["m.room.topic", ""],
-                        ["m.room.avatar", ""],
-                        ["m.room.canonical_alias", ""],
-                        ["m.room.create", ""],
-                    ],
-                    "timeline_limit": 30,
-                },
                 room_id_2: {
                     "required_state": [
                         ["m.room.name", ""],

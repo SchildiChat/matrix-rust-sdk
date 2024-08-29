@@ -23,7 +23,9 @@ use matrix_sdk::{
     test_utils::{events::EventFactory, logged_in_client_with_server},
 };
 use matrix_sdk_test::{
-    async_test, sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
+    async_test,
+    mocks::{mock_encryption_state, mock_redaction},
+    sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
     SyncResponseBuilder,
 };
 use matrix_sdk_ui::timeline::{EventSendState, RoomExt, TimelineItemContent, VirtualTimelineItem};
@@ -37,7 +39,7 @@ use wiremock::{
     Mock, ResponseTemplate,
 };
 
-use crate::{mock_encryption_state, mock_sync};
+use crate::mock_sync;
 
 mod echo;
 mod edit;
@@ -46,6 +48,7 @@ mod pagination;
 mod pinned_event;
 mod profiles;
 mod queue;
+mod reactions;
 mod read_receipts;
 mod replies;
 mod subscribe;
@@ -262,14 +265,7 @@ async fn test_redact_message() {
     assert!(day_divider.is_day_divider());
 
     // Redacting a remote event works.
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/redact/.*?/.*?"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "event_id": "$42"
-        })))
-        .mount(&server)
-        .await;
+    mock_redaction(event_id!("$42")).mount(&server).await;
 
     let event_id = first.as_event().unwrap();
 

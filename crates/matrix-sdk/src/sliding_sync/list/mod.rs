@@ -94,6 +94,23 @@ impl SlidingSyncList {
         self.inner.state.read().unwrap().clone()
     }
 
+    /// Check whether this list requires a [`http::Request::timeout`] value.
+    ///
+    /// A list requires a `timeout` query if and only if we want the server to
+    /// wait on new updates, i.e. to do a long-polling. If the list has a
+    /// selective sync mode ([`SlidingSyncMode::Selective`]), we expect the
+    /// server to always wait for new updates as the list ranges are always
+    /// the same. Otherwise, if the list is fully loaded, it means the list
+    /// ranges cover all the available rooms, then we expect the server
+    /// to always wait for new updates. If the list isn't fully loaded, it
+    /// means the current list ranges may hit a set of rooms that have no
+    /// update, but we don't want to wait for updates; we instead want to
+    /// move quickly to the next range.
+    pub(super) fn requires_timeout(&self) -> bool {
+        self.inner.request_generator.read().unwrap().is_selective()
+            || self.state().is_fully_loaded()
+    }
+
     /// Get a stream of state updates.
     ///
     /// If this list has been reloaded from a cache, the initial value read from
@@ -353,14 +370,24 @@ pub enum SlidingSyncListLoadingState {
     /// Sliding Sync has not started to load anything yet.
     #[default]
     NotLoaded,
+
     /// Sliding Sync has been preloaded, i.e. restored from a cache for example.
     Preloaded,
+
     /// Updates are received from the loaded rooms, and new rooms are being
     /// fetched in the background.
     PartiallyLoaded,
+
     /// Updates are received for all the loaded rooms, and all rooms have been
     /// loaded!
     FullyLoaded,
+}
+
+impl SlidingSyncListLoadingState {
+    /// Check whether the state is [`Self::FullyLoaded`].
+    fn is_fully_loaded(&self) -> bool {
+        matches!(self, Self::FullyLoaded)
+    }
 }
 
 /// Builder for a new sliding sync list in selective mode.
@@ -498,6 +525,7 @@ impl SlidingSyncMode {
 mod tests {
     use std::{
         cell::Cell,
+        ops::Not,
         sync::{Arc, Mutex},
     };
 
@@ -580,16 +608,23 @@ mod tests {
             list = $list:ident,
             list_state = $first_list_state:ident,
             maximum_number_of_rooms = $maximum_number_of_rooms:expr,
+            requires_timeout = $initial_requires_timeout:literal,
             $(
                 next => {
                     ranges = $( $range_start:literal ..= $range_end:literal ),* ,
                     is_fully_loaded = $is_fully_loaded:expr,
                     list_state = $list_state:ident,
+                    requires_timeout = $requires_timeout:literal,
                 }
             ),*
             $(,)*
         ) => {
             assert_eq!($list.state(), SlidingSyncListLoadingState::$first_list_state, "first state");
+            assert_eq!(
+                $list.requires_timeout(),
+                $initial_requires_timeout,
+                "initial requires_timeout",
+            );
 
             $(
                 {
@@ -617,6 +652,11 @@ mod tests {
                         SlidingSyncListLoadingState::$list_state,
                         "state",
                     );
+                    assert_eq!(
+                        $list.requires_timeout(),
+                        $requires_timeout,
+                        "requires_timeout",
+                    );
                 }
             )*
         };
@@ -634,32 +674,38 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = false,
             next => {
                 ranges = 0..=9,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             next => {
                 ranges = 10..=19,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             // The maximum number of rooms is reached!
             next => {
                 ranges = 20..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=24, // the range starts at 0 now!
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
     }
@@ -676,32 +722,38 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = false,
             next => {
                 ranges = 0..=9,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             next => {
                 ranges = 10..=19,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             // The maximum number of rooms to fetch is reached!
             next => {
                 ranges = 20..=21,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=21, // the range starts at 0 now!
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=21,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
     }
@@ -718,32 +770,38 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = false,
             next => {
                 ranges = 0..=9,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             next => {
                 ranges = 0..=19,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             // The maximum number of rooms is reached!
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
     }
@@ -760,32 +818,38 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = false,
             next => {
                 ranges = 0..=9,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             next => {
                 ranges = 0..=19,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             // The maximum number of rooms is reached!
             next => {
                 ranges = 0..=21,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=21,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=21,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
     }
@@ -802,22 +866,26 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             // The maximum number of rooms is reached directly!
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             }
         };
     }
@@ -834,22 +902,26 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             // The maximum number of rooms is reached directly!
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             }
         };
 
@@ -859,10 +931,12 @@ mod tests {
             list = list,
             list_state = PartiallyLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             next => {
                 ranges = 3..=7,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
 
@@ -872,10 +946,12 @@ mod tests {
             list = list,
             list_state = PartiallyLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             next => {
                 ranges = 42..=77,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
 
@@ -885,10 +961,12 @@ mod tests {
             list = list,
             list_state = PartiallyLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             next => {
                 ranges = ,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
     }
@@ -905,22 +983,26 @@ mod tests {
             list = list,
             list_state = NotLoaded,
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             // The maximum number of rooms is reached directly!
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=10, 42..=153,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             }
         };
 
@@ -931,32 +1013,38 @@ mod tests {
             list = list,
             list_state = PartiallyLoaded, // we had some partial state, but we can't be sure it's fully loaded until the next request
             maximum_number_of_rooms = 25,
+            requires_timeout = false,
             next => {
                 ranges = 0..=9,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             next => {
                 ranges = 0..=19,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             // The maximum number of rooms is reached!
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
 
@@ -967,32 +1055,38 @@ mod tests {
             list = list,
             list_state = PartiallyLoaded, // we had some partial state, but we can't be sure it's fully loaded until the next request
             maximum_number_of_rooms = 25,
+            requires_timeout = false,
             next => {
                 ranges = 0..=9,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             next => {
                 ranges = 10..=19,
                 is_fully_loaded = false,
                 list_state = PartiallyLoaded,
+                requires_timeout = false,
             },
             // The maximum number of rooms is reached!
             next => {
                 ranges = 20..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=24, // the range starts at 0 now!
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=24,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
         };
 
@@ -1010,29 +1104,33 @@ mod tests {
             list = list,
             list_state = PartiallyLoaded, // we had some partial state, but we can't be sure it's fully loaded until the next request
             maximum_number_of_rooms = 25,
+            requires_timeout = true,
             // The maximum number of rooms is reached directly!
             next => {
                 ranges = 0..=100,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             // Now it's fully loaded, so the same request must be produced every time.
             next => {
                 ranges = 0..=100,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             },
             next => {
                 ranges = 0..=100,
                 is_fully_loaded = true,
                 list_state = FullyLoaded,
+                requires_timeout = true,
             }
         };
     }
 
     #[async_test]
     #[allow(clippy::await_holding_lock)]
-    async fn test_sliding_sync_inner_update_maximum_number_of_rooms() {
+    async fn test_inner_update_maximum_number_of_rooms() {
         let (sender, _receiver) = channel(1);
 
         let mut list = SlidingSyncList::builder("foo")
@@ -1085,11 +1183,19 @@ mod tests {
     }
 
     #[test]
-    fn test_sliding_sync_state_serialization() {
+    fn test_sliding_sync_list_loading_state_serialization() {
         assert_json_roundtrip!(from SlidingSyncListLoadingState: SlidingSyncListLoadingState::NotLoaded => json!("NotLoaded"));
         assert_json_roundtrip!(from SlidingSyncListLoadingState: SlidingSyncListLoadingState::Preloaded => json!("Preloaded"));
         assert_json_roundtrip!(from SlidingSyncListLoadingState: SlidingSyncListLoadingState::PartiallyLoaded => json!("PartiallyLoaded"));
         assert_json_roundtrip!(from SlidingSyncListLoadingState: SlidingSyncListLoadingState::FullyLoaded => json!("FullyLoaded"));
+    }
+
+    #[test]
+    fn test_sliding_sync_list_loading_state_is_fully_loaded() {
+        assert!(SlidingSyncListLoadingState::NotLoaded.is_fully_loaded().not());
+        assert!(SlidingSyncListLoadingState::Preloaded.is_fully_loaded().not());
+        assert!(SlidingSyncListLoadingState::PartiallyLoaded.is_fully_loaded().not());
+        assert!(SlidingSyncListLoadingState::FullyLoaded.is_fully_loaded());
     }
 
     #[test]

@@ -15,22 +15,15 @@
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk::test_utils::events::EventFactory;
 use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
 use matrix_sdk_test::{async_test, ALICE, BOB};
-use ruma::{
-    events::{
-        reaction::RedactedReactionEventContent,
-        room::{
-            message::{
-                AddMentions, ForwardThread, OriginalSyncRoomMessageEvent,
-                RedactedRoomMessageEventContent, RoomMessageEventContent,
-            },
-            name::RoomNameEventContent,
-        },
-        FullStateEventContent,
+use ruma::events::{
+    reaction::RedactedReactionEventContent,
+    room::{
+        message::{OriginalSyncRoomMessageEvent, RedactedRoomMessageEventContent},
+        name::RoomNameEventContent,
     },
-    owned_room_id,
+    FullStateEventContent,
 };
 use stream_assert::assert_next_matches;
 
@@ -45,7 +38,7 @@ async fn test_redact_state_event() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
-    let f = EventFactory::new();
+    let f = &timeline.factory;
 
     timeline
         .handle_live_state_event(
@@ -77,7 +70,7 @@ async fn test_redact_replied_to_event() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
-    let f = EventFactory::new();
+    let f = &timeline.factory;
 
     timeline.handle_live_event(f.text_msg("Hello, world!").sender(&ALICE)).await;
 
@@ -87,14 +80,7 @@ async fn test_redact_replied_to_event() {
         first_item.original_json().unwrap().deserialize_as().unwrap();
 
     timeline
-        .handle_live_message_event(
-            &BOB,
-            RoomMessageEventContent::text_plain("Hello, alice.").make_reply_to(
-                &first_event.into_full_event(owned_room_id!("!whocares:local.host")),
-                ForwardThread::Yes,
-                AddMentions::No,
-            ),
-        )
+        .handle_live_event(f.text_msg("Hello, alice.").sender(&BOB).reply_to(&first_event.event_id))
         .await;
 
     let second_item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -123,7 +109,7 @@ async fn test_reaction_redaction() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
-    let f = EventFactory::new();
+    let f = &timeline.factory;
 
     timeline.handle_live_event(f.text_msg("hi!").sender(&ALICE)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -149,7 +135,7 @@ async fn test_reaction_redaction_timeline_filter() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
-    let f = EventFactory::new();
+    let f = &timeline.factory;
 
     // Initialise a timeline with a redacted reaction.
     timeline
@@ -196,7 +182,7 @@ async fn test_reaction_redaction_timeline_filter() {
 async fn test_receive_unredacted() {
     let timeline = TestTimeline::new();
 
-    let f = EventFactory::new();
+    let f = &timeline.factory;
 
     // send two events, second one redacted
     timeline.handle_live_event(f.text_msg("about to be redacted").sender(&ALICE)).await;

@@ -15,17 +15,13 @@
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk::test_utils::events::EventFactory;
-use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB, CAROL};
 use ruma::{
-    assign,
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        relation::{InReplyTo, Thread},
         room::{
             member::{MembershipState, RedactedRoomMemberEventContent, RoomMemberEventContent},
-            message::{MessageType, Relation, RoomMessageEventContent},
+            message::{MessageType, RoomMessageEventContent},
             name::RoomNameEventContent,
             topic::RedactedRoomTopicEventContent,
         },
@@ -48,21 +44,11 @@ async fn test_initial_events() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
+    let f = &timeline.factory;
     timeline
         .inner
         .add_events_at(
-            vec![
-                SyncTimelineEvent::new(
-                    timeline
-                        .event_builder
-                        .make_sync_message_event(*ALICE, RoomMessageEventContent::text_plain("A")),
-                ),
-                SyncTimelineEvent::new(
-                    timeline
-                        .event_builder
-                        .make_sync_message_event(*BOB, RoomMessageEventContent::text_plain("B")),
-                ),
-            ],
+            vec![f.text_msg("A").sender(*ALICE), f.text_msg("B").sender(*BOB)],
             TimelineEnd::Back,
             RemoteEventOrigin::Sync,
         )
@@ -100,8 +86,8 @@ async fn test_replace_with_initial_events_and_read_marker() {
     )
     .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
 
-    let factory = EventFactory::new();
-    let ev = factory.text_msg("hey").sender(*ALICE).into_sync();
+    let f = &timeline.factory;
+    let ev = f.text_msg("hey").sender(*ALICE).into_sync();
 
     timeline.inner.add_events_at(vec![ev], TimelineEnd::Back, RemoteEventOrigin::Sync).await;
 
@@ -110,7 +96,7 @@ async fn test_replace_with_initial_events_and_read_marker() {
     assert!(items[0].is_day_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "hey");
 
-    let ev = factory.text_msg("yo").sender(*BOB).into_sync();
+    let ev = f.text_msg("yo").sender(*BOB).into_sync();
     timeline.inner.replace_with_initial_remote_events(vec![ev], RemoteEventOrigin::Sync).await;
 
     let items = timeline.inner.items().await;
@@ -311,10 +297,10 @@ async fn test_dedup_pagination() {
 async fn test_dedup_initial() {
     let timeline = TestTimeline::new();
 
-    let factory = EventFactory::new();
-    let event_a = factory.text_msg("A").sender(*ALICE).into_sync();
-    let event_b = factory.text_msg("B").sender(*BOB).into_sync();
-    let event_c = factory.text_msg("C").sender(*CAROL).into_sync();
+    let f = &timeline.factory;
+    let event_a = f.text_msg("A").sender(*ALICE).into_sync();
+    let event_b = f.text_msg("B").sender(*BOB).into_sync();
+    let event_c = f.text_msg("C").sender(*CAROL).into_sync();
 
     timeline
         .inner
@@ -359,10 +345,10 @@ async fn test_dedup_initial() {
 async fn test_internal_id_prefix() {
     let timeline = TestTimeline::with_internal_id_prefix("le_prefix_".to_owned());
 
-    let factory = EventFactory::new();
-    let ev_a = factory.text_msg("A").sender(*ALICE).into_sync();
-    let ev_b = factory.text_msg("B").sender(*BOB).into_sync();
-    let ev_c = factory.text_msg("C").sender(*CAROL).into_sync();
+    let f = &timeline.factory;
+    let ev_a = f.text_msg("A").sender(*ALICE).into_sync();
+    let ev_b = f.text_msg("B").sender(*BOB).into_sync();
+    let ev_c = f.text_msg("C").sender(*CAROL).into_sync();
 
     timeline
         .inner
@@ -393,10 +379,11 @@ async fn test_sanitized() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
+    let f = &timeline.factory;
+
     timeline
-        .handle_live_message_event(
-            &ALICE,
-            RoomMessageEventContent::text_html(
+        .handle_live_event(
+            f.text_html(
                 "\
                     @@Unknown text@@
                     Some text\n\n\
@@ -409,7 +396,8 @@ async fn test_sanitized() {
                     <p>Some text</p>\
                     <code unknown=\"code\">Some code</code>\
                 ",
-            ),
+            )
+            .sender(&ALICE),
         )
         .await;
 
@@ -435,12 +423,8 @@ async fn test_reply() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
-    timeline
-        .handle_live_message_event(
-            &ALICE,
-            RoomMessageEventContent::text_plain("I want you to reply"),
-        )
-        .await;
+    let f = &timeline.factory;
+    timeline.handle_live_event(f.text_msg("I want you to reply").sender(&ALICE)).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
@@ -466,13 +450,12 @@ async fn test_reply() {
         "> <{first_event_sender}> I want you to reply\n\
          I'm replying!"
     );
-    let reply = assign!(RoomMessageEventContent::text_html(reply_plain, reply_formatted_body), {
-        relates_to: Some(Relation::Reply {
-            in_reply_to: InReplyTo::new(first_event_id.to_owned()),
-        }),
-    });
 
-    timeline.handle_live_message_event(&BOB, reply).await;
+    timeline
+        .handle_live_event(
+            f.text_html(reply_plain, reply_formatted_body).reply_to(first_event_id).sender(&BOB),
+        )
+        .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());
@@ -492,12 +475,8 @@ async fn test_thread() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
-    timeline
-        .handle_live_message_event(
-            &ALICE,
-            RoomMessageEventContent::text_plain("I want you to reply"),
-        )
-        .await;
+    let f = &timeline.factory;
+    timeline.handle_live_event(f.text_msg("I want you to reply").sender(&ALICE)).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
@@ -506,13 +485,13 @@ async fn test_thread() {
     let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert!(day_divider.is_day_divider());
 
-    let reply = assign!(RoomMessageEventContent::text_plain("I'm replying in a thread"), {
-        relates_to: Some(Relation::Thread(
-            Thread::plain(first_event_id.to_owned(), first_event_id.to_owned()),
-        ))
-    });
-
-    timeline.handle_live_message_event(&BOB, reply).await;
+    timeline
+        .handle_live_event(
+            f.text_msg("I'm replying in a thread")
+                .sender(&BOB)
+                .in_thread(first_event_id, first_event_id),
+        )
+        .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());

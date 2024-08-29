@@ -16,7 +16,7 @@ use std::{io, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
-use matrix_sdk::{test_utils::events::EventFactory, Error};
+use matrix_sdk::{send_queue::RoomSendQueueUpdate, test_utils::events::EventFactory, Error};
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
 use ruma::{
     event_id,
@@ -131,6 +131,7 @@ async fn test_remote_echo_full_trip() {
 async fn test_remote_echo_new_position() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
+    let f = &timeline.factory;
 
     // Given a local event…
     let txn_id = timeline
@@ -147,7 +148,7 @@ async fn test_remote_echo_new_position() {
     assert!(day_divider.is_day_divider());
 
     // … and another event that comes back before the remote echo
-    timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("test")).await;
+    timeline.handle_live_event(f.text_msg("test").sender(&BOB)).await;
 
     // … and is inserted before the local echo item
     let bob_message = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
@@ -187,8 +188,9 @@ async fn test_day_divider_duplication() {
     let timeline = TestTimeline::new();
 
     // Given two remote events from one day, and a local event from another day…
-    timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("A")).await;
-    timeline.handle_live_message_event(&BOB, RoomMessageEventContent::text_plain("B")).await;
+    let f = EventFactory::new().sender(&BOB);
+    timeline.handle_live_event(f.text_msg("A")).await;
+    timeline.handle_live_event(f.text_msg("B")).await;
     timeline
         .handle_local_event(AnyMessageLikeEventContent::RoomMessage(
             RoomMessageEventContent::text_plain("C"),
@@ -232,7 +234,7 @@ async fn test_day_divider_duplication() {
 async fn test_day_divider_removed_after_local_echo_disappeared() {
     let timeline = TestTimeline::new();
 
-    let f = EventFactory::new();
+    let f = &timeline.factory;
 
     timeline
         .handle_live_event(
@@ -264,11 +266,9 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
 
     // Cancel the local echo.
     timeline
-        .handle_room_send_queue_update(
-            matrix_sdk::send_queue::RoomSendQueueUpdate::CancelledLocalEvent {
-                transaction_id: txn_id,
-            },
-        )
+        .handle_room_send_queue_update(RoomSendQueueUpdate::CancelledLocalEvent {
+            transaction_id: txn_id,
+        })
         .await;
 
     let items = timeline.inner.items().await;
@@ -280,14 +280,14 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
 
 #[async_test]
 async fn test_read_marker_removed_after_local_echo_disappeared() {
-    let f = EventFactory::new();
-
     let event_id = event_id!("$1");
 
     let timeline = TestTimeline::with_room_data_provider(
         TestRoomDataProvider::default().with_fully_read_marker(event_id.to_owned()),
     )
     .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
+
+    let f = &timeline.factory;
 
     // Use `replace_with_initial_remote_events` which initializes the read marker;
     // other methods don't, by default.
@@ -326,11 +326,9 @@ async fn test_read_marker_removed_after_local_echo_disappeared() {
 
     // Cancel the local echo.
     timeline
-        .handle_room_send_queue_update(
-            matrix_sdk::send_queue::RoomSendQueueUpdate::CancelledLocalEvent {
-                transaction_id: txn_id,
-            },
-        )
+        .handle_room_send_queue_update(RoomSendQueueUpdate::CancelledLocalEvent {
+            transaction_id: txn_id,
+        })
         .await;
 
     let items = timeline.inner.items().await;

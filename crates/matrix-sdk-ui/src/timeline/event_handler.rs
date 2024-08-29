@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use as_variant::as_variant;
 use eyeball_im::{ObservableVectorTransaction, ObservableVectorTransactionEntry};
 use indexmap::IndexMap;
 use matrix_sdk::{
@@ -43,8 +42,7 @@ use ruma::{
     },
     html::RemoveReplyFallback,
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    RoomVersionId,
+    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId,
 };
 use tracing::{debug, error, field::debug, info, instrument, trace, warn};
 
@@ -64,12 +62,15 @@ use super::{
 };
 use crate::{
     events::SyncTimelineEventWithoutContent,
-    timeline::{event_item::ReactionInfo, reactions::PendingReaction, traits::RoomDataProvider},
+    timeline::{
+        event_item::{ReactionInfo, ReactionStatus},
+        reactions::PendingReaction,
+        traits::RoomDataProvider,
+    },
     DEFAULT_SANITIZER_MODE,
 };
 
 /// When adding an event, useful information related to the source of the event.
-#[derive(Clone)]
 pub(super) enum Flow {
     /// The event was locally created.
     Local {
@@ -99,7 +100,6 @@ pub(super) enum Flow {
     },
 }
 
-#[derive(Clone)]
 pub(super) struct TimelineEventContext {
     pub(super) sender: OwnedUserId,
     pub(super) sender_profile: Option<Profile>,
@@ -126,9 +126,6 @@ pub(super) enum TimelineEventKind {
     /// We're redacting a remote event that we may or may not know about (i.e.
     /// the redacted event *may* have a corresponding timeline item).
     Redaction { redacts: OwnedEventId },
-
-    /// A redaction of a local echo.
-    LocalRedaction { redacts: OwnedTransactionId },
 
     /// A timeline event for a room membership update.
     RoomMember {
@@ -349,6 +346,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                         let can_add_to_live = match self.live_timeline_updates_type {
                             LiveTimelineUpdatesAllowed::PinnedEvents => {
                                 room_data_provider.is_pinned_event(event_id)
+                                    || room_data_provider
+                                        .is_replacement_for_pinned_event(&event_kind)
                             }
                             LiveTimelineUpdatesAllowed::All => true,
                             LiveTimelineUpdatesAllowed::None => false,
@@ -444,9 +443,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             TimelineEventKind::Redaction { redacts } => {
                 self.handle_redaction(redacts);
             }
-            TimelineEventKind::LocalRedaction { redacts } => {
-                self.handle_reaction_redaction(TimelineEventItemId::TransactionId(redacts));
-            }
 
             TimelineEventKind::RoomMember { user_id, content, sender } => {
                 if should_add {
@@ -508,47 +504,57 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         &mut self,
         replacement: Replacement<RoomMessageEventContentWithoutRelation>,
     ) {
-        let found = self.update_timeline_item(&replacement.event_id, |this, event_item| {
-            if this.ctx.sender != event_item.sender() {
-                info!(
-                    original_sender = ?event_item.sender(), edit_sender = ?this.ctx.sender,
-                    "Edit event applies to another user's timeline item, discarding"
-                );
-                return None;
-            }
+        let Some((item_pos, item)) = rfind_event_by_id(self.items, &replacement.event_id) else {
+            debug!("Timeline item not found, discarding edit");
+            return;
+        };
 
-            let TimelineItemContent::Message(msg) = event_item.content() else {
-                info!(
-                    "Edit of message event applies to {:?}, discarding",
-                    event_item.content().debug_string(),
-                );
-                return None;
-            };
+        if self.ctx.sender != item.sender() {
+            info!(
+                original_sender = ?item.sender(), edit_sender = ?self.ctx.sender,
+                "Edit event applies to another user's timeline item, discarding"
+            );
+            return;
+        }
 
-            let mut msgtype = replacement.new_content.msgtype;
-            // Edit's content is never supposed to contain the reply fallback.
-            msgtype.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::No);
+        let TimelineItemContent::Message(msg) = item.content() else {
+            info!(
+                "Edit of message event applies to {:?}, discarding",
+                item.content().debug_string(),
+            );
+            return;
+        };
 
-            let new_content = TimelineItemContent::Message(Message {
-                msgtype,
-                in_reply_to: msg.in_reply_to.clone(),
-                thread_root: msg.thread_root.clone(),
-                edited: true,
-                mentions: replacement.new_content.mentions,
-            });
+        let mut msgtype = replacement.new_content.msgtype;
+        // Edit's content is never supposed to contain the reply fallback.
+        msgtype.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::No);
 
-            let edit_json = match &this.ctx.flow {
-                Flow::Local { .. } => None,
-                Flow::Remote { raw_event, .. } => Some(raw_event.clone()),
-            };
-
-            trace!("Applying edit");
-            Some(event_item.with_content(new_content, edit_json))
+        let new_content = TimelineItemContent::Message(Message {
+            msgtype,
+            in_reply_to: msg.in_reply_to.clone(),
+            thread_root: msg.thread_root.clone(),
+            edited: true,
+            mentions: replacement.new_content.mentions,
         });
 
-        if !found {
-            debug!("Timeline item not found, discarding edit");
+        let edit_json = match &self.ctx.flow {
+            Flow::Local { .. } => None,
+            Flow::Remote { raw_event, .. } => Some(raw_event.clone()),
+        };
+
+        let mut new_item = item.with_content(new_content, edit_json);
+
+        if let EventTimelineItemKind::Remote(remote_event) = &item.kind {
+            if let Flow::Remote { encryption_info, .. } = &self.ctx.flow {
+                new_item = new_item.with_kind(EventTimelineItemKind::Remote(
+                    remote_event.with_encryption_info(encryption_info.clone()),
+                ));
+            }
         }
+
+        trace!("Applying edit");
+        self.items.set(item_pos, TimelineItem::new(new_item, item.internal_id.to_owned()));
+        self.result.items_updated += 1;
     }
 
     // Redacted reaction events are no-ops so don't need to be handled
@@ -556,12 +562,12 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     fn handle_reaction(&mut self, c: ReactionEventContent) {
         let reacted_to_event_id = &c.relates_to.event_id;
 
-        let (reaction_id, old_txn_id) = match &self.ctx.flow {
-            Flow::Local { txn_id, .. } => {
-                (TimelineEventItemId::TransactionId(txn_id.clone()), None)
+        let (reaction_id, send_handle, old_txn_id) = match &self.ctx.flow {
+            Flow::Local { txn_id, send_handle, .. } => {
+                (TimelineEventItemId::TransactionId(txn_id.clone()), send_handle.clone(), None)
             }
             Flow::Remote { event_id, txn_id, .. } => {
-                (TimelineEventItemId::EventId(event_id.clone()), txn_id.as_ref())
+                (TimelineEventItemId::EventId(event_id.clone()), None, txn_id.as_ref())
             }
         };
 
@@ -577,17 +583,27 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 return;
             }
 
-            // Add the reaction to event item's bundled reactions.
+            trace!("Added reaction");
+
+            // Add the reaction to the event item's bundled reactions.
             let mut reactions = remote_event_item.reactions.clone();
 
             reactions.entry(c.relates_to.key.clone()).or_default().insert(
                 self.ctx.sender.clone(),
-                ReactionInfo { timestamp: self.ctx.timestamp, id: reaction_id.clone() },
+                ReactionInfo {
+                    timestamp: self.ctx.timestamp,
+                    status: match &reaction_id {
+                        TimelineEventItemId::TransactionId(_txn_id) => {
+                            ReactionStatus::LocalToRemote(send_handle)
+                        }
+                        TimelineEventItemId::EventId(event_id) => {
+                            ReactionStatus::RemoteToRemote(event_id.clone())
+                        }
+                    },
+                },
             );
 
-            trace!("Adding reaction");
-            self.items
-                .set(idx, event_item.with_inner_kind(remote_event_item.with_reactions(reactions)));
+            self.items.set(idx, event_item.with_reactions(reactions));
 
             self.result.items_updated += 1;
         } else {
@@ -630,51 +646,54 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         &mut self,
         replacement: Replacement<NewUnstablePollStartEventContentWithoutRelation>,
     ) {
-        let found = self.update_timeline_item(&replacement.event_id, |this, event_item| {
-            if this.ctx.sender != event_item.sender() {
-                info!(
-                    original_sender = ?event_item.sender(), edit_sender = ?this.ctx.sender,
-                    "Edit event applies to another user's timeline item, discarding"
-                );
-                return None;
-            }
-
-            let TimelineItemContent::Poll(poll_state) = &event_item.content() else {
-                info!(
-                    "Edit of poll event applies to {}, discarding",
-                    event_item.content().debug_string(),
-                );
-                return None;
-            };
-
-            let new_content = match poll_state.edit(&replacement.new_content) {
-                Ok(edited_poll_state) => TimelineItemContent::Poll(edited_poll_state),
-                Err(e) => {
-                    info!("Failed to apply poll edit: {e:?}");
-                    return None;
-                }
-            };
-
-            let edit_json = match &this.ctx.flow {
-                Flow::Local { .. } => None,
-                Flow::Remote { raw_event, .. } => Some(raw_event.clone()),
-            };
-
-            trace!("Applying edit");
-            Some(event_item.with_content(new_content, edit_json))
-        });
-
-        if !found {
+        let Some((item_pos, item)) = rfind_event_by_id(self.items, &replacement.event_id) else {
             debug!("Timeline item not found, discarding poll edit");
+            return;
+        };
+
+        if self.ctx.sender != item.sender() {
+            info!(
+                original_sender = ?item.sender(), edit_sender = ?self.ctx.sender,
+                "Edit event applies to another user's timeline item, discarding"
+            );
+            return;
         }
+
+        let TimelineItemContent::Poll(poll_state) = &item.content() else {
+            info!("Edit of poll event applies to {}, discarding", item.content().debug_string(),);
+            return;
+        };
+
+        let new_content = match poll_state.edit(&replacement.new_content) {
+            Ok(edited_poll_state) => TimelineItemContent::Poll(edited_poll_state),
+            Err(e) => {
+                info!("Failed to apply poll edit: {e:?}");
+                return;
+            }
+        };
+
+        let edit_json = match &self.ctx.flow {
+            Flow::Local { .. } => None,
+            Flow::Remote { raw_event, .. } => Some(raw_event.clone()),
+        };
+
+        trace!("Applying poll start edit.");
+        self.items.set(
+            item_pos,
+            TimelineItem::new(
+                item.with_content(new_content, edit_json),
+                item.internal_id.to_owned(),
+            ),
+        );
+        self.result.items_updated += 1;
     }
 
     fn handle_poll_start(&mut self, c: NewUnstablePollStartEventContent, should_add: bool) {
         let mut poll_state = PollState::new(c);
-        if let Flow::Remote { event_id, .. } = self.ctx.flow.clone() {
+        if let Flow::Remote { event_id, .. } = &self.ctx.flow {
             // Applying the cache to remote events only because local echoes
             // don't have an event ID that could be referenced by responses yet.
-            self.meta.poll_pending_events.apply(&event_id, &mut poll_state);
+            self.meta.poll_pending_events.apply(event_id, &mut poll_state);
         }
 
         if should_add {
@@ -683,44 +702,55 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     }
 
     fn handle_poll_response(&mut self, c: UnstablePollResponseEventContent) {
-        let found = self.update_timeline_item(&c.relates_to.event_id, |this, event_item| {
-            let poll_state = as_variant!(event_item.content(), TimelineItemContent::Poll)?;
-            Some(event_item.with_content(
-                TimelineItemContent::Poll(poll_state.add_response(
-                    &this.ctx.sender,
-                    this.ctx.timestamp,
-                    &c,
-                )),
-                None,
-            ))
-        });
-
-        if !found {
+        let Some((item_pos, item)) = rfind_event_by_id(self.items, &c.relates_to.event_id) else {
             self.meta.poll_pending_events.add_response(
                 &c.relates_to.event_id,
                 &self.ctx.sender,
                 self.ctx.timestamp,
                 &c,
             );
-        }
+            return;
+        };
+
+        let TimelineItemContent::Poll(poll_state) = item.content() else {
+            return;
+        };
+
+        let new_item = item.with_content(
+            TimelineItemContent::Poll(poll_state.add_response(
+                &self.ctx.sender,
+                self.ctx.timestamp,
+                &c,
+            )),
+            None,
+        );
+
+        trace!("Adding poll response.");
+        self.items.set(item_pos, TimelineItem::new(new_item, item.internal_id.to_owned()));
+        self.result.items_updated += 1;
     }
 
     fn handle_poll_end(&mut self, c: UnstablePollEndEventContent) {
-        let found = self.update_timeline_item(&c.relates_to.event_id, |this, event_item| {
-            let poll_state = as_variant!(event_item.content(), TimelineItemContent::Poll)?;
-            match poll_state.end(this.ctx.timestamp) {
-                Ok(poll_state) => {
-                    Some(event_item.with_content(TimelineItemContent::Poll(poll_state), None))
-                }
-                Err(_) => {
-                    info!("Got multiple poll end events, discarding");
-                    None
-                }
-            }
-        });
-
-        if !found {
+        let Some((item_pos, item)) = rfind_event_by_id(self.items, &c.relates_to.event_id) else {
             self.meta.poll_pending_events.add_end(&c.relates_to.event_id, self.ctx.timestamp);
+            return;
+        };
+
+        let TimelineItemContent::Poll(poll_state) = item.content() else {
+            return;
+        };
+
+        match poll_state.end(self.ctx.timestamp) {
+            Ok(poll_state) => {
+                let new_item = item.with_content(TimelineItemContent::Poll(poll_state), None);
+
+                trace!("Ending poll.");
+                self.items.set(item_pos, TimelineItem::new(new_item, item.internal_id.to_owned()));
+                self.result.items_updated += 1;
+            }
+            Err(_) => {
+                info!("Got multiple poll end events, discarding");
+            }
         }
     }
 
@@ -745,28 +775,21 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         }
 
         // General path: redact another kind of (non-reaction) event.
-        let found_redacted_event = self.update_timeline_item(&redacted, |this, event_item| {
-            if event_item.as_remote().is_none() {
+        if let Some((idx, item)) = rfind_event_by_id(self.items, &redacted) {
+            if item.as_remote().is_some() {
+                if let TimelineItemContent::RedactedMessage = &item.content {
+                    debug!("event item is already redacted");
+                } else {
+                    let new_item = item.redact(&self.meta.room_version);
+                    self.items.set(idx, TimelineItem::new(new_item, item.internal_id.to_owned()));
+                    self.result.items_updated += 1;
+                }
+            } else {
                 error!("inconsistent state: redaction received on a non-remote event item");
-                return None;
             }
-
-            if let TimelineItemContent::RedactedMessage = &event_item.content {
-                debug!("event item is already redacted");
-                return None;
-            }
-
-            Some(event_item.redact(&this.meta.room_version))
-        });
-
-        if !found_redacted_event {
+        } else {
             debug!("Timeline item not found, discarding redaction");
-        }
-
-        if self.result.items_updated == 0 {
-            // We will want to know this when debugging redaction issues.
-            debug!("redaction affected no event");
-        }
+        };
 
         // Look for any timeline event that's a reply to the redacted event, and redact
         // the replied-to event there as well.
@@ -800,54 +823,38 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             sender,
         }) = self.meta.reactions.map.remove(&reaction_id)
         {
-            let updated_event =
-                self.update_timeline_item(&reacted_to_event_id, |_this, event_item| {
-                    let Some(remote_event_item) = event_item.as_remote() else {
-                        error!("inconsistent state: redaction received on a non-remote event item");
-                        return None;
-                    };
-
-                    let mut reactions = remote_event_item.reactions.clone();
-
-                    if let Some(by_sender) = reactions.get_mut(&key) {
-                        if by_sender.swap_remove(&sender).is_none() {
-                            warn!("Tried to redact a reaction that wasn't sent by this sender");
-                        }
-
-                        // Remove the reaction group if this was the last reaction.
-                        if by_sender.is_empty() {
-                            reactions.swap_remove(&key);
-                        }
-                    } else {
-                        warn!(
-                            "Tried to redact a reaction for a key not present in the reaction list"
-                        );
-                    }
-
-                    trace!("Removing reaction");
-                    Some(event_item.with_kind(remote_event_item.with_reactions(reactions)))
-                });
-
-            if !updated_event {
+            let Some((item_pos, item)) = rfind_event_by_id(self.items, &reacted_to_event_id) else {
+                // The remote event wasn't in the timeline.
                 if let TimelineEventItemId::EventId(event_id) = reaction_id {
-                    // If the remote event wasn't in the timeline, remove any possibly pending
-                    // reactions to that event, as this redaction would affect them.
+                    // Remove any possibly pending reactions to that event, as this redaction would
+                    // affect them.
                     if let Some(reactions) =
                         self.meta.reactions.pending.get_mut(&reacted_to_event_id)
                     {
                         reactions.swap_remove(&event_id);
                     }
                 }
+
+                // We haven't redacted the reaction.
+                return false;
+            };
+
+            let Some(remote_event_item) = item.as_remote() else {
+                error!("inconsistent state: redaction received on a non-remote event item");
+                return false;
+            };
+
+            let mut reactions = remote_event_item.reactions.clone();
+            if reactions.remove_reaction(&sender, &key).is_some() {
+                trace!("Removing reaction");
+                let new_item = item.with_kind(remote_event_item.with_reactions(reactions));
+                self.items.set(item_pos, TimelineItem::new(new_item, item.internal_id.to_owned()));
+                self.result.items_updated += 1;
+                return true;
             }
-
-            return updated_event;
         }
 
-        if self.result.items_updated == 0 {
-            // We will want to know this when debugging redaction issues.
-            error!("redaction affected no event");
-        }
-
+        warn!("Reaction to redact was missing from the reaction or user map");
         false
     }
 
@@ -1049,7 +1056,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             Flow::Local { .. } => None,
             Flow::Remote { event_id, .. } => {
                 let reactions = self.meta.reactions.pending.remove(event_id)?;
-                let mut bundled = IndexMap::new();
+                let mut bundled = ReactionsByKeyBySender::default();
 
                 for (reaction_event_id, reaction) in reactions {
                     let group: &mut IndexMap<OwnedUserId, ReactionInfo> =
@@ -1059,35 +1066,13 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                         reaction.sender_id,
                         ReactionInfo {
                             timestamp: reaction.timestamp,
-                            id: TimelineEventItemId::EventId(reaction_event_id),
+                            status: ReactionStatus::RemoteToRemote(reaction_event_id),
                         },
                     );
                 }
 
                 Some(bundled)
             }
-        }
-    }
-
-    /// Updates the given timeline item.
-    ///
-    /// Returns true iff the item has been found (not necessarily updated),
-    /// false if it's not been found.
-    fn update_timeline_item(
-        &mut self,
-        event_id: &EventId,
-        update: impl FnOnce(&Self, &EventTimelineItem) -> Option<EventTimelineItem>,
-    ) -> bool {
-        if let Some((idx, item)) = rfind_event_by_id(self.items, event_id) {
-            trace!("Found timeline item to update");
-            if let Some(new_item) = update(self, item.inner) {
-                trace!("Updating item");
-                self.items.set(idx, TimelineItem::new(new_item, item.internal_id.to_owned()));
-                self.result.items_updated += 1;
-            }
-            true
-        } else {
-            false
         }
     }
 }

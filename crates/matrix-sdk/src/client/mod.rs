@@ -33,12 +33,12 @@ use imbl::Vector;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
+    event_cache_store::DynEventCacheStore,
     store::{DynStateStore, ServerCapabilities},
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
-use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -65,6 +65,7 @@ use ruma::{
     },
     assign,
     push::Ruleset,
+    time::Instant,
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
     RoomOrAliasId, ServerName, UInt, UserId,
 };
@@ -571,6 +572,11 @@ impl Client {
     /// Get a reference to the state store.
     pub fn store(&self) -> &DynStateStore {
         self.base_client().store()
+    }
+
+    /// Get a reference to the event cache store.
+    pub(crate) fn event_cache_store(&self) -> &DynEventCacheStore {
+        self.base_client().event_cache_store()
     }
 
     /// Access the native Matrix authentication API with this client.

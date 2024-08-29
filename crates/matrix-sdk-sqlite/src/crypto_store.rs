@@ -151,16 +151,20 @@ impl SqliteCryptoStore {
         Ok(rmp_serde::from_slice(&decoded)?)
     }
 
-    fn deserialize_pickled_inbound_group_session(
+    fn deserialize_and_unpickle_inbound_group_session(
         &self,
-        value: &[u8],
+        value: Vec<u8>,
         backed_up: bool,
-    ) -> Result<PickledInboundGroupSession> {
-        let mut pickle: PickledInboundGroupSession = self.deserialize_value(value)?;
-        // backed_up SQL column is source of truth, backed_up field in pickle
-        // needed for other stores though
+    ) -> Result<InboundGroupSession> {
+        let mut pickle: PickledInboundGroupSession = self.deserialize_value(&value)?;
+
+        // The `backed_up` SQL column is the source of truth, because we update it
+        // inside `mark_inbound_group_sessions_as_backed_up` and don't update
+        // the pickled value inside the `data` column (until now, when we are puling it
+        // out of the DB).
         pickle.backed_up = backed_up;
-        Ok(pickle)
+
+        Ok(InboundGroupSession::from_pickle(pickle)?)
     }
 
     fn deserialize_key_request(&self, value: &[u8], sent_out: bool) -> Result<GossipRequest> {
@@ -452,12 +456,12 @@ trait SqliteObjectCryptoStoreExt: SqliteObjectExt {
     async fn get_inbound_group_session(
         &self,
         session_id: Key,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Option<(Vec<u8>, Vec<u8>, bool)>> {
         Ok(self
             .query_row(
-                "SELECT room_id, data FROM inbound_group_session WHERE session_id = ?",
+                "SELECT room_id, data, backed_up FROM inbound_group_session WHERE session_id = ?",
                 (session_id,),
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .await
             .optional()?)
@@ -919,7 +923,7 @@ impl CryptoStore for SqliteCryptoStore {
         session_id: &str,
     ) -> Result<Option<InboundGroupSession>> {
         let session_id = self.encode_key("inbound_group_session", session_id);
-        let Some((room_id_from_db, value)) =
+        let Some((room_id_from_db, value, backed_up)) =
             self.acquire().await?.get_inbound_group_session(session_id).await?
         else {
             return Ok(None);
@@ -931,9 +935,7 @@ impl CryptoStore for SqliteCryptoStore {
             return Ok(None);
         }
 
-        let pickle = self.deserialize_value(&value)?;
-
-        Ok(Some(InboundGroupSession::from_pickle(pickle)?))
+        Ok(Some(self.deserialize_and_unpickle_inbound_group_session(value, backed_up)?))
     }
 
     async fn get_inbound_group_sessions(&self) -> Result<Vec<InboundGroupSession>> {
@@ -943,8 +945,7 @@ impl CryptoStore for SqliteCryptoStore {
             .await?
             .into_iter()
             .map(|(value, backed_up)| {
-                let pickle = self.deserialize_pickled_inbound_group_session(&value, backed_up)?;
-                Ok(InboundGroupSession::from_pickle(pickle)?)
+                self.deserialize_and_unpickle_inbound_group_session(value, backed_up)
             })
             .collect()
     }
@@ -966,10 +967,7 @@ impl CryptoStore for SqliteCryptoStore {
             .get_inbound_group_sessions_for_backup(limit)
             .await?
             .into_iter()
-            .map(|value| {
-                let pickle = self.deserialize_pickled_inbound_group_session(&value, false)?;
-                Ok(InboundGroupSession::from_pickle(pickle)?)
-            })
+            .map(|value| self.deserialize_and_unpickle_inbound_group_session(value, false))
             .collect()
     }
 
