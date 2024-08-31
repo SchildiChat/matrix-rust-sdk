@@ -986,7 +986,6 @@ impl BaseClient {
                     &mut ambiguity_cache,
                 )
                 .await?;
-            // TODO...?
 
             for raw in &new_info.ephemeral.events {
                 match raw.deserialize() {

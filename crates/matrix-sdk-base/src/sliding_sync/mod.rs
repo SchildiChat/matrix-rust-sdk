@@ -376,7 +376,7 @@ impl BaseClient {
         // Find or create the room in the store
         let is_new_room = !store.room_exists(room_id);
 
-        let is_space = state_events.iter().find(|ev| if let AnySyncStateEvent::RoomCreate(_) = ev { true } else { false })
+        let is_space = state_events.iter().find(|ev| matches!(ev, AnySyncStateEvent::RoomCreate { .. }))
             .and_then(|ev|
                 if let ruma::events::AnyFullStateEventContent::RoomCreate(ruma::events::FullStateEventContent::Original { content, .. }) = ev.content() {
                     content.room_type.map(|t| t == ruma::room::RoomType::Space)
