@@ -205,9 +205,9 @@ impl Store {
 
                 // SC: Also insert into spaces list
                 if Some(ruma::room::RoomType::Space) == new_room.room_type() {
-                     spaces.insert(new_room_id.clone(), new_room.clone());
+                    spaces.insert(new_room_id.clone(), new_room.clone());
                 } else {
-                     non_spaces.insert(new_room_id.clone(), new_room.clone());
+                    non_spaces.insert(new_room_id.clone(), new_room.clone());
                 }
 
                 rooms.insert(new_room_id, new_room);
@@ -273,6 +273,7 @@ impl Store {
         room_id: &RoomId,
         room_type: RoomState,
         room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
+        is_space: Option<bool>,
     ) -> Room {
         let user_id =
             &self.session_meta.get().expect("Creating room while not being logged in").user_id;
@@ -290,7 +291,7 @@ impl Store {
                 )
             })
             .clone();
-        if result.room_type() == Some(ruma::room::RoomType::Space) {
+        if is_space == Some(true) || (is_space == None && result.room_type() == Some(ruma::room::RoomType::Space)) {
             self.spaces.write().unwrap().get_or_create(room_id, || result.clone());
         } else {
             self.non_spaces.write().unwrap().get_or_create(room_id, || result.clone());

@@ -212,6 +212,7 @@ impl BaseClient {
             room_id,
             room_state,
             self.room_info_notable_update_sender.clone(),
+            None,
         )
     }
 
@@ -854,6 +855,7 @@ impl BaseClient {
             room_id,
             RoomState::Joined,
             self.room_info_notable_update_sender.clone(),
+            None,
         );
 
         if room.state() != RoomState::Joined {
@@ -880,6 +882,7 @@ impl BaseClient {
             room_id,
             RoomState::Left,
             self.room_info_notable_update_sender.clone(),
+            None,
         );
 
         if room.state() != RoomState::Left {
@@ -960,6 +963,7 @@ impl BaseClient {
                 &room_id,
                 RoomState::Joined,
                 self.room_info_notable_update_sender.clone(),
+                None,
             );
 
             let mut room_info = room.clone_info();
@@ -982,6 +986,7 @@ impl BaseClient {
                     &mut ambiguity_cache,
                 )
                 .await?;
+            // TODO...?
 
             for raw in &new_info.ephemeral.events {
                 match raw.deserialize() {
@@ -1081,6 +1086,7 @@ impl BaseClient {
                 &room_id,
                 RoomState::Left,
                 self.room_info_notable_update_sender.clone(),
+                None,
             );
 
             let mut room_info = room.clone_info();
@@ -1145,6 +1151,7 @@ impl BaseClient {
                 &room_id,
                 RoomState::Invited,
                 self.room_info_notable_update_sender.clone(),
+                None,
             );
 
             let mut room_info = room.clone_info();

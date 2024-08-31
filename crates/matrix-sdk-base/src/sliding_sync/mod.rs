@@ -376,6 +376,15 @@ impl BaseClient {
         // Find or create the room in the store
         let is_new_room = !store.room_exists(room_id);
 
+        let is_space = state_events.iter().find(|ev| if let AnySyncStateEvent::RoomCreate(_) = ev { true } else { false })
+            .and_then(|ev|
+                if let ruma::events::AnyFullStateEventContent::RoomCreate(ruma::events::FullStateEventContent::Original { content, .. }) = ev.content() {
+                    content.room_type.map(|t| t == ruma::room::RoomType::Space)
+                } else {
+                    None
+                }
+        );
+
         // Terrible hack I (Ivan) am ashamed to write, but there is a bug in the sliding
         // sync proxy… When a user receive an invite to a room, the room has no
         // `timestamp` despites having `m.room.create` in `bump_event_types`. The result
@@ -418,6 +427,7 @@ impl BaseClient {
             store,
             room_id,
             room_info_notable_updates,
+            is_space,
         );
 
         room_info.mark_state_partially_synced();
@@ -554,12 +564,14 @@ impl BaseClient {
         store: &Store,
         room_id: &RoomId,
         room_info_notable_updates: &mut BTreeMap<OwnedRoomId, RoomInfoNotableUpdateReasons>,
+        is_space: Option<bool>,
     ) -> (Room, RoomInfo, Option<InvitedRoom>) {
         if let Some(invite_state) = &room_data.invite_state {
             let room = store.get_or_create_room(
                 room_id,
                 RoomState::Invited,
                 self.room_info_notable_update_sender.clone(),
+                is_space,
             );
             let mut room_info = room.clone_info();
 
@@ -582,6 +594,7 @@ impl BaseClient {
                 room_id,
                 RoomState::Joined,
                 self.room_info_notable_update_sender.clone(),
+                is_space,
             );
             let mut room_info = room.clone_info();
 
