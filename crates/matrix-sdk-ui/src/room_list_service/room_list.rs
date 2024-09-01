@@ -29,6 +29,8 @@ use matrix_sdk_base::RoomInfoNotableUpdate;
 use tokio::{select, sync::broadcast};
 use tracing::trace;
 
+use super::sc_room_list::{ ScSortOrder, get_sort_by_vec };
+
 use super::{
     filters::BoxedFilterFn,
     sorters::{new_sorter_lexicographic, new_sorter_name, new_sorter_recency},
@@ -148,11 +150,14 @@ impl RoomList {
 
         let filter_fn_cell = AsyncCell::shared();
 
+        let sc_sort_order_cell = AsyncCell::shared();
+
         let limit = SharedObservable::<usize>::new(page_size);
         let limit_stream = limit.subscribe();
 
         let dynamic_entries_controller = RoomListDynamicEntriesController::new(
             filter_fn_cell.clone(),
+            sc_sort_order_cell.clone(),
             page_size,
             limit,
             list.maximum_number_of_rooms_stream(),
@@ -162,6 +167,8 @@ impl RoomList {
             loop {
                 let filter_fn = filter_fn_cell.take().await;
 
+                let sc_sort_order = sc_sort_order_cell.take().await;
+
                 let (raw_values, raw_stream) = self.entries();
 
                 // Combine normal stream events with other updates from rooms
@@ -169,10 +176,9 @@ impl RoomList {
 
                 let (values, stream) = (raw_values, merged_streams)
                     .filter(filter_fn)
-                    .sort_by(new_sorter_lexicographic(vec![
-                        Box::new(new_sorter_recency()),
-                        Box::new(new_sorter_name())
-                    ]))
+                    .sort_by(new_sorter_lexicographic(
+                        get_sort_by_vec(sc_sort_order)
+                    ))
                     .dynamic_limit_with_initial_value(page_size, limit_stream.clone());
 
                 // Clearing the stream before chaining with the real stream.
@@ -297,6 +303,7 @@ pub enum RoomListLoadingState {
 /// [`RoomList::entries_with_dynamic_adapters`]
 pub struct RoomListDynamicEntriesController {
     filter: Arc<AsyncCell<BoxedFilterFn>>,
+    sc_sort_order: Arc<AsyncCell<ScSortOrder>>,
     page_size: usize,
     limit: SharedObservable<usize>,
     maximum_number_of_rooms: Subscriber<Option<u32>>,
@@ -305,11 +312,12 @@ pub struct RoomListDynamicEntriesController {
 impl RoomListDynamicEntriesController {
     fn new(
         filter: Arc<AsyncCell<BoxedFilterFn>>,
+        sc_sort_order: Arc<AsyncCell<ScSortOrder>>,
         page_size: usize,
         limit_stream: SharedObservable<usize>,
         maximum_number_of_rooms: Subscriber<Option<u32>>,
     ) -> Self {
-        Self { filter, page_size, limit: limit_stream, maximum_number_of_rooms }
+        Self { filter, sc_sort_order, page_size, limit: limit_stream, maximum_number_of_rooms }
     }
 
     /// Set the filter.
@@ -324,6 +332,15 @@ impl RoomListDynamicEntriesController {
             false
         } else {
             self.filter.set(filter);
+            true
+        }
+    }
+
+    pub fn set_sort_order(&self, sort_order: ScSortOrder) -> bool {
+        if Arc::strong_count(&self.filter) == 1 {
+            false
+        } else {
+            self.sc_sort_order.set(sort_order);
             true
         }
     }

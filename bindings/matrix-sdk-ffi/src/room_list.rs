@@ -501,6 +501,10 @@ impl RoomListDynamicEntriesController {
         self.inner.set_filter(kind.into())
     }
 
+    fn set_sort_order(&self, sort_order: matrix_sdk_ui::room_list_service::sc_room_list::ScSortOrder) -> bool {
+        self.inner.set_sort_order(sort_order)
+    }
+
     fn add_one_page(&self) {
         self.inner.add_one_page();
     }

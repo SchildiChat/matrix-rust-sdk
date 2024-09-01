@@ -17,12 +17,16 @@
 mod lexicographic;
 mod name;
 mod recency;
+mod unread;
+mod tag;
 
 use std::cmp::Ordering;
 
 pub use lexicographic::new_sorter as new_sorter_lexicographic;
 pub use name::new_sorter as new_sorter_name;
 pub use recency::new_sorter as new_sorter_recency;
+pub use unread::new_sorter as new_sorter_unread;
+pub use tag::new_sorter as new_sorter_tag;
 
 use super::Room;
 
