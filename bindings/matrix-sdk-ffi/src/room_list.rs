@@ -502,7 +502,7 @@ impl RoomListDynamicEntriesController {
     }
 
     fn set_sort_order(&self, sort_order: matrix_sdk_ui::room_list_service::sc_room_list::ScSortOrder) -> bool {
-        self.inner.set_sort_order(sort_order)
+        self.inner.set_sort_order(sort_order.into())
     }
 
     fn add_one_page(&self) {
