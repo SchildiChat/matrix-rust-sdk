@@ -27,9 +27,8 @@ use ruma::{
 use tracing::{debug, error, warn};
 
 use super::{
-    inner::{
-        EventMeta, FullEventMeta, TimelineInnerMetadata, TimelineInnerState,
-        TimelineInnerStateTransaction,
+    controller::{
+        EventMeta, FullEventMeta, TimelineMetadata, TimelineState, TimelineStateTransaction,
     },
     traits::RoomDataProvider,
     util::{rfind_event_by_id, RelativePosition},
@@ -344,7 +343,7 @@ impl ReadReceiptTimelineUpdate {
     }
 }
 
-impl TimelineInnerStateTransaction<'_> {
+impl TimelineStateTransaction<'_> {
     pub(super) fn handle_explicit_read_receipts(
         &mut self,
         receipt_event_content: ReceiptEventContent,
@@ -492,7 +491,7 @@ impl TimelineInnerStateTransaction<'_> {
     }
 }
 
-impl TimelineInnerState {
+impl TimelineState {
     /// Populates our own latest read receipt in the in-memory by-user read
     /// receipt cache.
     pub(super) async fn populate_initial_user_receipt<P: RoomDataProvider>(
@@ -577,7 +576,7 @@ impl TimelineInnerState {
     }
 }
 
-impl TimelineInnerMetadata {
+impl TimelineMetadata {
     /// Get the latest receipt of the given type for the given user in the
     /// timeline.
     ///

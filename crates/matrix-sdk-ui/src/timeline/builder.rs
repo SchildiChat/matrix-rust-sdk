@@ -27,11 +27,11 @@ use tracing::{info, info_span, trace, warn, Instrument, Span};
 #[cfg(feature = "e2e-encryption")]
 use super::to_device::{handle_forwarded_room_key_event, handle_room_key_event};
 use super::{
-    inner::{TimelineInner, TimelineInnerSettings},
+    controller::{TimelineController, TimelineSettings},
     Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
 use crate::{
-    timeline::{event_item::RemoteEventOrigin, inner::TimelineEnd},
+    timeline::{controller::TimelineEnd, event_item::RemoteEventOrigin},
     unable_to_decrypt_hook::UtdHookManager,
 };
 
@@ -41,7 +41,7 @@ use crate::{
 #[derive(Debug)]
 pub struct TimelineBuilder {
     room: Room,
-    settings: TimelineInnerSettings,
+    settings: TimelineSettings,
     focus: TimelineFocus,
 
     /// An optional hook to call whenever we run into an unable-to-decrypt or a
@@ -56,7 +56,7 @@ impl TimelineBuilder {
     pub(super) fn new(room: &Room) -> Self {
         Self {
             room: room.clone(),
-            settings: TimelineInnerSettings::default(),
+            settings: TimelineSettings::default(),
             unable_to_decrypt_hook: None,
             focus: TimelineFocus::Live,
             internal_id_prefix: None,
@@ -157,12 +157,11 @@ impl TimelineBuilder {
         let (room_event_cache, event_cache_drop) = room.event_cache().await?;
         let (_, mut event_subscriber) = room_event_cache.subscribe().await?;
 
-        let is_live = matches!(focus, TimelineFocus::Live);
         let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
         let is_room_encrypted =
             room.is_encrypted().await.map_err(|_| Error::UnknownEncryptionState)?;
 
-        let inner = TimelineInner::new(
+        let controller = TimelineController::new(
             room,
             focus.clone(),
             internal_id_prefix,
@@ -171,15 +170,15 @@ impl TimelineBuilder {
         )
         .with_settings(settings);
 
-        let has_events = inner.init_focus(&room_event_cache).await?;
+        let has_events = controller.init_focus(&room_event_cache).await?;
 
-        let room = inner.room();
+        let room = controller.room();
         let client = room.client();
 
         let pinned_events_join_handle = if is_pinned_events {
             let mut pinned_event_ids_stream = room.pinned_event_ids_stream();
             Some(spawn({
-                let inner = inner.clone();
+                let inner = controller.clone();
                 async move {
                     while pinned_event_ids_stream.next().await.is_some() {
                         if let Ok(events) = inner.reload_pinned_events().await {
@@ -199,7 +198,7 @@ impl TimelineBuilder {
 
         let room_update_join_handle = spawn({
             let room_event_cache = room_event_cache.clone();
-            let inner = inner.clone();
+            let inner = controller.clone();
 
             let span =
                 info_span!(parent: Span::none(), "room_update_handler", room_id = ?room.room_id());
@@ -292,11 +291,11 @@ impl TimelineBuilder {
             .instrument(span)
         });
 
-        let local_echo_listener_handle = if is_live {
-            let timeline = inner.clone();
+        let local_echo_listener_handle = {
+            let timeline = controller.clone();
             let (local_echoes, mut listener) = room.send_queue().subscribe().await?;
 
-            Some(spawn({
+            spawn({
                 // Handles existing local echoes first.
                 for echo in local_echoes {
                     timeline.handle_local_echo(echo).await;
@@ -325,20 +324,20 @@ impl TimelineBuilder {
                     }
                 }
                 .instrument(span)
-            }))
-        } else {
-            None
+            })
         };
 
         // Not using room.add_event_handler here because RoomKey events are
         // to-device events that are not received in the context of a room.
 
         #[cfg(feature = "e2e-encryption")]
-        let room_key_handle = client
-            .add_event_handler(handle_room_key_event(inner.clone(), room.room_id().to_owned()));
+        let room_key_handle = client.add_event_handler(handle_room_key_event(
+            controller.clone(),
+            room.room_id().to_owned(),
+        ));
         #[cfg(feature = "e2e-encryption")]
         let forwarded_room_key_handle = client.add_event_handler(handle_forwarded_room_key_event(
-            inner.clone(),
+            controller.clone(),
             room.room_id().to_owned(),
         ));
 
@@ -350,7 +349,7 @@ impl TimelineBuilder {
         ];
 
         let room_key_from_backups_join_handle = {
-            let inner = inner.clone();
+            let inner = controller.clone();
             let room_id = inner.room().room_id();
 
             let stream = client.encryption().backups().room_keys_for_room_stream(room_id);
@@ -379,7 +378,7 @@ impl TimelineBuilder {
         };
 
         let timeline = Timeline {
-            inner,
+            controller,
             event_cache: room_event_cache,
             drop_handle: Arc::new(TimelineDropHandle {
                 client,

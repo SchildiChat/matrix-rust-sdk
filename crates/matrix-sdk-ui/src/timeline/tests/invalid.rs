@@ -25,7 +25,7 @@ use super::TestTimeline;
 use crate::timeline::TimelineItemContent;
 
 #[async_test]
-async fn invalid_edit() {
+async fn test_invalid_edit() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
@@ -48,11 +48,11 @@ async fn invalid_edit() {
 
     // Can't easily test the non-arrival of an item using the stream. Instead
     // just assert that there is still just a couple items in the timeline.
-    assert_eq!(timeline.inner.items().await.len(), 2);
+    assert_eq!(timeline.controller.items().await.len(), 2);
 }
 
 #[async_test]
-async fn invalid_event_content() {
+async fn test_invalid_event_content() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
@@ -100,7 +100,7 @@ async fn invalid_event_content() {
 }
 
 #[async_test]
-async fn invalid_event() {
+async fn test_invalid_event() {
     let timeline = TestTimeline::new();
 
     // This event is missing the sender field which the homeserver must add to
@@ -116,5 +116,5 @@ async fn invalid_event() {
             "type": "m.room.message",
         }))
         .await;
-    assert_eq!(timeline.inner.items().await.len(), 0);
+    assert_eq!(timeline.controller.items().await.len(), 0);
 }

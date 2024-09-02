@@ -25,7 +25,7 @@ mod sticky_parameters;
 mod utils;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{btree_map::Entry, BTreeMap, HashSet},
     fmt::Debug,
     future::Future,
     sync::{Arc, RwLock as StdRwLock},
@@ -33,6 +33,7 @@ use std::{
 };
 
 use async_stream::stream;
+pub use client::{Version, VersionBuilder};
 use futures_core::stream::Stream;
 pub use matrix_sdk_base::sliding_sync::http;
 use matrix_sdk_common::timer;
@@ -46,11 +47,10 @@ use tokio::{
     sync::{broadcast::Sender, Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock},
 };
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
-use url::Url;
 
 #[cfg(feature = "e2e-encryption")]
 use self::utils::JoinHandleExt as _;
-pub use self::{builder::*, error::*, list::*, room::*};
+pub use self::{builder::*, client::VersionBuilderError, error::*, list::*, room::*};
 use self::{
     cache::restore_sliding_sync_state,
     client::SlidingSyncResponseProcessor,
@@ -74,8 +74,9 @@ pub(super) struct SlidingSyncInner {
     /// Used to distinguish different connections to the sliding sync proxy.
     id: String,
 
-    /// Customize the sliding sync proxy URL.
-    sliding_sync_proxy: Option<Url>,
+    /// Either an overridden sliding sync [`Version`], or one inherited from the
+    /// client.
+    version: Version,
 
     /// The HTTP Matrix client.
     client: Client,
@@ -144,6 +145,8 @@ impl SlidingSync {
     ///
     /// If the associated `Room`s exist, it will be marked as
     /// members are missing, so that it ensures to re-fetch all members.
+    ///
+    /// A subscription to an already subscribed room is ignored.
     pub fn subscribe_to_rooms(
         &self,
         room_ids: &[&RoomId],
@@ -153,20 +156,31 @@ impl SlidingSync {
         let mut sticky = self.inner.sticky.write().unwrap();
         let room_subscriptions = &mut sticky.data_mut().room_subscriptions;
 
-        for room_id in room_ids {
-            if let Some(room) = self.inner.client.get_room(room_id) {
-                room.mark_members_missing();
-            }
+        let mut skip_sync_loop = false;
 
-            room_subscriptions.insert(
-                (*room_id).to_owned(),
-                (RoomSubscriptionState::default(), settings.clone()),
-            );
+        for room_id in room_ids {
+            // If the room subscription already exists, let's not
+            // override it with a new one. First, it would reset its
+            // state (`RoomSubscriptionState`), and second it would try to
+            // re-subscribe with the next request. We don't want that. A room
+            // subscription should happen once, and next subscriptions should
+            // be ignored.
+            if let Entry::Vacant(entry) = room_subscriptions.entry((*room_id).to_owned()) {
+                if let Some(room) = self.inner.client.get_room(room_id) {
+                    room.mark_members_missing();
+                }
+
+                entry.insert((RoomSubscriptionState::default(), settings.clone()));
+
+                skip_sync_loop = true;
+            }
         }
 
-        self.inner.internal_channel_send_if_possible(
-            SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
-        );
+        if skip_sync_loop {
+            self.inner.internal_channel_send_if_possible(
+                SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
+            );
+        }
     }
 
     /// Lookup a specific room
@@ -264,7 +278,7 @@ impl SlidingSync {
 
         // Compute `limited` for the SS proxy only, if we're interested in a room list
         // query.
-        if !self.inner.client.is_simplified_sliding_sync_enabled() && must_process_rooms_response {
+        if !self.inner.version.is_native() && must_process_rooms_response {
             let known_rooms = self.inner.rooms.read().await;
             compute_limited(&known_rooms, &mut sliding_sync_response.rooms);
         }
@@ -297,7 +311,9 @@ impl SlidingSync {
             //
             // NOTE: SS proxy workaround.
             if must_process_rooms_response {
-                response_processor.handle_room_response(&sliding_sync_response).await?;
+                response_processor
+                    .handle_room_response(&sliding_sync_response, self.inner.version.is_native())
+                    .await?;
             }
 
             response_processor.process_and_take_response().await?
@@ -537,7 +553,7 @@ impl SlidingSync {
         // Prepare the request.
         let request =
             self.inner.client.send(request, Some(request_config)).with_homeserver_override(
-                self.inner.sliding_sync_proxy.as_ref().map(ToString::to_string),
+                self.inner.version.overriding_url().map(ToString::to_string),
             );
 
         // Send the request and get a response with end-to-end encryption support.
@@ -670,7 +686,7 @@ impl SlidingSync {
         // because it's the future standard. If
         // `Client::is_simplified_sliding_sync_enabled` is turned off, the
         // Simplified MSC3575 `Request` must be transformed into a MSC3575 `Request`.
-        if !self.inner.client.is_simplified_sliding_sync_enabled() {
+        if !self.inner.version.is_native() {
             self.send_sync_request(
                 Into::<http::msc3575::Request>::into(request),
                 request_config,
@@ -837,9 +853,9 @@ impl SlidingSync {
         position_lock.pos = Some(new_pos);
     }
 
-    /// Get the URL to Sliding Sync.
-    pub fn sliding_sync_proxy(&self) -> Option<Url> {
-        self.inner.sliding_sync_proxy.clone()
+    /// Get the sliding sync version used by this instance.
+    pub fn version(&self) -> &Version {
+        &self.inner.version
     }
 
     /// Read the static extension configuration for this Sliding Sync.
@@ -956,10 +972,8 @@ impl StickyData for SlidingSyncStickyParameters {
         request.room_subscriptions = self
             .room_subscriptions
             .iter()
-            .filter_map(|(room_id, (state, room_subscription))| {
-                matches!(state, RoomSubscriptionState::Pending)
-                    .then(|| (room_id.clone(), room_subscription.clone()))
-            })
+            .filter(|(_, (state, _))| matches!(state, RoomSubscriptionState::Pending))
+            .map(|(room_id, (_, room_subscription))| (room_id.clone(), room_subscription.clone()))
             .collect();
         request.extensions = self.extensions.clone();
     }
@@ -1053,7 +1067,6 @@ fn compute_limited(
 #[cfg(test)]
 #[allow(clippy::dbg_macro)]
 mod tests {
-
     use std::{
         collections::BTreeMap,
         future::ready,
@@ -1079,7 +1092,7 @@ mod tests {
         compute_limited, http,
         sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
         FrozenSlidingSync, SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
-        SlidingSyncRoom, SlidingSyncStickyParameters,
+        SlidingSyncRoom, SlidingSyncStickyParameters, Version,
     };
     use crate::{
         sliding_sync::cache::restore_sliding_sync_state, test_utils::logged_in_client, Result,
@@ -1196,6 +1209,38 @@ mod tests {
             assert!(room_subscriptions.contains_key(room_id_1));
             assert!(!room_subscriptions.contains_key(room_id_2));
         }
+
+        // Subscribing to the same room doesn't reset the member sync state.
+
+        {
+            struct MemberMatcher(OwnedRoomId);
+
+            impl Match for MemberMatcher {
+                fn matches(&self, request: &Request) -> bool {
+                    request.url.path()
+                        == format!("/_matrix/client/r0/rooms/{room_id}/members", room_id = self.0)
+                        && request.method == Method::GET
+                }
+            }
+
+            let _mock_guard = Mock::given(MemberMatcher(room_id_0.to_owned()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "chunk": [],
+                })))
+                .mount_as_scoped(&server)
+                .await;
+
+            assert_matches!(room0.request_members().await, Ok(()));
+        }
+
+        // Members are synced, good, good.
+        assert!(room0.are_members_synced());
+
+        sliding_sync.subscribe_to_rooms(&[room_id_0], None);
+
+        // Members are still synced: because we have already subscribed to the
+        // room, the members aren't marked as unsynced.
+        assert!(room0.are_members_synced());
 
         Ok(())
     }
@@ -1993,42 +2038,56 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_sliding_sync_proxy_url() -> Result<()> {
+    async fn test_sliding_sync_version() -> Result<()> {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
+        // By default, sliding sync inherits its version from the client, which is
+        // `Native`.
         {
-            // A server that doesn't expose a sliding sync proxy gets and transmits none, by
-            // default.
-            let sync = client.sliding_sync("no-proxy")?.build().await?;
+            let sync = client.sliding_sync("default")?.build().await?;
 
-            assert!(sync.sliding_sync_proxy().is_none());
+            assert_matches!(sync.version(), Version::Native);
         }
 
+        // Sliding sync can override the configuration from the client.
         {
-            // The sliding sync builder can be used to customize a proxy, though.
             let url = Url::parse("https://bar.matrix/").unwrap();
-            let sync =
-                client.sliding_sync("own-proxy")?.sliding_sync_proxy(url.clone()).build().await?;
-            assert_eq!(sync.sliding_sync_proxy(), Some(url));
+            let sync = client
+                .sliding_sync("own-proxy")?
+                .version(Version::Proxy { url: url.clone() })
+                .build()
+                .await?;
+
+            assert_matches!(
+                sync.version(),
+                Version::Proxy { url: given_url } => {
+                    assert_eq!(&url, given_url);
+                }
+            );
         }
 
-        // Set the client's proxy, that will be inherited by sliding sync.
+        // Sliding sync inherits from the client…
         let url = Url::parse("https://foo.matrix/").unwrap();
-        client.set_sliding_sync_proxy(Some(url.clone()));
+        client.set_sliding_sync_version(Version::Proxy { url: url.clone() });
 
         {
             // The sliding sync inherits the client's sliding sync proxy URL.
             let sync = client.sliding_sync("client-proxy")?.build().await?;
-            assert_eq!(sync.sliding_sync_proxy(), Some(url));
+
+            assert_matches!(
+                sync.version(),
+                Version::Proxy { url: given_url } => {
+                    assert_eq!(&url, given_url);
+                }
+            );
         }
 
         {
-            // …unless we override it.
-            let url = Url::parse("https://bar.matrix/").unwrap();
-            let sync =
-                client.sliding_sync("own-proxy")?.sliding_sync_proxy(url.clone()).build().await?;
-            assert_eq!(sync.sliding_sync_proxy(), Some(url));
+            // …unless we override it afterwards.
+            let sync = client.sliding_sync("own-proxy")?.version(Version::Native).build().await?;
+
+            assert_matches!(sync.version(), Version::Native);
         }
 
         Ok(())

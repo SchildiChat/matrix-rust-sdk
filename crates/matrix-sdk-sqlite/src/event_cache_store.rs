@@ -1,12 +1,7 @@
-use std::{
-    borrow::Cow,
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{borrow::Cow, fmt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
+use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     event_cache_store::EventCacheStore,
     media::{MediaRequest, UniqueKey},
@@ -18,9 +13,8 @@ use tracing::debug;
 
 use crate::{
     error::{Error, Result},
-    get_or_create_store_cipher,
-    utils::{load_db_version, Key, SqliteObjectExt},
-    OpenStoreError, SqliteObjectStoreExt,
+    utils::{Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt, SqliteKeyValueStoreConnExt},
+    OpenStoreError,
 };
 
 mod keys {
@@ -39,18 +33,13 @@ const DATABASE_VERSION: u8 = 1;
 #[derive(Clone)]
 pub struct SqliteEventCacheStore {
     store_cipher: Option<Arc<StoreCipher>>,
-    path: Option<PathBuf>,
     pool: SqlitePool,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for SqliteEventCacheStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(path) = &self.path {
-            f.debug_struct("SqliteEventCacheStore").field("path", &path).finish()
-        } else {
-            f.debug_struct("SqliteEventCacheStore").field("path", &"memory store").finish()
-        }
+        f.debug_struct("SqliteEventCacheStore").finish_non_exhaustive()
     }
 }
 
@@ -73,41 +62,15 @@ impl SqliteEventCacheStore {
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        let mut version = load_db_version(&conn).await?;
-
-        if version == 0 {
-            init(&conn).await?;
-            version = 1;
-        }
+        let version = conn.db_version().await?;
+        run_migrations(&conn, version).await?;
 
         let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(get_or_create_store_cipher(p, &conn).await?)),
+            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
             None => None,
         };
-        let this = Self { store_cipher, path: None, pool };
-        this.run_migrations(&conn, version, None).await?;
 
-        Ok(this)
-    }
-
-    /// Run database migrations from the given `from` version to the given `to`
-    /// version
-    ///
-    /// If `to` is `None`, the current database version will be used.
-    async fn run_migrations(&self, conn: &SqliteConn, from: u8, to: Option<u8>) -> Result<()> {
-        let to = to.unwrap_or(DATABASE_VERSION);
-
-        if from < to {
-            debug!(version = from, new_version = to, "Upgrading database");
-        } else {
-            return Ok(());
-        }
-
-        // There is no migration currently since it's the first version of the database.
-
-        conn.set_kv("version", vec![to]).await?;
-
-        Ok(())
+        Ok(Self { store_cipher, pool })
     }
 
     fn encode_value(&self, value: Vec<u8>) -> Result<Vec<u8>> {
@@ -138,7 +101,7 @@ impl SqliteEventCacheStore {
         }
     }
 
-    async fn acquire(&self) -> Result<deadpool_sqlite::Object> {
+    async fn acquire(&self) -> Result<SqliteAsyncConn> {
         Ok(self.pool.get().await?)
     }
 }
@@ -149,70 +112,29 @@ async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
     Ok(cfg.create_pool(Runtime::Tokio1)?)
 }
 
-/// Initialize the database.
-async fn init(conn: &SqliteConn) -> Result<()> {
-    // First turn on WAL mode, this can't be done in the transaction, it fails with
-    // the error message: "cannot change into wal mode from within a transaction".
-    conn.execute_batch("PRAGMA journal_mode = wal;").await?;
-    conn.with_transaction(|txn| {
-        txn.execute_batch(include_str!("../migrations/event_cache_store/001_init.sql"))
-    })
-    .await?;
+/// Run migrations for the given version of the database.
+async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
+    if version == 0 {
+        debug!("Creating database");
+    } else if version < DATABASE_VERSION {
+        debug!(version, new_version = DATABASE_VERSION, "Upgrading database");
+    } else {
+        return Ok(());
+    }
 
-    conn.set_kv("version", vec![1]).await?;
+    if version < 1 {
+        // First turn on WAL mode, this can't be done in the transaction, it fails with
+        // the error message: "cannot change into wal mode from within a transaction".
+        conn.execute_batch("PRAGMA journal_mode = wal;").await?;
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!("../migrations/event_cache_store/001_init.sql"))?;
+            txn.set_db_version(1)
+        })
+        .await?;
+    }
 
     Ok(())
 }
-
-#[async_trait]
-trait SqliteObjectEventCacheStoreExt: SqliteObjectExt {
-    async fn set_media(&self, uri: Key, format: Key, data: Vec<u8>) -> Result<()> {
-        self.execute(
-            "INSERT OR REPLACE INTO media (uri, format, data, last_access) VALUES (?, ?, ?, CAST(strftime('%s') as INT))",
-            (uri, format, data),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn get_media(&self, uri: Key, format: Key) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .with_transaction::<_, rusqlite::Error, _>(move |txn| {
-                let Some(media) = txn
-                    .query_row::<Vec<u8>, _, _>(
-                        "SELECT data FROM media WHERE uri = ? AND format = ?",
-                        (&uri, &format),
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                else {
-                    return rusqlite::Result::Ok(None);
-                };
-
-                // Update the last access.
-                txn.execute(
-                    "UPDATE media SET last_access = CAST(strftime('%s') as INT) WHERE uri = ? AND format = ?",
-                    (uri, format),
-                )?;
-
-                rusqlite::Result::Ok(Some(media))
-            })
-            .await?)
-    }
-
-    async fn remove_media(&self, uri: Key, format: Key) -> Result<()> {
-        self.execute("DELETE FROM media WHERE uri = ? AND format = ?", (uri, format)).await?;
-        Ok(())
-    }
-
-    async fn remove_uri_medias(&self, uri: Key) -> Result<()> {
-        self.execute("DELETE FROM media WHERE uri = ?", (uri,)).await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl SqliteObjectEventCacheStoreExt for deadpool_sqlite::Object {}
 
 #[async_trait]
 impl EventCacheStore for SqliteEventCacheStore {
@@ -222,25 +144,62 @@ impl EventCacheStore for SqliteEventCacheStore {
         let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
         let data = self.encode_value(content)?;
-        self.acquire().await?.set_media(uri, format, data).await
+
+        let conn = self.acquire().await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO media (uri, format, data, last_access) VALUES (?, ?, ?, CAST(strftime('%s') as INT))",
+            (uri, format, data),
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
         let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        let data = self.acquire().await?.get_media(uri, format).await?;
+
+        let conn = self.acquire().await?;
+        let data = conn
+            .with_transaction::<_, rusqlite::Error, _>(move |txn| {
+                // Update the last access.
+                // We need to do this first so the transaction is in write mode right away.
+                // See: https://sqlite.org/lang_transaction.html#read_transactions_versus_write_transactions
+                txn.execute(
+                    "UPDATE media SET last_access = CAST(strftime('%s') as INT) \
+                     WHERE uri = ? AND format = ?",
+                    (&uri, &format),
+                )?;
+
+                txn.query_row::<Vec<u8>, _, _>(
+                    "SELECT data FROM media WHERE uri = ? AND format = ?",
+                    (&uri, &format),
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await?;
+
         data.map(|v| self.decode_value(&v).map(Into::into)).transpose()
     }
 
     async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
         let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
-        self.acquire().await?.remove_media(uri, format).await
+
+        let conn = self.acquire().await?;
+        conn.execute("DELETE FROM media WHERE uri = ? AND format = ?", (uri, format)).await?;
+
+        Ok(())
     }
 
     async fn remove_media_content_for_uri(&self, uri: &ruma::MxcUri) -> Result<()> {
         let uri = self.encode_key(keys::MEDIA, uri);
-        self.acquire().await?.remove_uri_medias(uri).await
+
+        let conn = self.acquire().await?;
+        conn.execute("DELETE FROM media WHERE uri = ?", (uri,)).await?;
+
+        Ok(())
     }
 }
 
@@ -262,7 +221,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::SqliteEventCacheStore;
-    use crate::utils::SqliteObjectExt;
+    use crate::utils::SqliteAsyncConnExt;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);

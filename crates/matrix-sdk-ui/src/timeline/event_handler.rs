@@ -47,13 +47,13 @@ use ruma::{
 use tracing::{debug, error, field::debug, info, instrument, trace, warn};
 
 use super::{
+    controller::{TimelineMetadata, TimelineStateTransaction},
     day_dividers::DayDividerAdjuster,
     event_item::{
         AnyOtherFullStateEventContent, EventSendState, EventTimelineItemKind,
         LocalEventTimelineItem, Profile, ReactionsByKeyBySender, RemoteEventOrigin,
         RemoteEventTimelineItem, TimelineEventItemId,
     },
-    inner::{TimelineInnerMetadata, TimelineInnerStateTransaction},
     polls::PollState,
     reactions::FullReactionKey,
     util::{rfind_event_by_id, rfind_event_item},
@@ -65,7 +65,6 @@ use crate::{
     timeline::{
         event_item::{ReactionInfo, ReactionStatus},
         reactions::PendingReaction,
-        traits::RoomDataProvider,
     },
     DEFAULT_SANITIZER_MODE,
 };
@@ -95,8 +94,6 @@ pub(super) enum Flow {
         position: TimelineItemPosition,
         /// Information about the encryption for this event.
         encryption_info: Option<EncryptionInfo>,
-        /// Should this event actually be added, based on the event filters.
-        should_add: bool,
     },
 }
 
@@ -108,6 +105,13 @@ pub(super) struct TimelineEventContext {
     pub(super) read_receipts: IndexMap<OwnedUserId, Receipt>,
     pub(super) is_highlighted: bool,
     pub(super) flow: Flow,
+
+    /// If the event represents a new item, should it be added to the timeline?
+    ///
+    /// This controls whether a new timeline *may* be added. If the update kind
+    /// is about an update to an existing timeline item (redaction, edit,
+    /// reaction, etc.), it's always handled by default.
+    pub(super) should_add_new_items: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -260,33 +264,18 @@ pub(super) struct HandleEventResult {
 /// updating the reactive Vec).
 pub(super) struct TimelineEventHandler<'a, 'o> {
     items: &'a mut ObservableVectorTransaction<'o, Arc<TimelineItem>>,
-    meta: &'a mut TimelineInnerMetadata,
+    meta: &'a mut TimelineMetadata,
     ctx: TimelineEventContext,
     result: HandleEventResult,
-    live_timeline_updates_type: LiveTimelineUpdatesAllowed,
-}
-
-/// Types of live updates expected in this timeline.
-#[derive(Debug, Clone)]
-pub enum LiveTimelineUpdatesAllowed {
-    All,
-    PinnedEvents,
-    None,
 }
 
 impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     pub(super) fn new(
-        state: &'a mut TimelineInnerStateTransaction<'o>,
+        state: &'a mut TimelineStateTransaction<'o>,
         ctx: TimelineEventContext,
     ) -> Self {
-        let TimelineInnerStateTransaction { items, meta, live_timeline_updates_type, .. } = state;
-        Self {
-            items,
-            meta,
-            ctx,
-            live_timeline_updates_type: live_timeline_updates_type.clone(),
-            result: HandleEventResult::default(),
-        }
+        let TimelineStateTransaction { items, meta, .. } = state;
+        Self { items, meta, ctx, result: HandleEventResult::default() }
     }
 
     /// Handle an event.
@@ -296,71 +285,33 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     /// `raw_event` is only needed to determine the cause of any UTDs,
     /// so if we know this is not a UTD it can be None.
     #[instrument(skip_all, fields(txn_id, event_id, position))]
-    pub(super) async fn handle_event<P: RoomDataProvider>(
+    pub(super) async fn handle_event(
         mut self,
         day_divider_adjuster: &mut DayDividerAdjuster,
         event_kind: TimelineEventKind,
         raw_event: Option<&Raw<AnySyncTimelineEvent>>,
-        room_data_provider: &P,
     ) -> HandleEventResult {
         let span = tracing::Span::current();
 
         day_divider_adjuster.mark_used();
 
-        let should_add = match &self.ctx.flow {
+        match &self.ctx.flow {
             Flow::Local { txn_id, .. } => {
                 span.record("txn_id", debug(txn_id));
                 debug!("Handling local event");
-
-                // Only add new timeline items if we're in the live mode, i.e. not in the
-                // event-focused mode.
-                matches!(self.live_timeline_updates_type, LiveTimelineUpdatesAllowed::All)
             }
 
-            Flow::Remote { event_id, txn_id, position, should_add, .. } => {
+            Flow::Remote { event_id, txn_id, position, .. } => {
                 span.record("event_id", debug(event_id));
                 span.record("position", debug(position));
                 if let Some(txn_id) = txn_id {
                     span.record("txn_id", debug(txn_id));
                 }
                 trace!("Handling remote event");
-
-                // Retrieve the origin of the event.
-                let origin = match position {
-                    TimelineItemPosition::End { origin }
-                    | TimelineItemPosition::Start { origin } => *origin,
-
-                    TimelineItemPosition::Update(idx) => self
-                        .items
-                        .get(*idx)
-                        .and_then(|item| item.as_event())
-                        .and_then(|item| item.as_remote())
-                        .map_or(RemoteEventOrigin::Unknown, |item| item.origin),
-                };
-
-                match origin {
-                    RemoteEventOrigin::Sync | RemoteEventOrigin::Unknown => {
-                        // If the event comes the sync (or is unknown), consider adding it only if
-                        // the timeline is in live mode; we don't want to display arbitrary sync
-                        // events in an event-focused timeline.
-                        let can_add_to_live = match self.live_timeline_updates_type {
-                            LiveTimelineUpdatesAllowed::PinnedEvents => {
-                                room_data_provider.is_pinned_event(event_id)
-                                    || room_data_provider
-                                        .is_replacement_for_pinned_event(&event_kind)
-                            }
-                            LiveTimelineUpdatesAllowed::All => true,
-                            LiveTimelineUpdatesAllowed::None => false,
-                        };
-                        can_add_to_live && *should_add
-                    }
-                    RemoteEventOrigin::Pagination | RemoteEventOrigin::Cache => {
-                        // Otherwise, forward the previous decision to add it.
-                        *should_add
-                    }
-                }
             }
         };
+
+        let should_add = self.ctx.should_add_new_items;
 
         match event_kind {
             TimelineEventKind::Message { content, relations } => match content {
@@ -572,11 +523,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         };
 
         if let Some((idx, event_item)) = rfind_event_by_id(self.items, reacted_to_event_id) {
-            let Some(remote_event_item) = event_item.as_remote() else {
-                error!("received reaction to a local echo");
-                return;
-            };
-
             // Ignore reactions on redacted events.
             if let TimelineItemContent::RedactedMessage = event_item.content() {
                 debug!("Ignoring reaction on redacted event");
@@ -586,7 +532,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             trace!("Added reaction");
 
             // Add the reaction to the event item's bundled reactions.
-            let mut reactions = remote_event_item.reactions.clone();
+            let mut reactions = event_item.reactions.clone();
 
             reactions.entry(c.relates_to.key.clone()).or_default().insert(
                 self.ctx.sender.clone(),
@@ -839,16 +785,10 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 return false;
             };
 
-            let Some(remote_event_item) = item.as_remote() else {
-                error!("inconsistent state: redaction received on a non-remote event item");
-                return false;
-            };
-
-            let mut reactions = remote_event_item.reactions.clone();
+            let mut reactions = item.reactions.clone();
             if reactions.remove_reaction(&sender, &key).is_some() {
                 trace!("Removing reaction");
-                let new_item = item.with_kind(remote_event_item.with_reactions(reactions));
-                self.items.set(item_pos, TimelineItem::new(new_item, item.internal_id.to_owned()));
+                self.items.set(item_pos, item.with_reactions(reactions));
                 self.result.items_updated += 1;
                 return true;
             }
@@ -894,7 +834,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 RemoteEventTimelineItem {
                     event_id: event_id.clone(),
                     transaction_id: txn_id.clone(),
-                    reactions,
                     read_receipts: self.ctx.read_receipts.clone(),
                     is_own: self.ctx.is_own_event,
                     is_highlighted: self.ctx.is_highlighted,
@@ -915,6 +854,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             timestamp,
             content,
             kind,
+            reactions,
             is_room_encrypted,
         );
 
@@ -967,10 +907,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                         if old_item.content.is_redacted() && !item.content.is_redacted() {
                             warn!("Got original form of an event that was previously redacted");
                             item.content = item.content.redact(&self.meta.room_version);
-                            item.as_remote_mut()
-                                .expect("Can't have a local item when flow == Remote")
-                                .reactions
-                                .clear();
+                            item.reactions.clear();
                         }
                     }
 

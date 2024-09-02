@@ -10,11 +10,16 @@ use matrix_sdk::{
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     reqwest::Certificate,
     ruma::{ServerName, UserId},
+    sliding_sync::{
+        Error as MatrixSlidingSyncError, VersionBuilder as MatrixSlidingSyncVersionBuilder,
+        VersionBuilderError,
+    },
     Client as MatrixClient, ClientBuildError as MatrixClientBuildError, HttpError, IdParseError,
     RumaApiError,
 };
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
+use url::Url;
 use zeroize::Zeroizing;
 
 use super::{client::Client, RUNTIME};
@@ -78,7 +83,7 @@ pub enum HumanQrLoginError {
     Declined,
     #[error("An unknown error has happened.")]
     Unknown,
-    #[error("The homeserver doesn't provide a sliding sync proxy in its configuration.")]
+    #[error("The homeserver doesn't provide sliding sync in its configuration.")]
     SlidingSyncNotAvailable,
     #[error("Unable to use OIDC as the supplied client metadata is invalid.")]
     OidcMetadataInvalid,
@@ -190,12 +195,13 @@ pub enum ClientBuildError {
     WellKnownLookupFailed(RumaApiError),
     #[error(transparent)]
     WellKnownDeserializationError(DeserializationError),
-    #[error("The homeserver doesn't provide a trusted sliding sync proxy in its well-known configuration.")]
-    SlidingSyncNotAvailable,
-
+    #[error(transparent)]
+    #[allow(dead_code)] // rustc's drunk, this is used
+    SlidingSync(MatrixSlidingSyncError),
+    #[error(transparent)]
+    SlidingSyncVersion(VersionBuilderError),
     #[error(transparent)]
     Sdk(MatrixClientBuildError),
-
     #[error("Failed to build the client: {message}")]
     Generic { message: String },
 }
@@ -211,10 +217,9 @@ impl From<MatrixClientBuildError> for ClientBuildError {
             MatrixClientBuildError::AutoDiscovery(FromHttpResponseError::Deserialization(e)) => {
                 ClientBuildError::WellKnownDeserializationError(e)
             }
-            MatrixClientBuildError::SlidingSyncNotAvailable => {
-                ClientBuildError::SlidingSyncNotAvailable
+            MatrixClientBuildError::SlidingSyncVersion(e) => {
+                ClientBuildError::SlidingSyncVersion(e)
             }
-
             _ => ClientBuildError::Sdk(e),
         }
     }
@@ -251,9 +256,7 @@ pub struct ClientBuilder {
     homeserver_cfg: Option<HomeserverConfig>,
     passphrase: Zeroizing<Option<String>>,
     user_agent: Option<String>,
-    requires_sliding_sync: bool,
-    sliding_sync_proxy: Option<String>,
-    is_simplified_sliding_sync_enabled: bool,
+    sliding_sync_version_builder: SlidingSyncVersionBuilder,
     proxy: Option<String>,
     disable_ssl_verification: bool,
     disable_automatic_token_refresh: bool,
@@ -276,10 +279,7 @@ impl ClientBuilder {
             homeserver_cfg: None,
             passphrase: Zeroizing::new(None),
             user_agent: None,
-            requires_sliding_sync: false,
-            sliding_sync_proxy: None,
-            // By default, Simplified MSC3575 is turned off.
-            is_simplified_sliding_sync_enabled: false,
+            sliding_sync_version_builder: SlidingSyncVersionBuilder::None,
             proxy: None,
             disable_ssl_verification: false,
             disable_automatic_token_refresh: false,
@@ -366,21 +366,12 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub fn requires_sliding_sync(self: Arc<Self>) -> Arc<Self> {
+    pub fn sliding_sync_version_builder(
+        self: Arc<Self>,
+        version_builder: SlidingSyncVersionBuilder,
+    ) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
-        builder.requires_sliding_sync = true;
-        Arc::new(builder)
-    }
-
-    pub fn sliding_sync_proxy(self: Arc<Self>, sliding_sync_proxy: Option<String>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.sliding_sync_proxy = sliding_sync_proxy;
-        Arc::new(builder)
-    }
-
-    pub fn simplified_sliding_sync(self: Arc<Self>, enable: bool) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.is_simplified_sliding_sync_enabled = enable;
+        builder.sliding_sync_version_builder = version_builder;
         Arc::new(builder)
     }
 
@@ -559,15 +550,31 @@ impl ClientBuilder {
             .with_encryption_settings(builder.encryption_settings)
             .with_room_key_recipient_strategy(builder.room_key_recipient_strategy);
 
-        if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
-            inner_builder = inner_builder.sliding_sync_proxy(sliding_sync_proxy);
-        }
-
-        inner_builder =
-            inner_builder.simplified_sliding_sync(builder.is_simplified_sliding_sync_enabled);
-
-        if builder.requires_sliding_sync {
-            inner_builder = inner_builder.requires_sliding_sync();
+        match builder.sliding_sync_version_builder {
+            SlidingSyncVersionBuilder::None => {
+                inner_builder = inner_builder
+                    .sliding_sync_version_builder(MatrixSlidingSyncVersionBuilder::None)
+            }
+            SlidingSyncVersionBuilder::Proxy { url } => {
+                inner_builder = inner_builder.sliding_sync_version_builder(
+                    MatrixSlidingSyncVersionBuilder::Proxy {
+                        url: Url::parse(&url)
+                            .map_err(|e| ClientBuildError::Generic { message: e.to_string() })?,
+                    },
+                )
+            }
+            SlidingSyncVersionBuilder::Native => {
+                inner_builder = inner_builder
+                    .sliding_sync_version_builder(MatrixSlidingSyncVersionBuilder::Native)
+            }
+            SlidingSyncVersionBuilder::DiscoverProxy => {
+                inner_builder = inner_builder
+                    .sliding_sync_version_builder(MatrixSlidingSyncVersionBuilder::DiscoverProxy)
+            }
+            SlidingSyncVersionBuilder::DiscoverNative => {
+                inner_builder = inner_builder
+                    .sliding_sync_version_builder(MatrixSlidingSyncVersionBuilder::DiscoverNative)
+            }
         }
 
         if let Some(config) = builder.request_config {
@@ -628,7 +635,7 @@ impl ClientBuilder {
         let builder = self.server_name_or_homeserver_url(server_name.to_owned());
 
         let client = builder.build().await.map_err(|e| match e {
-            ClientBuildError::SlidingSyncNotAvailable => HumanQrLoginError::SlidingSyncNotAvailable,
+            ClientBuildError::SlidingSync(_) => HumanQrLoginError::SlidingSyncNotAvailable,
             _ => {
                 error!("Couldn't build the client {e:?}");
                 HumanQrLoginError::Unknown
@@ -678,4 +685,13 @@ pub struct RequestConfig {
     max_concurrent_requests: Option<u64>,
     /// Base delay between retries.
     retry_timeout: Option<u64>,
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum SlidingSyncVersionBuilder {
+    None,
+    Proxy { url: String },
+    Native,
+    DiscoverProxy,
+    DiscoverNative,
 }

@@ -16,19 +16,22 @@ use std::{io, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
-use matrix_sdk::{send_queue::RoomSendQueueUpdate, test_utils::events::EventFactory, Error};
-use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
+use matrix_sdk::{
+    assert_next_matches_with_timeout, send_queue::RoomSendQueueUpdate,
+    test_utils::events::EventFactory, Error,
+};
+use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     event_id,
     events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
-    user_id, MilliSecondsSinceUnixEpoch,
+    uint, user_id, MilliSecondsSinceUnixEpoch,
 };
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
+    controller::TimelineSettings,
     event_item::{EventSendState, RemoteEventOrigin},
-    inner::TimelineInnerSettings,
     tests::TestRoomDataProvider,
 };
 
@@ -65,7 +68,7 @@ async fn test_remote_echo_full_trip() {
     {
         let some_io_error = Error::Io(io::Error::new(io::ErrorKind::Other, "this is a test"));
         timeline
-            .inner
+            .controller
             .update_event_send_state(
                 &txn_id,
                 EventSendState::SendingFailed {
@@ -90,7 +93,7 @@ async fn test_remote_echo_full_trip() {
     let event_id = event_id!("$W6mZSLWMmfuQQ9jhZWeTxFIM");
     let timestamp = {
         timeline
-            .inner
+            .controller
             .update_event_send_state(
                 &txn_id,
                 EventSendState::Sent { event_id: event_id.to_owned() },
@@ -109,16 +112,14 @@ async fn test_remote_echo_full_trip() {
     // Now, a sync has been run against the server, and an event with the same ID
     // comes in.
     timeline
-        .handle_live_event(sync_timeline_event!({
-            "content": {
-                "body": "echo",
-                "msgtype": "m.text",
-            },
-            "sender": &*ALICE,
-            "event_id": event_id,
-            "origin_server_ts": timestamp,
-            "type": "m.room.message",
-        }))
+        .handle_live_event(
+            timeline
+                .factory
+                .text_msg("echo")
+                .sender(*ALICE)
+                .event_id(event_id)
+                .server_ts(timestamp),
+        )
         .await;
 
     // The local echo is replaced with the remote echo.
@@ -159,19 +160,13 @@ async fn test_remote_echo_new_position() {
 
     // When the remote echo comes in…
     timeline
-        .handle_live_event(sync_timeline_event!({
-            "content": {
-                "body": "echo",
-                "msgtype": "m.text",
-            },
-            "sender": &*ALICE,
-            "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
-            "origin_server_ts": 6,
-            "type": "m.room.message",
-            "unsigned": {
-                "transaction_id": txn_id,
-            },
-        }))
+        .handle_live_event(
+            f.text_msg("echo")
+                .sender(*ALICE)
+                .event_id(event_id!("$eeG0HA0FAZ37wP8kXlNkxx3I"))
+                .server_ts(MilliSecondsSinceUnixEpoch(uint!(6)))
+                .unsigned_transaction_id(&txn_id),
+        )
         .await;
 
     // … the remote echo replaces the previous event.
@@ -197,7 +192,7 @@ async fn test_day_divider_duplication() {
         ))
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
     assert_eq!(items.len(), 5);
     assert!(items[0].is_day_divider());
     assert!(items[1].is_remote_event());
@@ -208,20 +203,13 @@ async fn test_day_divider_duplication() {
     // … when the second remote event is re-received (day still the same)
     let event_id = items[2].as_event().unwrap().event_id().unwrap();
     timeline
-        .handle_live_event(sync_timeline_event!({
-            "content": {
-                "body": "B",
-                "msgtype": "m.text",
-            },
-            "sender": &*BOB,
-            "event_id": event_id,
-            "origin_server_ts": 1,
-            "type": "m.room.message",
-        }))
+        .handle_live_event(
+            f.text_msg("B").event_id(event_id).server_ts(MilliSecondsSinceUnixEpoch(uint!(1))),
+        )
         .await;
 
     // … it should not impact the day dividers.
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
     assert_eq!(items.len(), 5);
     assert!(items[0].is_day_divider());
     assert!(items[1].is_remote_event());
@@ -244,7 +232,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
         )
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
     assert!(items[0].is_day_divider());
@@ -256,7 +244,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
     let txn_id =
         timeline.handle_local_event(RoomMessageEventContent::text_plain("local echo").into()).await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 4);
     assert!(items[0].is_day_divider());
@@ -271,7 +259,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
         })
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
     assert!(items[0].is_day_divider());
@@ -285,14 +273,14 @@ async fn test_read_marker_removed_after_local_echo_disappeared() {
     let timeline = TestTimeline::with_room_data_provider(
         TestRoomDataProvider::default().with_fully_read_marker(event_id.to_owned()),
     )
-    .with_settings(TimelineInnerSettings { track_read_receipts: true, ..Default::default() });
+    .with_settings(TimelineSettings { track_read_receipts: true, ..Default::default() });
 
     let f = &timeline.factory;
 
     // Use `replace_with_initial_remote_events` which initializes the read marker;
     // other methods don't, by default.
     timeline
-        .inner
+        .controller
         .replace_with_initial_remote_events(
             vec![f
                 .text_msg("msg1")
@@ -304,7 +292,7 @@ async fn test_read_marker_removed_after_local_echo_disappeared() {
         )
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
     assert!(items[0].is_day_divider());
@@ -316,7 +304,7 @@ async fn test_read_marker_removed_after_local_echo_disappeared() {
     let txn_id =
         timeline.handle_local_event(RoomMessageEventContent::text_plain("local echo").into()).await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 4);
     assert!(items[0].is_day_divider());
@@ -331,9 +319,87 @@ async fn test_read_marker_removed_after_local_echo_disappeared() {
         })
         .await;
 
-    let items = timeline.inner.items().await;
+    let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
     assert!(items[0].is_day_divider());
     assert!(items[1].is_remote_event());
+}
+
+#[async_test]
+async fn test_no_reuse_of_counters() {
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe().await;
+
+    let now = MilliSecondsSinceUnixEpoch::now();
+
+    // Given a local event…
+    timeline
+        .handle_local_event(AnyMessageLikeEventContent::RoomMessage(
+            RoomMessageEventContent::text_plain("echo"),
+        ))
+        .await;
+
+    // It gets added with a unique id
+    // Timeline = [local]
+    let local_id = assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value: item } => {
+        let event_item = item.as_event().unwrap();
+        assert!(event_item.is_local_echo());
+        assert_matches!(event_item.send_state(), Some(EventSendState::NotSentYet));
+        assert!(!event_item.can_be_replied_to());
+        item.unique_id().to_owned()
+    });
+
+    // The day divider comes in late.
+    // Timeline = [day-divider local]
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value } => {
+        assert!(value.is_day_divider());
+    });
+
+    // Add a remote event now.
+    timeline
+        .handle_live_event(
+            timeline
+                .factory
+                .text_msg("hey")
+                .sender(&ALICE)
+                .event_id(event_id!("$1"))
+                .server_ts(now),
+        )
+        .await;
+
+    // Timeline = [remote day-divider local]
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value: item } => {
+        assert!(!item.as_event().unwrap().is_local_echo());
+        // Both items have a different unique id.
+        assert_ne!(local_id, item.unique_id().to_owned());
+    });
+
+    // Day divider shenanigans.
+    // Timeline = [day-divider remote day-divider local]
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value } => {
+        assert!(value.is_day_divider());
+    });
+    // Timeline = [day-divider remote local]
+    assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 2 });
+
+    // When clearing the timeline, the local echo remains.
+    timeline.controller.clear().await;
+
+    assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 1 });
+
+    // The next timeline item comes with a different unique id.
+    timeline
+        .handle_live_event(
+            timeline.factory.text_msg("yo").sender(&ALICE).event_id(event_id!("$2")).server_ts(now),
+        )
+        .await;
+
+    let remote_id = assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value: item } => {
+        assert!(!item.as_event().unwrap().is_local_echo());
+        item.unique_id().to_owned()
+    });
+
+    // The remote id still isn't the same as the local id.
+    assert_ne!(local_id, remote_id);
 }

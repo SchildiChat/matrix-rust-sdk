@@ -31,7 +31,7 @@ use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
-    inner::TimelineInnerSettings, AnyOtherFullStateEventContent, TimelineEventTypeFilter,
+    controller::TimelineSettings, AnyOtherFullStateEventContent, TimelineEventTypeFilter,
     TimelineItem, TimelineItemContent, TimelineItemKind,
 };
 
@@ -88,12 +88,12 @@ async fn test_default_filter() {
 
     // TODO: After adding raw timeline items, check for one here.
 
-    assert_eq!(timeline.inner.items().await.len(), 4);
+    assert_eq!(timeline.controller.items().await.len(), 4);
 }
 
 #[async_test]
 async fn test_filter_always_false() {
-    let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
+    let timeline = TestTimeline::new().with_settings(TimelineSettings {
         event_filter: Arc::new(|_, _| false),
         ..Default::default()
     });
@@ -118,13 +118,13 @@ async fn test_filter_always_false() {
         .handle_live_state_event(&ALICE, RoomNameEventContent::new("Alice's room".to_owned()), None)
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 0);
+    assert_eq!(timeline.controller.items().await.len(), 0);
 }
 
 #[async_test]
 async fn test_custom_filter() {
     // Filter out all state events.
-    let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
+    let timeline = TestTimeline::new().with_settings(TimelineSettings {
         event_filter: Arc::new(|ev, _| matches!(ev, AnySyncTimelineEvent::MessageLike(_))),
         ..Default::default()
     });
@@ -153,13 +153,13 @@ async fn test_custom_filter() {
         .handle_live_state_event(&ALICE, RoomNameEventContent::new("Alice's room".to_owned()), None)
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 3);
+    assert_eq!(timeline.controller.items().await.len(), 3);
 }
 
 #[async_test]
 async fn test_hide_failed_to_parse() {
     let timeline = TestTimeline::new()
-        .with_settings(TimelineInnerSettings { add_failed_to_parse: false, ..Default::default() });
+        .with_settings(TimelineSettings { add_failed_to_parse: false, ..Default::default() });
 
     // m.room.message events must have a msgtype and body in content, so this
     // event with an empty content object should fail to deserialize.
@@ -186,7 +186,7 @@ async fn test_hide_failed_to_parse() {
         }))
         .await;
 
-    assert_eq!(timeline.inner.items().await.len(), 0);
+    assert_eq!(timeline.controller.items().await.len(), 0);
 }
 
 #[async_test]
@@ -194,7 +194,7 @@ async fn test_event_type_filter_include_only_room_names() {
     // Only return room name events
     let event_filter = TimelineEventTypeFilter::Include(vec![TimelineEventType::RoomName]);
 
-    let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
+    let timeline = TestTimeline::new().with_settings(TimelineSettings {
         event_filter: Arc::new(move |event, _| event_filter.filter(event)),
         ..Default::default()
     });
@@ -242,7 +242,7 @@ async fn test_event_type_filter_exclude_messages() {
     // Don't return any messages
     let event_filter = TimelineEventTypeFilter::Exclude(vec![TimelineEventType::RoomMessage]);
 
-    let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
+    let timeline = TestTimeline::new().with_settings(TimelineSettings {
         event_filter: Arc::new(move |event, _| event_filter.filter(event)),
         ..Default::default()
     });
@@ -287,7 +287,7 @@ async fn test_event_type_filter_exclude_messages() {
 
 impl TestTimeline {
     async fn get_event_items(&self) -> Vec<Arc<TimelineItem>> {
-        self.inner
+        self.controller
             .items()
             .await
             .into_iter()

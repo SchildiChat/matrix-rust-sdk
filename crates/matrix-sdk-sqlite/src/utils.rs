@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use core::fmt;
-use std::{borrow::Borrow, cmp::min, future::Future, iter, ops::Deref};
+use std::{borrow::Borrow, cmp::min, iter, ops::Deref};
 
 use async_trait::async_trait;
+use deadpool_sqlite::Object as SqliteAsyncConn;
 use itertools::Itertools;
+use matrix_sdk_store_encryption::StoreCipher;
 use rusqlite::{limits::Limit, OptionalExtension, Params, Row, Statement, Transaction};
 
 use crate::{
@@ -54,7 +56,7 @@ impl rusqlite::ToSql for Key {
 }
 
 #[async_trait]
-pub(crate) trait SqliteObjectExt {
+pub(crate) trait SqliteAsyncConnExt {
     async fn execute<P>(
         &self,
         sql: impl AsRef<str> + Send + 'static,
@@ -91,22 +93,19 @@ pub(crate) trait SqliteObjectExt {
         E: From<rusqlite::Error> + Send + 'static,
         F: FnOnce(&Transaction<'_>) -> Result<T, E> + Send + 'static;
 
-    async fn limit(&self, limit: Limit) -> i32;
-
-    async fn chunk_large_query_over<Query, Fut, Res>(
+    async fn chunk_large_query_over<Query, Res>(
         &self,
         mut keys_to_chunk: Vec<Key>,
         result_capacity: Option<usize>,
         do_query: Query,
     ) -> Result<Vec<Res>>
     where
-        Query: Fn(Vec<Key>) -> Fut + Send + Sync,
-        Fut: Future<Output = Result<Vec<Res>, rusqlite::Error>> + Send,
-        Res: Send;
+        Res: Send + 'static,
+        Query: Fn(&Transaction<'_>, Vec<Key>) -> Result<Vec<Res>> + Send + 'static;
 }
 
 #[async_trait]
-impl SqliteObjectExt for deadpool_sqlite::Object {
+impl SqliteAsyncConnExt for SqliteAsyncConn {
     async fn execute<P>(
         &self,
         sql: impl AsRef<str> + Send + 'static,
@@ -164,30 +163,55 @@ impl SqliteObjectExt for deadpool_sqlite::Object {
         .unwrap()
     }
 
-    async fn limit(&self, limit: Limit) -> i32 {
-        self.interact(move |conn| conn.limit(limit)).await.expect("Failed to fetch limit")
-    }
-
     /// Chunk a large query over some keys.
     ///
     /// Imagine there is a _dynamic_ query that runs potentially large number of
     /// parameters, so much that the maximum number of parameters can be hit.
     /// Then, this helper is for you. It will execute the query on chunks of
     /// parameters.
-    async fn chunk_large_query_over<Query, Fut, Res>(
+    async fn chunk_large_query_over<Query, Res>(
+        &self,
+        keys_to_chunk: Vec<Key>,
+        result_capacity: Option<usize>,
+        do_query: Query,
+    ) -> Result<Vec<Res>>
+    where
+        Res: Send + 'static,
+        Query: Fn(&Transaction<'_>, Vec<Key>) -> Result<Vec<Res>> + Send + 'static,
+    {
+        self.with_transaction(move |txn| {
+            txn.chunk_large_query_over(keys_to_chunk, result_capacity, do_query)
+        })
+        .await
+    }
+}
+
+pub(crate) trait SqliteTransactionExt {
+    fn chunk_large_query_over<Query, Res>(
+        &self,
+        keys_to_chunk: Vec<Key>,
+        result_capacity: Option<usize>,
+        do_query: Query,
+    ) -> Result<Vec<Res>>
+    where
+        Res: Send + 'static,
+        Query: Fn(&Transaction<'_>, Vec<Key>) -> Result<Vec<Res>> + Send + 'static;
+}
+
+impl<'a> SqliteTransactionExt for Transaction<'a> {
+    fn chunk_large_query_over<Query, Res>(
         &self,
         mut keys_to_chunk: Vec<Key>,
         result_capacity: Option<usize>,
         do_query: Query,
     ) -> Result<Vec<Res>>
     where
-        Query: Fn(Vec<Key>) -> Fut + Send + Sync,
-        Fut: Future<Output = Result<Vec<Res>, rusqlite::Error>> + Send,
-        Res: Send,
+        Res: Send + 'static,
+        Query: Fn(&Transaction<'_>, Vec<Key>) -> Result<Vec<Res>> + Send + 'static,
     {
         // Divide by 2 to allow space for more static parameters (not part of
         // `keys_to_chunk`).
-        let maximum_chunk_size = self.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER).await / 2;
+        let maximum_chunk_size = self.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER) / 2;
         let maximum_chunk_size: usize = maximum_chunk_size
             .try_into()
             .map_err(|_| Error::SqliteMaximumVariableNumber(maximum_chunk_size))?;
@@ -196,7 +220,7 @@ impl SqliteObjectExt for deadpool_sqlite::Object {
             // Chunking isn't necessary.
             let chunk = keys_to_chunk;
 
-            Ok(do_query(chunk).await?)
+            Ok(do_query(self, chunk)?)
         } else {
             // Chunking _is_ necessary.
 
@@ -210,7 +234,7 @@ impl SqliteObjectExt for deadpool_sqlite::Object {
                 let chunk = keys_to_chunk;
                 keys_to_chunk = tail;
 
-                all_results.extend(do_query(chunk).await?);
+                all_results.extend(do_query(self, chunk)?);
             }
 
             Ok(all_results)
@@ -218,11 +242,28 @@ impl SqliteObjectExt for deadpool_sqlite::Object {
     }
 }
 
-pub(crate) trait SqliteConnectionExt {
+/// Extension trait for a [`rusqlite::Connection`] that contains a key-value
+/// table named `kv`.
+///
+/// The table should be created like this:
+///
+/// ```sql
+/// CREATE TABLE "kv" (
+///     "key" TEXT PRIMARY KEY NOT NULL,
+///     "value" BLOB NOT NULL
+/// );
+/// ```
+pub(crate) trait SqliteKeyValueStoreConnExt {
+    /// Store the given value for the given key.
     fn set_kv(&self, key: &str, value: &[u8]) -> rusqlite::Result<()>;
+
+    /// Set the version of the database.
+    fn set_db_version(&self, version: u8) -> rusqlite::Result<()> {
+        self.set_kv("version", &[version])
+    }
 }
 
-impl SqliteConnectionExt for rusqlite::Connection {
+impl SqliteKeyValueStoreConnExt for rusqlite::Connection {
     fn set_kv(&self, key: &str, value: &[u8]) -> rusqlite::Result<()> {
         self.execute(
             "INSERT INTO kv VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
@@ -232,8 +273,30 @@ impl SqliteConnectionExt for rusqlite::Connection {
     }
 }
 
+/// Extension trait for an [`SqliteAsyncConn`] that contains a key-value
+/// table named `kv`.
+///
+/// The table should be created like this:
+///
+/// ```sql
+/// CREATE TABLE "kv" (
+///     "key" TEXT PRIMARY KEY NOT NULL,
+///     "value" BLOB NOT NULL
+/// );
+/// ```
 #[async_trait]
-pub(crate) trait SqliteObjectStoreExt: SqliteObjectExt {
+pub(crate) trait SqliteKeyValueStoreAsyncConnExt: SqliteAsyncConnExt {
+    /// Whether the `kv` table exists in this database.
+    async fn kv_table_exists(&self) -> rusqlite::Result<bool> {
+        self.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv')",
+            (),
+            |row| row.get(0),
+        )
+        .await
+    }
+
+    /// Get the stored value for the given key.
     async fn get_kv(&self, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
         let key = key.to_owned();
         self.query_row("SELECT value FROM kv WHERE key = ?", (key,), |row| row.get(0))
@@ -241,39 +304,54 @@ pub(crate) trait SqliteObjectStoreExt: SqliteObjectExt {
             .optional()
     }
 
+    /// Store the given value for the given key.
     async fn set_kv(&self, key: &str, value: Vec<u8>) -> rusqlite::Result<()>;
+
+    /// Get the version of the database.
+    async fn db_version(&self) -> Result<u8, OpenStoreError> {
+        let kv_exists = self.kv_table_exists().await.map_err(OpenStoreError::LoadVersion)?;
+
+        if kv_exists {
+            match self.get_kv("version").await.map_err(OpenStoreError::LoadVersion)?.as_deref() {
+                Some([v]) => Ok(*v),
+                Some(_) => Err(OpenStoreError::InvalidVersion),
+                None => Err(OpenStoreError::MissingVersion),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Get the [`StoreCipher`] of the database or create it.
+    async fn get_or_create_store_cipher(
+        &self,
+        passphrase: &str,
+    ) -> Result<StoreCipher, OpenStoreError> {
+        let encrypted_cipher = self.get_kv("cipher").await.map_err(OpenStoreError::LoadCipher)?;
+
+        let cipher = if let Some(encrypted) = encrypted_cipher {
+            StoreCipher::import(passphrase, &encrypted)?
+        } else {
+            let cipher = StoreCipher::new()?;
+            #[cfg(not(test))]
+            let export = cipher.export(passphrase);
+            #[cfg(test)]
+            let export = cipher._insecure_export_fast_for_testing(passphrase);
+            self.set_kv("cipher", export?).await.map_err(OpenStoreError::SaveCipher)?;
+            cipher
+        };
+
+        Ok(cipher)
+    }
 }
 
 #[async_trait]
-impl SqliteObjectStoreExt for deadpool_sqlite::Object {
+impl SqliteKeyValueStoreAsyncConnExt for SqliteAsyncConn {
     async fn set_kv(&self, key: &str, value: Vec<u8>) -> rusqlite::Result<()> {
         let key = key.to_owned();
         self.interact(move |conn| conn.set_kv(&key, &value)).await.unwrap()?;
 
         Ok(())
-    }
-}
-
-/// Load the version of the database with the given connection.
-pub(crate) async fn load_db_version(conn: &deadpool_sqlite::Object) -> Result<u8, OpenStoreError> {
-    let kv_exists = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'kv'",
-            (),
-            |row| row.get::<_, u32>(0),
-        )
-        .await
-        .map_err(OpenStoreError::LoadVersion)?
-        > 0;
-
-    if kv_exists {
-        match conn.get_kv("version").await.map_err(OpenStoreError::LoadVersion)?.as_deref() {
-            Some([v]) => Ok(*v),
-            Some(_) => Err(OpenStoreError::InvalidVersion),
-            None => Err(OpenStoreError::MissingVersion),
-        }
-    } else {
-        Ok(0)
     }
 }
 

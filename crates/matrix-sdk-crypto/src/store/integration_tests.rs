@@ -48,7 +48,7 @@ macro_rules! cryptostore_integration_tests {
             use $crate::{
                 olm::{
                     Account, Curve25519PublicKey, InboundGroupSession, OlmMessageHash,
-                    PrivateCrossSigningIdentity, Session,
+                    PrivateCrossSigningIdentity, SenderData, SenderDataType, Session
                 },
                 store::{
                     BackupDecryptionKey, Changes, CryptoStore, DeviceChanges, GossipRequest,
@@ -71,6 +71,9 @@ macro_rules! cryptostore_integration_tests {
                     EventEncryptionAlgorithm,
                 },
                 GossippedSecret, LocalTrust, DeviceData, SecretInfo, ToDeviceRequest, TrackedUser,
+                vodozemac::{
+                    megolm::{GroupSession, SessionConfig},
+                },
             };
 
             use super::get_store;
@@ -123,7 +126,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn save_account_via_generic_save() {
+            async fn test_save_account_via_generic_save() {
                 let store = get_store("save_account_via_generic", None, true).await;
                 assert!(store.get_static_account().is_none());
                 assert!(store.load_account().await.unwrap().is_none());
@@ -137,7 +140,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn save_account() {
+            async fn test_save_account() {
                 let store = get_store("save_account", None, true).await;
                 assert!(store.get_static_account().is_none());
                 assert!(store.load_account().await.unwrap().is_none());
@@ -151,7 +154,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn load_account() {
+            async fn test_load_account() {
                 let store = get_store("load_account", None, true).await;
                 let account = get_account();
 
@@ -167,7 +170,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn load_account_with_passphrase() {
+            async fn test_load_account_with_passphrase() {
                 let passphrase = Some("secret_passphrase");
                 let store = get_store("load_account_with_passphrase", passphrase, true).await;
                 let account = get_account();
@@ -184,7 +187,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn save_and_share_account() {
+            async fn test_save_and_share_account() {
                 let store = get_store("save_and_share_account", None, true).await;
                 let mut account = get_account();
 
@@ -209,7 +212,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn load_sessions() {
+            async fn test_load_sessions() {
                 let store = get_store("load_sessions", None, true).await;
                 let (account, session) = get_account_and_session().await;
                 store
@@ -236,7 +239,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn add_and_save_session() {
+            async fn test_add_and_save_session() {
                 let store_name = "add_and_save_session";
 
                 // Given we created a session and saved it in the store
@@ -288,7 +291,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn load_outbound_group_session() {
+            async fn test_load_outbound_group_session() {
                 let dir = "load_outbound_group_session";
                 let room_id = room_id!("!test:localhost");
 
@@ -338,7 +341,7 @@ macro_rules! cryptostore_integration_tests {
 
             /// Test that we can import an inbound group session via [`CryptoStore::save_changes`]
             #[async_test]
-            async fn save_changes_save_inbound_group_session() {
+            async fn test_save_changes_save_inbound_group_session() {
                 let (account, store) = get_loaded_store("save_inbound_group_session").await;
 
                 let room_id = &room_id!("!test:localhost");
@@ -353,7 +356,7 @@ macro_rules! cryptostore_integration_tests {
             /// Test that we can import a backed-up group session via
             /// [`CryptoStore::save_inbound_group_sessions`]
             #[async_test]
-            async fn save_inbound_group_session_from_backup() {
+            async fn test_save_inbound_group_session_from_backup() {
                 let (account, store) =
                     get_loaded_store("save_inbound_group_session_from_backup").await;
 
@@ -390,7 +393,7 @@ macro_rules! cryptostore_integration_tests {
             /// are waiting for more work on https://github.com/element-hq/element-web/issues/26892.
             #[ignore]
             #[async_test]
-            async fn save_inbound_group_session_from_old_backup() {
+            async fn test_save_inbound_group_session_from_old_backup() {
                 let (account, store) =
                     get_loaded_store("save_inbound_group_session_from_old_backup").await;
 
@@ -415,7 +418,7 @@ macro_rules! cryptostore_integration_tests {
             /// Test that we can import a not-backed-up group session via
             /// [`CryptoStore::save_inbound_group_sessions`]
             #[async_test]
-            async fn save_inbound_group_session_from_import() {
+            async fn test_save_inbound_group_session_from_import() {
                 let (account, store) =
                     get_loaded_store("save_inbound_group_session_from_import").await;
 
@@ -443,7 +446,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn mark_inbound_group_sessions_as_backed_up() {
+            async fn test_mark_inbound_group_sessions_as_backed_up() {
                 // Given a store exists with multiple unbacked-up sessions
                 let (account, store) =
                     get_loaded_store("mark_inbound_group_sessions_as_backed_up").await;
@@ -486,7 +489,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn reset_inbound_group_session_for_backup() {
+            async fn test_reset_inbound_group_session_for_backup() {
                 // Given a store exists where all sessions are backed up to backup_1
                 let (account, store) =
                     get_loaded_store("reset_inbound_group_session_for_backup").await;
@@ -526,7 +529,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn load_inbound_group_session() {
+            async fn test_load_inbound_group_session() {
                 let dir = "load_inbound_group_session";
                 let (account, store) = get_loaded_store(dir).await;
                 assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 0);
@@ -559,6 +562,118 @@ macro_rules! cryptostore_integration_tests {
 
                 assert_eq!(store.get_inbound_group_sessions().await.unwrap().len(), 1);
                 assert_eq!(store.inbound_group_session_counts(None).await.unwrap().total, 1);
+            }
+
+            #[async_test]
+            async fn test_fetch_inbound_group_sessions_for_device() {
+                // Given a store exists, containing inbound group sessions from different devices
+                let (account, store) =
+                    get_loaded_store("fetch_inbound_group_sessions_for_device").await;
+
+                let dev1 = Curve25519PublicKey::from_base64(
+                    "wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/sSRQ2oAKk4"
+                ).unwrap();
+                let dev2 = Curve25519PublicKey::from_base64(
+                    "LTpv2DGMhggPAXO02+7f68CNEp6A40F0Yl8B094Y8gc"
+                ).unwrap();
+
+                let dev_1_unknown_a = create_session(&account, &dev1, SenderDataType::UnknownDevice).await;
+                let dev_1_unknown_b = create_session(&account, &dev1, SenderDataType::UnknownDevice).await;
+
+                let dev_1_keys_a = create_session(&account, &dev1, SenderDataType::DeviceInfo).await;
+                let dev_1_keys_b = create_session(&account, &dev1, SenderDataType::DeviceInfo).await;
+                let dev_1_keys_c = create_session(&account, &dev1, SenderDataType::DeviceInfo).await;
+                let dev_1_keys_d = create_session(&account, &dev1, SenderDataType::DeviceInfo).await;
+
+                let dev_2_unknown = create_session(
+                    &account, &dev2, SenderDataType::UnknownDevice).await;
+
+                let dev_2_keys = create_session(
+                    &account, &dev2, SenderDataType::DeviceInfo).await;
+
+                let sessions = vec![
+                    dev_1_unknown_a.clone(),
+                    dev_1_unknown_b.clone(),
+                    dev_1_keys_a.clone(),
+                    dev_1_keys_b.clone(),
+                    dev_1_keys_c.clone(),
+                    dev_1_keys_d.clone(),
+                    dev_2_unknown.clone(),
+                    dev_2_keys.clone(),
+                ];
+
+                let changes = Changes {
+                    inbound_group_sessions: sessions,
+                    ..Default::default()
+                };
+                store.save_changes(changes).await.expect("Can't save group session");
+
+                // When we fetch the list of sessions for device 1, unknown
+                let sessions_1_u = store.get_inbound_group_sessions_for_device_batch(
+                    dev1,
+                    SenderDataType::UnknownDevice,
+                    None,
+                    10
+                ).await.expect("Failed to get sessions for dev1");
+
+                // Then the expected sessions are returned
+                assert_session_lists_eq(sessions_1_u, [dev_1_unknown_a, dev_1_unknown_b], "device 1 sessions");
+
+                // And when we ask for the list of sessions for device 2, with device keys
+                let sessions_2_d = store
+                    .get_inbound_group_sessions_for_device_batch(dev2, SenderDataType::DeviceInfo, None, 10)
+                    .await
+                    .expect("Failed to get sessions for dev2");
+
+                // Then the matching session is returned
+                assert_eq!(sessions_2_d, vec![dev_2_keys], "device 2 sessions");
+
+                // And we can fetch device 1, keys in batches.
+                // We call the batch function repeatedly, to ensure it terminates correctly.
+                let mut sessions_1_k = Vec::new();
+                let mut previous_last_session_id: Option<String> = None;
+                loop {
+                    let mut sessions_1_k_batch = store.get_inbound_group_sessions_for_device_batch(
+                        dev1,
+                        SenderDataType::DeviceInfo,
+                        previous_last_session_id,
+                        2
+                    ).await.expect("Failed to get batch 1");
+
+                    // If there are no results in the batch, we have reached the end of the results.
+                    let Some(last_session) = sessions_1_k_batch.last() else {
+                        break;
+                    };
+
+                    // Check that there are exactly two results in the batch
+                    assert_eq!(sessions_1_k_batch.len(), 2);
+
+                    previous_last_session_id = Some(last_session.session_id().to_owned());
+                    sessions_1_k.append(&mut sessions_1_k_batch);
+                }
+
+                assert_session_lists_eq(
+                    sessions_1_k,
+                    [dev_1_keys_a, dev_1_keys_b, dev_1_keys_c, dev_1_keys_d],
+                    "device 1 batched results"
+                );
+            }
+
+            /// Assert that two lists of sessions are the same, modulo ordering.
+            ///
+            /// There is no requirement for `get_inbound_group_sessions_for_device_batch` to
+            /// return the results in a specific order. This helper ensures that the two lists
+            /// of inbound group sessions are equivalent, without worrying about the ordering.
+            fn assert_session_lists_eq<I, J>(actual: I, expected: J, message: &str)
+                where I: IntoIterator<Item = InboundGroupSession>, J: IntoIterator<Item = InboundGroupSession>
+            {
+                let sorter = |a: &InboundGroupSession, b: &InboundGroupSession| Ord::cmp(a.session_id(), b.session_id());
+
+                let mut actual = Vec::from_iter(actual);
+                actual.sort_unstable_by(sorter);
+                let mut expected = Vec::from_iter(expected);
+                expected.sort_unstable_by(sorter);
+                assert_eq!(actual, expected, "{}", message);
             }
 
             #[async_test]
@@ -679,7 +794,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn device_deleting() {
+            async fn test_device_deleting() {
                 let dir = "device_deleting";
                 let (_account, store) = get_loaded_store(dir.clone()).await;
                 let device = get_device();
@@ -785,7 +900,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn private_identity_saving() {
+            async fn test_private_identity_saving() {
                 let (_, store) = get_loaded_store("private_identity_saving").await;
                 assert!(store.load_identity().await.unwrap().is_none());
                 let identity = PrivateCrossSigningIdentity::new(alice_id().to_owned());
@@ -799,7 +914,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn olm_hash_saving() {
+            async fn test_olm_hash_saving() {
                 let (_, store) = get_loaded_store("olm_hash_saving").await;
 
                 let hash = OlmMessageHash {
@@ -816,7 +931,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn key_request_saving() {
+            async fn test_key_request_saving() {
                 let (account, store) = get_loaded_store("key_request_saving").await;
                 let sender_key =
                     Curve25519PublicKey::from_base64("Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw")
@@ -878,7 +993,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn gossipped_secret_saving() {
+            async fn test_gossipped_secret_saving() {
                 let (account, store) = get_loaded_store("gossipped_secret_saving").await;
 
                 let secret = "It is a secret to everybody";
@@ -955,7 +1070,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn withheld_info_storage() {
+            async fn test_withheld_info_storage() {
                 let (account, store) = get_loaded_store("withheld_info_storage").await;
 
                 let mut info_list: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
@@ -1033,7 +1148,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn room_settings_saving() {
+            async fn test_room_settings_saving() {
                 let (_, store) = get_loaded_store("room_settings_saving").await;
 
                 let room_1 = room_id!("!test_1:localhost");
@@ -1074,7 +1189,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn backup_keys_saving() {
+            async fn test_backup_keys_saving() {
                 let (_account, store) = get_loaded_store("backup_keys_saving").await;
 
                 let restored = store.load_backup_keys().await.unwrap();
@@ -1098,7 +1213,7 @@ macro_rules! cryptostore_integration_tests {
             }
 
             #[async_test]
-            async fn custom_value_saving() {
+            async fn test_custom_value_saving() {
                 let (_, store) = get_loaded_store("custom_value_saving").await;
                 store.set_custom_value("A", "Hello".as_bytes().to_vec()).await.unwrap();
 
@@ -1111,6 +1226,39 @@ macro_rules! cryptostore_integration_tests {
 
             fn session_info(session: &InboundGroupSession) -> (&RoomId, &str) {
                 (&session.room_id(), &session.session_id())
+            }
+
+            async fn create_session(
+                account: &Account,
+                device_curve_key: &Curve25519PublicKey,
+                sender_data_type: SenderDataType,
+            ) -> InboundGroupSession {
+                let sender_data = match sender_data_type {
+                    SenderDataType::UnknownDevice => {
+                        SenderData::UnknownDevice { legacy_session: false, owner_check_failed: false }
+                    }
+                    SenderDataType::DeviceInfo => SenderData::DeviceInfo {
+                        device_keys: account.device_keys().clone(),
+                        legacy_session: false,
+                    },
+                    SenderDataType::SenderUnverifiedButPreviouslyVerified =>
+                        panic!("SenderUnverifiedButPreviouslyVerified not supported"),
+                    SenderDataType::SenderUnverified=> panic!("SenderUnverified not supported"),
+                    SenderDataType::SenderVerified => panic!("SenderVerified not supported"),
+                };
+
+                let session_key = GroupSession::new(SessionConfig::default()).session_key();
+
+                InboundGroupSession::new(
+                    device_curve_key.clone(),
+                    account.device_keys().ed25519_key().unwrap(),
+                    room_id!("!r:s.co"),
+                    &session_key,
+                    sender_data,
+                    EventEncryptionAlgorithm::MegolmV1AesSha2,
+                    None,
+                )
+                .unwrap()
             }
         }
     };

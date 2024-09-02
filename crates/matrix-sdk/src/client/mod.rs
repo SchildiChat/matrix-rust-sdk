@@ -77,6 +77,8 @@ use url::Url;
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
+#[cfg(feature = "experimental-sliding-sync")]
+use crate::sliding_sync::Version as SlidingSyncVersion;
 use crate::{
     authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
     config::RequestConfig,
@@ -226,18 +228,26 @@ pub(crate) struct ClientInner {
     /// All the data related to authentication and authorization.
     pub(crate) auth_ctx: Arc<AuthCtx>,
 
+    /// The URL of the server.
+    ///
+    /// Not to be confused with the `Self::homeserver`. `server` is usually
+    /// the server part in a user ID, e.g. with `@mnt_io:matrix.org`, here
+    /// `matrix.org` is the server, whilst `matrix-client.matrix.org` is the
+    /// homeserver (at the time of writing — 2024-08-28).
+    ///
+    /// This value is optional depending on how the `Client` has been built.
+    /// If it's been built from a homeserver URL directly, we don't know the
+    /// server. However, if the `Client` has been built from a server URL or
+    /// name, then the homeserver has been discovered, and we know both.
+    server: Option<Url>,
+
     /// The URL of the homeserver to connect to.
+    ///
+    /// This is the URL for the client-server Matrix API.
     homeserver: StdRwLock<Url>,
 
-    /// The sliding sync proxy that is trusted by the homeserver.
     #[cfg(feature = "experimental-sliding-sync")]
-    sliding_sync_proxy: StdRwLock<Option<Url>>,
-
-    /// Whether Simplified MSC3575 is used or not.
-    ///
-    /// This value must not be changed during the lifetime of the `Client`.
-    #[cfg(feature = "experimental-sliding-sync")]
-    is_simplified_sliding_sync_enabled: bool,
+    sliding_sync_version: StdRwLock<SlidingSyncVersion>,
 
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
@@ -310,9 +320,9 @@ impl ClientInner {
     #[allow(clippy::too_many_arguments)]
     async fn new(
         auth_ctx: Arc<AuthCtx>,
+        server: Option<Url>,
         homeserver: Url,
-        #[cfg(feature = "experimental-sliding-sync")] sliding_sync_proxy: Option<Url>,
-        #[cfg(feature = "experimental-sliding-sync")] is_simplified_sliding_sync_enabled: bool,
+        #[cfg(feature = "experimental-sliding-sync")] sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
         base_client: BaseClient,
         server_capabilities: ClientServerCapabilities,
@@ -322,12 +332,11 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
     ) -> Arc<Self> {
         let client = Self {
+            server,
             homeserver: StdRwLock::new(homeserver),
             auth_ctx,
             #[cfg(feature = "experimental-sliding-sync")]
-            sliding_sync_proxy: StdRwLock::new(sliding_sync_proxy),
-            #[cfg(feature = "experimental-sliding-sync")]
-            is_simplified_sliding_sync_enabled,
+            sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
             base_client,
             locks: Default::default(),
@@ -462,29 +471,29 @@ impl Client {
         self.inner.base_client.logged_in()
     }
 
-    /// The Homeserver of the client.
+    /// The server used by the client.
+    ///
+    /// See `Self::server` to learn more.
+    pub fn server(&self) -> Option<&Url> {
+        self.inner.server.as_ref()
+    }
+
+    /// The homeserver of the client.
     pub fn homeserver(&self) -> Url {
         self.inner.homeserver.read().unwrap().clone()
     }
 
-    /// The sliding sync proxy that is trusted by the homeserver.
+    /// Get the sliding sync version.
     #[cfg(feature = "experimental-sliding-sync")]
-    pub fn sliding_sync_proxy(&self) -> Option<Url> {
-        let server = self.inner.sliding_sync_proxy.read().unwrap();
-        Some(server.as_ref()?.clone())
+    pub fn sliding_sync_version(&self) -> SlidingSyncVersion {
+        self.inner.sliding_sync_version.read().unwrap().clone()
     }
 
-    /// Force to set the sliding sync proxy URL.
+    /// Override the sliding sync version.
     #[cfg(feature = "experimental-sliding-sync")]
-    pub fn set_sliding_sync_proxy(&self, sliding_sync_proxy: Option<Url>) {
-        let mut lock = self.inner.sliding_sync_proxy.write().unwrap();
-        *lock = sliding_sync_proxy;
-    }
-
-    /// Check whether Simplified MSC3575 must be used.
-    #[cfg(feature = "experimental-sliding-sync")]
-    pub fn is_simplified_sliding_sync_enabled(&self) -> bool {
-        self.inner.is_simplified_sliding_sync_enabled
+    pub fn set_sliding_sync_version(&self, version: SlidingSyncVersion) {
+        let mut lock = self.inner.sliding_sync_version.write().unwrap();
+        *lock = version;
     }
 
     /// Get the Matrix user session meta information.
@@ -2187,17 +2196,13 @@ impl Client {
 
     /// Create a new specialized `Client` that can process notifications.
     pub async fn notification_client(&self) -> Result<Client> {
-        #[cfg(feature = "experimental-sliding-sync")]
-        let sliding_sync_proxy = self.inner.sliding_sync_proxy.read().unwrap().clone();
-
         let client = Client {
             inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
+                self.server().cloned(),
                 self.homeserver(),
                 #[cfg(feature = "experimental-sliding-sync")]
-                sliding_sync_proxy,
-                #[cfg(feature = "experimental-sliding-sync")]
-                self.inner.is_simplified_sliding_sync_enabled,
+                self.sliding_sync_version(),
                 self.inner.http_client.clone(),
                 self.inner.base_client.clone_with_in_memory_state_store(),
                 self.inner.server_capabilities.read().await.clone(),
@@ -2308,7 +2313,9 @@ pub(crate) mod tests {
     use crate::{
         client::WeakClient,
         config::{RequestConfig, SyncSettings},
-        test_utils::{logged_in_client, no_retry_test_client, test_client_builder},
+        test_utils::{
+            logged_in_client, no_retry_test_client, set_client_session, test_client_builder,
+        },
         Error,
     };
 
@@ -2341,32 +2348,42 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_successful_discovery() {
+        // Imagine this is `matrix.org`.
         let server = MockServer::start().await;
+
+        // Imagine this is `matrix-client.matrix.org`.
+        let homeserver = MockServer::start().await;
+
+        // Imagine Alice has the user ID `@alice:matrix.org`.
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let alice = UserId::parse("@alice:".to_owned() + domain).unwrap();
 
+        // The `.well-known` is on the server (e.g. `matrix.org`).
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
+                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", &homeserver.uri()),
                 "application/json",
             ))
             .mount(&server)
             .await;
 
+        // The `/versions` is on the homeserver (e.g. `matrix-client.matrix.org`).
         Mock::given(method("GET"))
             .and(path("/_matrix/client/versions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .mount(&server)
+            .mount(&homeserver)
             .await;
+
         let client = Client::builder()
             .insecure_server_name_no_tls(alice.server_name())
             .build()
             .await
             .unwrap();
 
-        assert_eq!(client.homeserver(), Url::parse(server_url.as_ref()).unwrap());
+        assert_eq!(client.server().unwrap(), &Url::parse(&server.uri()).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(&homeserver.uri()).unwrap());
     }
 
     #[async_test]
@@ -2742,5 +2759,18 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|version| *version == MatrixVersion::V1_0));
+    }
+
+    #[async_test]
+    async fn test_no_network_doesnt_cause_infinite_retries() {
+        // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
+        // since we want infinite retries for transient errors.
+        let client =
+            test_client_builder(None).request_config(RequestConfig::new()).build().await.unwrap();
+        set_client_session(&client).await;
+
+        // We don't define a mock server on purpose here, so that the error is really a
+        // network error.
+        client.whoami().await.unwrap_err();
     }
 }

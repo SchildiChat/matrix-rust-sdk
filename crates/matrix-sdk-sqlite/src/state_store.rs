@@ -2,12 +2,12 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt, iter,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
+use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     deserialized_responses::{RawAnySyncOrStrippedState, SyncOrStrippedState},
     store::{
@@ -41,9 +41,11 @@ use tracing::{debug, warn};
 
 use crate::{
     error::{Error, Result},
-    get_or_create_store_cipher,
-    utils::{load_db_version, repeat_vars, Key, SqliteObjectExt},
-    OpenStoreError, SqliteObjectStoreExt,
+    utils::{
+        repeat_vars, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        SqliteKeyValueStoreConnExt,
+    },
+    OpenStoreError,
 };
 
 mod keys {
@@ -72,18 +74,13 @@ const DATABASE_VERSION: u8 = 7;
 #[derive(Clone)]
 pub struct SqliteStateStore {
     store_cipher: Option<Arc<StoreCipher>>,
-    path: Option<PathBuf>,
     pool: SqlitePool,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for SqliteStateStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(path) = &self.path {
-            f.debug_struct("SqliteStateStore").field("path", &path).finish()
-        } else {
-            f.debug_struct("SqliteStateStore").field("path", &"memory store").finish()
-        }
+        f.debug_struct("SqliteStateStore").finish_non_exhaustive()
     }
 }
 
@@ -106,7 +103,7 @@ impl SqliteStateStore {
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        let mut version = load_db_version(&conn).await?;
+        let mut version = conn.db_version().await?;
 
         if version == 0 {
             init(&conn).await?;
@@ -114,10 +111,10 @@ impl SqliteStateStore {
         }
 
         let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(get_or_create_store_cipher(p, &conn).await?)),
+            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
             None => None,
         };
-        let this = Self { store_cipher, path: None, pool };
+        let this = Self { store_cipher, pool };
         this.run_migrations(&conn, version, None).await?;
 
         Ok(this)
@@ -127,7 +124,7 @@ impl SqliteStateStore {
     /// version
     ///
     /// If `to` is `None`, the current database version will be used.
-    async fn run_migrations(&self, conn: &SqliteConn, from: u8, to: Option<u8>) -> Result<()> {
+    async fn run_migrations(&self, conn: &SqliteAsyncConn, from: u8, to: Option<u8>) -> Result<()> {
         let to = to.unwrap_or(DATABASE_VERSION);
 
         if from < to {
@@ -167,6 +164,7 @@ impl SqliteStateStore {
                     "../migrations/state_store/002_b_replace_room_info.sql"
                 ))?;
 
+                txn.set_db_version(2)?;
                 Result::<_, Error>::Ok(())
             })
             .await?;
@@ -217,6 +215,7 @@ impl SqliteStateStore {
                         .execute((data, room_id))?;
                 }
 
+                txn.set_db_version(3)?;
                 Result::<_, Error>::Ok(())
             })
             .await?;
@@ -226,7 +225,7 @@ impl SqliteStateStore {
             conn.with_transaction(move |txn| {
                 // Create new table.
                 txn.execute_batch(include_str!("../migrations/state_store/003_send_queue.sql"))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(4)
             })
             .await?;
         }
@@ -237,7 +236,7 @@ impl SqliteStateStore {
                 txn.execute_batch(include_str!(
                     "../migrations/state_store/004_send_queue_with_roomid_value.sql"
                 ))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(4)
             })
             .await?;
         }
@@ -248,7 +247,7 @@ impl SqliteStateStore {
                 txn.execute_batch(include_str!(
                     "../migrations/state_store/005_send_queue_dependent_events.sql"
                 ))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(6)
             })
             .await?;
         }
@@ -257,12 +256,10 @@ impl SqliteStateStore {
             conn.with_transaction(move |txn| {
                 // Drop media table.
                 txn.execute_batch(include_str!("../migrations/state_store/006_drop_media.sql"))?;
-                Result::<_, Error>::Ok(())
+                txn.set_db_version(7)
             })
             .await?;
         }
-
-        conn.set_kv("version", vec![to]).await?;
 
         Ok(())
     }
@@ -351,7 +348,7 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, full_key)
     }
 
-    async fn acquire(&self) -> Result<deadpool_sqlite::Object> {
+    async fn acquire(&self) -> Result<SqliteAsyncConn> {
         Ok(self.pool.get().await?)
     }
 
@@ -376,18 +373,17 @@ async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
 }
 
 /// Initialize the database.
-async fn init(conn: &SqliteConn) -> Result<()> {
+async fn init(conn: &SqliteAsyncConn) -> Result<()> {
     // First turn on WAL mode, this can't be done in the transaction, it fails with
     // the error message: "cannot change into wal mode from within a transaction".
     conn.execute_batch("PRAGMA journal_mode = wal;").await?;
     conn.with_transaction(|txn| {
-        txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))
+        txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))?;
+        txn.set_db_version(1)?;
+
+        Ok(())
     })
-    .await?;
-
-    conn.set_kv("version", vec![1]).await?;
-
-    Ok(())
+    .await
 }
 
 trait SqliteConnectionStateStoreExt {
@@ -670,7 +666,7 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
 }
 
 #[async_trait]
-trait SqliteObjectStateStoreExt: SqliteObjectExt {
+trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
     async fn get_kv_blob(&self, key: Key) -> Result<Option<Vec<u8>>> {
         Ok(self
             .query_row("SELECT value FROM kv_blob WHERE key = ?", (key,), |row| row.get(0))
@@ -681,15 +677,17 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     async fn get_kv_blobs(&self, keys: Vec<Key>) -> Result<Vec<Vec<u8>>> {
         let keys_length = keys.len();
 
-        self.chunk_large_query_over(keys, Some(keys_length), |keys| {
+        self.chunk_large_query_over(keys, Some(keys_length), |txn, keys| {
             let sql_params = repeat_vars(keys.len());
             let sql = format!("SELECT value FROM kv_blob WHERE key IN ({sql_params})");
 
             let params = rusqlite::params_from_iter(keys);
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| row.get(0)).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| row.get(0))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -709,15 +707,15 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 })
                 .await?)
         } else {
-            self.chunk_large_query_over(states, None, |states| {
+            self.chunk_large_query_over(states, None, |txn, states| {
                 let sql_params = repeat_vars(states.len());
                 let sql = format!("SELECT data FROM room_info WHERE state IN ({sql_params})");
 
-                self.prepare(sql, move |mut stmt| {
-                    stmt.query(rusqlite::params_from_iter(states))?
-                        .mapped(|row| row.get(0))
-                        .collect()
-                })
+                Ok(txn
+                    .prepare(&sql)?
+                    .query(rusqlite::params_from_iter(states))?
+                    .mapped(|row| row.get(0))
+                    .collect::<Result<_, _>>()?)
             })
             .await
         }
@@ -729,7 +727,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
         event_type: Key,
         state_keys: Vec<Key>,
     ) -> Result<Vec<(bool, Vec<u8>)>> {
-        self.chunk_large_query_over(state_keys, None, move |state_keys: Vec<Key>| {
+        self.chunk_large_query_over(state_keys, None, move |txn, state_keys: Vec<Key>| {
             let sql_params = repeat_vars(state_keys.len());
             let sql = format!(
                 "SELECT stripped, data FROM state_event
@@ -740,9 +738,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 [room_id.clone(), event_type.clone()].into_iter().chain(state_keys),
             );
 
-            self.prepare(sql, |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -772,7 +772,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let user_ids_length = user_ids.len();
 
-        self.chunk_large_query_over(user_ids, Some(user_ids_length), move |user_ids| {
+        self.chunk_large_query_over(user_ids, Some(user_ids_length), move |txn, user_ids| {
             let sql_params = repeat_vars(user_ids.len());
             let sql = format!(
                 "SELECT user_id, data FROM profile WHERE room_id = ? AND user_id IN ({sql_params})"
@@ -780,9 +780,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 
             let params = rusqlite::params_from_iter(iter::once(room_id.clone()).chain(user_ids));
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -794,7 +796,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
             })
             .await?
         } else {
-            self.chunk_large_query_over(memberships, None, move |memberships| {
+            self.chunk_large_query_over(memberships, None, move |txn, memberships| {
                 let sql_params = repeat_vars(memberships.len());
                 let sql = format!(
                     "SELECT data FROM member WHERE room_id = ? AND membership IN ({sql_params})"
@@ -803,9 +805,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
                 let params =
                     rusqlite::params_from_iter(iter::once(room_id.clone()).chain(memberships));
 
-                self.prepare(sql, move |mut stmt| {
-                    stmt.query(params)?.mapped(|row| row.get(0)).collect()
-                })
+                Ok(txn
+                    .prepare(&sql)?
+                    .query(params)?
+                    .mapped(|row| row.get(0))
+                    .collect::<Result<_, _>>()?)
             })
             .await?
         };
@@ -846,7 +850,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let names_length = names.len();
 
-        self.chunk_large_query_over(names, Some(names_length), move |names| {
+        self.chunk_large_query_over(names, Some(names_length), move |txn, names| {
             let sql_params = repeat_vars(names.len());
             let sql = format!(
                 "SELECT name, data FROM display_name WHERE room_id = ? AND name IN ({sql_params})"
@@ -854,9 +858,11 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 
             let params = rusqlite::params_from_iter(iter::once(room_id.clone()).chain(names));
 
-            self.prepare(sql, move |mut stmt| {
-                stmt.query(params)?.mapped(|row| Ok((row.get(0)?, row.get(1)?))).collect()
-            })
+            Ok(txn
+                .prepare(&sql)?
+                .query(params)?
+                .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                .collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -901,7 +907,7 @@ trait SqliteObjectStateStoreExt: SqliteObjectExt {
 }
 
 #[async_trait]
-impl SqliteObjectStateStoreExt for deadpool_sqlite::Object {
+impl SqliteObjectStateStoreExt for SqliteAsyncConn {
     async fn set_kv_blob(&self, key: Key, value: Vec<u8>) -> Result<()> {
         Ok(self.interact(move |conn| conn.set_kv_blob(&key, &value)).await.unwrap()?)
     }
@@ -2003,8 +2009,7 @@ mod migration_tests {
     use super::{create_pool, init, keys, SqliteStateStore};
     use crate::{
         error::{Error, Result},
-        get_or_create_store_cipher,
-        utils::SqliteObjectExt,
+        utils::{SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt},
     };
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
@@ -2022,8 +2027,8 @@ mod migration_tests {
 
         init(&conn).await?;
 
-        let store_cipher = Some(Arc::new(get_or_create_store_cipher(SECRET, &conn).await.unwrap()));
-        let this = SqliteStateStore { store_cipher, path: None, pool };
+        let store_cipher = Some(Arc::new(conn.get_or_create_store_cipher(SECRET).await.unwrap()));
+        let this = SqliteStateStore { store_cipher, pool };
         this.run_migrations(&conn, 1, Some(version)).await?;
 
         Ok(this)

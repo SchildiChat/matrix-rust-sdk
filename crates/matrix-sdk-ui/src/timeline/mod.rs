@@ -41,7 +41,6 @@ use ruma::{
             UnstablePollStartEventContent,
         },
         receipt::{Receipt, ReceiptThread},
-        relation::Annotation,
         room::{
             message::{
                 AddMentions, ForwardThread, OriginalRoomMessageEvent, RoomMessageEventContent,
@@ -62,13 +61,13 @@ use tracing::{error, instrument, trace, warn};
 use crate::timeline::pinned_events_loader::PinnedEventsRoom;
 
 mod builder;
+mod controller;
 mod day_dividers;
 mod error;
 mod event_handler;
 mod event_item;
 pub mod event_type_filter;
 pub mod futures;
-mod inner;
 mod item;
 mod pagination;
 mod pinned_events_loader;
@@ -85,6 +84,7 @@ mod virtual_item;
 
 pub use self::{
     builder::TimelineBuilder,
+    controller::default_event_filter,
     error::*,
     event_item::{
         AnyOtherFullStateEventContent, EncryptedMessage, EventItemOrigin, EventSendState,
@@ -94,7 +94,6 @@ pub use self::{
         TimelineEventItemId, TimelineItemContent,
     },
     event_type_filter::TimelineEventTypeFilter,
-    inner::default_event_filter,
     item::{TimelineItem, TimelineItemKind},
     pagination::LiveBackPaginationStatus,
     polls::PollResult,
@@ -102,8 +101,8 @@ pub use self::{
     virtual_item::VirtualTimelineItem,
 };
 use self::{
+    controller::TimelineController,
     futures::SendAttachment,
-    inner::TimelineInner,
     util::{rfind_event_by_id, rfind_event_item},
 };
 
@@ -155,7 +154,7 @@ pub enum ReplyContent {
 pub struct Timeline {
     /// Clonable, inner fields of the `Timeline`, shared with some background
     /// tasks.
-    inner: TimelineInner,
+    controller: TimelineController,
 
     /// The event cache specialized for this room's view.
     event_cache: RoomEventCache,
@@ -172,14 +171,10 @@ pub enum TimelineFocus {
     Live,
 
     /// Focus on a specific event, e.g. after clicking a permalink.
-    Event {
-        target: OwnedEventId,
-        num_context_events: u16,
-    },
+    Event { target: OwnedEventId, num_context_events: u16 },
 
-    PinnedEvents {
-        max_events_to_load: u16,
-    },
+    /// Only show pinned events.
+    PinnedEvents { max_events_to_load: u16 },
 }
 
 impl Timeline {
@@ -190,12 +185,12 @@ impl Timeline {
 
     /// Returns the room for this timeline.
     pub fn room(&self) -> &Room {
-        self.inner.room()
+        self.controller.room()
     }
 
     /// Clear all timeline items.
     pub async fn clear(&self) {
-        self.inner.clear().await;
+        self.controller.clear().await;
     }
 
     /// Retry decryption of previously un-decryptable events given a list of
@@ -227,7 +222,7 @@ impl Timeline {
         &self,
         session_ids: impl IntoIterator<Item = S>,
     ) {
-        self.inner
+        self.controller
             .retry_event_decryption(
                 self.room(),
                 Some(session_ids.into_iter().map(Into::into).collect()),
@@ -238,7 +233,7 @@ impl Timeline {
     #[cfg(feature = "e2e-encryption")]
     #[tracing::instrument(skip(self))]
     async fn retry_decryption_for_all_events(&self) {
-        self.inner.retry_event_decryption(self.room(), None).await;
+        self.controller.retry_event_decryption(self.room(), None).await;
     }
 
     /// Get the current timeline item for the given event ID, if any.
@@ -250,7 +245,7 @@ impl Timeline {
     /// possible, instead of just storing IDs and coming back to the timeline
     /// object to look up items.
     pub async fn item_by_event_id(&self, event_id: &EventId) -> Option<EventTimelineItem> {
-        let items = self.inner.items().await;
+        let items = self.controller.items().await;
         let (_, item) = rfind_event_by_id(&items, event_id)?;
         Some(item.to_owned())
     }
@@ -267,7 +262,7 @@ impl Timeline {
         &self,
         target: &TransactionId,
     ) -> Option<EventTimelineItem> {
-        let items = self.inner.items().await;
+        let items = self.controller.items().await;
         let (_, item) = rfind_event_item(&items, |item| {
             item.as_local().map_or(false, |local| local.transaction_id == target)
         })?;
@@ -276,8 +271,8 @@ impl Timeline {
 
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
-        if self.inner.is_live().await {
-            self.inner.items().await.last()?.as_event().cloned()
+        if self.controller.is_live().await {
+            self.controller.items().await.last()?.as_event().cloned()
         } else {
             None
         }
@@ -290,7 +285,7 @@ impl Timeline {
     pub async fn subscribe(
         &self,
     ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>) {
-        let (items, stream) = self.inner.subscribe().await;
+        let (items, stream) = self.controller.subscribe().await;
         let stream = TimelineStream::new(stream, self.drop_handle.clone());
         (items, stream)
     }
@@ -303,7 +298,7 @@ impl Timeline {
     pub async fn subscribe_batched(
         &self,
     ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>>) {
-        let (items, stream) = self.inner.subscribe_batched().await;
+        let (items, stream) = self.controller.subscribe_batched().await;
         let stream = TimelineStream::new(stream, self.drop_handle.clone());
         (items, stream)
     }
@@ -454,7 +449,7 @@ impl Timeline {
     /// Returns a local or remote timeline item identified by this transaction
     /// id.
     async fn item_by_transaction_id(&self, txn_id: &TransactionId) -> Option<EventTimelineItem> {
-        let items = self.inner.items().await;
+        let items = self.controller.items().await;
 
         let (_, found) = rfind_event_item(&items, |item| match &item.kind {
             EventTimelineItemKind::Local(local) => local.transaction_id == txn_id,
@@ -548,17 +543,20 @@ impl Timeline {
         Ok(())
     }
 
-    /// Toggle a reaction on an event
+    /// Toggle a reaction on an event.
+    ///
+    /// The `unique_id` parameter is a string returned by
+    /// [`TimelineItem::unique_id()`].
     ///
     /// Adds or redacts a reaction based on the state of the reaction at the
     /// time it is called.
     ///
-    /// When redacting an event, the redaction reason is not sent.
+    /// When redacting a previous reaction, the redaction reason is not set.
     ///
     /// Ensures that only one reaction is sent at a time to avoid race
     /// conditions and spamming the homeserver with requests.
-    pub async fn toggle_reaction(&self, annotation: &Annotation) -> Result<(), Error> {
-        self.inner.toggle_reaction_local(annotation).await?;
+    pub async fn toggle_reaction(&self, unique_id: &str, reaction_key: &str) -> Result<(), Error> {
+        self.controller.toggle_reaction_local(unique_id, reaction_key).await?;
         Ok(())
     }
 
@@ -650,7 +648,7 @@ impl Timeline {
     /// before all requests are handled.
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn fetch_details_for_event(&self, event_id: &EventId) -> Result<(), Error> {
-        self.inner.fetch_in_reply_to_details(event_id).await
+        self.controller.fetch_in_reply_to_details(event_id).await
     }
 
     /// Fetch all member events for the room this timeline is displaying.
@@ -662,13 +660,13 @@ impl Timeline {
     /// the `sender_profile` set to [`TimelineDetails::Error`].
     #[instrument(skip_all)]
     pub async fn fetch_members(&self) {
-        self.inner.set_sender_profiles_pending().await;
+        self.controller.set_sender_profiles_pending().await;
         match self.room().sync_members().await {
             Ok(_) => {
-                self.inner.update_missing_sender_profiles().await;
+                self.controller.update_missing_sender_profiles().await;
             }
             Err(e) => {
-                self.inner.set_sender_profiles_error(Arc::new(e)).await;
+                self.controller.set_sender_profiles_error(Arc::new(e)).await;
             }
         }
     }
@@ -683,7 +681,7 @@ impl Timeline {
         &self,
         user_id: &UserId,
     ) -> Option<(OwnedEventId, Receipt)> {
-        self.inner.latest_user_read_receipt(user_id).await
+        self.controller.latest_user_read_receipt(user_id).await
     }
 
     /// Get the ID of the timeline event with the latest read receipt for the
@@ -698,7 +696,7 @@ impl Timeline {
         &self,
         user_id: &UserId,
     ) -> Option<OwnedEventId> {
-        self.inner.latest_user_read_receipt_timeline_event_id(user_id).await
+        self.controller.latest_user_read_receipt_timeline_event_id(user_id).await
     }
 
     /// Send the given receipt.
@@ -715,7 +713,7 @@ impl Timeline {
         thread: ReceiptThread,
         event_id: OwnedEventId,
     ) -> Result<bool> {
-        if !self.inner.should_send_receipt(&receipt_type, &thread, &event_id).await {
+        if !self.controller.should_send_receipt(&receipt_type, &thread, &event_id).await {
             trace!(
                 "not sending receipt, because we already cover the event with a previous receipt"
             );
@@ -729,7 +727,7 @@ impl Timeline {
 
     /// SC: get fully_read marker ID
     pub async fn fully_read_event_id(&self) -> Option<OwnedEventId> {
-        self.inner.fully_read_event_id().await
+        self.controller.fully_read_event_id().await
     }
 
     /// SC: Same as send_single_receipt(), but without the should_send_receipt()-check
@@ -754,7 +752,7 @@ impl Timeline {
     pub async fn send_multiple_receipts(&self, mut receipts: Receipts) -> Result<()> {
         if let Some(fully_read) = &receipts.fully_read {
             if !self
-                .inner
+                .controller
                 .should_send_receipt(
                     &ReceiptType::FullyRead,
                     &ReceiptThread::Unthreaded,
@@ -768,7 +766,7 @@ impl Timeline {
 
         if let Some(read_receipt) = &receipts.public_read_receipt {
             if !self
-                .inner
+                .controller
                 .should_send_receipt(&ReceiptType::Read, &ReceiptThread::Unthreaded, read_receipt)
                 .await
             {
@@ -778,7 +776,7 @@ impl Timeline {
 
         if let Some(private_read_receipt) = &receipts.private_read_receipt {
             if !self
-                .inner
+                .controller
                 .should_send_receipt(
                     &ReceiptType::ReadPrivate,
                     &ReceiptThread::Unthreaded,
@@ -803,7 +801,7 @@ impl Timeline {
     /// Returns a boolean indicating if we sent the request or not.
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<bool> {
-        if let Some(event_id) = self.inner.latest_event_id().await {
+        if let Some(event_id) = self.controller.latest_event_id().await {
             self.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
         } else {
             trace!("can't mark room as read because there's no latest event id");
@@ -853,14 +851,14 @@ impl Timeline {
 impl Timeline {
     /// Get the current list of timeline items.
     pub async fn items(&self) -> Vector<Arc<TimelineItem>> {
-        self.inner.items().await
+        self.controller.items().await
     }
 
     pub async fn subscribe_filter_map<U: Clone>(
         &self,
         f: impl Fn(Arc<TimelineItem>) -> Option<U>,
     ) -> (Vector<U>, impl Stream<Item = VectorDiff<U>>) {
-        let (items, stream) = self.inner.subscribe_filter_map(f).await;
+        let (items, stream) = self.controller.subscribe_filter_map(f).await;
         let stream = TimelineStream::new(stream, self.drop_handle.clone());
         (items, stream)
     }
@@ -873,7 +871,7 @@ struct TimelineDropHandle {
     room_update_join_handle: JoinHandle<()>,
     pinned_events_join_handle: Option<JoinHandle<()>>,
     room_key_from_backups_join_handle: JoinHandle<()>,
-    local_echo_listener_handle: Option<JoinHandle<()>>,
+    local_echo_listener_handle: JoinHandle<()>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
 }
 
@@ -882,12 +880,10 @@ impl Drop for TimelineDropHandle {
         for handle in self.event_handler_handles.drain(..) {
             self.client.remove_event_handler(handle);
         }
-        if let Some(handle) = self.local_echo_listener_handle.take() {
-            handle.abort()
-        };
         if let Some(handle) = self.pinned_events_join_handle.take() {
             handle.abort()
         };
+        self.local_echo_listener_handle.abort();
         self.room_update_join_handle.abort();
         self.room_key_from_backups_join_handle.abort();
     }

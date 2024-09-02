@@ -26,6 +26,7 @@ use ruma::{
 };
 use tokio::sync::RwLock;
 use tracing::warn;
+use vodozemac::Curve25519PublicKey;
 
 use super::{
     caches::{DeviceStore, GroupSessionStore},
@@ -35,7 +36,7 @@ use super::{
 use crate::{
     gossiping::{GossipRequest, GossippedSecret, SecretInfo},
     identities::{DeviceData, UserIdentityData},
-    olm::{OutboundGroupSession, PrivateCrossSigningIdentity},
+    olm::{OutboundGroupSession, PrivateCrossSigningIdentity, SenderDataType},
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     TrackedUser,
 };
@@ -378,6 +379,48 @@ impl CryptoStore for MemoryStore {
         };
 
         Ok(RoomKeyCounts { total: self.inbound_group_sessions.count(), backed_up })
+    }
+
+    async fn get_inbound_group_sessions_for_device_batch(
+        &self,
+        sender_key: Curve25519PublicKey,
+        sender_data_type: SenderDataType,
+        after_session_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<InboundGroupSession>> {
+        // First, find all InboundGroupSessions, filtering for those that match the
+        // device and sender_data type.
+        let mut sessions: Vec<_> = self
+            .get_inbound_group_sessions()
+            .await?
+            .into_iter()
+            .filter(|session: &InboundGroupSession| {
+                session.creator_info.curve25519_key == sender_key
+                    && session.sender_data.to_type() == sender_data_type
+            })
+            .collect();
+
+        // Then, sort the sessions in order of ascending session ID...
+        sessions.sort_by_key(|s| s.session_id().to_owned());
+
+        // Figure out where in the array to start returning results from
+        let start_index = {
+            match after_session_id {
+                None => 0,
+                Some(id) => {
+                    let idx = sessions
+                        .iter()
+                        .position(|session| session.session_id() == id)
+                        .map(|idx| idx + 1);
+
+                    // If `after_session_id` was not found in the array, go to the end of the array
+                    idx.unwrap_or(sessions.len())
+                }
+            }
+        };
+
+        // Return up to `limit` items from the array, starting from `start_index`
+        Ok(sessions.drain(start_index..).take(limit).collect())
     }
 
     async fn inbound_group_sessions_for_backup(
@@ -1102,13 +1145,14 @@ mod integration_tests {
     use ruma::{
         events::secret::request::SecretName, DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId,
     };
+    use vodozemac::Curve25519PublicKey;
 
     use super::MemoryStore;
     use crate::{
         cryptostore_integration_tests, cryptostore_integration_tests_time,
         olm::{
             InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
-            StaticAccountData,
+            SenderDataType, StaticAccountData,
         },
         store::{BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts, RoomSettings},
         types::events::room_key_withheld::RoomKeyWithheldEvent,
@@ -1228,6 +1272,23 @@ mod integration_tests {
             backup_version: Option<&str>,
         ) -> Result<RoomKeyCounts, Self::Error> {
             self.0.inbound_group_session_counts(backup_version).await
+        }
+
+        async fn get_inbound_group_sessions_for_device_batch(
+            &self,
+            sender_key: Curve25519PublicKey,
+            sender_data_type: SenderDataType,
+            after_session_id: Option<String>,
+            limit: usize,
+        ) -> Result<Vec<InboundGroupSession>, Self::Error> {
+            self.0
+                .get_inbound_group_sessions_for_device_batch(
+                    sender_key,
+                    sender_data_type,
+                    after_session_id,
+                    limit,
+                )
+                .await
         }
 
         async fn inbound_group_sessions_for_backup(

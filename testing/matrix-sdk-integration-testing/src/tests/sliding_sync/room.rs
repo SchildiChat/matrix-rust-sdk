@@ -268,13 +268,12 @@ async fn test_joined_user_can_create_push_context_with_room_list_service() -> Re
 
     // And a new device for Alice that uses sliding sync,
     let hs = alice.homeserver();
-    let sliding_sync_url = alice.sliding_sync_proxy();
+    let sliding_sync_version = alice.sliding_sync_version();
     let alice_id = alice.user_id().unwrap().localpart().to_owned();
 
     let alice = Client::builder()
         .homeserver_url(hs)
-        .simplified_sliding_sync(false)
-        .sliding_sync_proxy(sliding_sync_url.unwrap())
+        .sliding_sync_version(sliding_sync_version)
         .build()
         .await
         .unwrap();
@@ -582,6 +581,8 @@ async fn test_room_notification_count() -> Result<()> {
     // Now Alice is only interesting in mentions of their name.
     let settings = alice.notification_settings().await;
 
+    let mut settings_changes = settings.subscribe_to_changes();
+
     tracing::warn!("Updating room notification mode to mentions and keywords only...");
     settings
         .set_room_notification_mode(
@@ -592,7 +593,7 @@ async fn test_room_notification_count() -> Result<()> {
     tracing::warn!("Done!");
 
     // Wait for remote echo.
-    tokio::time::sleep(Duration::from_secs(3))
+    timeout(Duration::from_secs(3), settings_changes.recv())
         .await
         .expect("timeout when waiting for settings update")
         .expect("should've received echo after updating settings");
