@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use matrix_sdk::RoomState;
 
 use super::{Room, Sorter};
 
@@ -34,11 +35,13 @@ pub fn new_sorter(pin_favorites: bool, bury_low_priority: bool) -> impl Sorter {
 
 fn room_to_tag_weight(room: &Room, pin_favorites: bool, bury_low_priority: bool) -> u8 {
     let inner_room = room.inner_room();
-    if pin_favorites && inner_room.is_favourite() {
+    if inner_room.state() == RoomState::Invited {
         0
-    } else if bury_low_priority && inner_room.is_low_priority() {
-        2
-    } else {
+    } else if pin_favorites && inner_room.is_favourite() {
         1
+    } else if bury_low_priority && inner_room.is_low_priority() {
+        3
+    } else {
+        2
     }
 }

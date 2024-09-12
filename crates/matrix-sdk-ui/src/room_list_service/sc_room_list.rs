@@ -18,12 +18,13 @@ pub struct ScSortOrder {
 pub fn get_sort_by_vec(sort_order: ScSortOrder) -> Vec<BoxedSorterFn> {
     let mut result: Vec<BoxedSorterFn> = Vec::new();
     tracing::info!("SC_DBG: sort by {} {} {} {}", sort_order.by_unread, sort_order.pin_favorites, sort_order.bury_low_priority, sort_order.client_generated_unread);
-    if sort_order.pin_favorites || sort_order.bury_low_priority {
-        result.push(Box::new(new_sorter_tag(
-            sort_order.pin_favorites,
-            sort_order.bury_low_priority
-        )));
-    }
+    // Always sort by tag: also sorts invites on top
+    //if sort_order.pin_favorites || sort_order.bury_low_priority {
+    result.push(Box::new(new_sorter_tag(
+        sort_order.pin_favorites,
+        sort_order.bury_low_priority
+    )));
+    //}
     if sort_order.by_unread {
         result.push(Box::new(new_sorter_unread(sort_order.client_generated_unread)));
     }
