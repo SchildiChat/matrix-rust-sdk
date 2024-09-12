@@ -133,12 +133,11 @@ impl RoomPagination {
     }
 
     async fn run_backwards_impl(&self, batch_size: u16) -> Result<Option<BackPaginationOutcome>> {
-        // Make sure there's at most one back-pagination request.
         let prev_token = self.get_or_wait_for_token().await;
 
         let paginator = &self.inner.pagination.paginator;
 
-        paginator.set_idle_state(prev_token.clone(), None)?;
+        paginator.set_idle_state(PaginatorState::Idle, prev_token.clone(), None)?;
 
         // Run the actual pagination.
         let PaginationResult { events, hit_end_of_timeline: reached_start } =
@@ -352,7 +351,6 @@ mod tests {
             event_cache.subscribe().unwrap();
 
             let (room_event_cache, _drop_handlers) = event_cache.for_room(room_id).await.unwrap();
-            let room_event_cache = room_event_cache.unwrap();
 
             // When I only have events in a room,
             {
@@ -405,7 +403,6 @@ mod tests {
             event_cache.subscribe().unwrap();
 
             let (room_event_cache, _drop_handlers) = event_cache.for_room(room_id).await.unwrap();
-            let room_event_cache = room_event_cache.unwrap();
 
             let expected_token = "old".to_owned();
 
@@ -460,7 +457,6 @@ mod tests {
             event_cache.subscribe().unwrap();
 
             let (room_event_cache, _drop_handles) = event_cache.for_room(room_id).await.unwrap();
-            let room_event_cache = room_event_cache.unwrap();
 
             let expected_token = "old".to_owned();
 

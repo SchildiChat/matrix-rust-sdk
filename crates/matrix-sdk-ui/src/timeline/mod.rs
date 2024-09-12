@@ -36,14 +36,11 @@ use pin_project_lite::pin_project;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType,
     events::{
-        poll::unstable_start::{
-            ReplacementUnstablePollStartEventContent, UnstablePollStartContentBlock,
-            UnstablePollStartEventContent,
-        },
+        poll::unstable_start::{NewUnstablePollStartEventContent, UnstablePollStartEventContent},
         receipt::{Receipt, ReceiptThread},
         room::{
             message::{
-                AddMentions, ForwardThread, OriginalRoomMessageEvent, RoomMessageEventContent,
+                AddMentions, ForwardThread, OriginalRoomMessageEvent,
                 RoomMessageEventContentWithoutRelation,
             },
             pinned_events::RoomPinnedEventsEventContent,
@@ -76,7 +73,6 @@ mod reactions;
 mod read_receipts;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "e2e-encryption")]
 mod to_device;
 mod traits;
 mod util;
@@ -174,7 +170,7 @@ pub enum TimelineFocus {
     Event { target: OwnedEventId, num_context_events: u16 },
 
     /// Only show pinned events.
-    PinnedEvents { max_events_to_load: u16 },
+    PinnedEvents { max_events_to_load: u16, max_concurrent_requests: u16 },
 }
 
 impl Timeline {
@@ -217,7 +213,6 @@ impl Timeline {
     /// }
     /// # anyhow::Ok(()) };
     /// ```
-    #[cfg(feature = "e2e-encryption")]
     pub async fn retry_decryption<S: Into<String>>(
         &self,
         session_ids: impl IntoIterator<Item = S>,
@@ -230,7 +225,6 @@ impl Timeline {
             .await;
     }
 
-    #[cfg(feature = "e2e-encryption")]
     #[tracing::instrument(skip(self))]
     async fn retry_decryption_for_all_events(&self) {
         self.controller.retry_event_decryption(self.room(), None).await;
@@ -477,7 +471,7 @@ impl Timeline {
     pub async fn edit(
         &self,
         item: &EventTimelineItem,
-        new_content: RoomMessageEventContentWithoutRelation,
+        new_content: EditedContent,
     ) -> Result<bool, Error> {
         let event_id = match item.identifier() {
             TimelineEventItemId::TransactionId(txn_id) => {
@@ -487,9 +481,30 @@ impl Timeline {
                         TimelineItemHandle::Remote(event_id) => event_id.to_owned(),
                         TimelineItemHandle::Local(handle) => {
                             // Relations are filled by the editing code itself.
-                            let new_content: RoomMessageEventContent = new_content.clone().into();
+                            let new_content: AnyMessageLikeEventContent = match new_content {
+                                EditedContent::RoomMessage(message) => {
+                                    if matches!(item.content, TimelineItemContent::Message(_)) {
+                                        AnyMessageLikeEventContent::RoomMessage(message.into())
+                                    } else {
+                                        warn!("New content (m.room.message) doesn't match previous event content.");
+                                        return Ok(false);
+                                    }
+                                }
+                                EditedContent::PollStart { new_content, .. } => {
+                                    if matches!(item.content, TimelineItemContent::Poll(_)) {
+                                        AnyMessageLikeEventContent::UnstablePollStart(
+                                            UnstablePollStartEventContent::New(
+                                                NewUnstablePollStartEventContent::new(new_content),
+                                            ),
+                                        )
+                                    } else {
+                                        warn!("New content (poll start) doesn't match previous event content.");
+                                        return Ok(false);
+                                    }
+                                }
+                            };
                             return Ok(handle
-                                .edit(new_content.into())
+                                .edit(new_content)
                                 .await
                                 .map_err(RoomSendQueueError::StorageError)?);
                         }
@@ -503,44 +518,11 @@ impl Timeline {
             TimelineEventItemId::EventId(event_id) => event_id,
         };
 
-        let content =
-            self.room().make_edit_event(&event_id, EditedContent::RoomMessage(new_content)).await?;
+        let content = self.room().make_edit_event(&event_id, new_content).await?;
 
         self.send(content).await?;
 
         Ok(true)
-    }
-
-    pub async fn edit_poll(
-        &self,
-        fallback_text: impl Into<String>,
-        poll: UnstablePollStartContentBlock,
-        edit_item: &EventTimelineItem,
-    ) -> Result<(), SendEventError> {
-        // TODO: refactor this function into [`Self::edit`], there's no good reason to
-        // keep a separate function for this.
-
-        // Early returns here must be in sync with `EventTimelineItem::is_editable`.
-        if !edit_item.is_own() {
-            return Err(UnsupportedEditItem::NotOwnEvent.into());
-        }
-        let Some(event_id) = edit_item.event_id() else {
-            return Err(UnsupportedEditItem::MissingEvent.into());
-        };
-
-        let TimelineItemContent::Poll(_) = edit_item.content() else {
-            return Err(UnsupportedEditItem::NotPollEvent.into());
-        };
-
-        let content = ReplacementUnstablePollStartEventContent::plain_text(
-            fallback_text,
-            poll,
-            event_id.into(),
-        );
-
-        self.send(UnstablePollStartEventContent::from(content).into()).await?;
-
-        Ok(())
     }
 
     /// Toggle a reaction on an event.
@@ -871,6 +853,7 @@ struct TimelineDropHandle {
     room_update_join_handle: JoinHandle<()>,
     pinned_events_join_handle: Option<JoinHandle<()>>,
     room_key_from_backups_join_handle: JoinHandle<()>,
+    room_key_backup_enabled_join_handle: JoinHandle<()>,
     local_echo_listener_handle: JoinHandle<()>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
 }
@@ -880,12 +863,15 @@ impl Drop for TimelineDropHandle {
         for handle in self.event_handler_handles.drain(..) {
             self.client.remove_event_handler(handle);
         }
+
         if let Some(handle) = self.pinned_events_join_handle.take() {
             handle.abort()
         };
+
         self.local_echo_listener_handle.abort();
         self.room_update_join_handle.abort();
         self.room_key_from_backups_join_handle.abort();
+        self.room_key_backup_enabled_join_handle.abort();
     }
 }
 

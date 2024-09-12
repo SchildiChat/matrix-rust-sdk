@@ -14,6 +14,8 @@ use futures_util::{
     future::{try_join, try_join_all},
     stream::FuturesUnordered,
 };
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::{DecryptionSettings, TrustRequirement};
 use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
@@ -1235,18 +1237,22 @@ impl Room {
         let machine = self.client.olm_machine().await;
         let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        let mut event =
-            match machine.decrypt_room_event(event.cast_ref(), self.inner.room_id()).await {
-                Ok(event) => event,
-                Err(e) => {
-                    self.client
-                        .encryption()
-                        .backups()
-                        .maybe_download_room_key(self.room_id().to_owned(), event.clone());
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+        let mut event = match machine
+            .decrypt_room_event(event.cast_ref(), self.inner.room_id(), &decryption_settings)
+            .await
+        {
+            Ok(event) => event,
+            Err(e) => {
+                self.client
+                    .encryption()
+                    .backups()
+                    .maybe_download_room_key(self.room_id().to_owned(), event.clone());
 
-                    return Err(e.into());
-                }
-            };
+                return Err(e.into());
+            }
+        };
 
         event.push_actions = self.event_push_actions(&event.event).await?;
 
@@ -1569,6 +1575,25 @@ impl Room {
             // could be quite useful if someone wants to enable encryption and
             // send a message right after it's enabled.
             _ = timeout(self.client.inner.sync_beat.listen(), SYNC_WAIT_TIME).await;
+
+            // If after waiting for a sync, we don't have the encryption state we expect,
+            // assume the local encryption state is incorrect; this will cause
+            // the SDK to re-request it later for confirmation, instead of
+            // assuming it's sync'd and correct (and not encrypted).
+            let _sync_lock = self.client.base_client().sync_lock().lock().await;
+            if !self.inner.is_encrypted() {
+                debug!("still not marked as encrypted, marking encryption state as missing");
+
+                let mut room_info = self.clone_info();
+                room_info.mark_encryption_state_missing();
+                let mut changes = StateChanges::default();
+                changes.add_room(room_info.clone());
+
+                self.client.store().save_changes(&changes).await?;
+                self.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
+            } else {
+                debug!("room successfully marked as encrypted");
+            }
         }
 
         Ok(())
@@ -2769,13 +2794,7 @@ impl Room {
     pub async fn event_cache(
         &self,
     ) -> event_cache::Result<(RoomEventCache, Arc<EventCacheDropHandles>)> {
-        let global_event_cache = self.client.event_cache();
-
-        global_event_cache.for_room(self.room_id()).await.map(|(maybe_room, drop_handles)| {
-            // SAFETY: the `RoomEventCache` must always been found, since we're constructing
-            // from a `Room`.
-            (maybe_room.unwrap(), drop_handles)
-        })
+        self.client.event_cache().for_room(self.room_id()).await
     }
 
     /// This will only send a call notification event if appropriate.

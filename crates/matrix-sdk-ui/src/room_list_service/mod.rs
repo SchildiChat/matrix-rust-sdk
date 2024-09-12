@@ -70,7 +70,7 @@ use matrix_sdk::{
 use matrix_sdk_base::sliding_sync::http;
 pub use room::*;
 pub use room_list::*;
-use ruma::{assign, events::StateEventType, OwnedRoomId, RoomId};
+use ruma::{assign, directory::RoomTypeFilter, events::StateEventType, OwnedRoomId, RoomId};
 pub use state::*;
 use thiserror::Error;
 use tokio::time::timeout;
@@ -159,7 +159,7 @@ impl RoomListService {
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
                         // returned. If true, only invited rooms are returned.
                         is_invite: None,
-                        not_room_types: vec!["m.space".to_owned()],
+                        not_room_types: vec![RoomTypeFilter::Space],
                     }))),
             )
             .await
@@ -186,7 +186,7 @@ impl RoomListService {
                     ])
                     .filters(Some(assign!(http::request::ListFilters::default(), {
                         is_invite: Some(false),
-                        room_types: vec!["m.space".to_owned()],
+                        room_types: vec![RoomTypeFilter::Space],
                     }))),
             )
             .await

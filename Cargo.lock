@@ -1311,6 +1311,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "deadpool"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6541a3916932fe57768d4be0b1ffb5ec7cbf74ca8c903fdfd5c0fe8aa958f0ed"
+dependencies = [
+ "deadpool-runtime",
+ "num_cpus",
+ "tokio",
+]
+
+[[package]]
 name = "deadpool-runtime"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1321,11 +1332,11 @@ dependencies = [
 
 [[package]]
 name = "deadpool-sqlite"
-version = "0.7.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8010e36e12f3be22543a5e478b4af20aeead9a700dd69581a5e050a070fc22c"
+checksum = "2f9cc6210316f8b7ced394e2a5d2833ce7097fb28afb5881299c61bc18e8e0e9"
 dependencies = [
- "deadpool",
+ "deadpool 0.12.1",
  "deadpool-sync",
  "rusqlite",
 ]
@@ -2206,9 +2217,9 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.8.4"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8094feaf31ff591f651a2664fb9cfd92bba7a60ce3197265e9482ebe753c8f7"
+checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
 ]
@@ -2275,9 +2286,9 @@ dependencies = [
 
 [[package]]
 name = "html5ever"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c13771afe0e6e846f1e67d038d4cb29998a6779f93c809212e4e9c32efd244d4"
+checksum = "0ff6858c1f7e2a470c5403091866fa95b36fe0dbac5d771f932c15e5ff1ee501"
 dependencies = [
  "log",
  "mac",
@@ -2841,9 +2852,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.27.0"
+version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf4e226dcd58b4be396f7bd3c20da8fdee2911400705297ba7d2d7cc2c30f716"
+checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2961,9 +2972,9 @@ checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "markup5ever"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16ce3abbeba692c8b8441d036ef91aea6df8da2c6b6e21c7e14d3c18e526be45"
+checksum = "d581ff8be69d08a2efa23a959d81aa22b739073f749f067348bd4f4ba4b69195"
 dependencies = [
  "log",
  "phf",
@@ -4511,9 +4522,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8746739f11d39ce5ad5c2520a9b75285310dbfe78c541ccf832d38615765aec0"
+checksum = "666f0f59e259aea2d72e6012290c09877a780935cc3c18b1ceded41f3890d59c"
 dependencies = [
  "bitflags 2.6.0",
  "memchr",
@@ -4584,7 +4595,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "rustls",
  "thiserror",
  "tokio",
@@ -4593,14 +4604,14 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.3"
+version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddf517c03a109db8100448a4be38d498df8a210a99fe0e1b9eaf39e78c640efe"
+checksum = "fadfaed2cd7f389d0161bb73eeb07b7b78f8691047a6f3e73caaeae55310a4a6"
 dependencies = [
  "bytes",
  "rand",
  "ring",
- "rustc-hash",
+ "rustc-hash 2.0.0",
  "rustls",
  "slab",
  "thiserror",
@@ -4986,7 +4997,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.10.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "assign",
  "js_int",
@@ -5003,7 +5014,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.18.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "as_variant",
  "assign",
@@ -5026,7 +5037,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.13.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "as_variant",
  "base64 0.22.1",
@@ -5058,7 +5069,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.28.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "as_variant",
  "indexmap 2.2.6",
@@ -5083,7 +5094,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.9.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "http",
  "js_int",
@@ -5097,7 +5108,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.2.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -5109,7 +5120,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.9.5"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "js_int",
  "thiserror",
@@ -5118,8 +5129,9 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.13.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
+ "cfg-if",
  "once_cell",
  "proc-macro-crate",
  "proc-macro2",
@@ -5133,7 +5145,7 @@ dependencies = [
 [[package]]
 name = "ruma-push-gateway-api"
 version = "0.9.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=29ed51b6f#29ed51b6ffab71951004a45ba9317a37c0192625"
+source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
 dependencies = [
  "js_int",
  "ruma-common",
@@ -5144,9 +5156,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.30.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a78046161564f5e7cd9008aff3b2990b3850dc8e0349119b98e8f251e099f24d"
+checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
 dependencies = [
  "bitflags 2.6.0",
  "fallible-iterator",
@@ -5167,6 +5179,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583034fd73374156e66797ed8e5b0d5690409c9226b22d87cb7f19821c05d152"
 
 [[package]]
 name = "rustc_version"
@@ -7083,7 +7101,7 @@ dependencies = [
  "assert-json-diff",
  "async-trait",
  "base64 0.21.7",
- "deadpool",
+ "deadpool 0.10.0",
  "futures",
  "http",
  "http-body-util",

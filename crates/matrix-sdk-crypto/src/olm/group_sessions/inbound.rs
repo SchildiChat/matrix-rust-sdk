@@ -127,7 +127,7 @@ pub struct InboundGroupSession {
     /// the session, or, if we can use that device information to find the
     /// sender's cross-signing identity, holds the user ID and cross-signing
     /// key.
-    pub(crate) sender_data: SenderData,
+    pub sender_data: SenderData,
 
     /// The Room this GroupSession belongs to
     pub room_id: OwnedRoomId,
@@ -771,7 +771,7 @@ mod tests {
                 "signing_key":{"ed25519":"wTRTdz4rn4EY+68cKPzpMdQ6RAlg7T8cbTmEjaXuUww"},
                 "sender_data":{
                     "UnknownDevice":{
-                        "legacy_session":true
+                        "legacy_session":false
                     }
                 },
                 "room_id":"!test:localhost",

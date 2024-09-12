@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "e2e-encryption")]
-use std::collections::BTreeSet;
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use as_variant::as_variant;
 use eyeball_im::{ObservableVectorEntry, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
 use futures_core::Stream;
 use imbl::Vector;
-#[cfg(all(test, feature = "e2e-encryption"))]
+#[cfg(test)]
 use matrix_sdk::crypto::OlmMachine;
 use matrix_sdk::{
     deserialized_responses::SyncTimelineEvent,
@@ -31,10 +29,6 @@ use matrix_sdk::{
     },
     Result, Room,
 };
-#[cfg(test)]
-use ruma::events::receipt::ReceiptEventContent;
-#[cfg(all(test, feature = "e2e-encryption"))]
-use ruma::RoomId;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType as SendReceiptType,
     events::{
@@ -50,21 +44,21 @@ use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, RoomVersionId,
     TransactionId, UserId,
 };
+#[cfg(test)]
+use ruma::{events::receipt::ReceiptEventContent, RoomId};
 use tokio::sync::{RwLock, RwLockWriteGuard};
-use tracing::{debug, error, field::debug, info, instrument, trace, warn};
-#[cfg(feature = "e2e-encryption")]
-use tracing::{field, info_span, Instrument as _};
+use tracing::{
+    debug, error, field, field::debug, info, info_span, instrument, trace, warn, Instrument as _,
+};
 
 pub(super) use self::state::{
-    EventMeta, FullEventMeta, TimelineEnd, TimelineMetadata, TimelineState,
+    EventMeta, FullEventMeta, PendingEdit, TimelineEnd, TimelineMetadata, TimelineState,
     TimelineStateTransaction,
 };
-#[cfg(feature = "e2e-encryption")]
-use super::traits::Decryptor;
 use super::{
     event_handler::TimelineEventKind,
     event_item::{ReactionStatus, RemoteEventOrigin},
-    traits::RoomDataProvider,
+    traits::{Decryptor, RoomDataProvider},
     util::{rfind_event_by_id, rfind_event_item, RelativePosition},
     Error, EventSendState, EventTimelineItem, InReplyToDetails, Message, PaginationError, Profile,
     ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
@@ -259,11 +253,12 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 )
             }
 
-            TimelineFocus::PinnedEvents { max_events_to_load } => (
+            TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests } => (
                 TimelineFocusData::PinnedEvents {
                     loader: PinnedEventsLoader::new(
                         Arc::new(room_data_provider.clone()),
                         max_events_to_load as usize,
+                        max_concurrent_requests as usize,
                     ),
                 },
                 TimelineFocusKind::PinnedEvents,
@@ -272,6 +267,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
         let state = TimelineState::new(
             focus_kind,
+            room_data_provider.own_user_id().to_owned(),
             room_data_provider.room_version(),
             internal_id_prefix,
             unable_to_decrypt_hook,
@@ -370,14 +366,13 @@ impl<P: RoomDataProvider> TimelineController<P> {
         num_events: u16,
     ) -> Result<bool, PaginationError> {
         let pagination = match &*self.focus.read().await {
-            TimelineFocusData::Live => return Err(PaginationError::NotEventFocusMode),
+            TimelineFocusData::Live | TimelineFocusData::PinnedEvents { .. } => {
+                return Err(PaginationError::NotEventFocusMode)
+            }
             TimelineFocusData::Event { paginator, .. } => paginator
                 .paginate_backward(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
-            TimelineFocusData::PinnedEvents { .. } => {
-                return Err(PaginationError::NotEventFocusMode)
-            }
         };
 
         self.add_events_at(pagination.events, TimelineEnd::Front, RemoteEventOrigin::Pagination)
@@ -395,14 +390,13 @@ impl<P: RoomDataProvider> TimelineController<P> {
         num_events: u16,
     ) -> Result<bool, PaginationError> {
         let pagination = match &*self.focus.read().await {
-            TimelineFocusData::Live => return Err(PaginationError::NotEventFocusMode),
+            TimelineFocusData::Live | TimelineFocusData::PinnedEvents { .. } => {
+                return Err(PaginationError::NotEventFocusMode)
+            }
             TimelineFocusData::Event { paginator, .. } => paginator
                 .paginate_forward(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
-            TimelineFocusData::PinnedEvents { .. } => {
-                return Err(PaginationError::NotEventFocusMode)
-            }
         };
 
         self.add_events_at(pagination.events, TimelineEnd::Back, RemoteEventOrigin::Pagination)
@@ -647,8 +641,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
     ) {
         let mut state = self.state.write().await;
 
-        state.clear();
-
         let track_read_markers = self.settings.track_read_receipts;
         if track_read_markers {
             state.populate_initial_user_receipt(&self.room_data_provider, ReceiptType::Read).await;
@@ -657,9 +649,14 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 .await;
         }
 
-        if !events.is_empty() {
+        // Replace the events if either the current event list or the new one aren't
+        // empty.
+        // Previously we just had to check the new one wasn't empty because
+        // we did a clear operation before so the current one would always be empty, but
+        // now we may want to replace a populated timeline with an empty one.
+        if !state.items.is_empty() || !events.is_empty() {
             state
-                .add_remote_events_at(
+                .replace_with_remove_events(
                     events,
                     TimelineEnd::Back,
                     origin,
@@ -803,7 +800,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
         // The event was already marked as sent, that's a broken state, let's
         // emit an error but also override to the given sent state.
         if let EventSendState::Sent { event_id: existing_event_id } = &local_item.send_state {
-            let new_event_id = new_event_id.map(debug);
             error!(?existing_event_id, ?new_event_id, "Local echo already marked as sent");
         }
 
@@ -945,7 +941,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
         true
     }
 
-    #[cfg(feature = "e2e-encryption")]
     #[instrument(skip(self, room), fields(room_id = ?room.room_id()))]
     pub(super) async fn retry_event_decryption(
         &self,
@@ -955,7 +950,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.retry_event_decryption_inner(room.to_owned(), session_ids).await
     }
 
-    #[cfg(all(test, feature = "e2e-encryption"))]
+    #[cfg(test)]
     pub(super) async fn retry_event_decryption_test(
         &self,
         room_id: &RoomId,
@@ -965,7 +960,6 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.retry_event_decryption_inner((olm_machine, room_id.to_owned()), session_ids).await
     }
 
-    #[cfg(feature = "e2e-encryption")]
     async fn retry_event_decryption_inner(
         &self,
         decryptor: impl Decryptor,
@@ -1333,6 +1327,10 @@ impl<P: RoomDataProvider> TimelineController<P> {
                     EventSendState::SendingFailed { error, is_recoverable },
                 )
                 .await;
+            }
+
+            RoomSendQueueUpdate::RetryEvent { transaction_id } => {
+                self.update_event_send_state(&transaction_id, EventSendState::NotSentYet).await;
             }
 
             RoomSendQueueUpdate::SentEvent { transaction_id, event_id } => {

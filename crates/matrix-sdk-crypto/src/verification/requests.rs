@@ -449,18 +449,8 @@ impl VerificationRequest {
             .get_qr(qr_verification.other_user_id(), qr_verification.flow_id().as_str())
             .is_some()
         {
-            debug!(
-                user_id = ?self.other_user(),
-                flow_id = self.flow_id().as_str(),
-                "Replacing existing QR verification"
-            );
             self.verification_cache.replace_qr(qr_verification.clone());
         } else {
-            debug!(
-                user_id = ?self.other_user(),
-                flow_id = self.flow_id().as_str(),
-                "Inserting new QR verification"
-            );
             self.verification_cache.insert_qr(qr_verification.clone());
         }
 
@@ -1347,6 +1337,7 @@ async fn receive_start<T: Clone>(
     info!(
         ?sender,
         device = ?content.from_device(),
+        method = ?content.method(),
         "Received a new verification start event",
     );
 
@@ -1447,7 +1438,7 @@ async fn receive_start<T: Clone>(
                 if let Some(request) = qr_verification.receive_reciprocation(content) {
                     request_state.verification_cache.add_request(request.into())
                 }
-                trace!(
+                debug!(
                     sender = ?identities.device_being_verified.user_id(),
                     device_id = ?identities.device_being_verified.device_id(),
                     verification = ?qr_verification,
@@ -1456,6 +1447,7 @@ async fn receive_start<T: Clone>(
 
                 Ok(None)
             } else {
+                warn!("Received a QR code reciprocation for an unknown flow");
                 Ok(None)
             }
         }

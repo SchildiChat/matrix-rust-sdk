@@ -61,8 +61,7 @@ use matrix_sdk_base::{
 use matrix_sdk_common::executor::{spawn, JoinHandle};
 use ruma::{
     events::{
-        reaction::ReactionEventContent, relation::Annotation,
-        room::message::RoomMessageEventContentWithoutRelation, AnyMessageLikeEventContent,
+        reaction::ReactionEventContent, relation::Annotation, AnyMessageLikeEventContent,
         EventContent as _,
     },
     serde::Raw,
@@ -556,6 +555,26 @@ impl RoomSendQueue {
             self.inner.notifier.notify_one();
         }
     }
+
+    /// Unwedge a local echo identified by its transaction identifier and try to
+    /// resend it.
+    pub async fn unwedge(&self, transaction_id: &TransactionId) -> Result<(), RoomSendQueueError> {
+        self.inner
+            .queue
+            .mark_as_unwedged(transaction_id)
+            .await
+            .map_err(RoomSendQueueError::StorageError)?;
+
+        // Wake up the queue, in case the room was asleep before unwedging the event.
+        self.inner.notifier.notify_one();
+
+        let _ = self
+            .inner
+            .updates
+            .send(RoomSendQueueUpdate::RetryEvent { transaction_id: transaction_id.to_owned() });
+
+        Ok(())
+    }
 }
 
 struct RoomSendQueueInner {
@@ -670,6 +689,19 @@ impl QueueStorage {
             .client()?
             .store()
             .update_send_queue_event_status(&self.room_id, transaction_id, true)
+            .await?)
+    }
+
+    /// Marks an event identified with the given transaction id as being now
+    /// unwedged and adds it back to the queue.
+    async fn mark_as_unwedged(
+        &self,
+        transaction_id: &TransactionId,
+    ) -> Result<(), RoomSendQueueStorageError> {
+        Ok(self
+            .client()?
+            .store()
+            .update_send_queue_event_status(&self.room_id, transaction_id, false)
             .await?)
     }
 
@@ -875,30 +907,33 @@ impl QueueStorage {
 
                     // Check the event is one we know how to edit with an edit event.
 
-                    // 1. It must be deserializable…
-                    let content = match new_content.deserialize() {
-                        Ok(c) => c,
+                    // It must be deserializable…
+                    let edited_content = match new_content.deserialize() {
+                        Ok(AnyMessageLikeEventContent::RoomMessage(c)) => {
+                            // Assume no relationships.
+                            EditedContent::RoomMessage(c.into())
+                        }
+
+                        Ok(AnyMessageLikeEventContent::UnstablePollStart(c)) => {
+                            let poll_start = c.poll_start().clone();
+                            EditedContent::PollStart {
+                                fallback_text: poll_start.question.text.clone(),
+                                new_content: poll_start,
+                            }
+                        }
+
+                        Ok(c) => {
+                            warn!("Unsupported edit content type: {:?}", c.event_type());
+                            return Ok(true);
+                        }
+
                         Err(err) => {
-                            warn!("unable to deserialize: {err}");
+                            warn!("Unable to deserialize: {err}");
                             return Ok(true);
                         }
                     };
 
-                    // 2. …and a room message, at this point.
-                    let AnyMessageLikeEventContent::RoomMessage(room_message_content) = content
-                    else {
-                        warn!("trying to send an edit event for a non-room message: aborting");
-                        return Ok(true);
-                    };
-
-                    // Assume no relation.
-                    let new_content: RoomMessageEventContentWithoutRelation =
-                        room_message_content.into();
-
-                    let edit_event = match room
-                        .make_edit_event(&event_id, EditedContent::RoomMessage(new_content))
-                        .await
-                    {
+                    let edit_event = match room.make_edit_event(&event_id, edited_content).await {
                         Ok(e) => e,
                         Err(err) => {
                             warn!("couldn't create edited event: {err}");
@@ -1165,6 +1200,12 @@ pub enum RoomSendQueueUpdate {
         /// while an unrecoverable error will be parked, until the user
         /// decides to cancel sending it.
         is_recoverable: bool,
+    },
+
+    /// The event has been unwedged and sending is now being retried.
+    RetryEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: OwnedTransactionId,
     },
 
     /// The event has been sent to the server, and the query returned
