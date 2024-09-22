@@ -214,7 +214,7 @@ impl BaseRoomInfoV1 {
             tombstone,
             topic,
             space_children: Default::default(),
-            rtc_member: BTreeMap::new(),
+            rtc_member_events: BTreeMap::new(),
             is_marked_unread: false,
             notable_tags: RoomNotableTags::empty(),
             pinned_events: None,

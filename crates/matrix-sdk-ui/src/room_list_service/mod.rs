@@ -151,6 +151,7 @@ impl RoomListService {
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
                         (StateEventType::RoomMember, "$ME".to_owned()),
                         (StateEventType::RoomName, "".to_owned()),
+                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
                     ])
                     .include_heroes(Some(true))
@@ -429,7 +430,14 @@ impl RoomListService {
             settings.required_state.push((StateEventType::RoomCreate, "".to_owned()));
         }
 
-        self.sliding_sync.subscribe_to_rooms(room_ids, Some(settings))
+        let cancel_in_flight_request = match self.state.get() {
+            State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
+                false
+            }
+            State::SettingUp | State::Running => true,
+        };
+
+        self.sliding_sync.subscribe_to_rooms(room_ids, Some(settings), cancel_in_flight_request)
     }
 
     #[cfg(test)]

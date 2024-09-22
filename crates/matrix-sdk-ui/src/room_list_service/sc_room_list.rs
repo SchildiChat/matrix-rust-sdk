@@ -7,7 +7,7 @@ use super::sorters::{
     new_sorter_lexicographic,
 };
 
-#[derive(uniffi::Record)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ScSortOrder {
     by_unread: bool,
     pin_favorites: bool,

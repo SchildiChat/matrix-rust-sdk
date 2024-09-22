@@ -907,15 +907,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b82cf0babdbd58558212896d1a4272303a57bdb245c2bf1147185fb45640e70"
 
 [[package]]
-name = "cmake"
-version = "0.1.50"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31c789563b815f77f4250caee12365734369f942439b7defd71e18a48197130"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "color-eyre"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1378,21 +1369,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f55bf8e7b65898637379c1b74eb1551107c8294ed26d855ceb9fd1a09cfc9bc0"
 dependencies = [
  "const-oid",
- "der_derive",
- "flagset",
  "pem-rfc7468",
  "zeroize",
-]
-
-[[package]]
-name = "der_derive"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.72",
 ]
 
 [[package]]
@@ -1886,12 +1864,6 @@ dependencies = [
  "libc",
  "winapi",
 ]
-
-[[package]]
-name = "flagset"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3ea1ec5f8307826a5b71094dd91fc04d4ae75d5709b20ad351c7fb4815c86ec"
 
 [[package]]
 name = "flate2"
@@ -3280,7 +3252,6 @@ dependencies = [
  "matrix-sdk-common",
  "matrix-sdk-qrcode",
  "matrix-sdk-test",
- "olm-rs",
  "pbkdf2",
  "proptest",
  "rand",
@@ -3891,29 +3862,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "olm-rs"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd6c2c7054110ce4d7b4756d7b7fe507fea9413968ad0ef8f1d043d504aec725"
-dependencies = [
- "getrandom",
- "olm-sys",
- "serde",
- "serde_json",
- "zeroize",
-]
-
-[[package]]
-name = "olm-sys"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2afecf25624989021f9f0f157f7152102fd147b89445d08449739f216002d339"
-dependencies = [
- "cmake",
- "fs_extra",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4280,17 +4228,6 @@ dependencies = [
  "der",
  "pkcs8",
  "spki",
-]
-
-[[package]]
-name = "pkcs7"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d79178be066405e0602bf3035946edef6b11b3f9dde46dfe5f8bfd7dea4b77e7"
-dependencies = [
- "der",
- "spki",
- "x509-cert",
 ]
 
 [[package]]
@@ -4997,7 +4934,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.10.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "assign",
  "js_int",
@@ -5014,7 +4951,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.18.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "as_variant",
  "assign",
@@ -5037,7 +4974,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.13.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "as_variant",
  "base64 0.22.1",
@@ -5069,7 +5006,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.28.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "as_variant",
  "indexmap 2.2.6",
@@ -5094,7 +5031,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.9.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "http",
  "js_int",
@@ -5108,7 +5045,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.2.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -5120,7 +5057,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.9.5"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "js_int",
  "thiserror",
@@ -5129,7 +5066,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.13.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -5145,7 +5082,7 @@ dependencies = [
 [[package]]
 name = "ruma-push-gateway-api"
 version = "0.9.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=32898b9bc#32898b9bc305cc6f835697f1315256cf12b9c422"
+source = "git+https://github.com/SchildiChat/ruma?rev=08f183e4#08f183e49af00cde93be18f6d1a18d3ba9e5c5ba"
 dependencies = [
  "js_int",
  "ruma-common",
@@ -6669,8 +6606,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 [[package]]
 name = "vodozemac"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "051d4af70b53b42adf2aac459a305851b8d754f210aaf11ab509e1065beff422"
+source = "git+https://github.com/matrix-org/vodozemac?rev=57cbf7e939d7b54d20207e8361b7135bd65c9cc2#57cbf7e939d7b54d20207e8361b7135bd65c9cc2"
 dependencies = [
  "aes",
  "arrayvec",
@@ -6684,7 +6620,6 @@ dependencies = [
  "hkdf",
  "hmac",
  "matrix-pickle",
- "pkcs7",
  "prost",
  "rand",
  "serde",
@@ -7126,17 +7061,6 @@ dependencies = [
  "rand_core",
  "serde",
  "zeroize",
-]
-
-[[package]]
-name = "x509-cert"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
-dependencies = [
- "const-oid",
- "der",
- "spki",
 ]
 
 [[package]]
