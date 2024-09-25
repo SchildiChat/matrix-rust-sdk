@@ -24,22 +24,26 @@ where
     }
 }
 
-pub fn new_sorter(client_generated_counts: bool) -> impl Sorter {
+pub fn new_sorter(client_generated_counts: bool, with_silent_unread: bool) -> impl Sorter {
     let matcher = UnreadMatcher {
-        order_key: move |left, right| (room_to_unread_weight(left, client_generated_counts), room_to_unread_weight(right, client_generated_counts)),
+        order_key: move |left, right| (room_to_unread_weight(left, client_generated_counts, with_silent_unread), room_to_unread_weight(right, client_generated_counts, with_silent_unread)),
     };
 
     move |left, right| -> Ordering { matcher.matches(left, right) }
 }
 
-fn room_to_unread_weight(room: &Room, client_generated_counts: bool) -> u8 {
+fn room_to_unread_weight(room: &Room, client_generated_counts: bool, with_silent_unread: bool) -> u8 {
     let inner_room = room.inner_room();
     if client_generated_counts {
         counts_to_unread_weight(
             inner_room.is_marked_unread(),
             inner_room.num_unread_mentions(),
             inner_room.num_unread_notifications(),
-            inner_room.num_unread_messages(),
+            if with_silent_unread {
+                inner_room.num_unread_messages()
+            } else {
+                0
+            },
         )
     } else {
         // Note: always use client-generated mention counts, server cannot know for encrypted rooms
@@ -47,7 +51,11 @@ fn room_to_unread_weight(room: &Room, client_generated_counts: bool) -> u8 {
             inner_room.is_marked_unread(),
             inner_room.num_unread_mentions(),
             inner_room.unread_notification_counts().notification_count,
-            inner_room.unread_count().unwrap_or_default(),
+            if with_silent_unread {
+                inner_room.unread_count().unwrap_or_default()
+            } else {
+                0
+            },
         )
     }
 }

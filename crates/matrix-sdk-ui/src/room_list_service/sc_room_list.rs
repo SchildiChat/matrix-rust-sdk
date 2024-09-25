@@ -13,6 +13,7 @@ pub struct ScSortOrder {
     pin_favorites: bool,
     bury_low_priority: bool,
     client_generated_unread: bool,
+    with_silent_unread: bool,
 }
 
 pub fn get_sort_by_vec(sort_order: ScSortOrder) -> Vec<BoxedSorterFn> {
@@ -26,7 +27,7 @@ pub fn get_sort_by_vec(sort_order: ScSortOrder) -> Vec<BoxedSorterFn> {
     )));
     //}
     if sort_order.by_unread {
-        result.push(Box::new(new_sorter_unread(sort_order.client_generated_unread)));
+        result.push(Box::new(new_sorter_unread(sort_order.client_generated_unread, sort_order.with_silent_unread)));
     }
     result.push(Box::new(new_sorter_recency()));
     result.push(Box::new(new_sorter_name()));
