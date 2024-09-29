@@ -7,14 +7,7 @@ use super::sorters::{
     new_sorter_lexicographic,
 };
 
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct ScSortOrder {
-    by_unread: bool,
-    pin_favorites: bool,
-    bury_low_priority: bool,
-    client_generated_unread: bool,
-    with_silent_unread: bool,
-}
+use matrix_sdk::schildi::ScSortOrder;
 
 pub fn get_sort_by_vec(sort_order: ScSortOrder) -> Vec<BoxedSorterFn> {
     let mut result: Vec<BoxedSorterFn> = Vec::new();

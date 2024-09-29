@@ -16,6 +16,9 @@
 #![warn(missing_debug_implementations, missing_docs)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+/// SchildiChat's additions to the Matrix Rust SDK.
+pub mod schildi;
+
 pub use async_trait::async_trait;
 pub use bytes;
 #[cfg(feature = "e2e-encryption")]

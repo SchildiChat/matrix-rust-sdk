@@ -14,6 +14,9 @@
 
 use std::{future::ready, sync::Arc};
 
+use matrix_sdk::schildi::ScInboxSettings;
+use tracing::info;
+
 use async_cell::sync::AsyncCell;
 use async_rx::StreamExt as _;
 use async_stream::stream;
@@ -153,14 +156,14 @@ impl RoomList {
 
         let filter_fn_cell = AsyncCell::shared();
 
-        let sc_sort_order_cell = AsyncCell::shared();
+        let sc_inbox_settings = AsyncCell::shared();
 
         let limit = SharedObservable::<usize>::new(page_size);
         let limit_stream = limit.subscribe();
 
         let dynamic_entries_controller = RoomListDynamicEntriesController::new(
             filter_fn_cell.clone(),
-            sc_sort_order_cell.clone(),
+            sc_inbox_settings.clone(),
             page_size,
             limit,
             list.maximum_number_of_rooms_stream(),
@@ -170,16 +173,18 @@ impl RoomList {
             loop {
                 let filter_fn = filter_fn_cell.take().await;
 
-                let sc_sort_order = sc_sort_order_cell.take().await;
+                let current_sc_inbox_settings = sc_inbox_settings.take().await;
 
                 let (raw_values, raw_stream) = self.entries();
 
                 // Combine normal stream events with other updates from rooms
                 let merged_streams = merge_stream_and_receiver(raw_values.clone(), raw_stream, room_info_notable_update_receiver.resubscribe());
 
+                let sc_sort_order_fn: BoxedSorterFn = current_sc_inbox_settings.sort_order.into();
+
                 let (values, stream) = (raw_values, merged_streams)
                     .filter(filter_fn)
-                    .sort_by(sc_sort_order)
+                    .sort_by(sc_sort_order_fn)
                     .dynamic_limit_with_initial_value(page_size, limit_stream.clone());
 
                 // Clearing the stream before chaining with the real stream.
@@ -299,7 +304,7 @@ pub enum RoomListLoadingState {
 /// [`RoomList::entries_with_dynamic_adapters`]
 pub struct RoomListDynamicEntriesController {
     filter: Arc<AsyncCell<BoxedFilterFn>>,
-    sc_sort_order: Arc<AsyncCell<BoxedSorterFn>>,
+    sc_inbox_settings: Arc<AsyncCell<ScInboxSettings>>,
     page_size: usize,
     limit: SharedObservable<usize>,
     maximum_number_of_rooms: Subscriber<Option<u32>>,
@@ -308,12 +313,12 @@ pub struct RoomListDynamicEntriesController {
 impl RoomListDynamicEntriesController {
     fn new(
         filter: Arc<AsyncCell<BoxedFilterFn>>,
-        sc_sort_order: Arc<AsyncCell<BoxedSorterFn>>,
+        sc_inbox_settings: Arc<AsyncCell<ScInboxSettings>>,
         page_size: usize,
         limit_stream: SharedObservable<usize>,
         maximum_number_of_rooms: Subscriber<Option<u32>>,
     ) -> Self {
-        Self { filter, sc_sort_order, page_size, limit: limit_stream, maximum_number_of_rooms }
+        Self { filter, sc_inbox_settings, page_size, limit: limit_stream, maximum_number_of_rooms }
     }
 
     /// Set the filter.
@@ -328,15 +333,25 @@ impl RoomListDynamicEntriesController {
             false
         } else {
             self.filter.set(filter);
+            // SC: this conflicts with set_sc_inbox_settings. When using this, assume default inbox
+            // settings to unblock stream creation.
+            self.sc_inbox_settings.set(Default::default());
             true
         }
     }
 
-    pub fn set_sort_order(&self, sort_order: BoxedSorterFn) -> bool {
-        if Arc::strong_count(&self.filter) == 1 {
+    /// Set the inbox settings (filter + sort order).
+    ///
+    /// If the associated stream has been dropped, returns `false` to indicate
+    /// the operation didn't have an effect.
+    pub fn set_sc_inbox_settings(&self, filter: BoxedFilterFn, settings: ScInboxSettings) -> bool {
+        if Arc::strong_count(&self.sc_inbox_settings) == 1 {
+            info!("Failed to update inbox settings");
             false
         } else {
-            self.sc_sort_order.set(sort_order);
+            self.sc_inbox_settings.set(settings);
+            self.filter.set(filter);
+            info!("Successfully set new inbox settings");
             true
         }
     }

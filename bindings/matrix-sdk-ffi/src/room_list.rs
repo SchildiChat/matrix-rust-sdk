@@ -15,6 +15,7 @@ use matrix_sdk_ui::{
         new_filter_fuzzy_match_room_name, new_filter_invite, new_filter_joined,
         new_filter_non_left, new_filter_none, new_filter_normalized_match_room_name,
         new_filter_unread, BoxedFilterFn, RoomCategory,
+        new_filter_sc_rooms,
     },
     timeline::default_event_filter,
     unable_to_decrypt_hook::UtdHookManager,
@@ -501,8 +502,8 @@ impl RoomListDynamicEntriesController {
         self.inner.set_filter(kind.into())
     }
 
-    fn set_sort_order(&self, sort_order: matrix_sdk_ui::room_list_service::sc_room_list::ScSortOrder) -> bool {
-        self.inner.set_sort_order(sort_order.into())
+    fn set_sc_inbox_settings(&self, filter: RoomListEntriesDynamicFilterKind, settings: matrix_sdk::schildi::ScInboxSettings) {
+        self.inner.set_sc_inbox_settings(filter.into(), settings);
     }
 
     fn add_one_page(&self) {
@@ -527,6 +528,7 @@ pub enum RoomListEntriesDynamicFilterKind {
     None,
     NormalizedMatchRoomName { pattern: String },
     FuzzyMatchRoomName { pattern: String },
+    ScRooms { rooms: Vec<String> },
 }
 
 #[derive(uniffi::Enum)]
@@ -567,6 +569,9 @@ impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
             }
             Kind::FuzzyMatchRoomName { pattern } => {
                 Box::new(new_filter_fuzzy_match_room_name(&pattern))
+            }
+            Kind::ScRooms { rooms } => {
+                Box::new(new_filter_sc_rooms(rooms))
             }
         }
     }

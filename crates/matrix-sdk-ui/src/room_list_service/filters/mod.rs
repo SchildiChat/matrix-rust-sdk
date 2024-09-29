@@ -63,6 +63,7 @@ mod none;
 mod normalized_match_room_name;
 mod not;
 mod unread;
+mod sc_rooms;
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -91,6 +92,8 @@ use wiremock::{
     matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
 };
+
+pub use sc_rooms::new_filter as new_filter_sc_rooms;
 
 use super::Room;
 
