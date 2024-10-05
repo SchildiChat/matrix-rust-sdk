@@ -575,7 +575,7 @@ impl Recovery {
 
     async fn update_recovery_state_no_fail(&self) {
         if let Err(e) = self.update_recovery_state().await {
-            error!("Coulnd't update the recovery state: {e:?}");
+            error!("Couldn't update the recovery state: {e:?}");
         }
     }
 
@@ -629,7 +629,7 @@ impl Recovery {
         }
     }
 
-    #[instrument]
+    #[instrument(skip_all)]
     pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {
         if let Some(user_id) = self.client.user_id() {
             if response.master_keys.contains_key(user_id) {

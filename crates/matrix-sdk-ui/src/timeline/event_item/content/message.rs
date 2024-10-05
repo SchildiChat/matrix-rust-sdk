@@ -139,6 +139,11 @@ impl Message {
         self.thread_root.is_some()
     }
 
+    /// Get the [`OwnedEventId`] of the root event of a thread if it exists.
+    pub fn thread_root(&self) -> Option<&OwnedEventId> {
+        self.thread_root.as_ref()
+    }
+
     /// Get the edit state of this message (has been edited: `true` /
     /// `false`).
     pub fn is_edited(&self) -> bool {

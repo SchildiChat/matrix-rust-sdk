@@ -1237,6 +1237,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.state.read().await.latest_user_read_receipt_timeline_event_id(user_id)
     }
 
+    /// Subscribe to changes in the read receipts of our own user.
+    pub async fn subscribe_own_user_read_receipts_changed(&self) -> impl Stream<Item = ()> {
+        self.state.read().await.meta.read_receipts.subscribe_own_user_read_receipts_changed()
+    }
+
     /// Handle a room send update that's a new local echo.
     pub(crate) async fn handle_local_echo(&self, echo: LocalEcho) {
         match echo.content {
@@ -1379,9 +1384,12 @@ impl TimelineController {
     #[instrument(skip(self))]
     pub(super) async fn fetch_in_reply_to_details(&self, event_id: &EventId) -> Result<(), Error> {
         let state = self.state.write().await;
-        let (index, item) =
-            rfind_event_by_id(&state.items, event_id).ok_or(Error::RemoteEventNotInTimeline)?;
-        let remote_item = item.as_remote().ok_or(Error::RemoteEventNotInTimeline)?.clone();
+        let (index, item) = rfind_event_by_id(&state.items, event_id)
+            .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?;
+        let remote_item = item
+            .as_remote()
+            .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?
+            .clone();
 
         let TimelineItemContent::Message(message) = item.content().clone() else {
             debug!("Event is not a message");
@@ -1417,7 +1425,7 @@ impl TimelineController {
         // changed while waiting for the request.
         let mut state = self.state.write().await;
         let (index, item) = rfind_event_by_id(&state.items, &remote_item.event_id)
-            .ok_or(Error::RemoteEventNotInTimeline)?;
+            .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?;
 
         // Check the state of the event again, it might have been redacted while
         // the request was in-flight.

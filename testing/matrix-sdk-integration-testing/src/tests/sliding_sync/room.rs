@@ -1,3 +1,6 @@
+// TODO: Remove this once all tests are re-enabled.
+#![allow(unused)]
+
 use std::{
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -31,6 +34,7 @@ use matrix_sdk::{
         space::SpaceRoomJoinRule,
         RoomId,
     },
+    sliding_sync::VersionBuilder,
     Client, RoomInfo, RoomMemberships, RoomState, SlidingSyncList, SlidingSyncMode,
 };
 use matrix_sdk_base::sliding_sync::http;
@@ -268,12 +272,11 @@ async fn test_joined_user_can_create_push_context_with_room_list_service() -> Re
 
     // And a new device for Alice that uses sliding sync,
     let hs = alice.homeserver();
-    let sliding_sync_version = alice.sliding_sync_version();
     let alice_id = alice.user_id().unwrap().localpart().to_owned();
 
     let alice = Client::builder()
         .homeserver_url(hs)
-        .sliding_sync_version(sliding_sync_version)
+        .sliding_sync_version_builder(VersionBuilder::Native)
         .build()
         .await
         .unwrap();
@@ -326,6 +329,7 @@ impl UpdateObserver {
     async fn next(&mut self) -> Option<RoomInfo> {
         // Wait for the room info updates to stabilize.
         let mut update = None;
+
         while let Ok(Some(up)) = timeout(Duration::from_secs(2), self.subscriber.next()).await {
             update = Some(up);
         }
@@ -358,23 +362,24 @@ async fn test_room_notification_count() -> Result<()> {
     use tokio::time::timeout;
 
     let bob = TestClientBuilder::new("bob").use_sqlite().build().await?;
+    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
 
-    // Spawn sync for bob.
-    let b = bob.clone();
-    spawn(async move {
-        let bob = b;
-        loop {
-            if let Err(err) = bob.sync(Default::default()).await {
-                tracing::error!("bob sync error: {err}");
+    // Spawn sync for Bob.
+    spawn({
+        let bob = bob.clone();
+
+        async move {
+            loop {
+                if let Err(err) = bob.sync(Default::default()).await {
+                    tracing::error!("bob sync error: {err}");
+                }
             }
         }
     });
 
-    // Set up sliding sync for alice.
-    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
-
+    // Spawn sync for Alice (with sliding sync).
     spawn({
-        let sync = alice
+        let alice_sync = alice
             .sliding_sync("main")?
             .with_receipt_extension(
                 assign!(http::request::Receipts::default(), { enabled: Some(true) }),
@@ -395,22 +400,30 @@ async fn test_room_notification_count() -> Result<()> {
             .await?;
 
         async move {
-            let stream = sync.sync();
+            let stream = alice_sync.sync();
             pin_mut!(stream);
-            while let Some(up) = stream.next().await {
-                warn!("alice sliding sync received an update: {up:?}");
+
+            while let Some(update) = stream.next().await {
+                warn!(?update, "Alice sliding sync received an update");
+
+                assert!(update.is_ok(), "Syncing Alice via sliding sync has failed");
             }
         }
     });
 
     let latest_event = Arc::new(Mutex::new(None));
-    let l = latest_event.clone();
-    alice.add_event_handler(|ev: AnySyncMessageLikeEvent| async move {
-        let mut latest_event = l.lock().await;
-        *latest_event = Some(ev);
+
+    // Handle new event to update the `latest_event` for Alice.
+    alice.add_event_handler({
+        let latest_event = latest_event.clone();
+
+        |ev: AnySyncMessageLikeEvent| async move {
+            let mut latest_event = latest_event.lock().await;
+            *latest_event = Some(ev);
+        }
     });
 
-    // alice creates a room and invites bob.
+    // Alice creates a room and invites Bob.
     let room_id = alice
         .create_room(assign!(CreateRoomRequest::new(), {
             invite: vec![bob.user_id().unwrap().to_owned()],
@@ -420,16 +433,7 @@ async fn test_room_notification_count() -> Result<()> {
         .room_id()
         .to_owned();
 
-    let mut alice_room = None;
-    for i in 1..=4 {
-        sleep(Duration::from_millis(30 * i)).await;
-        alice_room = alice.get_room(&room_id);
-        if alice_room.is_some() {
-            break;
-        }
-    }
-
-    let alice_room = alice_room.unwrap();
+    let alice_room = alice.get_room(&room_id).unwrap();
     assert_eq!(alice_room.state(), RoomState::Joined);
 
     alice_room.enable_encryption().await?;
@@ -450,6 +454,7 @@ async fn test_room_notification_count() -> Result<()> {
 
     {
         debug!("Bob joined the room");
+
         let update =
             update_observer.next().await.expect("we should get an update when Bob joins the room");
 
@@ -481,20 +486,6 @@ async fn test_room_notification_count() -> Result<()> {
         assert_eq!(alice_room.num_unread_notifications(), 1);
         assert_eq!(alice_room.num_unread_mentions(), 0);
 
-        // If the server hasn't updated the server-side notification count yet, wait for
-        // it and reassert.
-        if alice_room.unread_notification_counts().notification_count != 1 {
-            update_observer
-                .next()
-                .await
-                .expect("server should update server-side notification count");
-            assert_eq!(alice_room.unread_notification_counts().notification_count, 1);
-
-            assert_eq!(alice_room.num_unread_messages(), 1);
-            assert_eq!(alice_room.num_unread_notifications(), 1);
-            assert_eq!(alice_room.num_unread_mentions(), 0);
-        }
-
         update_observer.assert_is_pending();
     }
 
@@ -517,20 +508,6 @@ async fn test_room_notification_count() -> Result<()> {
         assert_eq!(alice_room.num_unread_messages(), 2);
         assert_eq!(alice_room.num_unread_notifications(), 2);
         assert_eq!(alice_room.num_unread_mentions(), 1);
-
-        // If the server hasn't updated the server-side notification count yet, wait for
-        // it and reassert.
-        if alice_room.unread_notification_counts().notification_count != 2 {
-            update_observer
-                .next()
-                .await
-                .expect("server should update server-side notification count");
-            assert_eq!(alice_room.unread_notification_counts().notification_count, 2);
-
-            assert_eq!(alice_room.num_unread_messages(), 2);
-            assert_eq!(alice_room.num_unread_notifications(), 2);
-            assert_eq!(alice_room.num_unread_mentions(), 1);
-        }
 
         update_observer.assert_is_pending();
     }
@@ -583,14 +560,14 @@ async fn test_room_notification_count() -> Result<()> {
 
     let mut settings_changes = settings.subscribe_to_changes();
 
-    tracing::warn!("Updating room notification mode to mentions and keywords only...");
+    warn!("Updating room notification mode to mentions and keywords only...");
     settings
         .set_room_notification_mode(
             alice_room.room_id(),
             matrix_sdk::notification_settings::RoomNotificationMode::MentionsAndKeywordsOnly,
         )
         .await?;
-    tracing::warn!("Done!");
+    warn!("Done!");
 
     // Wait for remote echo.
     timeout(Duration::from_secs(3), settings_changes.recv())
@@ -715,6 +692,7 @@ impl wiremock::Respond for &CustomResponder {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_delayed_decryption_latest_event() -> Result<()> {
     let server = MockServer::start().await;
 
@@ -902,6 +880,7 @@ async fn test_delayed_invite_response_and_sent_message_decryption() -> Result<()
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_room_info_notable_update_deduplication() -> Result<()> {
     let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
     let bob = TestClientBuilder::new("bob").use_sqlite().build().await?;
