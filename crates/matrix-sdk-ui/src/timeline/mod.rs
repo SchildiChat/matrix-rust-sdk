@@ -18,7 +18,7 @@
 
 use std::{path::PathBuf, pin::Pin, sync::Arc, task::Poll};
 
-use event_item::{EventTimelineItemKind, TimelineItemHandle};
+use event_item::{extract_room_msg_edit_content, EventTimelineItemKind, TimelineItemHandle};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use imbl::Vector;
@@ -68,7 +68,6 @@ pub mod futures;
 mod item;
 mod pagination;
 mod pinned_events_loader;
-mod polls;
 mod reactions;
 mod read_receipts;
 #[cfg(test)]
@@ -85,14 +84,13 @@ pub use self::{
     event_item::{
         AnyOtherFullStateEventContent, EncryptedMessage, EventItemOrigin, EventSendState,
         EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange, Message,
-        OtherState, Profile, ReactionInfo, ReactionStatus, ReactionsByKeyBySender, RepliedToEvent,
-        RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineDetails,
-        TimelineEventItemId, TimelineItemContent,
+        OtherState, PollResult, PollState, Profile, ReactionInfo, ReactionStatus,
+        ReactionsByKeyBySender, RepliedToEvent, RoomMembershipChange, RoomPinnedEventsChange,
+        Sticker, TimelineDetails, TimelineEventItemId, TimelineItemContent,
     },
     event_type_filter::TimelineEventTypeFilter,
     item::{TimelineItem, TimelineItemKind},
     pagination::LiveBackPaginationStatus,
-    polls::PollResult,
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
@@ -433,7 +431,7 @@ impl Timeline {
                 {
                     ReplyContent::Message(Message::from_event(
                         original_message.content.clone(),
-                        message_like_event.relations(),
+                        extract_room_msg_edit_content(message_like_event.relations()),
                         &self.items().await,
                     ))
                 } else {

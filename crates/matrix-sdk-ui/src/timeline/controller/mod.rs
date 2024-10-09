@@ -52,8 +52,8 @@ use tracing::{
 };
 
 pub(super) use self::state::{
-    EventMeta, FullEventMeta, PendingEdit, TimelineEnd, TimelineMetadata, TimelineState,
-    TimelineStateTransaction,
+    EventMeta, FullEventMeta, PendingEdit, PendingEditKind, TimelineEnd, TimelineMetadata,
+    TimelineState, TimelineStateTransaction,
 };
 use super::{
     event_handler::TimelineEventKind,
@@ -951,10 +951,9 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
         // Replace the local-related state (kind) and the content state.
         let new_item = TimelineItem::new(
-            prev_item.with_kind(ti_kind).with_content(
-                TimelineItemContent::message(content, Default::default(), &txn.items),
-                None,
-            ),
+            prev_item
+                .with_kind(ti_kind)
+                .with_content(TimelineItemContent::message(content, None, &txn.items), None),
             prev_item.internal_id.to_owned(),
         );
 

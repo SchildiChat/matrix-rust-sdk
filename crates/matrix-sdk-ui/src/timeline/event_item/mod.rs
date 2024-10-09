@@ -41,17 +41,21 @@ mod content;
 mod local;
 mod remote;
 
+pub(super) use self::{
+    content::{
+        extract_bundled_edit_event_json, extract_poll_edit_content, extract_room_msg_edit_content,
+        ResponseData,
+    },
+    local::LocalEventTimelineItem,
+    remote::{RemoteEventOrigin, RemoteEventTimelineItem},
+};
 pub use self::{
     content::{
         AnyOtherFullStateEventContent, EncryptedMessage, InReplyToDetails, MemberProfileChange,
-        MembershipChange, Message, OtherState, RepliedToEvent, RoomMembershipChange,
-        RoomPinnedEventsChange, Sticker, TimelineItemContent,
+        MembershipChange, Message, OtherState, PollResult, PollState, RepliedToEvent,
+        RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineItemContent,
     },
     local::EventSendState,
-};
-pub(super) use self::{
-    local::LocalEventTimelineItem,
-    remote::{RemoteEventOrigin, RemoteEventTimelineItem},
 };
 use super::{RepliedToInfo, ReplyContent, UnsupportedReplyItem};
 
@@ -715,19 +719,20 @@ impl ReactionsByKeyBySender {
 mod tests {
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
-    use matrix_sdk::test_utils::logged_in_client;
+    use matrix_sdk::test_utils::{events::EventFactory, logged_in_client};
     use matrix_sdk_base::{
         deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent, sliding_sync::http,
         MinimalStateEvent, OriginalMinimalStateEvent,
     };
     use matrix_sdk_test::{async_test, sync_timeline_event};
     use ruma::{
+        event_id,
         events::{
             room::{
                 member::RoomMemberEventContent,
                 message::{MessageFormat, MessageType},
             },
-            AnySyncTimelineEvent,
+            AnySyncTimelineEvent, BundledMessageLikeRelations,
         },
         room_id,
         serde::Raw,
@@ -764,6 +769,112 @@ mod tests {
         } else {
             panic!("Unexpected message type");
         }
+    }
+
+    #[async_test]
+    async fn test_latest_message_includes_bundled_edit() {
+        // Given a sync event that is suitable to be used as a latest_event, and
+        // contains a bundled edit,
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+
+        let f = EventFactory::new();
+
+        let original_event_id = event_id!("$original");
+
+        let mut relations = BundledMessageLikeRelations::new();
+        relations.replace = Some(Box::new(
+            f.text_html(" * Updated!", " * <b>Updated!</b>")
+                .edit(
+                    original_event_id,
+                    MessageType::text_html("Updated!", "<b>Updated!</b>").into(),
+                )
+                .event_id(event_id!("$edit"))
+                .sender(user_id)
+                .into_raw_sync(),
+        ));
+
+        let event = f
+            .text_html("**My M**", "<b>My M</b>")
+            .sender(user_id)
+            .event_id(original_event_id)
+            .bundled_relations(relations)
+            .server_ts(42)
+            .into_sync();
+
+        let client = logged_in_client(None).await;
+
+        // When we construct a timeline event from it,
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        // Then its properties correctly translate.
+        assert_eq!(timeline_item.sender, user_id);
+        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
+        assert_eq!(timeline_item.timestamp.0, UInt::new(42).unwrap());
+        if let MessageType::Text(txt) = timeline_item.content.as_message().unwrap().msgtype() {
+            assert_eq!(txt.body, "Updated!");
+            let formatted = txt.formatted.as_ref().unwrap();
+            assert_eq!(formatted.format, MessageFormat::Html);
+            assert_eq!(formatted.body, "<b>Updated!</b>");
+        } else {
+            panic!("Unexpected message type");
+        }
+    }
+
+    #[async_test]
+    async fn test_latest_poll_includes_bundled_edit() {
+        // Given a sync event that is suitable to be used as a latest_event, and
+        // contains a bundled edit,
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+
+        let f = EventFactory::new();
+
+        let original_event_id = event_id!("$original");
+
+        let mut relations = BundledMessageLikeRelations::new();
+        relations.replace = Some(Box::new(
+            f.poll_edit(
+                original_event_id,
+                "It's one banana, Michael, how much could it cost?",
+                vec!["1 dollar", "10 dollars", "100 dollars"],
+            )
+            .event_id(event_id!("$edit"))
+            .sender(user_id)
+            .into_raw_sync(),
+        ));
+
+        let event = f
+            .poll_start(
+                "It's one avocado, Michael, how much could it cost? 10 dollars?",
+                "It's one avocado, Michael, how much could it cost?",
+                vec!["1 dollar", "10 dollars", "100 dollars"],
+            )
+            .event_id(original_event_id)
+            .bundled_relations(relations)
+            .sender(user_id)
+            .into_sync();
+
+        let client = logged_in_client(None).await;
+
+        // When we construct a timeline event from it,
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        // Then its properties correctly translate.
+        assert_eq!(timeline_item.sender, user_id);
+
+        let poll = timeline_item.content().as_poll().unwrap();
+        assert!(poll.has_been_edited);
+        assert_eq!(
+            poll.start_event_content.poll_start.question.text,
+            "It's one banana, Michael, how much could it cost?"
+        );
     }
 
     #[async_test]

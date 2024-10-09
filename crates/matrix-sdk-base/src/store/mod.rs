@@ -57,6 +57,7 @@ use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tracing::warn;
 
 use crate::{
     event_cache_store::{DynEventCacheStore, IntoEventCacheStore},
@@ -176,6 +177,36 @@ impl Store {
         &self.sync_lock
     }
 
+    /// Load the room infos from the inner `StateStore`.
+    ///
+    /// Applies migrations to the room infos if needed.
+    async fn load_room_infos(&self) -> Result<Vec<RoomInfo>> {
+        let mut room_infos = self.inner.get_room_infos().await?;
+        let mut migrated_room_infos = Vec::with_capacity(room_infos.len());
+
+        for room_info in room_infos.iter_mut() {
+            if room_info.apply_migrations(self.inner.clone()).await {
+                migrated_room_infos.push(room_info.clone());
+            }
+        }
+
+        if !migrated_room_infos.is_empty() {
+            let changes = StateChanges {
+                room_infos: migrated_room_infos
+                    .into_iter()
+                    .map(|room_info| (room_info.room_id.clone(), room_info))
+                    .collect(),
+                ..Default::default()
+            };
+
+            if let Err(error) = self.inner.save_changes(&changes).await {
+                warn!("Failed to save migrated room infos: {error}");
+            }
+        }
+
+        Ok(room_infos)
+    }
+
     /// Set the meta of the session.
     ///
     /// Restores the state of this `Store` from the given `SessionMeta` and the
@@ -188,7 +219,7 @@ impl Store {
         room_info_notable_update_sender: &broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Result<()> {
         {
-            let room_infos = self.inner.get_room_infos().await?;
+            let room_infos = self.load_room_infos().await?;
 
             let mut rooms = self.rooms.write().unwrap();
             let mut spaces = self.spaces.write().unwrap();

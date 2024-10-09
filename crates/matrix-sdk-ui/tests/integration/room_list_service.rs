@@ -376,6 +376,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -400,6 +401,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 199]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -424,6 +426,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 299]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -448,6 +451,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 399]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -483,6 +487,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 19]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -510,6 +515,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 9]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -537,6 +543,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 9]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -571,6 +578,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The default range, in selective sync-mode.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -595,6 +603,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Still the default range, in selective sync-mode.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -618,6 +627,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode has changed to growing, with its initial range.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -642,6 +652,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Due to previous error, the sync-mode is back to selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -664,6 +675,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Sync-mode is now growing.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -687,6 +699,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is still growing, and the range has made progress.
                     "ranges": [[0, 199]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -711,6 +724,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Due to previous error, the sync-mode is back to selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -733,6 +747,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is now growing.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -755,6 +770,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // No error. The range is making progress.
                     "ranges": [[0, 199]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -779,6 +795,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                     // Range is making progress and is even reaching the maximum
                     // number of rooms.
                     "ranges": [[0, 209]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -803,6 +820,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Due to previous error, the sync-mode is back to selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -825,6 +843,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Sync-mode is now growing.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -863,6 +882,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The default range, in selective sync-mode.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -893,6 +913,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is still selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -916,6 +937,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is now growing, with its initial range.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -947,6 +969,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is back to selective.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -970,6 +993,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Sync-mode is growing, with its initial range.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -993,6 +1017,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Range is making progress, and has reached its maximum.
                     "ranges": [[0, 149]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1033,6 +1058,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 19]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1063,6 +1089,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 9]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1093,6 +1120,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 11]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1140,6 +1168,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 19]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1168,96 +1197,6 @@ async fn test_loading_states() -> Result<(), Error> {
 }
 
 #[async_test]
-async fn test_entries_stream() -> Result<(), Error> {
-    let (_, server, room_list) = new_room_list_service().await?;
-
-    let sync = room_list.sync();
-    pin_mut!(sync);
-
-    let all_rooms = room_list.all_rooms().await?;
-
-    let (previous_entries, entries_stream) = all_rooms.entries();
-    pin_mut!(entries_stream);
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = Init => SettingUp,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    "ranges": [[0, 19]],
-                },
-            },
-        },
-        respond with = {
-            "pos": "0",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 10,
-                },
-            },
-            "rooms": {
-                "!r0:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-                "!r1:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-                "!r2:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-            },
-        },
-    };
-
-    assert!(previous_entries.is_empty());
-    assert_entries_batch! {
-        [entries_stream]
-        push back [ "!r0:bar.org" ];
-        push back [ "!r1:bar.org" ];
-        push back [ "!r2:bar.org" ];
-        end;
-    };
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = SettingUp => Running,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    "ranges": [[0, 9]],
-                },
-            },
-        },
-        respond with = {
-            "pos": "1",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 9,
-                },
-            },
-            "rooms": {
-                "!r3:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-            },
-        },
-    };
-
-    assert_entries_batch! {
-        [entries_stream]
-        push back [ "!r3:bar.org" ];
-        end;
-    };
-
-    Ok(())
-}
-
-#[async_test]
 async fn test_dynamic_entries_stream() -> Result<(), Error> {
     let (client, server, room_list) = new_room_list_service().await?;
 
@@ -1277,6 +1216,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1331,6 +1271,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 9]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1440,6 +1381,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 9]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1606,6 +1548,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 9]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1676,6 +1619,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1774,6 +1718,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 4]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1859,6 +1804,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 4]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1933,6 +1879,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 5]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2106,6 +2053,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2141,7 +2089,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                 (StateEventType::RoomAvatar, "".to_owned()),
                 (StateEventType::RoomCanonicalAlias, "".to_owned()),
             ],
-            timeline_limit: Some(uint!(30)),
+            timeline_limit: uint!(30),
         })),
     );
 
@@ -2151,6 +2099,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "timeline_limit": 1,
                 },
             },
             "room_subscriptions": {
@@ -2184,7 +2133,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                 (StateEventType::RoomAvatar, "".to_owned()),
                 (StateEventType::RoomCanonicalAlias, "".to_owned()),
             ],
-            timeline_limit: Some(uint!(30)),
+            timeline_limit: uint!(30),
         })),
     );
 
@@ -2194,6 +2143,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "timeline_limit": 1,
                 },
             },
             "room_subscriptions": {
@@ -2227,7 +2177,7 @@ async fn test_room_subscription() -> Result<(), Error> {
                 (StateEventType::RoomAvatar, "".to_owned()),
                 (StateEventType::RoomCanonicalAlias, "".to_owned()),
             ],
-            timeline_limit: Some(uint!(30)),
+            timeline_limit: uint!(30),
         })),
     );
 
@@ -2240,6 +2190,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "timeline_limit": 1,
                 },
             },
             // NO `room_subscriptions`!
@@ -2274,6 +2225,7 @@ async fn test_room_unread_notifications() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2305,6 +2257,7 @@ async fn test_room_unread_notifications() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 0]],
+                    "timeline_limit": 1,
                 },
             },
         },
