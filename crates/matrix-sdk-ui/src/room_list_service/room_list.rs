@@ -39,7 +39,7 @@ use super::sorters::BoxedSorterFn;
 
 use super::{
     filters::BoxedFilterFn,
-    sorters::{new_sorter_lexicographic, new_sorter_name, new_sorter_recency},
+    //sorters::{new_sorter_lexicographic, new_sorter_name, new_sorter_recency},
     Error, Room, State,
 };
 
