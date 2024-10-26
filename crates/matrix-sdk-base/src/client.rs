@@ -29,7 +29,8 @@ use futures_util::Stream;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     store::DynCryptoStore, CollectStrategy, DecryptionSettings, EncryptionSettings,
-    EncryptionSyncChanges, OlmError, OlmMachine, ToDeviceRequest, TrustRequirement,
+    EncryptionSyncChanges, OlmError, OlmMachine, RoomEventDecryptionResult, ToDeviceRequest,
+    TrustRequirement,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
@@ -344,6 +345,13 @@ impl BaseClient {
         Ok(())
     }
 
+    /// Attempt to decrypt the given raw event into a `SyncTimelineEvent`.
+    ///
+    /// In the case of a decryption error, returns a `SyncTimelineEvent`
+    /// representing the decryption error; in the case of problems with our
+    /// application, returns `Err`.
+    ///
+    /// Returns `Ok(None)` if encryption is not configured.
     #[cfg(feature = "e2e-encryption")]
     async fn decrypt_sync_room_event(
         &self,
@@ -356,24 +364,37 @@ impl BaseClient {
         let decryption_settings = DecryptionSettings {
             sender_device_trust_requirement: self.decryption_trust_requirement,
         };
-        let event: SyncTimelineEvent =
-            olm.decrypt_room_event(event.cast_ref(), room_id, &decryption_settings).await?.into();
 
-        if let Ok(AnySyncTimelineEvent::MessageLike(e)) = event.event.deserialize() {
-            match &e {
-                AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
-                    original_event,
-                )) => {
-                    if let MessageType::VerificationRequest(_) = &original_event.content.msgtype {
-                        self.handle_verification_event(&e, room_id).await?;
+        let event = match olm
+            .try_decrypt_room_event(event.cast_ref(), room_id, &decryption_settings)
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => {
+                let event: SyncTimelineEvent = decrypted.into();
+
+                if let Ok(AnySyncTimelineEvent::MessageLike(e)) = event.raw().deserialize() {
+                    match &e {
+                        AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
+                            original_event,
+                        )) => {
+                            if let MessageType::VerificationRequest(_) =
+                                &original_event.content.msgtype
+                            {
+                                self.handle_verification_event(&e, room_id).await?;
+                            }
+                        }
+                        _ if e.event_type().to_string().starts_with("m.key.verification") => {
+                            self.handle_verification_event(&e, room_id).await?;
+                        }
+                        _ => (),
                     }
                 }
-                _ if e.event_type().to_string().starts_with("m.key.verification") => {
-                    self.handle_verification_event(&e, room_id).await?;
-                }
-                _ => (),
+                event
             }
-        }
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                SyncTimelineEvent::new_utd_event(event.clone(), utd_info)
+            }
+        };
 
         Ok(Some(event))
     }
@@ -385,6 +406,7 @@ impl BaseClient {
         room: &Room,
         limited: bool,
         events: Vec<Raw<AnySyncTimelineEvent>>,
+        ignore_state_events: bool,
         prev_batch: Option<String>,
         push_rules: &Ruleset,
         user_ids: &mut BTreeSet<OwnedUserId>,
@@ -396,14 +418,16 @@ impl BaseClient {
         let mut timeline = Timeline::new(limited, prev_batch);
         let mut push_context = self.get_push_room_context(room, room_info, changes).await?;
 
-        for event in events {
-            let mut event: SyncTimelineEvent = event.into();
+        for raw_event in events {
+            // Start by assuming we have a plaintext event. We'll replace it with a
+            // decrypted or UTD event below if necessary.
+            let mut event = SyncTimelineEvent::new(raw_event);
 
-            match event.event.deserialize() {
+            match event.raw().deserialize() {
                 Ok(e) => {
                     #[allow(clippy::single_match)]
                     match &e {
-                        AnySyncTimelineEvent::State(s) => {
+                        AnySyncTimelineEvent::State(s) if !ignore_state_events => {
                             match s {
                                 AnySyncStateEvent::RoomMember(member) => {
                                     Box::pin(ambiguity_cache.handle_event(
@@ -433,9 +457,11 @@ impl BaseClient {
                                 }
                             }
 
-                            let raw_event: Raw<AnySyncStateEvent> = event.event.clone().cast();
+                            let raw_event: Raw<AnySyncStateEvent> = event.raw().clone().cast();
                             changes.add_state_event(room.room_id(), s.clone(), raw_event);
                         }
+
+                        AnySyncTimelineEvent::State(_) => { /* do nothing */ }
 
                         AnySyncTimelineEvent::MessageLike(
                             AnySyncMessageLikeEvent::RoomRedaction(r),
@@ -444,8 +470,8 @@ impl BaseClient {
                                 room_info.room_version().unwrap_or(&RoomVersionId::V1);
 
                             if let Some(redacts) = r.redacts(room_version) {
-                                room_info.handle_redaction(r, event.event.cast_ref());
-                                let raw_event = event.event.clone().cast();
+                                room_info.handle_redaction(r, event.raw().cast_ref());
+                                let raw_event = event.raw().clone().cast();
 
                                 changes.add_redaction(room.room_id(), redacts, raw_event);
                             }
@@ -456,10 +482,10 @@ impl BaseClient {
                             AnySyncMessageLikeEvent::RoomEncrypted(
                                 SyncMessageLikeEvent::Original(_),
                             ) => {
-                                if let Ok(Some(e)) = Box::pin(
-                                    self.decrypt_sync_room_event(&event.event, room.room_id()),
+                                if let Some(e) = Box::pin(
+                                    self.decrypt_sync_room_event(event.raw(), room.room_id()),
                                 )
-                                .await
+                                .await?
                                 {
                                     event = e;
                                 }
@@ -495,14 +521,14 @@ impl BaseClient {
                     }
 
                     if let Some(context) = &push_context {
-                        let actions = push_rules.get_actions(&event.event, context);
+                        let actions = push_rules.get_actions(event.raw(), context);
 
                         if actions.iter().any(Action::should_notify) {
                             notifications.entry(room.room_id().to_owned()).or_default().push(
                                 Notification {
                                     actions: actions.to_owned(),
                                     event: RawAnySyncOrStrippedTimelineEvent::Sync(
-                                        event.event.clone(),
+                                        event.raw().clone(),
                                     ),
                                 },
                             );
@@ -521,11 +547,22 @@ impl BaseClient {
         Ok(timeline)
     }
 
+    /// Handles the stripped state events in `invite_state`, modifying the
+    /// room's info and posting notifications as needed.
+    ///
+    /// * `room` - The [`Room`] to modify.
+    /// * `events` - The contents of `invite_state` in the form of list of pairs
+    ///   of raw stripped state events with their deserialized counterpart.
+    /// * `push_rules` - The push rules for this room.
+    /// * `room_info` - The current room's info.
+    /// * `changes` - The accumulated list of changes to apply once the
+    ///   processing is finished.
+    /// * `notifications` - Notifications to post for the current room.
     #[instrument(skip_all, fields(room_id = ?room_info.room_id))]
     pub(crate) async fn handle_invited_state(
         &self,
         room: &Room,
-        events: &[Raw<AnyStrippedStateEvent>],
+        events: &[(Raw<AnyStrippedStateEvent>, AnyStrippedStateEvent)],
         push_rules: &Ruleset,
         room_info: &mut RoomInfo,
         changes: &mut StateChanges,
@@ -533,22 +570,12 @@ impl BaseClient {
     ) -> Result<()> {
         let mut state_events = BTreeMap::new();
 
-        for raw_event in events {
-            match raw_event.deserialize() {
-                Ok(e) => {
-                    room_info.handle_stripped_state_event(&e);
-                    state_events
-                        .entry(e.event_type())
-                        .or_insert_with(BTreeMap::new)
-                        .insert(e.state_key().to_owned(), raw_event.clone());
-                }
-                Err(err) => {
-                    warn!(
-                        room_id = ?room_info.room_id,
-                        "Couldn't deserialize stripped state event: {err:?}",
-                    );
-                }
-            }
+        for (raw_event, event) in events {
+            room_info.handle_stripped_state_event(event);
+            state_events
+                .entry(event.event_type())
+                .or_insert_with(BTreeMap::new)
+                .insert(event.state_key().to_owned(), raw_event.clone());
         }
 
         changes.stripped_state.insert(room_info.room_id().to_owned(), state_events.clone());
@@ -774,7 +801,7 @@ impl BaseClient {
 
             if let Ok(Some(decrypted)) = decrypt_sync_room_event.await {
                 // We found an event we can decrypt
-                if let Ok(any_sync_event) = decrypted.event.deserialize() {
+                if let Ok(any_sync_event) = decrypted.raw().deserialize() {
                     // We can deserialize it to find its type
                     match is_suitable_for_latest_event(&any_sync_event) {
                         PossibleLatestEvent::YesRoomMessage(_)
@@ -791,6 +818,33 @@ impl BaseClient {
             }
         }
         None
+    }
+
+    /// User has knocked on a room.
+    ///
+    /// Update the internal and cached state accordingly. Return the final Room.
+    pub async fn room_knocked(&self, room_id: &RoomId) -> Result<Room> {
+        let room = self.store.get_or_create_room(
+            room_id,
+            RoomState::Knocked,
+            self.room_info_notable_update_sender.clone(),
+            None,
+        );
+
+        if room.state() != RoomState::Knocked {
+            let _sync_lock = self.sync_lock().lock().await;
+
+            let mut room_info = room.clone_info();
+            room_info.mark_as_knocked();
+            room_info.mark_state_partially_synced();
+            room_info.mark_members_missing(); // the own member event changed
+            let mut changes = StateChanges::default();
+            changes.add_room(room_info.clone());
+            self.store.save_changes(&changes).await?; // Update the store
+            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
+        }
+
+        Ok(room)
     }
 
     /// User has joined a room.
@@ -959,6 +1013,7 @@ impl BaseClient {
                     &room,
                     new_info.timeline.limited,
                     new_info.timeline.events,
+                    false,
                     new_info.timeline.prev_batch,
                     &push_rules,
                     &mut user_ids,
@@ -1057,6 +1112,7 @@ impl BaseClient {
                     &room,
                     new_info.timeline.limited,
                     new_info.timeline.events,
+                    false,
                     new_info.timeline.prev_batch,
                     &push_rules,
                     &mut user_ids,
@@ -1099,13 +1155,16 @@ impl BaseClient {
                 None,
             );
 
+            let invite_state =
+                Self::deserialize_stripped_state_events(&new_info.invite_state.events);
+
             let mut room_info = room.clone_info();
             room_info.mark_as_invited();
             room_info.mark_state_fully_synced();
 
             self.handle_invited_state(
                 &room,
-                &new_info.invite_state.events,
+                &invite_state,
                 &push_rules,
                 &mut room_info,
                 &mut changes,
@@ -1116,6 +1175,35 @@ impl BaseClient {
             changes.add_room(room_info);
 
             new_rooms.invite.insert(room_id, new_info);
+        }
+
+        for (room_id, new_info) in response.rooms.knock {
+            let room = self.store.get_or_create_room(
+                &room_id,
+                RoomState::Knocked,
+                self.room_info_notable_update_sender.clone(),
+                None,
+            );
+
+            let knock_state = Self::deserialize_stripped_state_events(&new_info.knock_state.events);
+
+            let mut room_info = room.clone_info();
+            room_info.mark_as_knocked();
+            room_info.mark_state_fully_synced();
+
+            self.handle_invited_state(
+                &room,
+                &knock_state,
+                &push_rules,
+                &mut room_info,
+                &mut changes,
+                &mut notifications,
+            )
+            .await?;
+
+            changes.add_room(room_info);
+
+            new_rooms.knocked.insert(room_id, new_info);
         }
 
         account_data_processor.apply(&mut changes, &self.store).await;
@@ -1386,6 +1474,17 @@ impl BaseClient {
         self.store.room(room_id)
     }
 
+    /// Forget the room with the given room ID.
+    ///
+    /// The room will be dropped from the room list and the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The id of the room that should be forgotten.
+    pub async fn forget_room(&self, room_id: &RoomId) -> StoreResult<()> {
+        self.store.forget_room(room_id).await
+    }
+
     /// Get the olm machine.
     #[cfg(feature = "e2e-encryption")]
     pub async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
@@ -1543,6 +1642,21 @@ impl BaseClient {
                 Ok(event) => Some((raw_event.clone(), event)),
                 Err(e) => {
                     warn!("Couldn't deserialize state event: {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn deserialize_stripped_state_events(
+        raw_events: &[Raw<AnyStrippedStateEvent>],
+    ) -> Vec<(Raw<AnyStrippedStateEvent>, AnyStrippedStateEvent)> {
+        raw_events
+            .iter()
+            .filter_map(|raw_event| match raw_event.deserialize() {
+                Ok(event) => Some((raw_event.clone(), event)),
+                Err(e) => {
+                    warn!("Couldn't deserialize stripped state event: {e}");
                     None
                 }
             })

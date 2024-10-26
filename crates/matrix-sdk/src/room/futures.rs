@@ -17,8 +17,6 @@
 #![deny(unreachable_pub)]
 
 use std::future::IntoFuture;
-#[cfg(feature = "image-proc")]
-use std::io::Cursor;
 
 use eyeball::SharedObservable;
 use matrix_sdk_common::boxed_into_future;
@@ -32,13 +30,9 @@ use ruma::{
     serde::Raw,
     OwnedTransactionId, TransactionId,
 };
-#[cfg(feature = "image-proc")]
-use tracing::debug;
 use tracing::{info, trace, Instrument, Span};
 
 use super::Room;
-#[cfg(feature = "image-proc")]
-use crate::{attachment::generate_image_thumbnail, error::ImageError};
 use crate::{
     attachment::AttachmentConfig, config::RequestConfig, utils::IntoRawMessageLikeEventContent,
     Result, TransmissionProgress,
@@ -78,8 +72,8 @@ impl<'a> SendMessageLikeEvent<'a> {
     ///   corresponding [`SyncMessageLikeEvent`], but only for the *sending*
     ///   device. Other devices will not see it. This is then used to ignore
     ///   events sent by our own device and/or to implement local echo.
-    pub fn with_transaction_id(mut self, txn_id: &TransactionId) -> Self {
-        self.transaction_id = Some(txn_id.to_owned());
+    pub fn with_transaction_id(mut self, txn_id: OwnedTransactionId) -> Self {
+        self.transaction_id = Some(txn_id);
         self
     }
 
@@ -252,6 +246,7 @@ pub struct SendAttachment<'a> {
     config: AttachmentConfig,
     tracing_span: Span,
     send_progress: SharedObservable<TransmissionProgress>,
+    store_in_cache: bool,
 }
 
 impl<'a> SendAttachment<'a> {
@@ -270,6 +265,7 @@ impl<'a> SendAttachment<'a> {
             config,
             tracing_span: Span::current(),
             send_progress: Default::default(),
+            store_in_cache: false,
         }
     }
 
@@ -283,6 +279,15 @@ impl<'a> SendAttachment<'a> {
         self.send_progress = send_progress;
         self
     }
+
+    /// Whether the sent attachment should be stored in the cache or not.
+    ///
+    /// If set to true, then retrieving the data for the attachment will result
+    /// in a cache hit immediately after upload.
+    pub fn store_in_cache(mut self) -> Self {
+        self.store_in_cache = true;
+        self
+    }
 }
 
 impl<'a> IntoFuture for SendAttachment<'a> {
@@ -290,83 +295,26 @@ impl<'a> IntoFuture for SendAttachment<'a> {
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { room, filename, content_type, data, config, tracing_span, send_progress } = self;
+        let Self {
+            room,
+            filename,
+            content_type,
+            data,
+            config,
+            tracing_span,
+            send_progress,
+            store_in_cache,
+        } = self;
         let fut = async move {
-            if config.thumbnail.is_some() {
-                room.prepare_and_send_attachment(
-                    filename,
-                    content_type,
-                    data,
-                    config,
-                    send_progress,
-                )
-                .await
-            } else {
-                #[cfg(not(feature = "image-proc"))]
-                let thumbnail = None;
-
-                #[cfg(feature = "image-proc")]
-                let (data, thumbnail) = if config.generate_thumbnail {
-                    let content_type = content_type.clone();
-                    let make_thumbnail = move |data| {
-                        let res = generate_image_thumbnail(
-                            &content_type,
-                            Cursor::new(&data),
-                            config.thumbnail_size,
-                            config.thumbnail_format,
-                        );
-                        (data, res)
-                    };
-
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let (data, res) = tokio::task::spawn_blocking(move || make_thumbnail(data))
-                        .await
-                        .expect("Task join error");
-
-                    #[cfg(target_arch = "wasm32")]
-                    let (data, res) = make_thumbnail(data);
-
-                    let thumbnail = match res {
-                        Ok(thumbnail) => Some(thumbnail),
-                        Err(error) => {
-                            if matches!(error, ImageError::ThumbnailBiggerThanOriginal) {
-                                debug!("Not generating thumbnail: {error}");
-                            } else {
-                                tracing::warn!("Failed to generate thumbnail: {error}");
-                            }
-                            None
-                        }
-                    };
-
-                    (data, thumbnail)
-                } else {
-                    (data, None)
-                };
-
-                let config = AttachmentConfig {
-                    txn_id: config.txn_id,
-                    info: config.info,
-                    thumbnail,
-                    caption: config.caption,
-                    formatted_caption: config.formatted_caption,
-                    mentions: config.mentions,
-                    #[cfg(feature = "image-proc")]
-                    generate_thumbnail: false,
-                    #[cfg(feature = "image-proc")]
-                    thumbnail_size: None,
-                    #[cfg(feature = "image-proc")]
-                    thumbnail_format: Default::default(),
-                };
-
-                room.prepare_and_send_attachment(
-                    filename,
-                    content_type,
-                    data,
-                    config,
-                    send_progress,
-                )
-                .await
-            }
+            room.prepare_and_send_attachment(
+                filename,
+                content_type,
+                data,
+                config,
+                send_progress,
+                store_in_cache,
+            )
+            .await
         };
 
         Box::pin(fut.instrument(tracing_span))

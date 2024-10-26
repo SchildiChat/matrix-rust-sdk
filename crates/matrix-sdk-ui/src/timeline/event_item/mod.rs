@@ -25,7 +25,7 @@ use matrix_sdk::{
     Client, Error,
 };
 use matrix_sdk_base::{
-    deserialized_responses::{ShieldStateCode, SyncTimelineEvent, SENT_IN_CLEAR},
+    deserialized_responses::{ShieldStateCode, SENT_IN_CLEAR},
     latest_event::LatestEvent,
 };
 use once_cell::sync::Lazy;
@@ -103,22 +103,6 @@ pub enum TimelineEventItemId {
     EventId(OwnedEventId),
 }
 
-impl From<String> for TimelineEventItemId {
-    fn from(value: String) -> Self {
-        value.as_str().into()
-    }
-}
-
-impl From<&str> for TimelineEventItemId {
-    fn from(value: &str) -> Self {
-        if let Ok(event_id) = EventId::parse(value) {
-            TimelineEventItemId::EventId(event_id)
-        } else {
-            TimelineEventItemId::TransactionId(value.into())
-        }
-    }
-}
-
 /// An handle that usually allows to perform an action on a timeline event.
 ///
 /// If the item represents a remote item, then the event id is usually
@@ -161,8 +145,8 @@ impl EventTimelineItem {
         // potential footgun which could one day turn into a security issue.
         use super::traits::RoomDataProvider;
 
-        let SyncTimelineEvent { event: raw_sync_event, encryption_info, .. } =
-            latest_event.event().clone();
+        let raw_sync_event = latest_event.event().raw().clone();
+        let encryption_info = latest_event.event().encryption_info().cloned();
 
         let Ok(event) = raw_sync_event.deserialize_as::<AnySyncTimelineEvent>() else {
             warn!("Unable to deserialize latest_event as an AnySyncTimelineEvent!");
@@ -237,11 +221,20 @@ impl EventTimelineItem {
     ///
     /// This returns `true` for events created locally, until the server echoes
     /// back the full event as part of a sync response.
+    ///
+    /// This is the opposite of [`Self::is_remote_event`].
     pub fn is_local_echo(&self) -> bool {
         matches!(self.kind, EventTimelineItemKind::Local(_))
     }
 
-    pub(super) fn is_remote_event(&self) -> bool {
+    /// Check whether this item is a remote event.
+    ///
+    /// This returns `true` only for events that have been echoed back from the
+    /// homeserver. A local echo sent but not echoed back yet will return
+    /// `false` here.
+    ///
+    /// This is the opposite of [`Self::is_local_echo`].
+    pub fn is_remote_event(&self) -> bool {
         matches!(self.kind, EventTimelineItemKind::Remote(_))
     }
 
@@ -724,7 +717,7 @@ mod tests {
         deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent, sliding_sync::http,
         MinimalStateEvent, OriginalMinimalStateEvent,
     };
-    use matrix_sdk_test::{async_test, sync_timeline_event};
+    use matrix_sdk_test::{async_test, sync_state_event, sync_timeline_event};
     use ruma::{
         event_id,
         events::{
@@ -732,7 +725,7 @@ mod tests {
                 member::RoomMemberEventContent,
                 message::{MessageFormat, MessageType},
             },
-            AnySyncTimelineEvent, BundledMessageLikeRelations,
+            AnySyncStateEvent, AnySyncTimelineEvent, BundledMessageLikeRelations,
         },
         room_id,
         serde::Raw,
@@ -740,7 +733,7 @@ mod tests {
     };
 
     use super::{EventTimelineItem, Profile};
-    use crate::timeline::{TimelineDetails, TimelineEventItemId};
+    use crate::timeline::TimelineDetails;
 
     #[async_test]
     async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item() {
@@ -889,7 +882,12 @@ mod tests {
         let event = message_event(room_id, user_id, "**My M**", "<b>My M</b>", 122344);
         let client = logged_in_client(None).await;
         let mut room = http::response::Room::new();
-        room.timeline.push(member_event(room_id, user_id, "Alice Margatroid", "mxc://e.org/SEs"));
+        room.required_state.push(member_event_as_state_event(
+            room_id,
+            user_id,
+            "Alice Margatroid",
+            "mxc://e.org/SEs",
+        ));
 
         // And the room is stored in the client so it can be extracted when needed
         let response = response_with_room(room_id, room);
@@ -960,20 +958,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_raw_event_id_into_timeline_event_item_id_gets_event_id() {
-        let raw_id = "$123:example.com";
-        let id: TimelineEventItemId = raw_id.into();
-        assert_matches!(id, TimelineEventItemId::EventId(_));
-    }
-
-    #[test]
-    fn test_raw_str_into_timeline_event_item_id_gets_transaction_id() {
-        let raw_id = "something something";
-        let id: TimelineEventItemId = raw_id.into();
-        assert_matches!(id, TimelineEventItemId::TransactionId(_));
-    }
-
     fn member_event(
         room_id: &RoomId,
         user_id: &UserId,
@@ -981,6 +965,32 @@ mod tests {
         avatar_url: &str,
     ) -> Raw<AnySyncTimelineEvent> {
         sync_timeline_event!({
+            "type": "m.room.member",
+            "content": {
+                "avatar_url": avatar_url,
+                "displayname": display_name,
+                "membership": "join",
+                "reason": ""
+            },
+            "event_id": "$143273582443PhrSn:example.org",
+            "origin_server_ts": 143273583,
+            "room_id": room_id,
+            "sender": "@example:example.org",
+            "state_key": user_id,
+            "type": "m.room.member",
+            "unsigned": {
+              "age": 1234
+            }
+        })
+    }
+
+    fn member_event_as_state_event(
+        room_id: &RoomId,
+        user_id: &UserId,
+        display_name: &str,
+        avatar_url: &str,
+    ) -> Raw<AnySyncStateEvent> {
+        sync_state_event!({
             "type": "m.room.member",
             "content": {
                 "avatar_url": avatar_url,
@@ -1013,7 +1023,7 @@ mod tests {
         formatted_body: &str,
         ts: u64,
     ) -> SyncTimelineEvent {
-        sync_timeline_event!({
+        SyncTimelineEvent::new(sync_timeline_event!({
             "event_id": "$eventid6",
             "sender": user_id,
             "origin_server_ts": ts,
@@ -1025,7 +1035,6 @@ mod tests {
                 "formatted_body": formatted_body,
                 "msgtype": "m.text"
             },
-        })
-        .into()
+        }))
     }
 }

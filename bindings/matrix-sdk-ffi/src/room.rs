@@ -51,6 +51,7 @@ pub enum Membership {
     Invited,
     Joined,
     Left,
+    Knocked,
 }
 
 impl From<RoomState> for Membership {
@@ -59,6 +60,7 @@ impl From<RoomState> for Membership {
             RoomState::Invited => Membership::Invited,
             RoomState::Joined => Membership::Joined,
             RoomState::Left => Membership::Left,
+            RoomState::Knocked => Membership::Knocked,
         }
     }
 }
@@ -81,7 +83,7 @@ impl Room {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Room {
     pub fn id(&self) -> String {
         self.inner.room_id().to_string()
@@ -166,7 +168,12 @@ impl Room {
     /// the user who invited the logged-in user to a room.
     pub async fn inviter(&self) -> Option<RoomMember> {
         if self.inner.state() == RoomState::Invited {
-            self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
+            self.inner
+                .invite_details()
+                .await
+                .ok()
+                .and_then(|a| a.inviter)
+                .and_then(|m| m.try_into().ok())
         } else {
             None
         }
@@ -276,7 +283,7 @@ impl Room {
     pub async fn member(&self, user_id: String) -> Result<RoomMember, ClientError> {
         let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
         let member = self.inner.get_member(&user_id).await?.context("User not found")?;
-        Ok(member.into())
+        Ok(member.try_into().context("Unknown state membership")?)
     }
 
     pub async fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
@@ -875,7 +882,7 @@ impl Room {
 }
 
 /// Generates a `matrix.to` permalink to the given room alias.
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn matrix_to_room_alias_permalink(
     room_alias: String,
 ) -> std::result::Result<String, ClientError> {
@@ -931,17 +938,17 @@ impl From<RumaPowerLevels> for RoomPowerLevels {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomInfoListener: Sync + Send {
     fn call(&self, room_info: RoomInfo);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait TypingNotificationsListener: Sync + Send {
     fn call(&self, typing_user_ids: Vec<String>);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait IdentityStatusChangeListener: Sync + Send {
     fn call(&self, identity_status_change: Vec<IdentityStatusChange>);
 }
@@ -957,7 +964,7 @@ impl RoomMembersIterator {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomMembersIterator {
     fn len(&self) -> u32 {
         self.chunk_iterator.len()
@@ -966,7 +973,7 @@ impl RoomMembersIterator {
     fn next_chunk(&self, chunk_size: u32) -> Option<Vec<RoomMember>> {
         self.chunk_iterator
             .next(chunk_size)
-            .map(|members| members.into_iter().map(|m| m.into()).collect())
+            .map(|members| members.into_iter().filter_map(|m| m.try_into().ok()).collect())
     }
 }
 

@@ -2,12 +2,9 @@ use std::{fmt::Debug, mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, time::Durat
 
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt, TryFutureExt};
-use matrix_sdk::{
-    ruma::{
-        api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
-        assign, RoomId,
-    },
-    sliding_sync::http,
+use matrix_sdk::ruma::{
+    api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
+    RoomId,
 };
 use matrix_sdk_ui::{
     room_list_service::filters::{
@@ -86,7 +83,7 @@ pub struct RoomListService {
     pub(crate) utd_hook: Option<Arc<UtdHookManager>>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListService {
     fn state(&self, listener: Box<dyn RoomListServiceStateListener>) -> Arc<TaskHandle> {
         let state_stream = self.inner.state();
@@ -143,11 +140,7 @@ impl RoomListService {
         })))
     }
 
-    fn subscribe_to_rooms(
-        &self,
-        room_ids: Vec<String>,
-        settings: Option<RoomSubscription>,
-    ) -> Result<(), RoomListError> {
+    fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
         let room_ids = room_ids
             .into_iter()
             .map(|room_id| {
@@ -155,10 +148,7 @@ impl RoomListService {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        self.inner.subscribe_to_rooms(
-            &room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-            settings.map(Into::into),
-        );
+        self.inner.subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>());
 
         Ok(())
     }
@@ -170,7 +160,7 @@ pub struct RoomList {
     inner: Arc<matrix_sdk_ui::room_list_service::RoomList>,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomList {
     fn loading_state(
         &self,
@@ -300,7 +290,7 @@ pub struct RoomListEntriesWithDynamicAdaptersResult {
     entries_stream: Arc<TaskHandle>,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListEntriesWithDynamicAdaptersResult {
     fn controller(&self) -> Arc<RoomListDynamicEntriesController> {
         self.controller.clone()
@@ -378,17 +368,17 @@ impl From<matrix_sdk_ui::room_list_service::RoomListLoadingState> for RoomListLo
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListServiceStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListServiceState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListLoadingStateListener: Send + Sync + Debug {
     fn on_update(&self, state: RoomListLoadingState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListServiceSyncIndicatorListener: Send + Sync + Debug {
     fn on_update(&self, sync_indicator: RoomListServiceSyncIndicator);
 }
@@ -451,7 +441,7 @@ impl RoomListEntriesUpdate {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomListEntriesListener: Send + Sync + Debug {
     fn on_update(&self, room_entries_update: Vec<RoomListEntriesUpdate>);
 }
@@ -469,7 +459,7 @@ impl RoomListDynamicEntriesController {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListDynamicEntriesController {
     fn set_filter(&self, kind: RoomListEntriesDynamicFilterKind) -> bool {
         self.inner.set_filter(kind.into())
@@ -565,7 +555,7 @@ impl RoomListItem {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl RoomListItem {
     fn id(&self) -> String {
         self.inner.id().to_string()
@@ -696,38 +686,13 @@ impl RoomListItem {
     }
 }
 
-#[derive(uniffi::Record)]
-pub struct RequiredState {
-    pub key: String,
-    pub value: String,
-}
-
-#[derive(uniffi::Record)]
-pub struct RoomSubscription {
-    pub required_state: Option<Vec<RequiredState>>,
-    pub timeline_limit: u32,
-    pub include_heroes: Option<bool>,
-}
-
-impl From<RoomSubscription> for http::request::RoomSubscription {
-    fn from(val: RoomSubscription) -> Self {
-        assign!(http::request::RoomSubscription::default(), {
-            required_state: val.required_state.map(|r|
-                r.into_iter().map(|s| (s.key.into(), s.value)).collect()
-            ).unwrap_or_default(),
-            timeline_limit: val.timeline_limit.into(),
-            include_heroes: val.include_heroes,
-        })
-    }
-}
-
 #[derive(uniffi::Object)]
 pub struct UnreadNotificationsCount {
     highlight_count: u32,
     notification_count: u32,
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl UnreadNotificationsCount {
     fn highlight_count(&self) -> u32 {
         self.highlight_count

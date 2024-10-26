@@ -687,7 +687,7 @@ async fn test_incremental_upload_of_keys() -> Result<()> {
     // backup
     let content = RoomMessageEventContent::text_plain("Hello world");
     let txn_id = TransactionId::new();
-    let _ = alice_room.send(content).with_transaction_id(&txn_id).await?;
+    let _ = alice_room.send(content).with_transaction_id(txn_id).await?;
 
     Mock::given(method("GET"))
         .and(path("/_matrix/client/r0/sync"))
@@ -773,7 +773,7 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> Result<()> {
     // backup
     let content = RoomMessageEventContent::text_plain("Hello world");
     let txn_id = TransactionId::new();
-    let _ = alice_room.send(content).with_transaction_id(&txn_id).await?;
+    let _ = alice_room.send(content).with_transaction_id(txn_id).await?;
 
     // Set up sliding sync.
     let sliding = client
@@ -972,7 +972,7 @@ async fn test_enable_from_secret_storage() {
         room.event(event_id, None).await.expect("We should be able to fetch our encrypted event");
 
     assert_matches!(
-        event.encryption_info,
+        event.encryption_info(),
         None,
         "We should not be able to decrypt our encrypted event before we import the room keys from \
          the backup"
@@ -1042,9 +1042,9 @@ async fn test_enable_from_secret_storage() {
     let event =
         room.event(event_id, None).await.expect("We should be able to fetch our encrypted event");
 
-    assert_matches!(event.encryption_info, Some(..), "The event should now be decrypted");
+    assert_matches!(event.encryption_info(), Some(..), "The event should now be decrypted");
     let event: RoomMessageEvent =
-        event.event.deserialize_as().expect("We should be able to deserialize the event");
+        event.raw().deserialize_as().expect("We should be able to deserialize the event");
     let event = event.as_original().unwrap();
     assert_eq!(event.content.body(), "tt");
 
@@ -1392,7 +1392,7 @@ async fn test_enable_from_secret_storage_and_download_after_utd() {
         room.event(event_id, None).await.expect("We should be able to fetch our encrypted event");
 
     assert_matches!(
-        event.encryption_info,
+        event.encryption_info(),
         None,
         "We should not be able to decrypt the event right away"
     );
@@ -1412,9 +1412,9 @@ async fn test_enable_from_secret_storage_and_download_after_utd() {
     let event =
         room.event(event_id, None).await.expect("We should be able to fetch our encrypted event");
 
-    assert_matches!(event.encryption_info, Some(..), "The event should now be decrypted");
+    assert_matches!(event.encryption_info(), Some(..), "The event should now be decrypted");
     let event: RoomMessageEvent =
-        event.event.deserialize_as().expect("We should be able to deserialize the event");
+        event.raw().deserialize_as().expect("We should be able to deserialize the event");
     let event = event.as_original().unwrap();
     assert_eq!(event.content.body(), "tt");
 
@@ -1522,7 +1522,7 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
         room.event(event_id, None).await.expect("We should be able to fetch our encrypted event");
 
     assert_matches!(
-        event.encryption_info,
+        event.encryption_info(),
         None,
         "We should not be able to decrypt the event right away"
     );
@@ -1542,9 +1542,9 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
     let event =
         room.event(event_id, None).await.expect("We should be able to fetch our encrypted event");
 
-    assert_matches!(event.encryption_info, Some(..), "The event should now be decrypted");
+    assert_matches!(event.encryption_info(), Some(..), "The event should now be decrypted");
     let event: RoomMessageEvent =
-        event.event.deserialize_as().expect("We should be able to deserialize the event");
+        event.raw().deserialize_as().expect("We should be able to deserialize the event");
     let event = event.as_original().unwrap();
     assert_eq!(event.content.body(), "tt");
 

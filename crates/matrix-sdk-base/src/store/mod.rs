@@ -75,7 +75,7 @@ pub use self::{
     memory_store::MemoryStore,
     traits::{
         ChildTransactionId, ComposerDraft, ComposerDraftType, DependentQueuedEvent,
-        DependentQueuedEventKind, DynStateStore, IntoStateStore, QueuedEvent,
+        DependentQueuedEventKind, DynStateStore, IntoStateStore, QueueWedgeError, QueuedEvent,
         SerializableEventContent, ServerCapabilities, StateStore, StateStoreDataKey,
         StateStoreDataValue, StateStoreExt,
     },
@@ -328,6 +328,17 @@ impl Store {
             self.non_spaces.write().unwrap().get_or_create(room_id, || result.clone());
         }
         result
+    }
+
+    /// Forget the room with the given room ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The id of the room that should be forgotten.
+    pub(crate) async fn forget_room(&self, room_id: &RoomId) -> Result<()> {
+        self.inner.remove_room(room_id).await?;
+        self.rooms.write().unwrap().remove(room_id);
+        Ok(())
     }
 }
 

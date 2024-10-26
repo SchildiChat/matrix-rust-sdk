@@ -1,17 +1,20 @@
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
-#[cfg(feature = "image-proc")]
-use matrix_sdk::attachment::{ImageFormat, ThumbnailFormat};
 use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseImageInfo, BaseThumbnailInfo, BaseVideoInfo,
         Thumbnail,
     },
     config::SyncSettings,
+    media::{MediaFormat, MediaRequest, MediaThumbnailSettings, MediaThumbnailSize},
     test_utils::logged_in_client_with_server,
 };
 use matrix_sdk_test::{async_test, mocks::mock_encryption_state, test_json, DEFAULT_TEST_ROOM_ID};
-use ruma::{event_id, events::Mentions, owned_user_id, uint};
+use ruma::{
+    event_id,
+    events::{room::MediaSource, Mentions},
+    owned_mxc_uri, owned_user_id, uint,
+};
 use serde_json::json;
 use wiremock::{
     matchers::{body_partial_json, header, method, path, path_regex},
@@ -65,7 +68,7 @@ async fn test_room_attachment_send() {
         .await
         .unwrap();
 
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
+    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id);
 }
 
 #[async_test]
@@ -179,6 +182,9 @@ async fn test_room_attachment_send_wrong_info() {
 async fn test_room_attachment_send_info_thumbnail() {
     let (client, server) = logged_in_client_with_server().await;
 
+    let media_mxc = owned_mxc_uri!("mxc://example.com/media");
+    let thumbnail_mxc = owned_mxc_uri!("mxc://example.com/thumbnail");
+
     Mock::given(method("PUT"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
         .and(header("authorization", "Bearer 1234"))
@@ -193,20 +199,37 @@ async fn test_room_attachment_send_info_thumbnail() {
                     "mimetype":"image/jpeg",
                     "size": 3600,
                 },
-                "thumbnail_url": "mxc://example.com/AQwafuaFswefuhsfAFAgsw",
+                "thumbnail_url": thumbnail_mxc,
             }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
         .mount(&server)
         .await;
 
+    let counter = Mutex::new(0);
     Mock::given(method("POST"))
         .and(path("/_matrix/media/r0/upload"))
         .and(header("authorization", "Bearer 1234"))
         .and(header("content-type", "image/jpeg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://example.com/AQwafuaFswefuhsfAFAgsw"
-        })))
+        .respond_with({
+            // First request: return the thumbnail MXC;
+            // Second request: return the media MXC.
+            let media_mxc = media_mxc.clone();
+            let thumbnail_mxc = thumbnail_mxc.clone();
+            move |_: &wiremock::Request| {
+                let mut counter = counter.lock().unwrap();
+                if *counter == 0 {
+                    *counter += 1;
+                    ResponseTemplate::new(200).set_body_json(json!({
+                      "content_uri": &thumbnail_mxc
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                      "content_uri": &media_mxc
+                    }))
+                }
+            }
+        })
         .expect(2)
         .mount(&server)
         .await;
@@ -220,6 +243,24 @@ async fn test_room_attachment_send_info_thumbnail() {
 
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
+    // Preconditions: nothing is found in the cache.
+    let media_request =
+        MediaRequest { source: MediaSource::Plain(media_mxc), format: MediaFormat::File };
+    let thumbnail_request = MediaRequest {
+        source: MediaSource::Plain(thumbnail_mxc.clone()),
+        format: MediaFormat::Thumbnail(MediaThumbnailSettings {
+            size: MediaThumbnailSize {
+                method: ruma::media::Method::Scale,
+                width: uint!(480),
+                height: uint!(360),
+            },
+            animated: false,
+        }),
+    };
+    let _ = client.media().get_media_content(&media_request, true).await.unwrap_err();
+    let _ = client.media().get_media_content(&thumbnail_request, true).await.unwrap_err();
+
+    // Send the attachment with a thumbnail.
     let config = AttachmentConfig::with_thumbnail(Thumbnail {
         data: b"Thumbnail".to_vec(),
         content_type: mime::IMAGE_JPEG,
@@ -238,10 +279,48 @@ async fn test_room_attachment_send_info_thumbnail() {
 
     let response = room
         .send_attachment("image", &mime::IMAGE_JPEG, b"Hello world".to_vec(), config)
+        .store_in_cache()
         .await
         .unwrap();
 
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
+    // The event was sent.
+    assert_eq!(response.event_id, event_id!("$h29iv0s8:example.com"));
+
+    // The media is immediately cached in the cache store, so we don't need to set
+    // up another mock endpoint for getting the media.
+    let reloaded = client.media().get_media_content(&media_request, true).await.unwrap();
+    assert_eq!(reloaded, b"Hello world");
+
+    // The thumbnail is cached with sensible defaults.
+    let reloaded = client.media().get_media_content(&thumbnail_request, true).await.unwrap();
+    assert_eq!(reloaded, b"Thumbnail");
+
+    // The thumbnail can't be retrieved as a file.
+    let _ = client
+        .media()
+        .get_media_content(
+            &MediaRequest {
+                source: MediaSource::Plain(thumbnail_mxc.clone()),
+                format: MediaFormat::File,
+            },
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    // But it is not found when requesting it as a thumbnail with a different size.
+    let thumbnail_request = MediaRequest {
+        source: MediaSource::Plain(thumbnail_mxc),
+        format: MediaFormat::Thumbnail(MediaThumbnailSettings {
+            size: MediaThumbnailSize {
+                method: ruma::media::Method::Scale,
+                width: uint!(42),
+                height: uint!(1337),
+            },
+            animated: false,
+        }),
+    };
+    let _ = client.media().get_media_content(&thumbnail_request, true).await.unwrap_err();
 }
 
 #[async_test]
@@ -287,235 +366,6 @@ async fn test_room_attachment_send_mentions() {
             AttachmentConfig::new()
                 .mentions(Some(Mentions::with_user_ids([owned_user_id!("@user:localhost")]))),
         )
-        .await
-        .unwrap();
-
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
-}
-
-#[cfg(feature = "image-proc")]
-const IMAGE_BYTES: &[u8] = include_bytes!("matrix-rusty.jpg");
-
-#[cfg(feature = "image-proc")]
-#[async_test]
-async fn test_room_attachment_generate_thumbnail_original_format() {
-    let (client, server) = logged_in_client_with_server().await;
-
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(body_partial_json(json!({
-            "url": "mxc://localhost/AQwafuaFswefuhsfAFAgsw",
-            "info": {
-                "mimetype": "image/jpeg",
-                "thumbnail_info": {
-                    "h": 600,
-                    "w": 600,
-                    "mimetype":"image/jpeg",
-                },
-                "thumbnail_url": "mxc://localhost/AQwafuaFswefuhsfAFAgsw",
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/r0/upload"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/jpeg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://localhost/AQwafuaFswefuhsfAFAgsw"
-        })))
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    mock_sync(&server, &*test_json::SYNC, None).await;
-    mock_encryption_state(&server, false).await;
-
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
-
-    let _response = client.sync_once(sync_settings).await.unwrap();
-
-    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
-
-    let config = AttachmentConfig::new().generate_thumbnail(None, ThumbnailFormat::Original);
-
-    let response = room
-        .send_attachment("image", &mime::IMAGE_JPEG, IMAGE_BYTES.to_vec(), config)
-        .await
-        .unwrap();
-
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
-}
-
-#[cfg(feature = "image-proc")]
-#[async_test]
-async fn test_room_attachment_generate_thumbnail_always_format() {
-    let (client, server) = logged_in_client_with_server().await;
-
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(body_partial_json(json!({
-            "url": "mxc://localhost/original",
-            "info": {
-                "mimetype": "image/jpeg",
-                "thumbnail_info": {
-                    "h": 600,
-                    "w": 600,
-                    "mimetype":"image/png",
-                },
-                "thumbnail_url": "mxc://localhost/thumbnail",
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/r0/upload"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/jpeg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://localhost/original"
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/r0/upload"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/png"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://localhost/thumbnail"
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    mock_sync(&server, &*test_json::SYNC, None).await;
-    mock_encryption_state(&server, false).await;
-
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
-
-    let _response = client.sync_once(sync_settings).await.unwrap();
-
-    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
-
-    let config =
-        AttachmentConfig::new().generate_thumbnail(None, ThumbnailFormat::Always(ImageFormat::Png));
-
-    let response = room
-        .send_attachment("image", &mime::IMAGE_JPEG, IMAGE_BYTES.to_vec(), config)
-        .await
-        .unwrap();
-
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
-}
-
-#[cfg(feature = "image-proc")]
-#[async_test]
-async fn test_room_attachment_generate_thumbnail_not_fallback_format() {
-    let (client, server) = logged_in_client_with_server().await;
-
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(body_partial_json(json!({
-            "url": "mxc://localhost/AQwafuaFswefuhsfAFAgsw",
-            "info": {
-                "mimetype": "image/jpeg",
-                "thumbnail_info": {
-                    "h": 600,
-                    "w": 600,
-                    "mimetype":"image/jpeg",
-                },
-                "thumbnail_url": "mxc://localhost/AQwafuaFswefuhsfAFAgsw",
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/r0/upload"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/jpeg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://localhost/AQwafuaFswefuhsfAFAgsw"
-        })))
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    mock_sync(&server, &*test_json::SYNC, None).await;
-    mock_encryption_state(&server, false).await;
-
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
-
-    let _response = client.sync_once(sync_settings).await.unwrap();
-
-    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
-
-    let config = AttachmentConfig::new()
-        .generate_thumbnail(None, ThumbnailFormat::Fallback(ImageFormat::Png));
-
-    let response = room
-        .send_attachment("image", &mime::IMAGE_JPEG, IMAGE_BYTES.to_vec(), config)
-        .await
-        .unwrap();
-
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
-}
-
-#[cfg(feature = "image-proc")]
-#[async_test]
-async fn test_room_attachment_generate_thumbnail_bigger_than_image() {
-    use matrix_sdk_test::mocks::mock_encryption_state;
-
-    let (client, server) = logged_in_client_with_server().await;
-
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(body_partial_json(json!({
-            "url": "mxc://localhost/original",
-            "info": {
-                "mimetype": "image/jpeg",
-            }
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/r0/upload"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/jpeg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://localhost/original"
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    mock_sync(&server, &*test_json::SYNC, None).await;
-    mock_encryption_state(&server, false).await;
-
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
-
-    let _response = client.sync_once(sync_settings).await.unwrap();
-
-    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
-
-    let config =
-        AttachmentConfig::new().generate_thumbnail(Some((1400, 1400)), ThumbnailFormat::Original);
-
-    let response = room
-        .send_attachment("image", &mime::IMAGE_JPEG, IMAGE_BYTES.to_vec(), config)
         .await
         .unwrap();
 

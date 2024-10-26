@@ -19,13 +19,14 @@ use futures_util::{
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 pub use identity_status_changes::IdentityStatusChanges;
 #[cfg(feature = "e2e-encryption")]
-use matrix_sdk_base::crypto::DecryptionSettings;
+use matrix_sdk_base::crypto::{DecryptionSettings, RoomEventDecryptionResult};
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
 use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
+    media::{MediaThumbnailSettings, MediaThumbnailSize},
     store::StateStoreExt,
     ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
     StateStoreDataValue,
@@ -69,12 +70,17 @@ use ruma::{
             avatar::{self, RoomAvatarEventContent},
             encryption::RoomEncryptionEventContent,
             history_visibility::HistoryVisibility,
-            message::RoomMessageEventContent,
+            message::{
+                AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
+                ImageMessageEventContent, MessageType, RoomMessageEventContent,
+                UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock, VideoInfo,
+                VideoMessageEventContent,
+            },
             name::RoomNameEventContent,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
             server_acl::RoomServerAclEventContent,
             topic::RoomTopicEventContent,
-            MediaSource,
+            ImageInfo, MediaSource, ThumbnailInfo,
         },
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         tag::{TagInfo, TagName},
@@ -104,7 +110,7 @@ pub use self::{
 #[cfg(doc)]
 use crate::event_cache::EventCache;
 use crate::{
-    attachment::AttachmentConfig,
+    attachment::{AttachmentConfig, AttachmentInfo},
     client::WeakClient,
     config::RequestConfig,
     error::{BeaconError, WrongRoomState},
@@ -315,7 +321,7 @@ impl Room {
 
             for event in &mut response.chunk {
                 event.push_actions =
-                    Some(push_rules.get_actions(&event.event, &push_context).to_owned());
+                    Some(push_rules.get_actions(event.raw(), &push_context).to_owned());
             }
         }
 
@@ -386,8 +392,8 @@ impl Room {
     /// will be included.)
     ///
     /// The first item in the stream provides the current state of the room:
-    /// each member of the room who is not in "pinned" state will be
-    /// included (except the current user).
+    /// each member of the room who is not in "pinned" or "verified" state will
+    /// be included (except the current user).
     ///
     /// If the `changed_to` property of an [`IdentityStatusChange`] is set to
     /// `PinViolation` then a warning should be displayed to the user. If it is
@@ -420,7 +426,7 @@ impl Room {
         }
 
         let mut event = TimelineEvent::new(event);
-        event.push_actions = self.event_push_actions(&event.event).await?;
+        event.push_actions = self.event_push_actions(event.raw()).await?;
 
         Ok(event)
     }
@@ -1210,7 +1216,8 @@ impl Room {
     /// # Arguments
     /// * `event` - The room event to be decrypted.
     ///
-    /// Returns the decrypted event.
+    /// Returns the decrypted event. In the case of a decryption error, returns
+    /// a `TimelineEvent` representing the decryption error.
     #[cfg(feature = "e2e-encryption")]
     pub async fn decrypt_event(
         &self,
@@ -1222,24 +1229,21 @@ impl Room {
         let decryption_settings = DecryptionSettings {
             sender_device_trust_requirement: self.client.base_client().decryption_trust_requirement,
         };
-        let decrypted = match machine
-            .decrypt_room_event(event.cast_ref(), self.inner.room_id(), &decryption_settings)
-            .await
+        let mut event: TimelineEvent = match machine
+            .try_decrypt_room_event(event.cast_ref(), self.inner.room_id(), &decryption_settings)
+            .await?
         {
-            Ok(event) => event,
-            Err(e) => {
+            RoomEventDecryptionResult::Decrypted(decrypted) => decrypted.into(),
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
                 self.client
                     .encryption()
                     .backups()
                     .maybe_download_room_key(self.room_id().to_owned(), event.clone());
-
-                return Err(e.into());
+                TimelineEvent::new_utd_event(event.clone().cast(), utd_info)
             }
         };
 
-        let mut event: TimelineEvent = decrypted.into();
-        event.push_actions = self.event_push_actions(&event.event).await?;
-
+        event.push_actions = self.event_push_actions(event.raw()).await?;
         Ok(event)
     }
 
@@ -1711,7 +1715,7 @@ impl Room {
     /// let txn_id = TransactionId::new();
     ///
     /// if let Some(room) = client.get_room(&room_id) {
-    ///     room.send(content).with_transaction_id(&txn_id).await?;
+    ///     room.send(content).with_transaction_id(txn_id).await?;
     /// }
     ///
     /// // Custom events work too:
@@ -1906,6 +1910,13 @@ impl Room {
     ///   media.
     ///
     /// * `config` - Metadata and configuration for the attachment.
+    ///
+    /// * `send_progress` - An observable to transmit forward progress about the
+    ///   upload.
+    ///
+    /// * `store_in_cache` - A boolean defining whether the uploaded media will
+    ///   be stored in the cache immediately after a successful upload.
+    #[instrument(skip_all)]
     pub(super) async fn prepare_and_send_attachment<'a>(
         &'a self,
         filename: &'a str,
@@ -1913,48 +1924,195 @@ impl Room {
         data: Vec<u8>,
         mut config: AttachmentConfig,
         send_progress: SharedObservable<TransmissionProgress>,
+        store_in_cache: bool,
     ) -> Result<send_message_event::v3::Response> {
         self.ensure_room_joined()?;
 
         let txn_id = config.txn_id.take();
         let mentions = config.mentions.take();
 
+        let thumbnail = config.thumbnail.take();
+
+        // If necessary, store caching data for the thumbnail ahead of time.
+        let thumbnail_cache_info = if store_in_cache {
+            // Use a small closure returning Option to avoid an unnecessary complicated
+            // chain of map/and_then.
+            let get_info = || {
+                let thumbnail = thumbnail.as_ref()?;
+                let info = thumbnail.info.as_ref()?;
+                Some((thumbnail.data.clone(), info.height?, info.width?))
+            };
+            get_info()
+        } else {
+            None
+        };
+
         #[cfg(feature = "e2e-encryption")]
-        let content = if self.is_encrypted().await? {
+        let (media_source, thumbnail_source, thumbnail_info) = if self.is_encrypted().await? {
             self.client
-                .prepare_encrypted_attachment_message(
-                    filename,
-                    content_type,
-                    data,
-                    config,
-                    send_progress,
-                )
+                .upload_encrypted_media_and_thumbnail(content_type, &data, thumbnail, send_progress)
                 .await?
         } else {
             self.client
                 .media()
-                .prepare_attachment_message(filename, content_type, data, config, send_progress)
+                .upload_plain_media_and_thumbnail(
+                    content_type,
+                    // TODO: get rid of this clone; wait for Ruma to use `Bytes` or something
+                    // similar.
+                    data.clone(),
+                    thumbnail,
+                    send_progress,
+                )
                 .await?
         };
 
         #[cfg(not(feature = "e2e-encryption"))]
-        let content = self
+        let (media_source, thumbnail_source, thumbnail_info) = self
             .client
             .media()
-            .prepare_attachment_message(filename, content_type, data, config, send_progress)
+            .upload_plain_media_and_thumbnail(content_type, data.clone(), thumbnail, send_progress)
             .await?;
 
-        let mut message = RoomMessageEventContent::new(content);
+        if store_in_cache {
+            let cache_store = self.client.event_cache_store();
 
-        if let Some(mentions) = mentions {
-            message = message.add_mentions(mentions);
+            // A failure to cache shouldn't prevent the whole upload from finishing
+            // properly, so only log errors during caching.
+
+            debug!("caching the media");
+            let request = MediaRequest { source: media_source.clone(), format: MediaFormat::File };
+            if let Err(err) = cache_store.add_media_content(&request, data).await {
+                warn!("unable to cache the media after uploading it: {err}");
+            }
+
+            if let Some(((data, height, width), source)) =
+                thumbnail_cache_info.zip(thumbnail_source.as_ref())
+            {
+                debug!("caching the thumbnail");
+
+                // Do a best guess at figuring the media request: not animated, cropped
+                // thumbnail of the original size.
+                let request = MediaRequest {
+                    source: source.clone(),
+                    format: MediaFormat::Thumbnail(MediaThumbnailSettings {
+                        size: MediaThumbnailSize {
+                            method: ruma::media::Method::Scale,
+                            width,
+                            height,
+                        },
+                        animated: false,
+                    }),
+                };
+
+                if let Err(err) = cache_store.add_media_content(&request, data).await {
+                    warn!("unable to cache the media after uploading it: {err}");
+                }
+            }
         }
 
-        let mut fut = self.send(message);
-        if let Some(txn_id) = &txn_id {
+        let msg_type = self.make_attachment_message(
+            content_type,
+            media_source,
+            thumbnail_source,
+            thumbnail_info,
+            filename,
+            config,
+        );
+
+        let mut content = RoomMessageEventContent::new(msg_type);
+
+        if let Some(mentions) = mentions {
+            content = content.add_mentions(mentions);
+        }
+
+        let mut fut = self.send(content);
+        if let Some(txn_id) = txn_id {
             fut = fut.with_transaction_id(txn_id);
         }
         fut.await
+    }
+
+    /// Creates the inner [`MessageType`] for an already-uploaded media file
+    /// provided by its source.
+    fn make_attachment_message(
+        &self,
+        content_type: &Mime,
+        source: MediaSource,
+        thumbnail_source: Option<MediaSource>,
+        thumbnail_info: Option<Box<ThumbnailInfo>>,
+        filename: &str,
+        config: AttachmentConfig,
+    ) -> MessageType {
+        // if config.caption is set, use it as body, and filename as the file name
+        // otherwise, body is the filename, and the filename is not set.
+        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
+        let (body, filename) = match config.caption {
+            Some(caption) => (caption, Some(filename.to_owned())),
+            None => (filename.to_owned(), None),
+        };
+
+        match content_type.type_() {
+            mime::IMAGE => {
+                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(ImageMessageEventContent::new(body, source), {
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
+                });
+                MessageType::Image(content)
+            }
+
+            mime::AUDIO => {
+                let mut content = AudioMessageEventContent::new(body, source);
+
+                if let Some(AttachmentInfo::Voice { audio_info, waveform: Some(waveform_vec) }) =
+                    &config.info
+                {
+                    if let Some(duration) = audio_info.duration {
+                        let waveform = waveform_vec.iter().map(|v| (*v).into()).collect();
+                        content.audio =
+                            Some(UnstableAudioDetailsContentBlock::new(duration, waveform));
+                    }
+                    content.voice = Some(UnstableVoiceContentBlock::new());
+                }
+
+                let mut audio_info = config.info.map(AudioInfo::from).unwrap_or_default();
+                audio_info.mimetype = Some(content_type.as_ref().to_owned());
+                let content = content.info(Box::new(audio_info));
+
+                MessageType::Audio(content)
+            }
+
+            mime::VIDEO => {
+                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(VideoMessageEventContent::new(body, source), {
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
+                });
+                MessageType::Video(content)
+            }
+
+            _ => {
+                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
+                    mimetype: Some(content_type.as_ref().to_owned()),
+                    thumbnail_source,
+                    thumbnail_info
+                });
+                let content = assign!(FileMessageEventContent::new(body, source), {
+                    info: Some(Box::new(info))
+                });
+                MessageType::File(content)
+            }
+        }
     }
 
     /// Update the power levels of a select set of users of this room.
@@ -2653,7 +2811,17 @@ impl Room {
 
         let request = forget_room::v3::Request::new(self.inner.room_id().to_owned());
         let _response = self.client.send(request, None).await?;
-        self.client.store().remove_room(self.inner.room_id()).await?;
+
+        // If it was a DM, remove the room from the `m.direct` global account data.
+        if self.inner.direct_targets_length() != 0 {
+            if let Err(e) = self.set_is_direct(false).await {
+                // It is not important whether we managed to remove the room, it will not have
+                // any consequences, so just log the error.
+                warn!(room_id = ?self.room_id(), "failed to remove room from m.direct account data: {e}");
+            }
+        }
+
+        self.client.base_client().forget_room(self.inner.room_id()).await?;
 
         Ok(())
     }

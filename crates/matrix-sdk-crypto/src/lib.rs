@@ -15,6 +15,7 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(missing_docs, missing_debug_implementations)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 
 pub mod backups;
 mod ciphers;
@@ -38,7 +39,9 @@ mod verification;
 pub mod testing {
     pub use crate::identities::{
         device::testing::get_device,
-        user::testing::{get_other_identity, get_own_identity},
+        user::testing::{
+            get_other_identity, get_own_identity, simulate_key_query_response_for_verification,
+        },
     };
 }
 
@@ -88,6 +91,7 @@ pub use identities::{
     OwnUserIdentityData, UserDevices, UserIdentity, UserIdentityData,
 };
 pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
+use matrix_sdk_common::deserialized_responses::{DecryptedRoomEvent, UnableToDecryptInfo};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
@@ -140,4 +144,15 @@ pub struct DecryptionSettings {
     /// event. If the sender's device is not sufficiently trusted,
     /// [`MegolmError::SenderIdentityNotTrusted`] will be returned.
     pub sender_device_trust_requirement: TrustRequirement,
+}
+
+/// The result of an attempt to decrypt a room event: either a successful
+/// decryption, or information on a failure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RoomEventDecryptionResult {
+    /// A successfully-decrypted encrypted event.
+    Decrypted(DecryptedRoomEvent),
+
+    /// We were unable to decrypt the event
+    UnableToDecrypt(UnableToDecryptInfo),
 }

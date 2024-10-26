@@ -36,7 +36,7 @@ use async_stream::stream;
 pub use client::{Version, VersionBuilder};
 use futures_core::stream::Stream;
 pub use matrix_sdk_base::sliding_sync::http;
-use matrix_sdk_common::timer;
+use matrix_sdk_common::{deserialized_responses::SyncTimelineEvent, timer};
 use ruma::{
     api::{client::error::ErrorKind, OutgoingRequest},
     assign, OwnedEventId, OwnedRoomId, RoomId,
@@ -345,7 +345,7 @@ impl SlidingSync {
                         if let Some(joined_room) = sync_response.rooms.join.remove(&room_id) {
                             joined_room.timeline.events
                         } else {
-                            room_data.timeline.drain(..).map(Into::into).collect()
+                            room_data.timeline.drain(..).map(SyncTimelineEvent::new).collect()
                         };
 
                     match rooms_map.get_mut(&room_id) {
@@ -2303,7 +2303,7 @@ mod tests {
         let no_local_events = room_id!("!crepe:example.org");
         let already_limited = room_id!("!paris:example.org");
 
-        let response_timeline = vec![event_c.event.clone(), event_d.event.clone()];
+        let response_timeline = vec![event_c.raw().clone(), event_d.raw().clone()];
 
         let local_rooms = BTreeMap::from_iter([
             (
@@ -2386,21 +2386,21 @@ mod tests {
                 no_overlap.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
                 partial_overlap.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
                 complete_overlap.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
@@ -2414,7 +2414,7 @@ mod tests {
                 no_local_events.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
@@ -2422,7 +2422,7 @@ mod tests {
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
                     limited: true,
-                    timeline: vec![event_c.event, event_d.event],
+                    timeline: vec![event_c.into_raw(), event_d.into_raw()],
                 }),
             ),
         ]);

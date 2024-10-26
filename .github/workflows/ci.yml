@@ -40,14 +40,18 @@ jobs:
           - markdown
           - socks
           - sso-login
-          - image-proc
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libsqlite
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
 
       - name: Load cache
         uses: Swatinem/rust-cache@v2
@@ -81,7 +85,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -112,7 +116,12 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
+
+      - name: Install libsqlite
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -158,12 +167,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Install protoc
         uses: taiki-e/install-action@v2
         with:
           tool: protoc@3.20.3
+
+      - name: Install libsqlite
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -220,7 +235,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -268,7 +283,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -286,10 +301,10 @@ jobs:
 
     steps:
       - name: Checkout Actions Repository
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Check the spelling of the files in our repo
-        uses: crate-ci/typos@v1.25.0
+        uses: crate-ci/typos@v1.26.0
 
   clippy:
     name: Run clippy
@@ -298,7 +313,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
 
       - name: Install protoc
         uses: taiki-e/install-action@v2
@@ -365,7 +380,12 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
+
+      - name: Install libsqlite
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

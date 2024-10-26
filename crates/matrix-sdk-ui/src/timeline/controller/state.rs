@@ -54,6 +54,7 @@ use crate::{
             TimelineItemPosition,
         },
         event_item::{PollState, RemoteEventOrigin, ResponseData},
+        item::TimelineUniqueId,
         reactions::Reactions,
         read_receipts::ReadReceipts,
         traits::RoomDataProvider,
@@ -234,7 +235,7 @@ impl TimelineState {
             };
 
             event.push_actions = push_rules_context.as_ref().map(|(push_rules, push_context)| {
-                push_rules.get_actions(&event.event, push_context).to_owned()
+                push_rules.get_actions(event.raw(), push_context).to_owned()
             });
 
             let handle_one_res = txn
@@ -421,7 +422,17 @@ impl TimelineStateTransaction<'_> {
         settings: &TimelineSettings,
         day_divider_adjuster: &mut DayDividerAdjuster,
     ) -> HandleEventResult {
-        let raw = event.event;
+        let SyncTimelineEvent { push_actions, kind } = event;
+        let encryption_info = kind.encryption_info().cloned();
+
+        let (raw, utd_info) = match kind {
+            matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                utd_info,
+                event,
+            } => (event, Some(utd_info)),
+            _ => (kind.into_raw(), None),
+        };
+
         let (event_id, sender, timestamp, txn_id, event_kind, should_add) = match raw.deserialize()
         {
             Ok(event) => {
@@ -478,7 +489,7 @@ impl TimelineStateTransaction<'_> {
                     event.sender().to_owned(),
                     event.origin_server_ts(),
                     event.transaction_id().map(ToOwned::to_owned),
-                    TimelineEventKind::from_event(event, &room_version),
+                    TimelineEventKind::from_event(event, &room_version, utd_info),
                     should_add,
                 )
             }
@@ -577,11 +588,11 @@ impl TimelineStateTransaction<'_> {
             } else {
                 Default::default()
             },
-            is_highlighted: event.push_actions.iter().any(Action::is_highlight),
+            is_highlighted: push_actions.iter().any(Action::is_highlight),
             flow: Flow::Remote {
                 event_id: event_id.clone(),
                 raw_event: raw,
-                encryption_info: event.encryption_info,
+                encryption_info,
                 txn_id,
                 position,
             },
@@ -625,11 +636,7 @@ impl TimelineStateTransaction<'_> {
 
         trace!("SC_RM_DBG clear");
 
-        // Only clear the internal counter if there are no local echoes. Otherwise, we
-        // might end up reusing the same internal id for a local echo and
-        // another item.
-        let reset_internal_id = !has_local_echoes;
-        self.meta.clear(reset_internal_id);
+        self.meta.clear();
 
         debug!(remaining_items = self.items.len(), "Timeline cleared");
     }
@@ -867,6 +874,13 @@ pub(in crate::timeline) struct TimelineMetadata {
     // **** DYNAMIC FIELDS ****
     /// The next internal identifier for timeline items, used for both local and
     /// remote echoes.
+    ///
+    /// This is never cleared, but always incremented, to avoid issues with
+    /// reusing a stale internal id across timeline clears. We don't expect
+    /// we can hit `u64::max_value()` realistically, but if this would
+    /// happen, we do a wrapping addition when incrementing this
+    /// id; the previous 0 value would have disappeared a long time ago, unless
+    /// the device has terabytes of RAM.
     next_internal_id: u64,
 
     /// List of all the events as received in the timeline, even the ones that
@@ -932,10 +946,9 @@ impl TimelineMetadata {
         }
     }
 
-    pub(crate) fn clear(&mut self, reset_internal_id: bool) {
-        if reset_internal_id {
-            self.next_internal_id = 0;
-        }
+    pub(crate) fn clear(&mut self) {
+        // Note: we don't clear the next internal id to avoid bad cases of stale unique
+        // ids across timeline clears.
         self.all_events.clear();
         self.reactions.clear();
         self.pending_poll_events.clear();
@@ -978,11 +991,11 @@ impl TimelineMetadata {
 
     /// Returns the next internal id for a timeline item (and increment our
     /// internal counter).
-    fn next_internal_id(&mut self) -> String {
+    fn next_internal_id(&mut self) -> TimelineUniqueId {
         let val = self.next_internal_id;
-        self.next_internal_id += 1;
+        self.next_internal_id = self.next_internal_id.wrapping_add(1);
         let prefix = self.internal_id_prefix.as_deref().unwrap_or("");
-        format!("{prefix}{val}")
+        TimelineUniqueId(format!("{prefix}{val}"))
     }
 
     /// Returns a new timeline item with a fresh internal id.

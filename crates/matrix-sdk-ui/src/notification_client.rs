@@ -20,10 +20,7 @@ use std::{
 use futures_util::{pin_mut, StreamExt as _};
 use matrix_sdk::{room::Room, Client, ClientBuildError, SlidingSyncList, SlidingSyncMode};
 use matrix_sdk_base::{
-    crypto::{vodozemac, MegolmError},
-    deserialized_responses::TimelineEvent,
-    sliding_sync::http,
-    RoomState, StoreError,
+    deserialized_responses::TimelineEvent, sliding_sync::http, RoomState, StoreError,
 };
 use ruma::{
     assign,
@@ -216,23 +213,23 @@ impl NotificationClient {
 
                         tokio::time::sleep(Duration::from_millis(wait)).await;
 
-                        match room.decrypt_event(raw_event.cast_ref()).await {
-                            Ok(new_event) => {
+                        let new_event = room.decrypt_event(raw_event.cast_ref()).await?;
+
+                        match new_event.kind {
+                            matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                                utd_info, ..} => {
+                                if utd_info.reason.is_missing_room_key() {
+                                    // Decryption error that could be caused by a missing room
+                                    // key; retry in a few.
+                                    wait *= 2;
+                                } else {
+                                    debug!("Event could not be decrypted, but waiting longer is unlikely to help: {:?}", utd_info.reason);
+                                    return Ok(None);
+                                }
+                            }
+                            _ => {
                                 trace!("Waiting succeeded and event could be decrypted!");
                                 return Ok(Some(new_event));
-                            }
-                            Err(matrix_sdk::Error::MegolmError(
-                                MegolmError::MissingRoomKey(_)
-                                | MegolmError::Decryption(
-                                    vodozemac::megolm::DecryptionError::UnknownMessageIndex(_, _),
-                                ),
-                            )) => {
-                                // Decryption error that could be caused by a missing room key;
-                                // retry in a few.
-                                wait *= 2;
-                            }
-                            Err(err) => {
-                                return Err(err.into());
                             }
                         }
                     }
@@ -259,10 +256,21 @@ impl NotificationClient {
         match encryption_sync {
             Ok(sync) => match sync.run_fixed_iterations(2, sync_permit_guard).await {
                 Ok(()) => match room.decrypt_event(raw_event.cast_ref()).await {
-                    Ok(new_event) => {
-                        trace!("Encryption sync managed to decrypt the event.");
-                        Ok(Some(new_event))
-                    }
+                    Ok(new_event) => match new_event.kind {
+                        matrix_sdk::deserialized_responses::TimelineEventKind::UnableToDecrypt {
+                            utd_info, ..
+                        } => {
+                            trace!(
+                                "Encryption sync failed to decrypt the event: {:?}",
+                                utd_info.reason
+                            );
+                            Ok(None)
+                        }
+                        _ => {
+                            trace!("Encryption sync managed to decrypt the event.");
+                            Ok(Some(new_event))
+                        }
+                    },
                     Err(err) => {
                         trace!("Encryption sync failed to decrypt the event: {err}");
                         Ok(None)
@@ -496,9 +504,12 @@ impl NotificationClient {
         let push_actions = match &raw_event {
             RawNotificationEvent::Timeline(timeline_event) => {
                 // Timeline events may be encrypted, so make sure they get decrypted first.
-                if let Some(timeline_event) = self.retry_decryption(&room, timeline_event).await? {
-                    raw_event = RawNotificationEvent::Timeline(timeline_event.event.cast());
-                    timeline_event.push_actions
+                if let Some(mut timeline_event) =
+                    self.retry_decryption(&room, timeline_event).await?
+                {
+                    let push_actions = timeline_event.push_actions.take();
+                    raw_event = RawNotificationEvent::Timeline(timeline_event.into_raw());
+                    push_actions
                 } else {
                     room.event_push_actions(timeline_event).await?
                 }
@@ -549,9 +560,7 @@ impl NotificationClient {
         let mut timeline_event = response.event.ok_or(Error::ContextMissingEvent)?;
         let state_events = response.state;
 
-        if let Some(decrypted_event) =
-            self.retry_decryption(&room, timeline_event.event.cast_ref()).await?
-        {
+        if let Some(decrypted_event) = self.retry_decryption(&room, timeline_event.raw()).await? {
             timeline_event = decrypted_event;
         }
 
@@ -561,11 +570,12 @@ impl NotificationClient {
             }
         }
 
+        let push_actions = timeline_event.push_actions.take();
         Ok(Some(
             NotificationItem::new(
                 &room,
-                RawNotificationEvent::Timeline(timeline_event.event.cast()),
-                timeline_event.push_actions.as_deref(),
+                RawNotificationEvent::Timeline(timeline_event.into_raw()),
+                push_actions.as_deref(),
                 state_events,
             )
             .await?,

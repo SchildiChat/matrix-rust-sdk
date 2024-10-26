@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{io, sync::Arc};
+use std::sync::Arc;
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{
     assert_next_matches_with_timeout, send_queue::RoomSendQueueUpdate,
-    test_utils::events::EventFactory, Error,
+    test_utils::events::EventFactory,
 };
+use matrix_sdk_base::store::QueueWedgeError;
 use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     event_id,
@@ -66,15 +67,15 @@ async fn test_remote_echo_full_trip() {
     // Scenario 2: The local event has not been sent to the server successfully, it
     // has failed. In this case, there is no event ID.
     {
-        let some_io_error = Error::Io(io::Error::new(io::ErrorKind::Other, "this is a test"));
+        let error =
+            Arc::new(matrix_sdk::Error::SendQueueWedgeError(QueueWedgeError::GenericApiError {
+                msg: "this is a test".to_owned(),
+            }));
         timeline
             .controller
             .update_event_send_state(
                 &txn_id,
-                EventSendState::SendingFailed {
-                    error: Arc::new(some_io_error),
-                    is_recoverable: true,
-                },
+                EventSendState::SendingFailed { error, is_recoverable: true },
             )
             .await;
 
@@ -85,7 +86,7 @@ async fn test_remote_echo_full_trip() {
             event_item.send_state(),
             Some(EventSendState::SendingFailed { is_recoverable: true, .. })
         );
-        assert_eq!(item.unique_id(), id);
+        assert_eq!(*item.unique_id(), id);
     }
 
     // Scenario 3: The local event has been sent successfully to the server and an
@@ -104,7 +105,7 @@ async fn test_remote_echo_full_trip() {
         let event_item = item.as_event().unwrap();
         assert!(event_item.is_local_echo());
         assert_matches!(event_item.send_state(), Some(EventSendState::Sent { .. }));
-        assert_eq!(item.unique_id(), id);
+        assert_eq!(*item.unique_id(), id);
 
         event_item.timestamp()
     };
@@ -125,7 +126,7 @@ async fn test_remote_echo_full_trip() {
     // The local echo is replaced with the remote echo.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
     assert!(!item.as_event().unwrap().is_local_echo());
-    assert_eq!(item.unique_id(), id);
+    assert_eq!(*item.unique_id(), id);
 }
 
 #[async_test]

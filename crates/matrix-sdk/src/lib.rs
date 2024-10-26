@@ -12,8 +12,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 /// SchildiChat's additions to the Matrix Rust SDK.
@@ -26,7 +28,7 @@ pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
     store::{DynStateStore, MemoryStore, StateStoreExt},
-    ComposerDraft, ComposerDraftType, DisplayName, Room as BaseRoom,
+    ComposerDraft, ComposerDraftType, DisplayName, QueueWedgeError, Room as BaseRoom,
     RoomCreateWithCreatorEventContent, RoomHero, RoomInfo, RoomMember as BaseRoomMember,
     RoomMemberships, RoomState, SessionMeta, StateChanges, StateStore, StoreError,
 };
@@ -72,8 +74,6 @@ pub use authentication::{AuthApi, AuthSession, SessionTokens};
 pub use client::{
     sanitize_server_name, Client, ClientBuildError, ClientBuilder, LoopCtrl, SessionChange,
 };
-#[cfg(feature = "image-proc")]
-pub use error::ImageError;
 pub use error::{
     Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError, Result,
     RumaApiError,

@@ -1,6 +1,7 @@
 mod ci;
 mod fixup;
 mod kotlin;
+mod release;
 mod swift;
 mod workspace;
 
@@ -8,6 +9,7 @@ use ci::CiArgs;
 use clap::{Parser, Subcommand};
 use fixup::FixupArgs;
 use kotlin::KotlinArgs;
+use release::ReleaseArgs;
 use swift::SwiftArgs;
 use xshell::cmd;
 
@@ -33,6 +35,8 @@ enum Command {
         #[clap(long)]
         open: bool,
     },
+    /// Prepare and publish a release of the matrix-sdk crates
+    Release(ReleaseArgs),
     Swift(SwiftArgs),
     Kotlin(KotlinArgs),
 }
@@ -44,6 +48,7 @@ fn main() -> Result<()> {
         Command::Doc { open } => build_docs(open.then_some("--open"), DenyWarnings::No),
         Command::Swift(cfg) => cfg.run(),
         Command::Kotlin(cfg) => cfg.run(),
+        Command::Release(cfg) => cfg.run(),
     }
 }
 
@@ -63,8 +68,6 @@ fn build_docs(
 
     // Keep in sync with .github/workflows/docs.yml
     cmd!("rustup run {NIGHTLY} cargo doc --no-deps --workspace --features docsrs")
-        // Work around https://github.com/rust-lang/cargo/issues/10744
-        .env("CARGO_TARGET_APPLIES_TO_HOST", "true")
         .env("RUSTDOCFLAGS", rustdocflags)
         .args(extra_args)
         .run()?;

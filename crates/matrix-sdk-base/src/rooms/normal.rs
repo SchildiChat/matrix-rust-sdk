@@ -23,6 +23,8 @@ use std::{
 use bitflags::bitflags;
 use eyeball::{SharedObservable, Subscriber};
 use futures_util::{Stream, StreamExt};
+#[cfg(feature = "experimental-sliding-sync")]
+use matrix_sdk_common::deserialized_responses::TimelineEventKind;
 #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
 use matrix_sdk_common::ring_buffer::RingBuffer;
 #[cfg(feature = "experimental-sliding-sync")]
@@ -183,15 +185,17 @@ impl RoomSummary {
 }
 
 /// Enum keeping track in which state the room is, e.g. if our own user is
-/// joined, invited, or has left the room.
+/// joined, RoomState::Invited, or has left the room.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RoomState {
     /// The room is in a joined state.
     Joined,
     /// The room is in a left state.
     Left,
-    /// The room is in a invited state.
+    /// The room is in an invited state.
     Invited,
+    /// The room is in a knocked state.
+    Knocked,
 }
 
 impl From<&MembershipState> for RoomState {
@@ -202,7 +206,7 @@ impl From<&MembershipState> for RoomState {
             MembershipState::Ban => Self::Left,
             MembershipState::Invite => Self::Invited,
             MembershipState::Join => Self::Joined,
-            MembershipState::Knock => Self::Left,
+            MembershipState::Knock => Self::Knocked,
             MembershipState::Leave => Self::Left,
             _ => panic!("Unexpected MembershipState: {}", membership_state),
         }
@@ -272,6 +276,11 @@ impl Room {
     /// Get the state of the room.
     pub fn state(&self) -> RoomState {
         self.inner.read().room_state
+    }
+
+    /// Get the previous state of the room, if it had any.
+    pub fn prev_state(&self) -> Option<RoomState> {
+        self.inner.read().prev_room_state
     }
 
     /// Whether this room's [`RoomType`] is `m.space`.
@@ -447,6 +456,9 @@ impl Room {
                     },
                 }
             }
+
+            // TODO: implement logic once we have the stripped events as we'd have with an Invite
+            RoomState::Knocked => Ok(false),
         }
     }
 
@@ -870,8 +882,8 @@ impl Room {
     /// Get the `RoomMember` with the given `user_id`.
     ///
     /// Returns `None` if the member was never part of this room, otherwise
-    /// return a `RoomMember` that can be in a joined, invited, left, banned
-    /// state.
+    /// return a `RoomMember` that can be in a joined, RoomState::Invited, left,
+    /// banned state.
     ///
     /// Async because it can read from storage.
     pub async fn get_member(&self, user_id: &UserId) -> StoreResult<Option<RoomMember>> {
@@ -1043,6 +1055,9 @@ pub struct RoomInfo {
     /// The state of the room.
     pub(crate) room_state: RoomState,
 
+    /// The previous state of the room, if any.
+    pub(crate) prev_room_state: Option<RoomState>,
+
     /// The unread notifications counts, as returned by the server.
     ///
     /// These might be incorrect for encrypted rooms, since the server doesn't
@@ -1131,6 +1146,7 @@ impl RoomInfo {
             version: 1,
             room_id: room_id.into(),
             room_state,
+            prev_room_state: None,
             notification_counts: Default::default(),
             unread_count: None,
             summary: Default::default(),
@@ -1152,22 +1168,30 @@ impl RoomInfo {
 
     /// Mark this Room as joined.
     pub fn mark_as_joined(&mut self) {
-        self.room_state = RoomState::Joined;
+        self.set_state(RoomState::Joined);
     }
 
     /// Mark this Room as left.
     pub fn mark_as_left(&mut self) {
-        self.room_state = RoomState::Left;
+        self.set_state(RoomState::Left);
     }
 
     /// Mark this Room as invited.
     pub fn mark_as_invited(&mut self) {
-        self.room_state = RoomState::Invited;
+        self.set_state(RoomState::Invited);
+    }
+
+    /// Mark this Room as knocked.
+    pub fn mark_as_knocked(&mut self) {
+        self.set_state(RoomState::Knocked);
     }
 
     /// Set the membership RoomState of this Room
     pub fn set_state(&mut self, room_state: RoomState) {
-        self.room_state = room_state;
+        if room_state != self.room_state {
+            self.prev_room_state = Some(self.room_state);
+            self.room_state = room_state;
+        }
     }
 
     /// Mark this Room as having all the members synced.
@@ -1276,9 +1300,12 @@ impl RoomInfo {
         if let Some(latest_event) = &mut self.latest_event {
             tracing::trace!("Checking if redaction applies to latest event");
             if latest_event.event_id().as_deref() == Some(redacts) {
-                match apply_redaction(&latest_event.event().event, _raw, room_version) {
+                match apply_redaction(latest_event.event().raw(), _raw, room_version) {
                     Some(redacted) => {
-                        latest_event.event_mut().event = redacted;
+                        // Even if the original event was encrypted, redaction removes all its
+                        // fields so it cannot possibly be successfully decrypted after redaction.
+                        latest_event.event_mut().kind =
+                            TimelineEventKind::PlainText { event: redacted };
                         debug!("Redacted latest event");
                     }
                     None => {
@@ -1705,6 +1732,8 @@ bitflags! {
         const INVITED  = 0b00000010;
         /// The room is in a left state.
         const LEFT     = 0b00000100;
+        /// The room is in a knocked state.
+        const KNOCKED  = 0b00001000;
     }
 }
 
@@ -1719,6 +1748,7 @@ impl RoomStateFilter {
             RoomState::Joined => Self::JOINED,
             RoomState::Left => Self::LEFT,
             RoomState::Invited => Self::INVITED,
+            RoomState::Knocked => Self::KNOCKED,
         };
 
         self.contains(bit_state)
@@ -1829,7 +1859,8 @@ mod tests {
     use crate::{
         rooms::RoomNotableTags,
         store::{IntoStateStore, MemoryStore, StateChanges, StateStore},
-        BaseClient, DisplayName, MinimalStateEvent, OriginalMinimalStateEvent, SessionMeta,
+        BaseClient, DisplayName, MinimalStateEvent, OriginalMinimalStateEvent,
+        RoomInfoNotableUpdateReasons, SessionMeta,
     };
 
     #[test]
@@ -1847,6 +1878,7 @@ mod tests {
             version: 1,
             room_id: room_id!("!gda78o:server.tld").into(),
             room_state: RoomState::Invited,
+            prev_room_state: None,
             notification_counts: UnreadNotificationsCount {
                 highlight_count: 1,
                 notification_count: 2,
@@ -1864,9 +1896,9 @@ mod tests {
             last_prev_batch: Some("pb".to_owned()),
             sync_info: SyncInfo::FullySynced,
             encryption_state_synced: true,
-            latest_event: Some(Box::new(LatestEvent::new(
-                Raw::from_json_string(json!({"sender": "@u:i.uk"}).to_string()).unwrap().into(),
-            ))),
+            latest_event: Some(Box::new(LatestEvent::new(SyncTimelineEvent::new(
+                Raw::from_json_string(json!({"sender": "@u:i.uk"}).to_string()).unwrap(),
+            )))),
             base_info: Box::new(
                 assign!(BaseRoomInfo::new(), { pinned_events: Some(RoomPinnedEventsEventContent::new(vec![owned_event_id!("$a")])) }),
             ),
@@ -1881,6 +1913,7 @@ mod tests {
             "version": 1,
             "room_id": "!gda78o:server.tld",
             "room_state": "Invited",
+            "prev_room_state": null,
             "notification_counts": {
                 "highlight_count": 1,
                 "notification_count": 2,
@@ -1900,10 +1933,7 @@ mod tests {
             "encryption_state_synced": true,
             "latest_event": {
                 "event": {
-                    "encryption_info": null,
-                    "event": {
-                        "sender": "@u:i.uk",
-                    },
+                    "kind": {"PlainText": {"event": {"sender": "@u:i.uk"}}},
                 },
             },
             "base_info": {
@@ -1952,6 +1982,7 @@ mod tests {
         let info_json = json!({
             "room_id": "!gda78o:server.tld",
             "room_state": "Invited",
+            "prev_room_state": null,
             "notification_counts": {
                 "highlight_count": 1,
                 "notification_count": 2,
@@ -2028,7 +2059,8 @@ mod tests {
 
         let info_json = json!({
             "room_id": "!gda78o:server.tld",
-            "room_state": "Invited",
+            "room_state": "Joined",
+            "prev_room_state": "Invited",
             "notification_counts": {
                 "highlight_count": 1,
                 "notification_count": 2,
@@ -2068,7 +2100,8 @@ mod tests {
         let info: RoomInfo = serde_json::from_value(info_json).unwrap();
 
         assert_eq!(info.room_id, room_id!("!gda78o:server.tld"));
-        assert_eq!(info.room_state, RoomState::Invited);
+        assert_eq!(info.room_state, RoomState::Joined);
+        assert_eq!(info.prev_room_state, Some(RoomState::Invited));
         assert_eq!(info.notification_counts.highlight_count, 1);
         assert_eq!(info.notification_counts.notification_count, 2);
         assert_eq!(
@@ -3185,5 +3218,33 @@ mod tests {
         // Creating a new room info initializes it to version 1.
         let new_room_info = RoomInfo::new(room_id!("!new_room:localhost"), RoomState::Joined);
         assert_eq!(new_room_info.version, 1);
+    }
+
+    #[async_test]
+    async fn test_prev_room_state_is_updated() {
+        let (_store, room) = make_room_test_helper(RoomState::Invited);
+        assert_eq!(room.prev_state(), None);
+        assert_eq!(room.state(), RoomState::Invited);
+
+        // Invited -> Joined
+        let mut room_info = room.clone_info();
+        room_info.mark_as_joined();
+        room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
+        assert_eq!(room.prev_state(), Some(RoomState::Invited));
+        assert_eq!(room.state(), RoomState::Joined);
+
+        // No change when the same state is used
+        let mut room_info = room.clone_info();
+        room_info.mark_as_joined();
+        room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
+        assert_eq!(room.prev_state(), Some(RoomState::Invited));
+        assert_eq!(room.state(), RoomState::Joined);
+
+        // Joined -> Left
+        let mut room_info = room.clone_info();
+        room_info.mark_as_left();
+        room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
+        assert_eq!(room.prev_state(), Some(RoomState::Joined));
+        assert_eq!(room.state(), RoomState::Left);
     }
 }

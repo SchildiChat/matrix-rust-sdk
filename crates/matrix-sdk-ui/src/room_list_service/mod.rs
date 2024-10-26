@@ -61,7 +61,7 @@ mod state;
 use std::{sync::Arc, time::Duration};
 
 use async_stream::stream;
-use eyeball::{SharedObservable, Subscriber};
+use eyeball::Subscriber;
 use futures_util::{pin_mut, Stream, StreamExt};
 use matrix_sdk::{
     event_cache::EventCacheError, Client, Error as SlidingSyncError, SlidingSync, SlidingSyncList,
@@ -70,13 +70,34 @@ use matrix_sdk::{
 use matrix_sdk_base::sliding_sync::http;
 pub use room::*;
 pub use room_list::*;
-use ruma::{assign, directory::RoomTypeFilter, events::StateEventType, OwnedRoomId, RoomId};
+use ruma::{assign, directory::RoomTypeFilter, events::StateEventType, OwnedRoomId, RoomId, UInt};
 pub use state::*;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::debug;
 
 use crate::timeline;
+
+/// The default `required_state` constant value for sliding sync lists and
+/// sliding sync room subscriptions.
+const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
+    (StateEventType::RoomName, ""),
+    (StateEventType::RoomEncryption, ""),
+    (StateEventType::RoomMember, "$LAZY"),
+    (StateEventType::RoomMember, "$ME"),
+    (StateEventType::RoomTopic, ""),
+    (StateEventType::RoomCanonicalAlias, ""),
+    (StateEventType::RoomPowerLevels, ""),
+    (StateEventType::CallMember, ""),
+];
+
+/// The default `required_state` constant value for sliding sync room
+/// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
+const DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: &[(StateEventType, &str)] =
+    &[(StateEventType::RoomCreate, ""), (StateEventType::RoomPinnedEvents, "")];
+
+/// The default `timeline_limit` value when used with room subscriptions.
+const DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT: u32 = 20;
 
 /// The [`RoomListService`] type. See the module's documentation to learn more.
 #[derive(Debug)]
@@ -90,7 +111,7 @@ pub struct RoomListService {
     /// The current state of the `RoomListService`.
     ///
     /// `RoomListService` is a simple state-machine.
-    state: SharedObservable<State>,
+    state_machine: StateMachine,
 }
 
 impl RoomListService {
@@ -146,14 +167,12 @@ impl RoomListService {
                             .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
                     )
                     .timeline_limit(1)
-                    .required_state(vec![
-                        (StateEventType::RoomEncryption, "".to_owned()),
-                        (StateEventType::RoomMember, "$LAZY".to_owned()),
-                        (StateEventType::RoomMember, "$ME".to_owned()),
-                        (StateEventType::RoomName, "".to_owned()),
-                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
-                        (StateEventType::RoomPowerLevels, "".to_owned()),
-                    ])
+                    .required_state(
+                        DEFAULT_REQUIRED_STATE
+                            .iter()
+                            .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
+                            .collect(),
+                    )
                     .include_heroes(Some(true))
                     .filters(Some(assign!(http::request::ListFilters::default(), {
                         // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
@@ -200,7 +219,7 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state: SharedObservable::new(State::Init) })
+        Ok(Self { client, sliding_sync, state_machine: StateMachine::new() })
     }
 
     /// Start to sync the room list.
@@ -236,7 +255,7 @@ impl RoomListService {
                 debug!("Run a sync iteration");
 
                 // Calculate the next state, and run the associated actions.
-                let next_state = self.state.get().next(&self.sliding_sync).await?;
+                let next_state = self.state_machine.next(&self.sliding_sync).await?;
 
                 // Do the sync.
                 match sync.next().await {
@@ -245,7 +264,7 @@ impl RoomListService {
                         debug!(state = ?next_state, "New state");
 
                         // Update the state.
-                        self.state.set(next_state);
+                        self.state_machine.set(next_state);
 
                         yield Ok(());
                     }
@@ -255,7 +274,7 @@ impl RoomListService {
                         debug!(expected_state = ?next_state, "New state is an error");
 
                         let next_state = State::Error { from: Box::new(next_state) };
-                        self.state.set(next_state);
+                        self.state_machine.set(next_state);
 
                         yield Err(Error::SlidingSync(error));
 
@@ -267,7 +286,7 @@ impl RoomListService {
                         debug!(expected_state = ?next_state, "New state is a termination");
 
                         let next_state = State::Terminated { from: Box::new(next_state) };
-                        self.state.set(next_state);
+                        self.state_machine.set(next_state);
 
                         break;
                     }
@@ -314,8 +333,8 @@ impl RoomListService {
         // when the session is forced to expire, the state remains `Terminated`, thus
         // the actions aren't executed as expected. Consequently, let's update the
         // state.
-        if let State::Terminated { from } = self.state.get() {
-            self.state.set(State::Error { from });
+        if let State::Terminated { from } = self.state_machine.get() {
+            self.state_machine.set(State::Error { from });
         }
     }
 
@@ -369,7 +388,7 @@ impl RoomListService {
                     // Update the `current_state`.
                     current_state = next_state;
                 } else {
-                    // Something is broken with `self.state`. Let's stop this stream too.
+                    // Something is broken with the state. Let's stop this stream too.
                     break;
                 }
             }
@@ -383,7 +402,7 @@ impl RoomListService {
 
     /// Get a subscriber to the state.
     pub fn state(&self) -> Subscriber<State> {
-        self.state.subscribe()
+        self.state_machine.subscribe()
     }
 
     async fn list_for(&self, sliding_sync_list_name: &str, is_space_list: bool) -> Result<RoomList, Error> {
@@ -413,24 +432,21 @@ impl RoomListService {
     ///
     /// It means that all events from these rooms will be received every time,
     /// no matter how the `RoomList` is configured.
-    pub fn subscribe_to_rooms(
-        &self,
-        room_ids: &[&RoomId],
-        settings: Option<http::request::RoomSubscription>,
-    ) {
-        let mut settings = settings.unwrap_or_default();
+    pub fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
+        let settings = assign!(http::request::RoomSubscription::default(), {
+            required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                (state_event.clone(), (*value).to_owned())
+            })
+            .chain(
+                DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                    (state_event.clone(), (*value).to_owned())
+                })
+            )
+            .collect(),
+            timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
+        });
 
-        // Make sure to always include the room creation event in the required state
-        // events, to know what the room version is.
-        if !settings
-            .required_state
-            .iter()
-            .any(|(event_type, _state_key)| *event_type == StateEventType::RoomCreate)
-        {
-            settings.required_state.push((StateEventType::RoomCreate, "".to_owned()));
-        }
-
-        let cancel_in_flight_request = match self.state.get() {
+        let cancel_in_flight_request = match self.state_machine.get() {
             State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
                 false
             }
@@ -651,13 +667,16 @@ mod tests {
         let _ = sync.next().await;
 
         // State is `Terminated`, as expected!
-        assert_eq!(room_list.state.get(), State::Terminated { from: Box::new(State::Running) });
+        assert_eq!(
+            room_list.state_machine.get(),
+            State::Terminated { from: Box::new(State::Running) }
+        );
 
         // Now, let's make the sliding sync session to expire.
         room_list.expire_sync_session().await;
 
         // State is `Error`, as a regular session expiration would generate!
-        assert_eq!(room_list.state.get(), State::Error { from: Box::new(State::Running) });
+        assert_eq!(room_list.state_machine.get(), State::Error { from: Box::new(State::Running) });
 
         Ok(())
     }

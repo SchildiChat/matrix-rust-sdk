@@ -6,6 +6,7 @@ use matrix_sdk::{
     encryption::{backups, recovery},
 };
 use thiserror::Error;
+use tracing::{error, info};
 use zeroize::Zeroize;
 
 use super::RUNTIME;
@@ -23,22 +24,22 @@ pub struct Encryption {
     pub(crate) _client: Arc<Client>,
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait BackupStateListener: Sync + Send {
     fn on_update(&self, status: BackupState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait BackupSteadyStateListener: Sync + Send {
     fn on_update(&self, status: BackupUploadState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RecoveryStateListener: Sync + Send {
     fn on_update(&self, status: RecoveryState);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait VerificationStateListener: Sync + Send {
     fn on_update(&self, status: VerificationState);
 }
@@ -162,7 +163,7 @@ impl From<recovery::RecoveryState> for RecoveryState {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait EnableRecoveryProgressListener: Sync + Send {
     fn on_update(&self, status: EnableRecoveryProgress);
 }
@@ -212,7 +213,7 @@ impl From<encryption::VerificationState> for VerificationState {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Encryption {
     /// Get the public ed25519 key of our own device. This is usually what is
     /// called the fingerprint of the device.
@@ -413,16 +414,40 @@ impl Encryption {
 
     /// Get the E2EE identity of a user.
     ///
-    /// Returns Ok(None) if this user does not exist.
+    /// This method always tries to fetch the identity from the store, which we
+    /// only have if the user is tracked, meaning that we are both members
+    /// of the same encrypted room. If no user is found locally, a request will
+    /// be made to the homeserver.
     ///
-    /// Returns an error if there was a problem contacting the crypto store, or
-    /// if our client is not logged in.
-    pub async fn get_user_identity(
+    /// # Arguments
+    ///
+    /// * `user_id` - The ID of the user that the identity belongs to.
+    ///
+    /// Returns a `UserIdentity` if one is found. Returns an error if there
+    /// was an issue with the crypto store or with the request to the
+    /// homeserver.
+    ///
+    /// This will always return `None` if the client hasn't been logged in.
+    pub async fn user_identity(
         &self,
         user_id: String,
     ) -> Result<Option<Arc<UserIdentity>>, ClientError> {
-        let identity = self.inner.get_user_identity(user_id.as_str().try_into()?).await?;
-        Ok(identity.map(|i| Arc::new(UserIdentity { inner: i })))
+        match self.inner.get_user_identity(user_id.as_str().try_into()?).await {
+            Ok(Some(identity)) => {
+                return Ok(Some(Arc::new(UserIdentity { inner: identity })));
+            }
+            Ok(None) => {
+                info!("No identity found in the store.");
+            }
+            Err(error) => {
+                error!("Failed fetching identity from the store: {}", error);
+            }
+        };
+
+        info!("Requesting identity from the server.");
+
+        let identity = self.inner.request_user_identity(user_id.as_str().try_into()?).await?;
+        Ok(identity.map(|identity| Arc::new(UserIdentity { inner: identity })))
     }
 }
 
@@ -432,7 +457,7 @@ pub struct UserIdentity {
     inner: matrix_sdk::encryption::identities::UserIdentity,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl UserIdentity {
     /// Remember this identity, ensuring it does not result in a pin violation.
     ///
@@ -461,6 +486,14 @@ impl UserIdentity {
     pub(crate) fn master_key(&self) -> Option<String> {
         self.inner.master_key().get_first_key().map(|k| k.to_base64())
     }
+
+    /// Is the user identity considered to be verified.
+    ///
+    /// If the identity belongs to another user, our own user identity needs to
+    /// be verified as well for the identity to be considered to be verified.
+    pub fn is_verified(&self) -> bool {
+        self.inner.is_verified()
+    }
 }
 
 #[derive(uniffi::Object)]
@@ -468,7 +501,7 @@ pub struct IdentityResetHandle {
     pub(crate) inner: matrix_sdk::encryption::recovery::IdentityResetHandle,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl IdentityResetHandle {
     /// Get the underlying [`CrossSigningResetAuthType`] this identity reset
     /// process is using.

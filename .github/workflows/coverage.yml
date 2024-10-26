@@ -58,9 +58,14 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.2.0
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install libsqlite
+        run: |
+          sudo apt-get update
+          sudo apt-get install libsqlite3-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -89,7 +94,7 @@ jobs:
         run: |
           rustup run stable cargo tarpaulin \
             --skip-clean --profile cov --out xml \
-            --features experimental-widgets,testing,image-proc
+            --features experimental-widgets,testing
         env:
           CARGO_PROFILE_COV_INHERITS: 'dev'
           CARGO_PROFILE_COV_DEBUG: 1
