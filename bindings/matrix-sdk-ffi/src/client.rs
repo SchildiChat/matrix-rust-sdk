@@ -213,10 +213,10 @@ impl Client {
         let session_verification_controller: Arc<
             tokio::sync::RwLock<Option<SessionVerificationController>>,
         > = Default::default();
-        let ctrl = session_verification_controller.clone();
+        let controller = session_verification_controller.clone();
 
         sdk_client.add_event_handler(move |ev: AnyToDeviceEvent| async move {
-            if let Some(session_verification_controller) = &*ctrl.clone().read().await {
+            if let Some(session_verification_controller) = &*controller.clone().read().await {
                 session_verification_controller.process_to_device_message(ev).await;
             } else {
                 debug!("received to-device message, but verification controller isn't ready");
@@ -266,7 +266,31 @@ impl Client {
 impl Client {
     /// Information about login options for the client's homeserver.
     pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
-        let supports_oidc_login = self.inner.oidc().fetch_authentication_issuer().await.is_ok();
+        let oidc = self.inner.oidc();
+        let (supports_oidc_login, supported_oidc_prompts) = match oidc
+            .fetch_authentication_issuer()
+            .await
+        {
+            Ok(issuer) => match &oidc.given_provider_metadata(&issuer).await {
+                Ok(metadata) => {
+                    let prompts = metadata
+                        .prompt_values_supported
+                        .as_ref()
+                        .map_or_else(Vec::new, |prompts| prompts.iter().map(Into::into).collect());
+
+                    (true, prompts)
+                }
+                Err(error) => {
+                    error!("Failed to fetch OIDC provider metadata: {error}");
+                    (true, Default::default())
+                }
+            },
+            Err(error) => {
+                error!("Failed to fetch authentication issuer: {error}");
+                (false, Default::default())
+            }
+        };
+
         let supports_password_login = self.supports_password_login().await.ok().unwrap_or(false);
         let sliding_sync_version = self.sliding_sync_version();
 
@@ -274,6 +298,7 @@ impl Client {
             url: self.homeserver(),
             sliding_sync_version,
             supports_oidc_login,
+            supported_oidc_prompts,
             supports_password_login,
         })
     }
@@ -1036,7 +1061,7 @@ impl Client {
         &self,
         room_id: String,
         via_servers: Vec<String>,
-    ) -> Result<RoomPreview, ClientError> {
+    ) -> Result<Arc<RoomPreview>, ClientError> {
         let room_id = RoomId::parse(&room_id).context("room_id is not a valid room id")?;
 
         let via_servers = via_servers
@@ -1049,16 +1074,16 @@ impl Client {
         // rustc win that one fight.
         let room_id: &RoomId = &room_id;
 
-        let sdk_room_preview = self.inner.get_room_preview(room_id.into(), via_servers).await?;
+        let room_preview = self.inner.get_room_preview(room_id.into(), via_servers).await?;
 
-        Ok(RoomPreview::from_sdk(sdk_room_preview))
+        Ok(Arc::new(RoomPreview::new(self.inner.clone(), room_preview)))
     }
 
     /// Given a room alias, get the preview of a room, to interact with it.
     pub async fn get_room_preview_from_room_alias(
         &self,
         room_alias: String,
-    ) -> Result<RoomPreview, ClientError> {
+    ) -> Result<Arc<RoomPreview>, ClientError> {
         let room_alias =
             RoomAliasId::parse(&room_alias).context("room_alias is not a valid room alias")?;
 
@@ -1066,9 +1091,9 @@ impl Client {
         // rustc win that one fight.
         let room_alias: &RoomAliasId = &room_alias;
 
-        let sdk_room_preview = self.inner.get_room_preview(room_alias.into(), Vec::new()).await?;
+        let room_preview = self.inner.get_room_preview(room_alias.into(), Vec::new()).await?;
 
-        Ok(RoomPreview::from_sdk(sdk_room_preview))
+        Ok(Arc::new(RoomPreview::new(self.inner.clone(), room_preview)))
     }
 
     /// Waits until an at least partially synced room is received, and returns
@@ -1767,7 +1792,7 @@ impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
     }
 }
 
-#[derive(uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum OidcPrompt {
     /// The Authorization Server must not display any authentication or consent
     /// user interface pages.
@@ -1799,6 +1824,20 @@ pub enum OidcPrompt {
     Unknown { value: String },
 }
 
+impl From<&SdkOidcPrompt> for OidcPrompt {
+    fn from(value: &SdkOidcPrompt) -> Self {
+        match value {
+            SdkOidcPrompt::None => Self::None,
+            SdkOidcPrompt::Login => Self::Login,
+            SdkOidcPrompt::Consent => Self::Consent,
+            SdkOidcPrompt::SelectAccount => Self::SelectAccount,
+            SdkOidcPrompt::Create => Self::Create,
+            SdkOidcPrompt::Unknown(value) => Self::Unknown { value: value.to_owned() },
+            _ => Self::Unknown { value: value.to_string() },
+        }
+    }
+}
+
 impl From<OidcPrompt> for SdkOidcPrompt {
     fn from(value: OidcPrompt) -> Self {
         match value {
@@ -1813,7 +1852,7 @@ impl From<OidcPrompt> for SdkOidcPrompt {
 }
 
 /// The rule used for users wishing to join this room.
-#[derive(uniffi::Enum)]
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum JoinRule {
     /// Anyone can join the room without any prior action.
     Public,
@@ -1839,10 +1878,16 @@ pub enum JoinRule {
     /// conditions described in a set of [`AllowRule`]s, or they can request
     /// an invite to the room.
     KnockRestricted { rules: Vec<AllowRule> },
+
+    /// A custom join rule, up for interpretation by the consumer.
+    Custom {
+        /// The string representation for this custom rule.
+        repr: String,
+    },
 }
 
 /// An allow rule which defines a condition that allows joining a room.
-#[derive(uniffi::Enum)]
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum AllowRule {
     /// Only a member of the `room_id` Room can join the one this rule is used
     /// in.
@@ -1866,6 +1911,7 @@ impl TryFrom<JoinRule> for ruma::events::room::join_rules::JoinRule {
                 let rules = allow_rules_from(rules)?;
                 Ok(Self::KnockRestricted(ruma::events::room::join_rules::Restricted::new(rules)))
             }
+            JoinRule::Custom { repr } => Ok(serde_json::from_str(&repr)?),
         }
     }
 }
