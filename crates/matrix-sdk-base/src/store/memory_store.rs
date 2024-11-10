@@ -36,12 +36,10 @@ use ruma::{
 use tracing::{debug, instrument, trace, warn};
 
 use super::{
-    traits::{
-        ChildTransactionId, ComposerDraft, QueuedEvent, SerializableEventContent,
-        ServerCapabilities,
-    },
-    DependentQueuedEvent, DependentQueuedEventKind, Result, RoomInfo, StateChanges, StateStore,
-    StoreError,
+    send_queue::{ChildTransactionId, QueuedRequest, SentRequestKey},
+    traits::{ComposerDraft, ServerCapabilities},
+    DependentQueuedRequest, DependentQueuedRequestKind, QueuedRequestKind, Result, RoomInfo,
+    StateChanges, StateStore, StoreError,
 };
 use crate::{
     deserialized_responses::RawAnySyncOrStrippedState, store::QueueWedgeError,
@@ -90,8 +88,8 @@ pub struct MemoryStore {
         >,
     >,
     custom: StdRwLock<HashMap<Vec<u8>, Vec<u8>>>,
-    send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<QueuedEvent>>>,
-    dependent_send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<DependentQueuedEvent>>>,
+    send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<QueuedRequest>>>,
+    dependent_send_queue_events: StdRwLock<BTreeMap<OwnedRoomId, Vec<DependentQueuedRequest>>>,
 }
 
 impl MemoryStore {
@@ -804,26 +802,26 @@ impl StateStore for MemoryStore {
         Ok(())
     }
 
-    async fn save_send_queue_event(
+    async fn save_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
-        event: SerializableEventContent,
+        kind: QueuedRequestKind,
     ) -> Result<(), Self::Error> {
         self.send_queue_events
             .write()
             .unwrap()
             .entry(room_id.to_owned())
             .or_default()
-            .push(QueuedEvent { event, transaction_id, error: None });
+            .push(QueuedRequest { kind, transaction_id, error: None });
         Ok(())
     }
 
-    async fn update_send_queue_event(
+    async fn update_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
-        content: SerializableEventContent,
+        kind: QueuedRequestKind,
     ) -> Result<bool, Self::Error> {
         if let Some(entry) = self
             .send_queue_events
@@ -834,7 +832,7 @@ impl StateStore for MemoryStore {
             .iter_mut()
             .find(|item| item.transaction_id == transaction_id)
         {
-            entry.event = content;
+            entry.kind = kind;
             entry.error = None;
             Ok(true)
         } else {
@@ -842,7 +840,7 @@ impl StateStore for MemoryStore {
         }
     }
 
-    async fn remove_send_queue_event(
+    async fn remove_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
@@ -865,14 +863,14 @@ impl StateStore for MemoryStore {
         Ok(false)
     }
 
-    async fn load_send_queue_events(
+    async fn load_send_queue_requests(
         &self,
         room_id: &RoomId,
-    ) -> Result<Vec<QueuedEvent>, Self::Error> {
+    ) -> Result<Vec<QueuedRequest>, Self::Error> {
         Ok(self.send_queue_events.write().unwrap().entry(room_id.to_owned()).or_default().clone())
     }
 
-    async fn update_send_queue_event_status(
+    async fn update_send_queue_request_status(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
@@ -892,45 +890,45 @@ impl StateStore for MemoryStore {
         Ok(())
     }
 
-    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
         Ok(self.send_queue_events.read().unwrap().keys().cloned().collect())
     }
 
-    async fn save_dependent_send_queue_event(
+    async fn save_dependent_queued_request(
         &self,
         room: &RoomId,
         parent_transaction_id: &TransactionId,
         own_transaction_id: ChildTransactionId,
-        content: DependentQueuedEventKind,
+        content: DependentQueuedRequestKind,
     ) -> Result<(), Self::Error> {
         self.dependent_send_queue_events.write().unwrap().entry(room.to_owned()).or_default().push(
-            DependentQueuedEvent {
+            DependentQueuedRequest {
                 kind: content,
                 parent_transaction_id: parent_transaction_id.to_owned(),
                 own_transaction_id,
-                event_id: None,
+                parent_key: None,
             },
         );
         Ok(())
     }
 
-    async fn update_dependent_send_queue_event(
+    async fn update_dependent_queued_request(
         &self,
         room: &RoomId,
         parent_txn_id: &TransactionId,
-        event_id: OwnedEventId,
+        sent_parent_key: SentRequestKey,
     ) -> Result<usize, Self::Error> {
         let mut dependent_send_queue_events = self.dependent_send_queue_events.write().unwrap();
         let dependents = dependent_send_queue_events.entry(room.to_owned()).or_default();
         let mut num_updated = 0;
         for d in dependents.iter_mut().filter(|item| item.parent_transaction_id == parent_txn_id) {
-            d.event_id = Some(event_id.clone());
+            d.parent_key = Some(sent_parent_key.clone());
             num_updated += 1;
         }
         Ok(num_updated)
     }
 
-    async fn remove_dependent_send_queue_event(
+    async fn remove_dependent_queued_request(
         &self,
         room: &RoomId,
         txn_id: &ChildTransactionId,
@@ -949,10 +947,10 @@ impl StateStore for MemoryStore {
     ///
     /// This returns absolutely all the dependent send queue events, whether
     /// they have an event id or not.
-    async fn list_dependent_send_queue_events(
+    async fn load_dependent_queued_requests(
         &self,
         room: &RoomId,
-    ) -> Result<Vec<DependentQueuedEvent>, Self::Error> {
+    ) -> Result<Vec<DependentQueuedRequest>, Self::Error> {
         Ok(self.dependent_send_queue_events.read().unwrap().get(room).cloned().unwrap_or_default())
     }
 }

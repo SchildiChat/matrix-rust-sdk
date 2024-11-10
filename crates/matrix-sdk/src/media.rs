@@ -296,7 +296,7 @@ impl Media {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn get_media_file(
         &self,
-        request: &MediaRequest,
+        request: &MediaRequestParameters,
         filename: Option<String>,
         content_type: &Mime,
         use_cache: bool,
@@ -371,13 +371,13 @@ impl Media {
     /// * `use_cache` - If we should use the media cache for this request.
     pub async fn get_media_content(
         &self,
-        request: &MediaRequest,
+        request: &MediaRequestParameters,
         use_cache: bool,
     ) -> Result<Vec<u8>> {
         // Read from the cache.
         if use_cache {
             if let Some(content) =
-                self.client.event_cache_store().get_media_content(request).await?
+                self.client.event_cache_store().lock().await?.get_media_content(request).await?
             {
                 return Ok(content);
             }
@@ -437,16 +437,17 @@ impl Media {
 
                 content
             }
+
             MediaSource::Plain(uri) => {
                 if let MediaFormat::Thumbnail(settings) = &request.format {
                     if use_auth {
                         let mut request =
                             authenticated_media::get_content_thumbnail::v1::Request::from_uri(
                                 uri,
-                                settings.size.width,
-                                settings.size.height,
+                                settings.width,
+                                settings.height,
                             )?;
-                        request.method = Some(settings.size.method.clone());
+                        request.method = Some(settings.method.clone());
                         request.animated = Some(settings.animated);
 
                         self.client.send(request, request_config).await?.file
@@ -455,10 +456,10 @@ impl Media {
                         let request = {
                             let mut request = media::get_content_thumbnail::v3::Request::from_url(
                                 uri,
-                                settings.size.width,
-                                settings.size.height,
+                                settings.width,
+                                settings.height,
                             )?;
-                            request.method = Some(settings.size.method.clone());
+                            request.method = Some(settings.method.clone());
                             request.animated = Some(settings.animated);
                             request
                         };
@@ -477,7 +478,12 @@ impl Media {
         };
 
         if use_cache {
-            self.client.event_cache_store().add_media_content(request, content.clone()).await?;
+            self.client
+                .event_cache_store()
+                .lock()
+                .await?
+                .add_media_content(request, content.clone())
+                .await?;
         }
 
         Ok(content)
@@ -488,8 +494,8 @@ impl Media {
     /// # Arguments
     ///
     /// * `request` - The `MediaRequest` of the content.
-    pub async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
-        Ok(self.client.event_cache_store().remove_media_content(request).await?)
+    pub async fn remove_media_content(&self, request: &MediaRequestParameters) -> Result<()> {
+        Ok(self.client.event_cache_store().lock().await?.remove_media_content(request).await?)
     }
 
     /// Delete all the media content corresponding to the given
@@ -499,7 +505,7 @@ impl Media {
     ///
     /// * `uri` - The `MxcUri` of the files.
     pub async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<()> {
-        Ok(self.client.event_cache_store().remove_media_content_for_uri(uri).await?)
+        Ok(self.client.event_cache_store().lock().await?.remove_media_content_for_uri(uri).await?)
     }
 
     /// Get the file of the given media event content.
@@ -524,7 +530,10 @@ impl Media {
     ) -> Result<Option<Vec<u8>>> {
         let Some(source) = event_content.source() else { return Ok(None) };
         let file = self
-            .get_media_content(&MediaRequest { source, format: MediaFormat::File }, use_cache)
+            .get_media_content(
+                &MediaRequestParameters { source, format: MediaFormat::File },
+                use_cache,
+            )
             .await?;
         Ok(Some(file))
     }
@@ -539,7 +548,11 @@ impl Media {
     /// * `event_content` - The media event content.
     pub async fn remove_file(&self, event_content: &impl MediaEventContent) -> Result<()> {
         if let Some(source) = event_content.source() {
-            self.remove_media_content(&MediaRequest { source, format: MediaFormat::File }).await?;
+            self.remove_media_content(&MediaRequestParameters {
+                source,
+                format: MediaFormat::File,
+            })
+            .await?;
         }
 
         Ok(())
@@ -572,7 +585,7 @@ impl Media {
         let Some(source) = event_content.thumbnail_source() else { return Ok(None) };
         let thumbnail = self
             .get_media_content(
-                &MediaRequest { source, format: MediaFormat::Thumbnail(settings) },
+                &MediaRequestParameters { source, format: MediaFormat::Thumbnail(settings) },
                 use_cache,
             )
             .await?;
@@ -596,7 +609,7 @@ impl Media {
         settings: MediaThumbnailSettings,
     ) -> Result<()> {
         if let Some(source) = event_content.source() {
-            self.remove_media_content(&MediaRequest {
+            self.remove_media_content(&MediaRequestParameters {
                 source,
                 format: MediaFormat::Thumbnail(settings),
             })
@@ -613,7 +626,7 @@ impl Media {
         data: Vec<u8>,
         thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(MediaSource, Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
+    ) -> Result<(MediaSource, Option<(MediaSource, Box<ThumbnailInfo>)>)> {
         let upload_thumbnail = self.upload_thumbnail(thumbnail, send_progress.clone());
 
         let upload_attachment = async move {
@@ -623,10 +636,9 @@ impl Media {
                 .map_err(Error::from)
         };
 
-        let ((thumbnail_source, thumbnail_info), response) =
-            try_join(upload_thumbnail, upload_attachment).await?;
+        let (thumbnail, response) = try_join(upload_thumbnail, upload_attachment).await?;
 
-        Ok((MediaSource::Plain(response.content_uri), thumbnail_source, thumbnail_info))
+        Ok((MediaSource::Plain(response.content_uri), thumbnail))
     }
 
     /// Uploads an unencrypted thumbnail to the media repository, and returns
@@ -635,9 +647,9 @@ impl Media {
         &self,
         thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
+    ) -> Result<Option<(MediaSource, Box<ThumbnailInfo>)>> {
         let Some(thumbnail) = thumbnail else {
-            return Ok((None, None));
+            return Ok(None);
         };
 
         let response = self
@@ -654,6 +666,6 @@ impl Media {
             { mimetype: Some(thumbnail.content_type.as_ref().to_owned()) }
         );
 
-        Ok((Some(MediaSource::Plain(url)), Some(Box::new(thumbnail_info))))
+        Ok(Some((MediaSource::Plain(url), Box::new(thumbnail_info))))
     }
 }

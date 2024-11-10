@@ -30,6 +30,7 @@ use futures_util::{
     future::{try_join, try_join_all},
     stream::FuturesUnordered,
 };
+use http::StatusCode;
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 pub use identity_status_changes::IdentityStatusChanges;
 #[cfg(feature = "e2e-encryption")]
@@ -40,7 +41,7 @@ use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
-    media::{MediaThumbnailSettings, MediaThumbnailSize},
+    media::MediaThumbnailSettings,
     store::StateStoreExt,
     ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
     StateStoreDataValue,
@@ -78,7 +79,7 @@ use ruma::{
         beacon_info::BeaconInfoEventContent,
         call::notify::{ApplicationType, CallNotifyEventContent, NotifyType},
         direct::DirectEventContent,
-        marked_unread::MarkedUnreadEventContent,
+        marked_unread::{MarkedUnreadEventContent, UnstableMarkedUnreadEventContent},
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
             avatar::{self, RoomAvatarEventContent},
@@ -86,11 +87,12 @@ use ruma::{
             history_visibility::HistoryVisibility,
             message::{
                 AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
-                ImageMessageEventContent, MessageType, RoomMessageEventContent,
+                FormattedBody, ImageMessageEventContent, MessageType, RoomMessageEventContent,
                 UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock, VideoInfo,
                 VideoMessageEventContent,
             },
             name::RoomNameEventContent,
+            pinned_events::RoomPinnedEventsEventContent,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
             server_acl::RoomServerAclEventContent,
             topic::RoomTopicEventContent,
@@ -130,7 +132,7 @@ use crate::{
     error::{BeaconError, WrongRoomState},
     event_cache::{self, EventCacheDropHandles, RoomEventCache},
     event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
-    media::{MediaFormat, MediaRequest},
+    media::{MediaFormat, MediaRequestParameters},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     room::power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt},
     sync::RoomUpdate,
@@ -262,7 +264,7 @@ impl Room {
     /// ```
     pub async fn avatar(&self, format: MediaFormat) -> Result<Option<Vec<u8>>> {
         let Some(url) = self.avatar_url() else { return Ok(None) };
-        let request = MediaRequest { source: MediaSource::Plain(url.to_owned()), format };
+        let request = MediaRequestParameters { source: MediaSource::Plain(url.to_owned()), format };
         Ok(Some(self.client.media().get_media_content(&request, true).await?))
     }
 
@@ -1960,7 +1962,7 @@ impl Room {
         };
 
         #[cfg(feature = "e2e-encryption")]
-        let (media_source, thumbnail_source, thumbnail_info) = if self.is_encrypted().await? {
+        let (media_source, thumbnail) = if self.is_encrypted().await? {
             self.client
                 .upload_encrypted_media_and_thumbnail(content_type, &data, thumbnail, send_progress)
                 .await?
@@ -1979,63 +1981,54 @@ impl Room {
         };
 
         #[cfg(not(feature = "e2e-encryption"))]
-        let (media_source, thumbnail_source, thumbnail_info) = self
+        let (media_source, thumbnail) = self
             .client
             .media()
             .upload_plain_media_and_thumbnail(content_type, data.clone(), thumbnail, send_progress)
             .await?;
 
         if store_in_cache {
-            let cache_store = self.client.event_cache_store();
+            let cache_store_lock_guard = self.client.event_cache_store().lock().await?;
 
             // A failure to cache shouldn't prevent the whole upload from finishing
             // properly, so only log errors during caching.
 
             debug!("caching the media");
-            let request = MediaRequest { source: media_source.clone(), format: MediaFormat::File };
-            if let Err(err) = cache_store.add_media_content(&request, data).await {
+            let request =
+                MediaRequestParameters { source: media_source.clone(), format: MediaFormat::File };
+
+            if let Err(err) = cache_store_lock_guard.add_media_content(&request, data).await {
                 warn!("unable to cache the media after uploading it: {err}");
             }
 
             if let Some(((data, height, width), source)) =
-                thumbnail_cache_info.zip(thumbnail_source.as_ref())
+                thumbnail_cache_info.zip(thumbnail.as_ref().map(|tuple| &tuple.0))
             {
                 debug!("caching the thumbnail");
 
-                // Do a best guess at figuring the media request: not animated, cropped
-                // thumbnail of the original size.
-                let request = MediaRequest {
+                let request = MediaRequestParameters {
                     source: source.clone(),
-                    format: MediaFormat::Thumbnail(MediaThumbnailSettings {
-                        size: MediaThumbnailSize {
-                            method: ruma::media::Method::Scale,
-                            width,
-                            height,
-                        },
-                        animated: false,
-                    }),
+                    format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(width, height)),
                 };
 
-                if let Err(err) = cache_store.add_media_content(&request, data).await {
+                if let Err(err) = cache_store_lock_guard.add_media_content(&request, data).await {
                     warn!("unable to cache the media after uploading it: {err}");
                 }
             }
         }
 
-        let msg_type = self.make_attachment_message(
-            content_type,
-            media_source,
-            thumbnail_source,
-            thumbnail_info,
-            filename,
-            config,
+        let content = Self::make_attachment_event(
+            self.make_attachment_type(
+                content_type,
+                filename,
+                media_source,
+                config.caption,
+                config.formatted_caption,
+                config.info,
+                thumbnail,
+            ),
+            mentions,
         );
-
-        let mut content = RoomMessageEventContent::new(msg_type);
-
-        if let Some(mentions) = mentions {
-            content = content.add_mentions(mentions);
-        }
 
         let mut fut = self.send(content);
         if let Some(txn_id) = txn_id {
@@ -2046,33 +2039,37 @@ impl Room {
 
     /// Creates the inner [`MessageType`] for an already-uploaded media file
     /// provided by its source.
-    fn make_attachment_message(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn make_attachment_type(
         &self,
         content_type: &Mime,
-        source: MediaSource,
-        thumbnail_source: Option<MediaSource>,
-        thumbnail_info: Option<Box<ThumbnailInfo>>,
         filename: &str,
-        config: AttachmentConfig,
+        source: MediaSource,
+        caption: Option<String>,
+        formatted_caption: Option<FormattedBody>,
+        info: Option<AttachmentInfo>,
+        thumbnail: Option<(MediaSource, Box<ThumbnailInfo>)>,
     ) -> MessageType {
-        // if config.caption is set, use it as body, and filename as the file name
-        // otherwise, body is the filename, and the filename is not set.
+        // If caption is set, use it as body, and filename as the file name; otherwise,
+        // body is the filename, and the filename is not set.
         // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
-        let (body, filename) = match config.caption {
+        let (body, filename) = match caption {
             Some(caption) => (caption, Some(filename.to_owned())),
             None => (filename.to_owned(), None),
         };
 
+        let (thumbnail_source, thumbnail_info) = thumbnail.unzip();
+
         match content_type.type_() {
             mime::IMAGE => {
-                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
+                let info = assign!(info.map(ImageInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
                 });
                 let content = assign!(ImageMessageEventContent::new(body, source), {
                     info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
+                    formatted: formatted_caption,
                     filename
                 });
                 MessageType::Image(content)
@@ -2082,7 +2079,7 @@ impl Room {
                 let mut content = AudioMessageEventContent::new(body, source);
 
                 if let Some(AttachmentInfo::Voice { audio_info, waveform: Some(waveform_vec) }) =
-                    &config.info
+                    &info
                 {
                     if let Some(duration) = audio_info.duration {
                         let waveform = waveform_vec.iter().map(|v| (*v).into()).collect();
@@ -2092,7 +2089,7 @@ impl Room {
                     content.voice = Some(UnstableVoiceContentBlock::new());
                 }
 
-                let mut audio_info = config.info.map(AudioInfo::from).unwrap_or_default();
+                let mut audio_info = info.map(AudioInfo::from).unwrap_or_default();
                 audio_info.mimetype = Some(content_type.as_ref().to_owned());
                 let content = content.info(Box::new(audio_info));
 
@@ -2100,21 +2097,21 @@ impl Room {
             }
 
             mime::VIDEO => {
-                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
+                let info = assign!(info.map(VideoInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
                 });
                 let content = assign!(VideoMessageEventContent::new(body, source), {
                     info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
+                    formatted: formatted_caption,
                     filename
                 });
                 MessageType::Video(content)
             }
 
             _ => {
-                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
+                let info = assign!(info.map(FileInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
@@ -2125,6 +2122,19 @@ impl Room {
                 MessageType::File(content)
             }
         }
+    }
+
+    /// Creates the [`RoomMessageEventContent`] based on the message type and
+    /// mentions.
+    pub(crate) fn make_attachment_event(
+        msg_type: MessageType,
+        mentions: Option<Mentions>,
+    ) -> RoomMessageEventContent {
+        let mut content = RoomMessageEventContent::new(msg_type);
+        if let Some(mentions) = mentions {
+            content = content.add_mentions(mentions);
+        }
+        content
     }
 
     /// Update the power levels of a select set of users of this room.
@@ -2139,7 +2149,7 @@ impl Room {
         &self,
         updates: Vec<(&UserId, Int)>,
     ) -> Result<send_state_event::v3::Response> {
-        let mut power_levels = self.room_power_levels().await?;
+        let mut power_levels = self.power_levels().await?;
 
         for (user_id, new_level) in updates {
             if new_level == power_levels.users_default {
@@ -2157,20 +2167,10 @@ impl Room {
     /// Any values that are `None` in the given `RoomPowerLevelChanges` will
     /// remain unchanged.
     pub async fn apply_power_level_changes(&self, changes: RoomPowerLevelChanges) -> Result<()> {
-        let mut power_levels = self.room_power_levels().await?;
+        let mut power_levels = self.power_levels().await?;
         power_levels.apply(changes)?;
         self.send_state_event(RoomPowerLevelsEventContent::from(power_levels)).await?;
         Ok(())
-    }
-
-    /// Get the current power levels of this room.
-    pub async fn room_power_levels(&self) -> Result<RoomPowerLevels> {
-        Ok(self
-            .get_state_event_static::<RoomPowerLevelsEventContent>()
-            .await?
-            .ok_or(Error::InsufficientData)?
-            .deserialize()?
-            .power_levels())
     }
 
     /// Resets the room's power levels to the default values
@@ -2180,7 +2180,7 @@ impl Room {
         let default_power_levels = RoomPowerLevels::from(RoomPowerLevelsEventContent::new());
         let changes = RoomPowerLevelChanges::from(default_power_levels);
         self.apply_power_level_changes(changes).await?;
-        self.room_power_levels().await
+        Ok(self.power_levels().await?)
     }
 
     /// Gets the suggested role for the user with the provided `user_id`.
@@ -2197,14 +2197,14 @@ impl Room {
     /// This method checks the `RoomPowerLevels` events instead of loading the
     /// member list and looking for the member.
     pub async fn get_user_power_level(&self, user_id: &UserId) -> Result<i64> {
-        let event = self.room_power_levels().await?;
+        let event = self.power_levels().await?;
         Ok(event.for_user(user_id).into())
     }
 
     /// Gets a map with the `UserId` of users with power levels other than `0`
     /// and this power level.
     pub async fn users_with_power_levels(&self) -> HashMap<OwnedUserId, i64> {
-        let power_levels = self.room_power_levels().await.ok();
+        let power_levels = self.power_levels().await.ok();
         let mut user_power_levels = HashMap::<OwnedUserId, i64>::new();
         if let Some(power_levels) = power_levels {
             for (id, level) in power_levels.users.into_iter() {
@@ -2487,7 +2487,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_redact_own(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_redact_own_event(user_id))
+        Ok(self.power_levels().await?.user_can_redact_own_event(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to redact
@@ -2495,7 +2495,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_redact_other(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_redact_event_of_other(user_id))
+        Ok(self.power_levels().await?.user_can_redact_event_of_other(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to ban in the
@@ -2503,7 +2503,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_ban(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_ban(user_id))
+        Ok(self.power_levels().await?.user_can_ban(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to kick in the
@@ -2511,7 +2511,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_invite(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_invite(user_id))
+        Ok(self.power_levels().await?.user_can_invite(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to kick in the
@@ -2519,7 +2519,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_kick(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_kick(user_id))
+        Ok(self.power_levels().await?.user_can_kick(user_id))
     }
 
     /// Returns true if the user with the given user_id is able to send a
@@ -2531,7 +2531,7 @@ impl Room {
         user_id: &UserId,
         state_event: StateEventType,
     ) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_send_state(user_id, state_event))
+        Ok(self.power_levels().await?.user_can_send_state(user_id, state_event))
     }
 
     /// Returns true if the user with the given user_id is able to send a
@@ -2543,7 +2543,7 @@ impl Room {
         user_id: &UserId,
         message: MessageLikeEventType,
     ) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_send_message(user_id, message))
+        Ok(self.power_levels().await?.user_can_send_message(user_id, message))
     }
 
     /// Returns true if the user with the given user_id is able to pin or unpin
@@ -2552,7 +2552,7 @@ impl Room {
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_pin_unpin(&self, user_id: &UserId) -> Result<bool> {
         Ok(self
-            .room_power_levels()
+            .power_levels()
             .await?
             .user_can_send_state(user_id, StateEventType::RoomPinnedEvents))
     }
@@ -2562,7 +2562,7 @@ impl Room {
     ///
     /// The call may fail if there is an error in getting the power levels.
     pub async fn can_user_trigger_room_notification(&self, user_id: &UserId) -> Result<bool> {
-        Ok(self.room_power_levels().await?.user_can_trigger_room_notification(user_id))
+        Ok(self.power_levels().await?.user_can_trigger_room_notification(user_id))
     }
 
     /// Get a list of servers that should know this room.
@@ -2941,7 +2941,7 @@ impl Room {
     pub async fn set_unread_flag(&self, unread: bool) -> Result<()> {
         let user_id = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
-        let content = MarkedUnreadEventContent::new(unread);
+        let content = UnstableMarkedUnreadEventContent::from(MarkedUnreadEventContent::new(unread));
 
         let request = set_room_account_data::v3::Request::new(
             user_id.to_owned(),
@@ -3139,6 +3139,32 @@ impl Room {
             .remove_kv_data(StateStoreDataKey::ComposerDraft(self.room_id()))
             .await?;
         Ok(())
+    }
+
+    /// Load pinned state events for a room from the `/state` endpoint in the
+    /// home server.
+    pub async fn load_pinned_events(&self) -> Result<Option<Vec<OwnedEventId>>> {
+        let response = self
+            .client
+            .send(
+                get_state_events_for_key::v3::Request::new(
+                    self.room_id().to_owned(),
+                    StateEventType::RoomPinnedEvents,
+                    "".to_owned(),
+                ),
+                None,
+            )
+            .await;
+
+        match response {
+            Ok(response) => {
+                Ok(Some(response.content.deserialize_as::<RoomPinnedEventsEventContent>()?.pinned))
+            }
+            Err(http_error) => match http_error.as_client_api_error() {
+                Some(error) if error.status_code == StatusCode::NOT_FOUND => Ok(None),
+                _ => Err(http_error.into()),
+            },
+        }
     }
 }
 

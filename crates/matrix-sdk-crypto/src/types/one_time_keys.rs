@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use ruma::{serde::Raw, DeviceKeyAlgorithm};
+use ruma::{serde::Raw, OneTimeKeyAlgorithm};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{value::to_raw_value, Value};
 use vodozemac::Curve25519PublicKey;
@@ -103,27 +103,17 @@ impl SignedKey {
 pub enum OneTimeKey {
     /// A signed Curve25519 one-time key.
     SignedKey(SignedKey),
-
-    /// An unsigned Curve25519 one-time key.
-    #[serde(serialize_with = "serialize_curve_key")]
-    Key(Curve25519PublicKey),
 }
 
 impl OneTimeKey {
-    /// Deserialize the [`OneTimeKey`] from a [`DeviceKeyAlgorithm`] and a Raw
+    /// Deserialize the [`OneTimeKey`] from a [`OneTimeKeyAlgorithm`] and a Raw
     /// JSON value.
     pub fn deserialize(
-        algorithm: DeviceKeyAlgorithm,
+        algorithm: OneTimeKeyAlgorithm,
         key: &Raw<ruma::encryption::OneTimeKey>,
     ) -> Result<Self, serde_json::Error> {
         match algorithm {
-            DeviceKeyAlgorithm::Curve25519 => {
-                let key: String = key.deserialize_as()?;
-                Ok(OneTimeKey::Key(
-                    Curve25519PublicKey::from_base64(&key).map_err(serde::de::Error::custom)?,
-                ))
-            }
-            DeviceKeyAlgorithm::SignedCurve25519 => {
+            OneTimeKeyAlgorithm::SignedCurve25519 => {
                 let key: SignedKey = key.deserialize_as()?;
                 Ok(OneTimeKey::SignedKey(key))
             }
@@ -137,7 +127,6 @@ impl OneTimeKey {
     pub fn fallback(&self) -> bool {
         match self {
             OneTimeKey::SignedKey(s) => s.fallback(),
-            OneTimeKey::Key(_) => false,
         }
     }
 }

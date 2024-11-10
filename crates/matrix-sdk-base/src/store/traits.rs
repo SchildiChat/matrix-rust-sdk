@@ -16,7 +16,6 @@ use std::{
     borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     fmt,
-    ops::Deref,
     sync::Arc,
 };
 
@@ -29,20 +28,23 @@ use ruma::{
     events::{
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        AnyGlobalAccountDataEvent, AnyMessageLikeEventContent, AnyRoomAccountDataEvent,
-        EmptyStateKey, EventContent as _, GlobalAccountDataEvent, GlobalAccountDataEventContent,
-        GlobalAccountDataEventType, RawExt as _, RedactContent, RedactedStateEventContent,
-        RoomAccountDataEvent, RoomAccountDataEventContent, RoomAccountDataEventType,
-        StateEventType, StaticEventContent, StaticStateEventContent,
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, EmptyStateKey, GlobalAccountDataEvent,
+        GlobalAccountDataEventContent, GlobalAccountDataEventType, RedactContent,
+        RedactedStateEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
+        RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
     },
     serde::Raw,
     time::SystemTime,
-    EventId, OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId,
-    OwnedUserId, RoomId, TransactionId, UserId,
+    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId,
+    TransactionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{StateChanges, StoreError};
+use super::{
+    send_queue::SentRequestKey, ChildTransactionId, DependentQueuedRequest,
+    DependentQueuedRequestKind, QueueWedgeError, QueuedRequest, QueuedRequestKind, StateChanges,
+    StoreError,
+};
 use crate::{
     deserialized_responses::{RawAnySyncOrStrippedState, RawMemberEvent, RawSyncOrStrippedState},
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships,
@@ -342,7 +344,7 @@ pub trait StateStore: AsyncTraitDeps {
     /// * `room_id` - The `RoomId` of the room to delete.
     async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error>;
 
-    /// Save an event to be sent by a send queue later.
+    /// Save a request to be sent by a send queue later (e.g. sending an event).
     ///
     /// # Arguments
     ///
@@ -351,98 +353,104 @@ pub trait StateStore: AsyncTraitDeps {
     ///   (and its transaction). Note: this is expected to be randomly generated
     ///   and thus unique.
     /// * `content` - Serializable event content to be sent.
-    async fn save_send_queue_event(
+    async fn save_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
-        content: SerializableEventContent,
+        request: QueuedRequestKind,
     ) -> Result<(), Self::Error>;
 
-    /// Updates a send queue event with the given content, and resets its wedged
-    /// status to false.
+    /// Updates a send queue request with the given content, and resets its
+    /// error status.
     ///
     /// # Arguments
     ///
     /// * `room_id` - The `RoomId` of the send queue's room.
-    /// * `transaction_id` - The unique key identifying the event to be sent
+    /// * `transaction_id` - The unique key identifying the request to be sent
     ///   (and its transaction).
     /// * `content` - Serializable event content to replace the original one.
     ///
-    /// Returns true if an event has been updated, or false otherwise.
-    async fn update_send_queue_event(
+    /// Returns true if a request has been updated, or false otherwise.
+    async fn update_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
-        content: SerializableEventContent,
+        content: QueuedRequestKind,
     ) -> Result<bool, Self::Error>;
 
-    /// Remove an event previously inserted with [`Self::save_send_queue_event`]
-    /// from the database, based on its transaction id.
+    /// Remove a request previously inserted with
+    /// [`Self::save_send_queue_request`] from the database, based on its
+    /// transaction id.
     ///
-    /// Returns true if an event has been removed, or false otherwise.
-    async fn remove_send_queue_event(
+    /// Returns true if something has been removed, or false otherwise.
+    async fn remove_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
     ) -> Result<bool, Self::Error>;
 
-    /// Loads all the send queue events for the given room.
-    async fn load_send_queue_events(
+    /// Loads all the send queue requests for the given room.
+    async fn load_send_queue_requests(
         &self,
         room_id: &RoomId,
-    ) -> Result<Vec<QueuedEvent>, Self::Error>;
+    ) -> Result<Vec<QueuedRequest>, Self::Error>;
 
     /// Updates the send queue error status (wedge) for a given send queue
-    /// event.
-    /// Set `error` to None if the problem has been resolved and the event was
-    /// finally sent.
-    async fn update_send_queue_event_status(
+    /// request.
+    async fn update_send_queue_request_status(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
         error: Option<QueueWedgeError>,
     ) -> Result<(), Self::Error>;
 
-    /// Loads all the rooms which have any pending events in their send queue.
-    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error>;
+    /// Loads all the rooms which have any pending requests in their send queue.
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error>;
 
-    /// Add a new entry to the list of dependent send queue event for an event.
-    async fn save_dependent_send_queue_event(
+    /// Add a new entry to the list of dependent send queue requests for a
+    /// parent request.
+    async fn save_dependent_queued_request(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
         own_txn_id: ChildTransactionId,
-        content: DependentQueuedEventKind,
+        content: DependentQueuedRequestKind,
     ) -> Result<(), Self::Error>;
 
-    /// Update a set of dependent send queue events with an event id,
-    /// effectively marking them as ready.
+    /// Update a set of dependent send queue requests with a key identifying the
+    /// homeserver's response, effectively marking them as ready.
     ///
-    /// Returns the number of updated events.
-    async fn update_dependent_send_queue_event(
+    /// ⚠ Beware! There's no verification applied that the parent key type is
+    /// compatible with the dependent event type. The invalid state may be
+    /// lazily filtered out in `load_dependent_queued_requests`.
+    ///
+    /// Returns the number of updated requests.
+    async fn update_dependent_queued_request(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
-        event_id: OwnedEventId,
+        sent_parent_key: SentRequestKey,
     ) -> Result<usize, Self::Error>;
 
-    /// Remove a specific dependent send queue event by id.
+    /// Remove a specific dependent send queue request by id.
     ///
-    /// Returns true if the dependent send queue event has been indeed removed.
-    async fn remove_dependent_send_queue_event(
+    /// Returns true if the dependent send queue request has been indeed
+    /// removed.
+    async fn remove_dependent_queued_request(
         &self,
         room: &RoomId,
         own_txn_id: &ChildTransactionId,
     ) -> Result<bool, Self::Error>;
 
-    /// List all the dependent send queue events.
+    /// List all the dependent send queue requests.
     ///
-    /// This returns absolutely all the dependent send queue events, whether
-    /// they have an event id or not. They must be returned in insertion order.
-    async fn list_dependent_send_queue_events(
+    /// This returns absolutely all the dependent send queue requests, whether
+    /// they have a parent event id or not. As a contract for implementors, they
+    /// must be returned in insertion order.
+    async fn load_dependent_queued_requests(
         &self,
         room: &RoomId,
-    ) -> Result<Vec<DependentQueuedEvent>, Self::Error>;
+    ) -> Result<Vec<DependentQueuedRequest>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -628,93 +636,93 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         self.0.remove_room(room_id).await.map_err(Into::into)
     }
 
-    async fn save_send_queue_event(
+    async fn save_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
-        content: SerializableEventContent,
+        content: QueuedRequestKind,
     ) -> Result<(), Self::Error> {
-        self.0.save_send_queue_event(room_id, transaction_id, content).await.map_err(Into::into)
+        self.0.save_send_queue_request(room_id, transaction_id, content).await.map_err(Into::into)
     }
 
-    async fn update_send_queue_event(
+    async fn update_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
-        content: SerializableEventContent,
+        content: QueuedRequestKind,
     ) -> Result<bool, Self::Error> {
-        self.0.update_send_queue_event(room_id, transaction_id, content).await.map_err(Into::into)
+        self.0.update_send_queue_request(room_id, transaction_id, content).await.map_err(Into::into)
     }
 
-    async fn remove_send_queue_event(
+    async fn remove_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
     ) -> Result<bool, Self::Error> {
-        self.0.remove_send_queue_event(room_id, transaction_id).await.map_err(Into::into)
+        self.0.remove_send_queue_request(room_id, transaction_id).await.map_err(Into::into)
     }
 
-    async fn load_send_queue_events(
+    async fn load_send_queue_requests(
         &self,
         room_id: &RoomId,
-    ) -> Result<Vec<QueuedEvent>, Self::Error> {
-        self.0.load_send_queue_events(room_id).await.map_err(Into::into)
+    ) -> Result<Vec<QueuedRequest>, Self::Error> {
+        self.0.load_send_queue_requests(room_id).await.map_err(Into::into)
     }
 
-    async fn update_send_queue_event_status(
+    async fn update_send_queue_request_status(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
         error: Option<QueueWedgeError>,
     ) -> Result<(), Self::Error> {
         self.0
-            .update_send_queue_event_status(room_id, transaction_id, error)
+            .update_send_queue_request_status(room_id, transaction_id, error)
             .await
             .map_err(Into::into)
     }
 
-    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
-        self.0.load_rooms_with_unsent_events().await.map_err(Into::into)
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        self.0.load_rooms_with_unsent_requests().await.map_err(Into::into)
     }
 
-    async fn save_dependent_send_queue_event(
+    async fn save_dependent_queued_request(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
         own_txn_id: ChildTransactionId,
-        content: DependentQueuedEventKind,
+        content: DependentQueuedRequestKind,
     ) -> Result<(), Self::Error> {
         self.0
-            .save_dependent_send_queue_event(room_id, parent_txn_id, own_txn_id, content)
+            .save_dependent_queued_request(room_id, parent_txn_id, own_txn_id, content)
             .await
             .map_err(Into::into)
     }
 
-    async fn update_dependent_send_queue_event(
+    async fn update_dependent_queued_request(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
-        event_id: OwnedEventId,
+        sent_parent_key: SentRequestKey,
     ) -> Result<usize, Self::Error> {
         self.0
-            .update_dependent_send_queue_event(room_id, parent_txn_id, event_id)
+            .update_dependent_queued_request(room_id, parent_txn_id, sent_parent_key)
             .await
             .map_err(Into::into)
     }
 
-    async fn remove_dependent_send_queue_event(
+    async fn remove_dependent_queued_request(
         &self,
         room_id: &RoomId,
         own_txn_id: &ChildTransactionId,
     ) -> Result<bool, Self::Error> {
-        self.0.remove_dependent_send_queue_event(room_id, own_txn_id).await.map_err(Into::into)
+        self.0.remove_dependent_queued_request(room_id, own_txn_id).await.map_err(Into::into)
     }
 
-    async fn list_dependent_send_queue_events(
+    async fn load_dependent_queued_requests(
         &self,
         room_id: &RoomId,
-    ) -> Result<Vec<DependentQueuedEvent>, Self::Error> {
-        self.0.list_dependent_send_queue_events(room_id).await.map_err(Into::into)
+    ) -> Result<Vec<DependentQueuedRequest>, Self::Error> {
+        self.0.load_dependent_queued_requests(room_id).await.map_err(Into::into)
     }
 }
 
@@ -1101,210 +1109,6 @@ impl StateStoreDataKey<'_> {
     /// Key prefix to use for the [`ComposerDraft`][Self::ComposerDraft]
     /// variant.
     pub const COMPOSER_DRAFT: &'static str = "composer_draft";
-}
-
-/// A thin wrapper to serialize a `AnyMessageLikeEventContent`.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct SerializableEventContent {
-    event: Raw<AnyMessageLikeEventContent>,
-    event_type: String,
-}
-
-#[cfg(not(tarpaulin_include))]
-impl fmt::Debug for SerializableEventContent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Don't include the event in the debug display.
-        f.debug_struct("SerializedEventContent")
-            .field("event_type", &self.event_type)
-            .finish_non_exhaustive()
-    }
-}
-
-impl SerializableEventContent {
-    /// Create a [`SerializableEventContent`] from a raw
-    /// [`AnyMessageLikeEventContent`] along with its type.
-    pub fn from_raw(event: Raw<AnyMessageLikeEventContent>, event_type: String) -> Self {
-        Self { event_type, event }
-    }
-
-    /// Create a [`SerializableEventContent`] from an
-    /// [`AnyMessageLikeEventContent`].
-    pub fn new(event: &AnyMessageLikeEventContent) -> Result<Self, serde_json::Error> {
-        Ok(Self::from_raw(Raw::new(event)?, event.event_type().to_string()))
-    }
-
-    /// Convert a [`SerializableEventContent`] back into a
-    /// [`AnyMessageLikeEventContent`].
-    pub fn deserialize(&self) -> Result<AnyMessageLikeEventContent, serde_json::Error> {
-        self.event.deserialize_with_type(self.event_type.clone().into())
-    }
-
-    /// Returns the raw event content along with its type.
-    ///
-    /// Useful for callers manipulating custom events.
-    pub fn raw(self) -> (Raw<AnyMessageLikeEventContent>, String) {
-        (self.event, self.event_type)
-    }
-}
-
-/// An event to be sent with a send queue.
-#[derive(Clone)]
-pub struct QueuedEvent {
-    /// The content of the message-like event we'd like to send.
-    pub event: SerializableEventContent,
-
-    /// Unique transaction id for the queued event, acting as a key.
-    pub transaction_id: OwnedTransactionId,
-
-    /// Set when the event couldn't be sent because of an unrecoverable API
-    /// error. `None` if the event is in queue for being sent.
-    pub error: Option<QueueWedgeError>,
-}
-
-impl QueuedEvent {
-    /// True if the event couldn't be sent because of an unrecoverable API
-    /// error. See [`Self::error`] for more details on the reason.
-    pub fn is_wedged(&self) -> bool {
-        self.error.is_some()
-    }
-}
-
-/// Represents a failed to send unrecoverable error of an event sent via the
-/// send_queue.
-///
-/// It is a serializable representation of a client error, see
-/// `From` implementation for more details. These errors can not be
-/// automatically retried, but yet some manual action can be taken before retry
-/// sending. If not the only solution is to delete the local event.
-#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
-pub enum QueueWedgeError {
-    /// This error occurs when there are some insecure devices in the room, and
-    /// the current encryption setting prohibits sharing with them.
-    #[error("There are insecure devices in the room")]
-    InsecureDevices {
-        /// The insecure devices as a Map of userID to deviceID.
-        user_device_map: BTreeMap<OwnedUserId, Vec<OwnedDeviceId>>,
-    },
-
-    /// This error occurs when a previously verified user is not anymore, and
-    /// the current encryption setting prohibits sharing when it happens.
-    #[error("Some users that were previously verified are not anymore")]
-    IdentityViolations {
-        /// The users that are expected to be verified but are not.
-        users: Vec<OwnedUserId>,
-    },
-
-    /// It is required to set up cross-signing and properly verify the current
-    /// session before sending.
-    #[error("Own verification is required")]
-    CrossVerificationRequired,
-
-    /// Other errors.
-    #[error("Other unrecoverable error: {msg}")]
-    GenericApiError {
-        /// Description of the error.
-        msg: String,
-    },
-}
-
-/// The specific user intent that characterizes a [`DependentQueuedEvent`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum DependentQueuedEventKind {
-    /// The event should be edited.
-    Edit {
-        /// The new event for the content.
-        new_content: SerializableEventContent,
-    },
-
-    /// The event should be redacted/aborted/removed.
-    Redact,
-
-    /// The event should be reacted to, with the given key.
-    React {
-        /// Key used for the reaction.
-        key: String,
-    },
-}
-
-/// A transaction id identifying a [`DependentQueuedEvent`] rather than its
-/// parent [`QueuedEvent`].
-///
-/// This thin wrapper adds some safety to some APIs, making it possible to
-/// distinguish between the parent's `TransactionId` and the dependent event's
-/// own `TransactionId`.
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ChildTransactionId(OwnedTransactionId);
-
-impl ChildTransactionId {
-    /// Returns a new [`ChildTransactionId`].
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self(TransactionId::new())
-    }
-}
-
-impl Deref for ChildTransactionId {
-    type Target = TransactionId;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<String> for ChildTransactionId {
-    fn from(val: String) -> Self {
-        Self(val.into())
-    }
-}
-
-impl From<ChildTransactionId> for OwnedTransactionId {
-    fn from(val: ChildTransactionId) -> Self {
-        val.0
-    }
-}
-
-/// An event to be sent, depending on a [`QueuedEvent`] to be sent first.
-///
-/// Depending on whether the event has been sent or not, this will either update
-/// the local echo in the storage, or send an event equivalent to the user
-/// intent to the homeserver.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DependentQueuedEvent {
-    /// Unique identifier for this dependent queued event.
-    ///
-    /// Useful for deletion.
-    pub own_transaction_id: ChildTransactionId,
-
-    /// The kind of user intent.
-    pub kind: DependentQueuedEventKind,
-
-    /// Transaction id for the parent's local echo / used in the server request.
-    ///
-    /// Note: this is the transaction id used for the depended-on event, i.e.
-    /// the one that was originally sent and that's being modified with this
-    /// dependent event.
-    pub parent_transaction_id: OwnedTransactionId,
-
-    /// If the parent event has been sent, the parent's event identifier
-    /// returned by the server once the local echo has been sent out.
-    ///
-    /// Note: this is the event id used for the depended-on event after it's
-    /// been sent, not for a possible event that could have been sent
-    /// because of this [`DependentQueuedEvent`].
-    pub event_id: Option<OwnedEventId>,
-}
-
-#[cfg(not(tarpaulin_include))]
-impl fmt::Debug for QueuedEvent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Hide the content from the debug log.
-        f.debug_struct("QueuedEvent")
-            .field("transaction_id", &self.transaction_id)
-            .field("is_wedged", &self.is_wedged())
-            .finish_non_exhaustive()
-    }
 }
 
 #[cfg(test)]

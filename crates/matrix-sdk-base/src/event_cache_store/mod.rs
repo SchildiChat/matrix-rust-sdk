@@ -19,7 +19,7 @@
 //! into the event cache for the actual storage. By default this brings an
 //! in-memory store.
 
-use std::str::Utf8Error;
+use std::{fmt, ops::Deref, str::Utf8Error, sync::Arc};
 
 #[cfg(any(test, feature = "testing"))]
 #[macro_use]
@@ -27,6 +27,9 @@ pub mod integration_tests;
 mod memory_store;
 mod traits;
 
+use matrix_sdk_common::store_locks::{
+    BackingStore, CrossProcessStoreLock, CrossProcessStoreLockGuard, LockStoreError,
+};
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 
 #[cfg(any(test, feature = "testing"))]
@@ -35,6 +38,78 @@ pub use self::{
     memory_store::MemoryStore,
     traits::{DynEventCacheStore, EventCacheStore, IntoEventCacheStore},
 };
+
+/// The high-level public type to represent an `EventCacheStore` lock.
+#[derive(Clone)]
+pub struct EventCacheStoreLock {
+    /// The inner cross process lock that is used to lock the `EventCacheStore`.
+    cross_process_lock: CrossProcessStoreLock<LockableEventCacheStore>,
+
+    /// The store itself.
+    ///
+    /// That's the only place where the store exists.
+    store: Arc<DynEventCacheStore>,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for EventCacheStoreLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("EventCacheStoreLock").finish_non_exhaustive()
+    }
+}
+
+impl EventCacheStoreLock {
+    /// Create a new lock around the [`EventCacheStore`].
+    pub fn new<S>(store: S, key: String, holder: String) -> Self
+    where
+        S: IntoEventCacheStore,
+    {
+        let store = store.into_event_cache_store();
+
+        Self {
+            cross_process_lock: CrossProcessStoreLock::new(
+                LockableEventCacheStore(store.clone()),
+                key,
+                holder,
+            ),
+            store,
+        }
+    }
+
+    /// Acquire a spin lock (see [`CrossProcessStoreLock::spin_lock`]).
+    pub async fn lock(&self) -> Result<EventCacheStoreLockGuard<'_>, LockStoreError> {
+        let cross_process_lock_guard = self.cross_process_lock.spin_lock(None).await?;
+
+        Ok(EventCacheStoreLockGuard { cross_process_lock_guard, store: self.store.deref() })
+    }
+}
+
+/// An RAII implementation of a “scoped lock” of an [`EventCacheStoreLock`].
+/// When this structure is dropped (falls out of scope), the lock will be
+/// unlocked.
+pub struct EventCacheStoreLockGuard<'a> {
+    /// The cross process lock guard.
+    #[allow(unused)]
+    cross_process_lock_guard: CrossProcessStoreLockGuard,
+
+    /// A reference to the store.
+    store: &'a DynEventCacheStore,
+}
+
+#[cfg(not(tarpaulin_include))]
+impl<'a> fmt::Debug for EventCacheStoreLockGuard<'a> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("EventCacheStoreLockGuard").finish_non_exhaustive()
+    }
+}
+
+impl<'a> Deref for EventCacheStoreLockGuard<'a> {
+    type Target = DynEventCacheStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.store
+    }
+}
 
 /// Event cache store specific error type.
 #[derive(Debug, thiserror::Error)]
@@ -83,3 +158,23 @@ impl EventCacheStoreError {
 
 /// An `EventCacheStore` specific result type.
 pub type Result<T, E = EventCacheStoreError> = std::result::Result<T, E>;
+
+/// A type that wraps the [`EventCacheStore`] but implements [`BackingStore`] to
+/// make it usable inside the cross process lock.
+#[derive(Clone, Debug)]
+struct LockableEventCacheStore(Arc<DynEventCacheStore>);
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl BackingStore for LockableEventCacheStore {
+    type LockError = EventCacheStoreError;
+
+    async fn try_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> std::result::Result<bool, Self::LockError> {
+        self.0.try_take_leased_lock(lease_duration_ms, key, holder).await
+    }
+}

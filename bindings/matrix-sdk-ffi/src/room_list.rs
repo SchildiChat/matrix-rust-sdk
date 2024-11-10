@@ -1,12 +1,6 @@
 #![allow(deprecated)]
 
-use std::{
-    fmt::Debug,
-    mem::{ManuallyDrop, MaybeUninit},
-    ptr::addr_of_mut,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt::Debug, mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, time::Duration};
 
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt, TryFutureExt};
@@ -35,6 +29,7 @@ use crate::{
     room_preview::RoomPreview,
     timeline::{EventTimelineItem, Timeline},
     timeline_event_filter::TimelineEventTypeFilter,
+    utils::AsyncRuntimeDropped,
     TaskHandle, RUNTIME,
 };
 
@@ -196,7 +191,6 @@ impl RoomList {
         listener: Box<dyn RoomListEntriesListener>,
     ) -> Arc<RoomListEntriesWithDynamicAdaptersResult> {
         let this = self.clone();
-        let client = self.room_list_service.inner.client();
         let utd_hook = self.room_list_service.utd_hook.clone();
 
         // The following code deserves a bit of explanation.
@@ -244,10 +238,7 @@ impl RoomList {
         // borrowing `this`, which is going to live long enough since it will live as
         // long as `entries_stream` and `dynamic_entries_controller`.
         let (entries_stream, dynamic_entries_controller) =
-            this.inner.entries_with_dynamic_adapters(
-                page_size.try_into().unwrap(),
-                client.room_info_notable_update_receiver(),
-            );
+            this.inner.entries_with_dynamic_adapters(page_size.try_into().unwrap());
 
         // FFI dance to make those values consumable by foreign language, nothing fancy
         // here, that's the real code for this method.
@@ -651,7 +642,7 @@ impl RoomListItem {
 
         let room_preview = client.get_room_preview(&room_or_alias_id, server_names).await?;
 
-        Ok(Arc::new(RoomPreview::new(ManuallyDrop::new(client), room_preview)))
+        Ok(Arc::new(RoomPreview::new(AsyncRuntimeDropped::new(client), room_preview)))
     }
 
     /// Build a full `Room` FFI object, filling its associated timeline.

@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    mem::ManuallyDrop,
     path::Path,
     sync::{Arc, RwLock},
 };
@@ -9,7 +8,8 @@ use std::{
 use anyhow::{anyhow, Context as _};
 use matrix_sdk::{
     media::{
-        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequest, MediaThumbnailSettings,
+        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
+        MediaThumbnailSettings,
     },
     oidc::{
         registrations::{ClientId, OidcRegistrations},
@@ -23,9 +23,9 @@ use matrix_sdk::{
         },
         OidcAuthorizationData, OidcSession,
     },
+    reqwest::StatusCode,
     ruma::{
         api::client::{
-            media::get_content_thumbnail::v3::Method,
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
             session::get_login_types,
@@ -41,7 +41,7 @@ use matrix_sdk::{
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
     },
     sliding_sync::Version as SdkSlidingSyncVersion,
-    AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
+    AuthApi, AuthSession, Client as MatrixClient, HttpError, SessionChange, SessionTokens,
 };
 use matrix_sdk_ui::notification_client::{
     NotificationClient as MatrixNotificationClient,
@@ -79,6 +79,7 @@ use crate::{
     ruma::AuthData,
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
+    utils::AsyncRuntimeDropped,
     ClientError,
 };
 
@@ -184,24 +185,10 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 
 #[derive(uniffi::Object)]
 pub struct Client {
-    pub(crate) inner: ManuallyDrop<MatrixClient>,
+    pub(crate) inner: AsyncRuntimeDropped<MatrixClient>,
     delegate: RwLock<Option<Arc<dyn ClientDelegate>>>,
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
-}
-
-impl Drop for Client {
-    fn drop(&mut self) {
-        // Dropping the inner OlmMachine must happen within a tokio context
-        // because deadpool drops sqlite connections in the DB pool on tokio's
-        // blocking threadpool to avoid blocking async worker threads.
-        let _guard = RUNTIME.enter();
-        // SAFETY: self.inner is never used again, which is the only requirement
-        //         for ManuallyDrop::drop to be used safely.
-        unsafe {
-            ManuallyDrop::drop(&mut self.inner);
-        }
-    }
 }
 
 impl Client {
@@ -224,7 +211,7 @@ impl Client {
         });
 
         let client = Client {
-            inner: ManuallyDrop::new(sdk_client),
+            inner: AsyncRuntimeDropped::new(sdk_client),
             delegate: RwLock::new(None),
             session_verification_controller,
         };
@@ -455,7 +442,7 @@ impl Client {
             .inner
             .media()
             .get_media_file(
-                &MediaRequest { source, format: MediaFormat::File },
+                &MediaRequestParameters { source, format: MediaFormat::File },
                 filename,
                 &mime_type,
                 use_cache,
@@ -503,7 +490,7 @@ impl Client {
         Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
             // Respawn tasks for rooms that had unsent events. At this point we've just
             // created the subscriber, so it'll be notified about errors.
-            q.respawn_tasks_for_rooms_with_unsent_events().await;
+            q.respawn_tasks_for_rooms_with_unsent_requests().await;
 
             loop {
                 match subscriber.recv().await {
@@ -606,6 +593,10 @@ impl Client {
         &self,
         action: Option<AccountManagementAction>,
     ) -> Result<Option<String>, ClientError> {
+        if !matches!(self.inner.auth_api(), Some(AuthApi::Oidc(..))) {
+            return Ok(None);
+        }
+
         match self.inner.oidc().account_management_url(action.map(Into::into)).await {
             Ok(url) => Ok(url.map(|u| u.to_string())),
             Err(e) => {
@@ -735,10 +726,11 @@ impl Client {
     ) -> Result<Vec<u8>, ClientError> {
         let source = (*media_source).clone();
 
+        debug!(?source, "requesting media file");
         Ok(self
             .inner
             .media()
-            .get_media_content(&MediaRequest { source, format: MediaFormat::File }, true)
+            .get_media_content(&MediaRequestParameters { source, format: MediaFormat::File }, true)
             .await?)
     }
 
@@ -750,14 +742,14 @@ impl Client {
     ) -> Result<Vec<u8>, ClientError> {
         let source = (*media_source).clone();
 
+        debug!(source = ?media_source, width, height, "requesting media thumbnail");
         Ok(self
             .inner
             .media()
             .get_media_content(
-                &MediaRequest {
+                &MediaRequestParameters {
                     source,
                     format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
-                        Method::Scale,
                         UInt::new(width).unwrap(),
                         UInt::new(height).unwrap(),
                     )),
@@ -1046,10 +1038,21 @@ impl Client {
     pub async fn resolve_room_alias(
         &self,
         room_alias: String,
-    ) -> Result<ResolvedRoomAlias, ClientError> {
+    ) -> Result<Option<ResolvedRoomAlias>, ClientError> {
         let room_alias = RoomAliasId::parse(&room_alias)?;
-        let response = self.inner.resolve_room_alias(&room_alias).await?;
-        Ok(response.into())
+        match self.inner.resolve_room_alias(&room_alias).await {
+            Ok(response) => Ok(Some(response.into())),
+            Err(HttpError::Reqwest(http_error)) => match http_error.status() {
+                Some(StatusCode::NOT_FOUND) => Ok(None),
+                _ => Err(http_error.into()),
+            },
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Checks if a room alias exists in the current homeserver.
+    pub async fn room_alias_exists(&self, room_alias: String) -> Result<bool, ClientError> {
+        self.resolve_room_alias(room_alias).await.map(|ret| ret.is_some())
     }
 
     /// Given a room id, get the preview of a room, to interact with it.
@@ -1134,6 +1137,23 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Checks if a room alias is available in the current homeserver.
+    pub async fn is_room_alias_available(&self, alias: String) -> Result<bool, ClientError> {
+        let alias = RoomAliasId::parse(alias)?;
+        match self.inner.resolve_room_alias(&alias).await {
+            // The room alias was resolved, so it's already in use.
+            Ok(_) => Ok(false),
+            Err(HttpError::Reqwest(error)) => {
+                match error.status() {
+                    // The room alias wasn't found, so it's available.
+                    Some(StatusCode::NOT_FOUND) => Ok(true),
+                    _ => Err(HttpError::Reqwest(error).into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

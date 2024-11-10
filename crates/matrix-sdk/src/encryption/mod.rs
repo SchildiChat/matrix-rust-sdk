@@ -459,7 +459,7 @@ impl Client {
         data: &[u8],
         thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(MediaSource, Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
+    ) -> Result<(MediaSource, Option<(MediaSource, Box<ThumbnailInfo>)>)> {
         let upload_thumbnail =
             self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
 
@@ -470,10 +470,9 @@ impl Client {
                 .await
         };
 
-        let ((thumbnail_source, thumbnail_info), file) =
-            try_join(upload_thumbnail, upload_attachment).await?;
+        let (thumbnail, file) = try_join(upload_thumbnail, upload_attachment).await?;
 
-        Ok((MediaSource::Encrypted(Box::new(file)), thumbnail_source, thumbnail_info))
+        Ok((MediaSource::Encrypted(Box::new(file)), thumbnail))
     }
 
     /// Uploads an encrypted thumbnail to the media repository, and returns
@@ -483,9 +482,9 @@ impl Client {
         thumbnail: Option<Thumbnail>,
         content_type: &mime::Mime,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
+    ) -> Result<Option<(MediaSource, Box<ThumbnailInfo>)>> {
         let Some(thumbnail) = thumbnail else {
-            return Ok((None, None));
+            return Ok(None);
         };
 
         let mut cursor = Cursor::new(thumbnail.data);
@@ -501,7 +500,7 @@ impl Client {
                     mimetype: Some(thumbnail.content_type.as_ref().to_owned())
                 });
 
-        Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
+        Ok(Some((MediaSource::Encrypted(Box::new(file)), Box::new(thumbnail_info))))
     }
 
     /// Claim one-time keys creating new Olm sessions.
@@ -775,7 +774,7 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn verification_state(&self) -> Subscriber<VerificationState> {
-        self.client.inner.verification_state.subscribe()
+        self.client.inner.verification_state.subscribe_reset()
     }
 
     /// Get a verification object with the given flow id.
@@ -1605,6 +1604,10 @@ impl Encryption {
 
         let this = self.clone();
         tasks.setup_e2ee = Some(spawn(async move {
+            // Update the current state first, so we don't have to wait for the result of
+            // network requests
+            this.update_verification_state().await;
+
             if this.settings().auto_enable_cross_signing {
                 if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
                     error!("Couldn't bootstrap cross signing {e:?}");
@@ -1617,8 +1620,6 @@ impl Encryption {
             if let Err(e) = this.recovery().setup().await {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
-
-            this.update_verification_state().await;
         }));
     }
 
@@ -1697,7 +1698,14 @@ impl Encryption {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        ops::Not,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use matrix_sdk_base::SessionMeta;
     use matrix_sdk_test::{
@@ -1712,13 +1720,15 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         matchers::{header, method, path_regex},
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, ResponseTemplate,
     };
 
     use crate::{
+        assert_next_matches_with_timeout,
         config::RequestConfig,
+        encryption::VerificationState,
         matrix_auth::{MatrixSession, MatrixSessionTokens},
-        test_utils::logged_in_client,
+        test_utils::{logged_in_client, no_retry_test_client, set_client_session},
         Client,
     };
 
@@ -2017,5 +2027,41 @@ mod tests {
         // Re-taking the lock doesn't update the olm machine.
         let after_taking_lock_second_time = client.olm_machine().await.as_ref().unwrap().clone();
         assert!(after_taking_lock_first_time.same_as(&after_taking_lock_second_time));
+    }
+
+    #[async_test]
+    async fn test_update_verification_state_is_updated_before_any_requests_happen() {
+        // Given a client and a server
+        let client = no_retry_test_client(None).await;
+        let server = MockServer::start().await;
+
+        // When we subscribe to its verification state
+        let mut verification_state = client.encryption().verification_state();
+
+        // We can get its initial value, and it's Unknown
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unknown);
+
+        // We set up a mocked request to check this endpoint is not called before
+        // reading the new state
+        let keys_requested = Arc::new(AtomicBool::new(false));
+        let inner_bool = keys_requested.clone();
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/_matrix/client/r0/user/.*/account_data/m.secret_storage.default_key",
+            ))
+            .respond_with(move |_req: &Request| {
+                inner_bool.fetch_or(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            })
+            .mount(&server)
+            .await;
+
+        // When the session is initialised and the encryption tasks spawn
+        set_client_session(&client).await;
+
+        // Then we can get an updated value without waiting for any network requests
+        assert!(keys_requested.load(Ordering::SeqCst).not());
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unverified);
     }
 }

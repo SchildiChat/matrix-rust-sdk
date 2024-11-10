@@ -1,7 +1,7 @@
 use matrix_sdk::{
     config::RequestConfig,
     matrix_auth::{MatrixSession, MatrixSessionTokens},
-    media::{MediaFormat, MediaRequest, MediaThumbnailSettings, MediaThumbnailSize},
+    media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     test_utils::logged_in_client_with_server,
     Client, SessionMeta,
 };
@@ -35,7 +35,7 @@ async fn test_get_media_content_no_auth() {
 
     let media = client.media();
 
-    let request = MediaRequest {
+    let request = MediaRequestParameters {
         source: MediaSource::Plain(mxc_uri!("mxc://localhost/textfile").to_owned()),
         format: MediaFormat::File,
     };
@@ -161,7 +161,7 @@ async fn test_get_media_file_no_auth() {
         .media()
         .get_thumbnail(
             &event_content,
-            MediaThumbnailSettings::new(Method::Scale, uint!(100), uint!(100)),
+            MediaThumbnailSettings::with_method(Method::Scale, uint!(100), uint!(100)),
             true,
         )
         .await
@@ -183,7 +183,9 @@ async fn test_get_media_file_no_auth() {
         .await;
 
     let settings = MediaThumbnailSettings {
-        size: MediaThumbnailSize { method: Method::Crop, width: uint!(100), height: uint!(100) },
+        method: Method::Crop,
+        width: uint!(100),
+        height: uint!(100),
         animated: true,
     };
     client.media().get_thumbnail(&event_content, settings, true).await.unwrap();
@@ -270,7 +272,7 @@ async fn test_get_media_file_with_auth_matrix_1_11() {
         .media()
         .get_thumbnail(
             &event_content,
-            MediaThumbnailSettings::new(Method::Scale, uint!(100), uint!(100)),
+            MediaThumbnailSettings::with_method(Method::Scale, uint!(100), uint!(100)),
             true,
         )
         .await
@@ -293,7 +295,9 @@ async fn test_get_media_file_with_auth_matrix_1_11() {
         .await;
 
     let settings = MediaThumbnailSettings {
-        size: MediaThumbnailSize { method: Method::Crop, width: uint!(100), height: uint!(100) },
+        method: Method::Crop,
+        width: uint!(100),
+        height: uint!(100),
         animated: true,
     };
     client.media().get_thumbnail(&event_content, settings, true).await.unwrap();
@@ -383,7 +387,7 @@ async fn test_get_media_file_with_auth_matrix_stable_feature() {
         .media()
         .get_thumbnail(
             &event_content,
-            MediaThumbnailSettings::new(Method::Scale, uint!(100), uint!(100)),
+            MediaThumbnailSettings::with_method(Method::Scale, uint!(100), uint!(100)),
             true,
         )
         .await
@@ -406,7 +410,9 @@ async fn test_get_media_file_with_auth_matrix_stable_feature() {
         .await;
 
     let settings = MediaThumbnailSettings {
-        size: MediaThumbnailSize { method: Method::Crop, width: uint!(100), height: uint!(100) },
+        method: Method::Crop,
+        width: uint!(100),
+        height: uint!(100),
         animated: true,
     };
     client.media().get_thumbnail(&event_content, settings, true).await.unwrap();

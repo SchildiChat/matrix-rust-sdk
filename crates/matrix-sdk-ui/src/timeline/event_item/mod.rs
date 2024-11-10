@@ -158,9 +158,18 @@ impl EventTimelineItem {
         let event_id = event.event_id().to_owned();
         let is_own = client.user_id().map(|uid| uid == sender).unwrap_or(false);
 
+        // Get the room's power levels for calculating the latest event
+        let power_levels = if let Some(room) = client.get_room(room_id) {
+            room.power_levels().await.ok()
+        } else {
+            None
+        };
+        let room_power_levels_info = client.user_id().zip(power_levels.as_ref());
+
         // If we don't (yet) know how to handle this type of message, return `None`
         // here. If we do, convert it into a `TimelineItemContent`.
-        let content = TimelineItemContent::from_latest_event_content(event)?;
+        let content =
+            TimelineItemContent::from_latest_event_content(event, room_power_levels_info)?;
 
         // We don't currently bundle any reactions with the main event. This could
         // conceivably be wanted in the message preview in future.
@@ -733,7 +742,7 @@ mod tests {
     };
 
     use super::{EventTimelineItem, Profile};
-    use crate::timeline::TimelineDetails;
+    use crate::timeline::{MembershipChange, TimelineDetails, TimelineItemContent};
 
     #[async_test]
     async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item() {
@@ -761,6 +770,62 @@ mod tests {
             assert_eq!(formatted.body, "<b>My M</b>");
         } else {
             panic!("Unexpected message type");
+        }
+    }
+
+    #[async_test]
+    async fn test_latest_knock_member_state_event_can_be_wrapped_as_a_timeline_item() {
+        // Given a sync knock member state event that is suitable to be used as a
+        // latest_event
+
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+        let raw_event = member_event_as_state_event(
+            room_id,
+            user_id,
+            "knock",
+            "Alice Margatroid",
+            "mxc://e.org/SEs",
+        );
+        let client = logged_in_client(None).await;
+
+        // Add power levels state event, otherwise the knock state event can't be used
+        // as the latest event
+        let power_level_event = sync_state_event!({
+            "type": "m.room.power_levels",
+            "content": {},
+            "event_id": "$143278582443PhrSn:example.org",
+            "origin_server_ts": 143273581,
+            "room_id": room_id,
+            "sender": user_id,
+            "state_key": "",
+            "unsigned": {
+              "age": 1234
+            }
+        });
+        let mut room = http::response::Room::new();
+        room.required_state.push(power_level_event);
+
+        // And the room is stored in the client so it can be extracted when needed
+        let response = response_with_room(room_id, room);
+        client.process_sliding_sync_test_helper(&response).await.unwrap();
+
+        // When we construct a timeline event from it
+        let event = SyncTimelineEvent::new(raw_event.cast());
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        // Then its properties correctly translate
+        assert_eq!(timeline_item.sender, user_id);
+        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
+        assert_eq!(timeline_item.timestamp.0, UInt::new(143273583).unwrap());
+        if let TimelineItemContent::MembershipChange(change) = timeline_item.content {
+            assert_eq!(change.user_id, user_id);
+            assert_matches!(change.change, Some(MembershipChange::Knocked));
+        } else {
+            panic!("Unexpected state event type");
         }
     }
 
@@ -885,6 +950,7 @@ mod tests {
         room.required_state.push(member_event_as_state_event(
             room_id,
             user_id,
+            "join",
             "Alice Margatroid",
             "mxc://e.org/SEs",
         ));
@@ -987,6 +1053,7 @@ mod tests {
     fn member_event_as_state_event(
         room_id: &RoomId,
         user_id: &UserId,
+        membership: &str,
         display_name: &str,
         avatar_url: &str,
     ) -> Raw<AnySyncStateEvent> {
@@ -995,15 +1062,14 @@ mod tests {
             "content": {
                 "avatar_url": avatar_url,
                 "displayname": display_name,
-                "membership": "join",
+                "membership": membership,
                 "reason": ""
             },
             "event_id": "$143273582443PhrSn:example.org",
             "origin_server_ts": 143273583,
             "room_id": room_id,
-            "sender": "@example:example.org",
+            "sender": user_id,
             "state_key": user_id,
-            "type": "m.room.member",
             "unsigned": {
               "age": 1234
             }

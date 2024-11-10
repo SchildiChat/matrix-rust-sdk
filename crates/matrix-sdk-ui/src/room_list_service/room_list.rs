@@ -122,8 +122,10 @@ impl RoomList {
     }
 
     /// Get a subscriber to the room list loading state.
+    ///
+    /// This method will send out the current loading state as the first update.
     pub fn loading_state(&self) -> Subscriber<RoomListLoadingState> {
-        self.loading_state.subscribe()
+        self.loading_state.subscribe_reset()
     }
 
     /// Get a stream of rooms.
@@ -152,8 +154,8 @@ impl RoomList {
     pub fn entries_with_dynamic_adapters(
         &self,
         page_size: usize,
-        room_info_notable_update_receiver: broadcast::Receiver<RoomInfoNotableUpdate>,
     ) -> (impl Stream<Item = Vec<VectorDiff<Room>>> + '_, RoomListDynamicEntriesController) {
+        let room_info_notable_update_receiver = self.client.room_info_notable_update_receiver();
         let list = self.sliding_sync_list.clone();
 
         let filter_fn_cell = AsyncCell::shared();

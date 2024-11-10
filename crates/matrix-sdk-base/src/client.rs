@@ -14,11 +14,11 @@
 // limitations under the License.
 
 #[cfg(feature = "e2e-encryption")]
-use std::ops::Deref;
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, iter,
-    sync::Arc,
+    ops::Deref,
 };
 
 use eyeball::{SharedObservable, Subscriber};
@@ -43,6 +43,7 @@ use ruma::{
     api::client as api,
     events::{
         ignored_user_list::IgnoredUserListEvent,
+        marked_unread::MarkedUnreadEventContent,
         push_rules::{PushRulesEvent, PushRulesEventContent},
         room::{
             member::{MembershipState, RoomMemberEventContent, SyncRoomMemberEvent},
@@ -71,7 +72,7 @@ use crate::RoomMemberships;
 use crate::{
     deserialized_responses::{RawAnySyncOrStrippedTimelineEvent, SyncTimelineEvent},
     error::{Error, Result},
-    event_cache_store::DynEventCacheStore,
+    event_cache_store::EventCacheStoreLock,
     response_processors::AccountDataProcessor,
     rooms::{
         normal::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons},
@@ -93,25 +94,28 @@ use crate::{
 pub struct BaseClient {
     /// Database
     pub(crate) store: Store,
+
     /// The store used by the event cache.
-    event_cache_store: Arc<DynEventCacheStore>,
+    event_cache_store: EventCacheStoreLock,
+
     /// The store used for encryption.
     ///
     /// This field is only meant to be used for `OlmMachine` initialization.
     /// All operations on it happen inside the `OlmMachine`.
     #[cfg(feature = "e2e-encryption")]
     crypto_store: Arc<DynCryptoStore>,
+
     /// The olm-machine that is created once the
     /// [`SessionMeta`][crate::session::SessionMeta] is set via
     /// [`BaseClient::set_session_meta`]
     #[cfg(feature = "e2e-encryption")]
     olm_machine: Arc<RwLock<Option<OlmMachine>>>,
+
     /// Observable of when a user is ignored/unignored.
     pub(crate) ignore_user_list_changes: SharedObservable<Vec<String>>,
 
     /// A sender that is used to communicate changes to room information. Each
-    /// event contains the room and a boolean whether this event should
-    /// trigger a room list update.
+    /// tick contains the room ID and the reasons that have generated this tick.
     pub(crate) room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
 
     /// The strategy to use for picking recipient devices, when sending an
@@ -246,14 +250,13 @@ impl BaseClient {
     }
 
     /// Get a reference to the store.
-    #[allow(unknown_lints, clippy::explicit_auto_deref)]
     pub fn store(&self) -> &DynStateStore {
-        &*self.store
+        self.store.deref()
     }
 
     /// Get a reference to the event cache store.
-    pub fn event_cache_store(&self) -> &DynEventCacheStore {
-        &*self.event_cache_store
+    pub fn event_cache_store(&self) -> &EventCacheStoreLock {
+        &self.event_cache_store
     }
 
     /// Is the client logged in.
@@ -684,6 +687,25 @@ impl BaseClient {
             }
         }
 
+        // Helper to update the unread marker for stable and unstable prefixes.
+        fn on_unread_marker(
+            room_id: &RoomId,
+            content: &MarkedUnreadEventContent,
+            room_info: &mut RoomInfo,
+            room_info_notable_updates: &mut BTreeMap<OwnedRoomId, RoomInfoNotableUpdateReasons>,
+        ) {
+            if room_info.base_info.is_marked_unread != content.unread {
+                // Notify the room list about a manual read marker change if the
+                // value's changed.
+                room_info_notable_updates
+                    .entry(room_id.to_owned())
+                    .or_default()
+                    .insert(RoomInfoNotableUpdateReasons::UNREAD_MARKER);
+            }
+
+            room_info.base_info.is_marked_unread = content.unread;
+        }
+
         // Handle new events.
         for raw_event in events {
             match raw_event.deserialize() {
@@ -693,19 +715,24 @@ impl BaseClient {
                     match event {
                         AnyRoomAccountDataEvent::MarkedUnread(event) => {
                             on_room_info(room_id, changes, self, |room_info| {
-                                if room_info.base_info.is_marked_unread != event.content.unread {
-                                    // Notify the room list about a manual read marker change if the
-                                    // value's changed.
-                                    room_info_notable_updates
-                                        .entry(room_id.to_owned())
-                                        .or_default()
-                                        .insert(RoomInfoNotableUpdateReasons::UNREAD_MARKER);
-                                }
-
-                                room_info.base_info.is_marked_unread = event.content.unread;
+                                on_unread_marker(
+                                    room_id,
+                                    &event.content,
+                                    room_info,
+                                    room_info_notable_updates,
+                                );
                             });
                         }
-
+                        AnyRoomAccountDataEvent::UnstableMarkedUnread(event) => {
+                            on_room_info(room_id, changes, self, |room_info| {
+                                on_unread_marker(
+                                    room_id,
+                                    &event.content.0,
+                                    room_info,
+                                    room_info_notable_updates,
+                                );
+                            });
+                        }
                         AnyRoomAccountDataEvent::Tag(event) => {
                             on_room_info(room_id, changes, self, |room_info| {
                                 room_info.base_info.handle_notable_tags(&event.content.tags);
@@ -790,6 +817,8 @@ impl BaseClient {
         room: &Room,
     ) -> Option<(Box<LatestEvent>, usize)> {
         let enc_events = room.latest_encrypted_events();
+        let power_levels = room.power_levels().await.ok();
+        let power_levels_info = Some(room.own_user_id()).zip(power_levels.as_ref());
 
         // Walk backwards through the encrypted events, looking for one we can decrypt
         for (i, event) in enc_events.iter().enumerate().rev() {
@@ -803,13 +832,13 @@ impl BaseClient {
                 // We found an event we can decrypt
                 if let Ok(any_sync_event) = decrypted.raw().deserialize() {
                     // We can deserialize it to find its type
-                    match is_suitable_for_latest_event(&any_sync_event) {
+                    match is_suitable_for_latest_event(&any_sync_event, power_levels_info) {
                         PossibleLatestEvent::YesRoomMessage(_)
                         | PossibleLatestEvent::YesPoll(_)
                         | PossibleLatestEvent::YesCallInvite(_)
                         | PossibleLatestEvent::YesCallNotify(_)
-                        | PossibleLatestEvent::YesSticker(_) => {
-                            // The event is the right type for us to use as latest_event
+                        | PossibleLatestEvent::YesSticker(_)
+                        | PossibleLatestEvent::YesKnockedStateEvent(_) => {
                             return Some((Box::new(LatestEvent::new(decrypted)), i));
                         }
                         _ => (),

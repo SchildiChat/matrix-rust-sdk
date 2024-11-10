@@ -58,7 +58,7 @@ use crate::{
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait BackingStore {
-    type Error: Error + Send + Sync;
+    type LockError: Error + Send + Sync;
 
     /// Try to take a lock using the given store.
     async fn try_lock(
@@ -66,7 +66,7 @@ pub trait BackingStore {
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> Result<bool, Self::Error>;
+    ) -> Result<bool, Self::LockError>;
 }
 
 /// Small state machine to handle wait times.
@@ -338,7 +338,7 @@ pub enum LockStoreError {
 mod tests {
     use std::{
         collections::HashMap,
-        sync::{atomic, Arc, Mutex},
+        sync::{atomic, Arc, RwLock},
         time::Instant,
     };
 
@@ -350,47 +350,18 @@ mod tests {
     };
 
     use super::{
-        BackingStore, CrossProcessStoreLock, CrossProcessStoreLockGuard, LockStoreError,
-        EXTEND_LEASE_EVERY_MS,
+        memory_store_helper::try_take_leased_lock, BackingStore, CrossProcessStoreLock,
+        CrossProcessStoreLockGuard, LockStoreError, EXTEND_LEASE_EVERY_MS,
     };
 
     #[derive(Clone, Default)]
     struct TestStore {
-        leases: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+        leases: Arc<RwLock<HashMap<String, (String, Instant)>>>,
     }
 
     impl TestStore {
         fn try_take_leased_lock(&self, lease_duration_ms: u32, key: &str, holder: &str) -> bool {
-            let now = Instant::now();
-            let expiration = now + Duration::from_millis(lease_duration_ms.into());
-            let mut leases = self.leases.lock().unwrap();
-            if let Some(prev) = leases.get_mut(key) {
-                if prev.0 == holder {
-                    // We had the lease before, extend it.
-                    prev.1 = expiration;
-                    true
-                } else {
-                    // We didn't have it.
-                    if prev.1 < now {
-                        // Steal it!
-                        prev.0 = holder.to_owned();
-                        prev.1 = expiration;
-                        true
-                    } else {
-                        // We tried our best.
-                        false
-                    }
-                }
-            } else {
-                leases.insert(
-                    key.to_owned(),
-                    (
-                        holder.to_owned(),
-                        Instant::now() + Duration::from_millis(lease_duration_ms.into()),
-                    ),
-                );
-                true
-            }
+            try_take_leased_lock(&self.leases, lease_duration_ms, key, holder)
         }
     }
 
@@ -400,7 +371,7 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl BackingStore for TestStore {
-        type Error = DummyError;
+        type LockError = DummyError;
 
         /// Try to take a lock using the given store.
         async fn try_lock(
@@ -408,7 +379,7 @@ mod tests {
             lease_duration_ms: u32,
             key: &str,
             holder: &str,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<bool, Self::LockError> {
             Ok(self.try_take_leased_lock(lease_duration_ms, key, holder))
         }
     }
@@ -523,5 +494,61 @@ mod tests {
         assert_matches!(lock1.spin_lock(Some(200)).await, Err(LockStoreError::LockTimeout));
 
         Ok(())
+    }
+}
+
+/// Some code that is shared by almost all `MemoryStore` implementations out
+/// there.
+pub mod memory_store_helper {
+    use std::{
+        collections::{hash_map::Entry, HashMap},
+        sync::RwLock,
+        time::{Duration, Instant},
+    };
+
+    pub fn try_take_leased_lock(
+        leases: &RwLock<HashMap<String, (String, Instant)>>,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> bool {
+        let now = Instant::now();
+        let expiration = now + Duration::from_millis(lease_duration_ms.into());
+
+        match leases.write().unwrap().entry(key.to_owned()) {
+            // There is an existing holder.
+            Entry::Occupied(mut entry) => {
+                let (current_holder, current_expiration) = entry.get_mut();
+
+                if current_holder == holder {
+                    // We had the lease before, extend it.
+                    *current_expiration = expiration;
+
+                    true
+                } else {
+                    // We didn't have it.
+                    if *current_expiration < now {
+                        // Steal it!
+                        *current_holder = holder.to_owned();
+                        *current_expiration = expiration;
+
+                        true
+                    } else {
+                        // We tried our best.
+                        false
+                    }
+                }
+            }
+
+            // There is no holder, easy.
+            Entry::Vacant(entry) => {
+                entry.insert((
+                    holder.to_owned(),
+                    Instant::now() + Duration::from_millis(lease_duration_ms.into()),
+                ));
+
+                true
+            }
+        }
     }
 }

@@ -304,7 +304,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check the spelling of the files in our repo
-        uses: crate-ci/typos@v1.26.8
+        uses: crate-ci/typos@v1.27.0
 
   clippy:
     name: Run clippy
@@ -371,7 +371,7 @@ jobs:
       # tests need a synapse: this is a service and not michaelkaye/setup-matrix-synapse@main as the
       # latter does not provide networking for services to communicate with it.
       synapse:
-        image: ghcr.io/matrix-org/synapse-service:v1.115.0 # keep in sync with ./coverage.yml
+        image: ghcr.io/matrix-org/synapse-service:v1.117.0 # keep in sync with ./coverage.yml
         env:
             SYNAPSE_COMPLEMENT_DATABASE: sqlite
             SERVER_NAME: synapse

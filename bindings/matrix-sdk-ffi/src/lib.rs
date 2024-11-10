@@ -16,6 +16,7 @@ mod notification;
 mod notification_settings;
 mod platform;
 mod room;
+mod room_alias;
 mod room_directory_search;
 mod room_info;
 mod room_list;

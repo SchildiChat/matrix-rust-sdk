@@ -20,7 +20,7 @@ use ruma::{
 };
 
 use super::DynEventCacheStore;
-use crate::media::{MediaFormat, MediaRequest, MediaThumbnailSettings};
+use crate::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
 
 /// `EventCacheStore` integration tests.
 ///
@@ -31,6 +31,9 @@ use crate::media::{MediaFormat, MediaRequest, MediaThumbnailSettings};
 pub trait EventCacheStoreIntegrationTests {
     /// Test media content storage.
     async fn test_media_content(&self);
+
+    /// Test replacing a MXID.
+    async fn test_replace_media_key(&self);
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -38,11 +41,13 @@ pub trait EventCacheStoreIntegrationTests {
 impl EventCacheStoreIntegrationTests for DynEventCacheStore {
     async fn test_media_content(&self) {
         let uri = mxc_uri!("mxc://localhost/media");
-        let request_file =
-            MediaRequest { source: MediaSource::Plain(uri.to_owned()), format: MediaFormat::File };
-        let request_thumbnail = MediaRequest {
+        let request_file = MediaRequestParameters {
             source: MediaSource::Plain(uri.to_owned()),
-            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
+            format: MediaFormat::File,
+        };
+        let request_thumbnail = MediaRequestParameters {
+            source: MediaSource::Plain(uri.to_owned()),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::with_method(
                 Method::Crop,
                 uint!(100),
                 uint!(100),
@@ -50,7 +55,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         };
 
         let other_uri = mxc_uri!("mxc://localhost/media-other");
-        let request_other_file = MediaRequest {
+        let request_other_file = MediaRequestParameters {
             source: MediaSource::Plain(other_uri.to_owned()),
             format: MediaFormat::File,
         };
@@ -139,6 +144,44 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
             "other media was removed"
         );
     }
+
+    async fn test_replace_media_key(&self) {
+        let uri = mxc_uri!("mxc://sendqueue.local/tr4n-s4ct-10n1-d");
+        let req = MediaRequestParameters {
+            source: MediaSource::Plain(uri.to_owned()),
+            format: MediaFormat::File,
+        };
+
+        let content = "hello".as_bytes().to_owned();
+
+        // Media isn't present in the cache.
+        assert!(self.get_media_content(&req).await.unwrap().is_none(), "unexpected media found");
+
+        // Add the media.
+        self.add_media_content(&req, content.clone()).await.expect("adding media failed");
+
+        // Sanity-check: media is found after adding it.
+        assert_eq!(self.get_media_content(&req).await.unwrap().unwrap(), b"hello");
+
+        // Replacing a media request works.
+        let new_uri = mxc_uri!("mxc://matrix.org/tr4n-s4ct-10n1-d");
+        let new_req = MediaRequestParameters {
+            source: MediaSource::Plain(new_uri.to_owned()),
+            format: MediaFormat::File,
+        };
+        self.replace_media_key(&req, &new_req)
+            .await
+            .expect("replacing the media request key failed");
+
+        // Finding with the previous request doesn't work anymore.
+        assert!(
+            self.get_media_content(&req).await.unwrap().is_none(),
+            "unexpected media found with the old key"
+        );
+
+        // Finding with the new request does work.
+        assert_eq!(self.get_media_content(&new_req).await.unwrap().unwrap(), b"hello");
+    }
 }
 
 /// Macro building to allow your `EventCacheStore` implementation to run the
@@ -183,6 +226,89 @@ macro_rules! event_cache_store_integration_tests {
                 let event_cache_store =
                     get_event_cache_store().await.unwrap().into_event_cache_store();
                 event_cache_store.test_media_content().await;
+            }
+
+            #[async_test]
+            async fn test_replace_media_key() {
+                let event_cache_store =
+                    get_event_cache_store().await.unwrap().into_event_cache_store();
+                event_cache_store.test_replace_media_key().await;
+            }
+        }
+    };
+}
+
+/// Macro generating tests for the event cache store, related to time (mostly
+/// for the cross-process lock).
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! event_cache_store_integration_tests_time {
+    () => {
+        #[cfg(not(target_arch = "wasm32"))]
+        mod event_cache_store_integration_tests_time {
+            use std::time::Duration;
+
+            use matrix_sdk_test::async_test;
+            use $crate::event_cache_store::IntoEventCacheStore;
+
+            use super::get_event_cache_store;
+
+            #[async_test]
+            async fn test_lease_locks() {
+                let store = get_event_cache_store().await.unwrap().into_event_cache_store();
+
+                let acquired0 = store.try_take_leased_lock(0, "key", "alice").await.unwrap();
+                assert!(acquired0);
+
+                // Should extend the lease automatically (same holder).
+                let acquired2 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
+                assert!(acquired2);
+
+                // Should extend the lease automatically (same holder + time is ok).
+                let acquired3 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
+                assert!(acquired3);
+
+                // Another attempt at taking the lock should fail, because it's taken.
+                let acquired4 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(!acquired4);
+
+                // Even if we insist.
+                let acquired5 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(!acquired5);
+
+                // That's a nice test we got here, go take a little nap.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Still too early.
+                let acquired55 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(!acquired55);
+
+                // Ok you can take another nap then.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                // At some point, we do get the lock.
+                let acquired6 = store.try_take_leased_lock(0, "key", "bob").await.unwrap();
+                assert!(acquired6);
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // The other gets it almost immediately too.
+                let acquired7 = store.try_take_leased_lock(0, "key", "alice").await.unwrap();
+                assert!(acquired7);
+
+                tokio::time::sleep(Duration::from_millis(1)).await;
+
+                // But when we take a longer lease...
+                let acquired8 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(acquired8);
+
+                // It blocks the other user.
+                let acquired9 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
+                assert!(!acquired9);
+
+                // We can hold onto our lease.
+                let acquired10 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
+                assert!(acquired10);
             }
         }
     };

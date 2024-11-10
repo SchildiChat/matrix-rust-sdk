@@ -105,8 +105,8 @@ impl Timeline {
         filename: String,
         mime_type: Option<String>,
         attachment_config: AttachmentConfig,
-        store_in_cache: bool,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
+        use_send_queue: bool,
     ) -> Result<(), RoomError> {
         let mime_str = mime_type.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
         let mime_type =
@@ -114,8 +114,8 @@ impl Timeline {
 
         let mut request = self.inner.send_attachment(filename, mime_type, attachment_config);
 
-        if store_in_cache {
-            request.store_in_cache();
+        if use_send_queue {
+            request = request.use_send_queue();
         }
 
         if let Some(progress_watcher) = progress_watcher {
@@ -309,8 +309,8 @@ impl Timeline {
         image_info: ImageInfo,
         caption: Option<String>,
         formatted_caption: Option<FormattedBody>,
-        store_in_cache: bool,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
+        use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_image_info = BaseImageInfo::try_from(&image_info)
@@ -326,8 +326,8 @@ impl Timeline {
                 url,
                 image_info.mimetype,
                 attachment_config,
-                store_in_cache,
                 progress_watcher,
+                use_send_queue,
             )
             .await
         }))
@@ -341,8 +341,8 @@ impl Timeline {
         video_info: VideoInfo,
         caption: Option<String>,
         formatted_caption: Option<FormattedBody>,
-        store_in_cache: bool,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
+        use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_video_info: BaseVideoInfo = BaseVideoInfo::try_from(&video_info)
@@ -358,8 +358,8 @@ impl Timeline {
                 url,
                 video_info.mimetype,
                 attachment_config,
-                store_in_cache,
                 progress_watcher,
+                use_send_queue,
             )
             .await
         }))
@@ -371,8 +371,8 @@ impl Timeline {
         audio_info: AudioInfo,
         caption: Option<String>,
         formatted_caption: Option<FormattedBody>,
-        store_in_cache: bool,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
+        use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_audio_info: BaseAudioInfo = BaseAudioInfo::try_from(&audio_info)
@@ -388,8 +388,8 @@ impl Timeline {
                 url,
                 audio_info.mimetype,
                 attachment_config,
-                store_in_cache,
                 progress_watcher,
+                use_send_queue,
             )
             .await
         }))
@@ -403,8 +403,8 @@ impl Timeline {
         waveform: Vec<u16>,
         caption: Option<String>,
         formatted_caption: Option<FormattedBody>,
-        store_in_cache: bool,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
+        use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_audio_info: BaseAudioInfo = BaseAudioInfo::try_from(&audio_info)
@@ -421,8 +421,8 @@ impl Timeline {
                 url,
                 audio_info.mimetype,
                 attachment_config,
-                store_in_cache,
                 progress_watcher,
+                use_send_queue,
             )
             .await
         }))
@@ -432,8 +432,8 @@ impl Timeline {
         self: Arc<Self>,
         url: String,
         file_info: FileInfo,
-        store_in_cache: bool,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
+        use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_file_info: BaseFileInfo =
@@ -446,8 +446,8 @@ impl Timeline {
                 url,
                 file_info.mimetype,
                 attachment_config,
-                store_in_cache,
                 progress_watcher,
+                use_send_queue,
             )
             .await
         }))

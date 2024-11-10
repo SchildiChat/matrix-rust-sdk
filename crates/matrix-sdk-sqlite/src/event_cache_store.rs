@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     event_cache_store::EventCacheStore,
-    media::{MediaRequest, UniqueKey},
+    media::{MediaRequestParameters, UniqueKey},
 };
 use matrix_sdk_store_encryption::StoreCipher;
+use ruma::MilliSecondsSinceUnixEpoch;
 use rusqlite::OptionalExtension;
 use tokio::fs;
 use tracing::debug;
@@ -26,8 +27,8 @@ mod keys {
 ///
 /// This is used to figure whether the SQLite database requires a migration.
 /// Every new SQL migration should imply a bump of this number, and changes in
-/// the [`SqliteEventCacheStore::run_migrations`] function.
-const DATABASE_VERSION: u8 = 1;
+/// the [`run_migrations`] function.
+const DATABASE_VERSION: u8 = 2;
 
 /// A SQLite-based event cache store.
 #[derive(Clone)]
@@ -133,6 +134,14 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         .await?;
     }
 
+    if version < 2 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!("../migrations/event_cache_store/002_lease_locks.sql"))?;
+            txn.set_db_version(2)
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -140,7 +149,44 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
 impl EventCacheStore for SqliteEventCacheStore {
     type Error = Error;
 
-    async fn add_media_content(&self, request: &MediaRequest, content: Vec<u8>) -> Result<()> {
+    async fn try_take_leased_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> Result<bool> {
+        let key = key.to_owned();
+        let holder = holder.to_owned();
+
+        let now: u64 = MilliSecondsSinceUnixEpoch::now().get().into();
+        let expiration = now + lease_duration_ms as u64;
+
+        let num_touched = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.execute(
+                    "INSERT INTO lease_locks (key, holder, expiration)
+                    VALUES (?1, ?2, ?3)
+                    ON CONFLICT (key)
+                    DO
+                        UPDATE SET holder = ?2, expiration = ?3
+                        WHERE holder = ?2
+                        OR expiration < ?4
+                ",
+                    (key, holder, expiration, now),
+                )
+            })
+            .await?;
+
+        Ok(num_touched == 1)
+    }
+
+    async fn add_media_content(
+        &self,
+        request: &MediaRequestParameters,
+        content: Vec<u8>,
+    ) -> Result<()> {
         let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
         let data = self.encode_value(content)?;
@@ -155,7 +201,29 @@ impl EventCacheStore for SqliteEventCacheStore {
         Ok(())
     }
 
-    async fn get_media_content(&self, request: &MediaRequest) -> Result<Option<Vec<u8>>> {
+    async fn replace_media_key(
+        &self,
+        from: &MediaRequestParameters,
+        to: &MediaRequestParameters,
+    ) -> Result<(), Self::Error> {
+        let prev_uri = self.encode_key(keys::MEDIA, from.source.unique_key());
+        let prev_format = self.encode_key(keys::MEDIA, from.format.unique_key());
+
+        let new_uri = self.encode_key(keys::MEDIA, to.source.unique_key());
+        let new_format = self.encode_key(keys::MEDIA, to.format.unique_key());
+
+        let conn = self.acquire().await?;
+        conn.execute(
+            r#"UPDATE media SET uri = ?, format = ?, last_access = CAST(strftime('%s') as INT)
+               WHERE uri = ? AND format = ?"#,
+            (new_uri, new_format, prev_uri, prev_format),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_media_content(&self, request: &MediaRequestParameters) -> Result<Option<Vec<u8>>> {
         let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
 
@@ -183,7 +251,7 @@ impl EventCacheStore for SqliteEventCacheStore {
         data.map(|v| self.decode_value(&v).map(Into::into)).transpose()
     }
 
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<()> {
+    async fn remove_media_content(&self, request: &MediaRequestParameters) -> Result<()> {
         let uri = self.encode_key(keys::MEDIA, request.source.unique_key());
         let format = self.encode_key(keys::MEDIA, request.format.unique_key());
 
@@ -212,8 +280,8 @@ mod tests {
 
     use matrix_sdk_base::{
         event_cache_store::{EventCacheStore, EventCacheStoreError},
-        event_cache_store_integration_tests,
-        media::{MediaFormat, MediaRequest, MediaThumbnailSettings},
+        event_cache_store_integration_tests, event_cache_store_integration_tests_time,
+        media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     };
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
@@ -236,6 +304,7 @@ mod tests {
     }
 
     event_cache_store_integration_tests!();
+    event_cache_store_integration_tests_time!();
 
     async fn get_event_cache_store_content_sorted_by_last_access(
         event_cache_store: &SqliteEventCacheStore,
@@ -253,11 +322,13 @@ mod tests {
     async fn test_last_access() {
         let event_cache_store = get_event_cache_store().await.expect("creating media cache failed");
         let uri = mxc_uri!("mxc://localhost/media");
-        let file_request =
-            MediaRequest { source: MediaSource::Plain(uri.to_owned()), format: MediaFormat::File };
-        let thumbnail_request = MediaRequest {
+        let file_request = MediaRequestParameters {
             source: MediaSource::Plain(uri.to_owned()),
-            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
+            format: MediaFormat::File,
+        };
+        let thumbnail_request = MediaRequestParameters {
+            source: MediaSource::Plain(uri.to_owned()),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::with_method(
                 Method::Crop,
                 uint!(100),
                 uint!(100),
@@ -317,6 +388,7 @@ mod encrypted_tests {
 
     use matrix_sdk_base::{
         event_cache_store::EventCacheStoreError, event_cache_store_integration_tests,
+        event_cache_store_integration_tests_time,
     };
     use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
@@ -341,4 +413,5 @@ mod encrypted_tests {
     }
 
     event_cache_store_integration_tests!();
+    event_cache_store_integration_tests_time!();
 }

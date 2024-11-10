@@ -60,7 +60,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::warn;
 
 use crate::{
-    event_cache_store::{DynEventCacheStore, IntoEventCacheStore},
+    event_cache_store,
     rooms::{normal::RoomInfoNotableUpdate, RoomInfo, RoomState},
     MinimalRoomMemberEvent, Room, RoomStateFilter, SessionMeta,
 };
@@ -68,16 +68,20 @@ use crate::{
 pub(crate) mod ambiguity_map;
 mod memory_store;
 pub mod migration_helpers;
+mod send_queue;
 
 #[cfg(any(test, feature = "testing"))]
 pub use self::integration_tests::StateStoreIntegrationTests;
 pub use self::{
     memory_store::MemoryStore,
+    send_queue::{
+        ChildTransactionId, DependentQueuedRequest, DependentQueuedRequestKind,
+        FinishUploadThumbnailInfo, QueueWedgeError, QueuedRequest, QueuedRequestKind,
+        SentMediaInfo, SentRequestKey, SerializableEventContent,
+    },
     traits::{
-        ChildTransactionId, ComposerDraft, ComposerDraftType, DependentQueuedEvent,
-        DependentQueuedEventKind, DynStateStore, IntoStateStore, QueueWedgeError, QueuedEvent,
-        SerializableEventContent, ServerCapabilities, StateStore, StateStoreDataKey,
-        StateStoreDataValue, StateStoreExt,
+        ComposerDraft, ComposerDraftType, DynStateStore, IntoStateStore, ServerCapabilities,
+        StateStore, StateStoreDataKey, StateStoreDataValue, StateStoreExt,
     },
 };
 
@@ -511,7 +515,7 @@ pub struct StoreConfig {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store: Arc<DynCryptoStore>,
     pub(crate) state_store: Arc<DynStateStore>,
-    pub(crate) event_cache_store: Arc<DynEventCacheStore>,
+    pub(crate) event_cache_store: event_cache_store::EventCacheStoreLock,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -529,8 +533,11 @@ impl StoreConfig {
             #[cfg(feature = "e2e-encryption")]
             crypto_store: matrix_sdk_crypto::store::MemoryStore::new().into_crypto_store(),
             state_store: Arc::new(MemoryStore::new()),
-            event_cache_store: crate::event_cache_store::MemoryStore::new()
-                .into_event_cache_store(),
+            event_cache_store: event_cache_store::EventCacheStoreLock::new(
+                event_cache_store::MemoryStore::new(),
+                "default-key".to_owned(),
+                "matrix-sdk-base".to_owned(),
+            ),
         }
     }
 
@@ -550,8 +557,15 @@ impl StoreConfig {
     }
 
     /// Set a custom implementation of an `EventCacheStore`.
-    pub fn event_cache_store(mut self, event_cache_store: impl IntoEventCacheStore) -> Self {
-        self.event_cache_store = event_cache_store.into_event_cache_store();
+    ///
+    /// The `key` and `holder` arguments represent the key and holder inside the
+    /// [`CrossProcessStoreLock::new`][matrix_sdk_common::store_locks::CrossProcessStoreLock::new].
+    pub fn event_cache_store<S>(mut self, event_cache_store: S, key: String, holder: String) -> Self
+    where
+        S: event_cache_store::IntoEventCacheStore,
+    {
+        self.event_cache_store =
+            event_cache_store::EventCacheStoreLock::new(event_cache_store, key, holder);
         self
     }
 }

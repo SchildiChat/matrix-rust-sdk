@@ -19,7 +19,7 @@ use matrix_sdk_common::AsyncTraitDeps;
 use ruma::MxcUri;
 
 use super::EventCacheStoreError;
-use crate::media::MediaRequest;
+use crate::media::MediaRequestParameters;
 
 /// An abstract trait that can be used to implement different store backends
 /// for the event cache of the SDK.
@@ -28,6 +28,14 @@ use crate::media::MediaRequest;
 pub trait EventCacheStore: AsyncTraitDeps {
     /// The error type used by this event cache store.
     type Error: fmt::Debug + Into<EventCacheStoreError>;
+
+    /// Try to take a lock using the given store.
+    async fn try_take_leased_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> Result<bool, Self::Error>;
 
     /// Add a media file's content in the media store.
     ///
@@ -38,8 +46,33 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// * `content` - The content of the file.
     async fn add_media_content(
         &self,
-        request: &MediaRequest,
+        request: &MediaRequestParameters,
         content: Vec<u8>,
+    ) -> Result<(), Self::Error>;
+
+    /// Replaces the given media's content key with another one.
+    ///
+    /// This should be used whenever a temporary (local) MXID has been used, and
+    /// it must now be replaced with its actual remote counterpart (after
+    /// uploading some content, or creating an empty MXC URI).
+    ///
+    /// ⚠ No check is performed to ensure that the media formats are consistent,
+    /// i.e. it's possible to update with a thumbnail key a media that was
+    /// keyed as a file before. The caller is responsible of ensuring that
+    /// the replacement makes sense, according to their use case.
+    ///
+    /// This should not raise an error when the `from` parameter points to an
+    /// unknown media, and it should silently continue in this case.
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - The previous `MediaRequest` of the file.
+    ///
+    /// * `to` - The new `MediaRequest` of the file.
+    async fn replace_media_key(
+        &self,
+        from: &MediaRequestParameters,
+        to: &MediaRequestParameters,
     ) -> Result<(), Self::Error>;
 
     /// Get a media file's content out of the media store.
@@ -49,7 +82,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// * `request` - The `MediaRequest` of the file.
     async fn get_media_content(
         &self,
-        request: &MediaRequest,
+        request: &MediaRequestParameters,
     ) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Remove a media file's content from the media store.
@@ -57,7 +90,10 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// # Arguments
     ///
     /// * `request` - The `MediaRequest` of the file.
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<(), Self::Error>;
+    async fn remove_media_content(
+        &self,
+        request: &MediaRequestParameters,
+    ) -> Result<(), Self::Error>;
 
     /// Remove all the media files' content associated to an `MxcUri` from the
     /// media store.
@@ -83,22 +119,42 @@ impl<T: fmt::Debug> fmt::Debug for EraseEventCacheStoreError<T> {
 impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
     type Error = EventCacheStoreError;
 
+    async fn try_take_leased_lock(
+        &self,
+        lease_duration_ms: u32,
+        key: &str,
+        holder: &str,
+    ) -> Result<bool, Self::Error> {
+        self.0.try_take_leased_lock(lease_duration_ms, key, holder).await.map_err(Into::into)
+    }
+
     async fn add_media_content(
         &self,
-        request: &MediaRequest,
+        request: &MediaRequestParameters,
         content: Vec<u8>,
     ) -> Result<(), Self::Error> {
         self.0.add_media_content(request, content).await.map_err(Into::into)
     }
 
+    async fn replace_media_key(
+        &self,
+        from: &MediaRequestParameters,
+        to: &MediaRequestParameters,
+    ) -> Result<(), Self::Error> {
+        self.0.replace_media_key(from, to).await.map_err(Into::into)
+    }
+
     async fn get_media_content(
         &self,
-        request: &MediaRequest,
+        request: &MediaRequestParameters,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         self.0.get_media_content(request).await.map_err(Into::into)
     }
 
-    async fn remove_media_content(&self, request: &MediaRequest) -> Result<(), Self::Error> {
+    async fn remove_media_content(
+        &self,
+        request: &MediaRequestParameters,
+    ) -> Result<(), Self::Error> {
         self.0.remove_media_content(request).await.map_err(Into::into)
     }
 
