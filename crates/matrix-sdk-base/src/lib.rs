@@ -28,7 +28,7 @@ mod client;
 pub mod debug;
 pub mod deserialized_responses;
 mod error;
-pub mod event_cache_store;
+pub mod event_cache;
 pub mod latest_event;
 pub mod media;
 pub mod notification_settings;
@@ -56,7 +56,7 @@ pub use http;
 pub use matrix_sdk_crypto as crypto;
 pub use once_cell;
 pub use rooms::{
-    DisplayName, Room, RoomCreateWithCreatorEventContent, RoomHero, RoomInfo,
+    Room, RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
     RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMember, RoomMemberships, RoomState,
     RoomStateFilter,
 };

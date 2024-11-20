@@ -81,6 +81,7 @@ use crate::{
 mod content;
 
 pub use content::MessageContent;
+use matrix_sdk::utils::formatted_body_from;
 
 use crate::error::QueueWedgeError;
 
@@ -293,7 +294,7 @@ impl Timeline {
         msg: Arc<RoomMessageEventContentWithoutRelation>,
     ) -> Result<Arc<SendHandle>, ClientError> {
         match self.inner.send((*msg).to_owned().with_relation(None).into()).await {
-            Ok(handle) => Ok(Arc::new(SendHandle { inner: Mutex::new(Some(handle)) })),
+            Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
             Err(err) => {
                 error!("error when sending a message: {err}");
                 Err(anyhow::anyhow!(err).into())
@@ -312,6 +313,8 @@ impl Timeline {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
         use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
+        let formatted_caption =
+            formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_image_info = BaseImageInfo::try_from(&image_info)
                 .map_err(|_| RoomError::InvalidAttachmentData)?;
@@ -320,7 +323,7 @@ impl Timeline {
             let attachment_config = build_thumbnail_info(thumbnail_url, image_info.thumbnail_info)?
                 .info(attachment_info)
                 .caption(caption)
-                .formatted_caption(formatted_caption.map(Into::into));
+                .formatted_caption(formatted_caption);
 
             self.send_attachment(
                 url,
@@ -344,6 +347,8 @@ impl Timeline {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
         use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
+        let formatted_caption =
+            formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_video_info: BaseVideoInfo = BaseVideoInfo::try_from(&video_info)
                 .map_err(|_| RoomError::InvalidAttachmentData)?;
@@ -374,6 +379,8 @@ impl Timeline {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
         use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
+        let formatted_caption =
+            formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_audio_info: BaseAudioInfo = BaseAudioInfo::try_from(&audio_info)
                 .map_err(|_| RoomError::InvalidAttachmentData)?;
@@ -406,6 +413,8 @@ impl Timeline {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
         use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
+        let formatted_caption =
+            formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_audio_info: BaseAudioInfo = BaseAudioInfo::try_from(&audio_info)
                 .map_err(|_| RoomError::InvalidAttachmentData)?;
@@ -432,15 +441,22 @@ impl Timeline {
         self: Arc<Self>,
         url: String,
         file_info: FileInfo,
+        caption: Option<String>,
+        formatted_caption: Option<FormattedBody>,
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
         use_send_queue: bool,
     ) -> Arc<SendAttachmentJoinHandle> {
+        let formatted_caption =
+            formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
         SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
             let base_file_info: BaseFileInfo =
                 BaseFileInfo::try_from(&file_info).map_err(|_| RoomError::InvalidAttachmentData)?;
             let attachment_info = AttachmentInfo::File(base_file_info);
 
-            let attachment_config = AttachmentConfig::new().info(attachment_info);
+            let attachment_config = AttachmentConfig::new()
+                .info(attachment_info)
+                .caption(caption)
+                .formatted_caption(formatted_caption.map(Into::into));
 
             self.send_attachment(
                 url,
@@ -733,9 +749,16 @@ impl Timeline {
     }
 }
 
+/// A handle to perform actions onto a local echo.
 #[derive(uniffi::Object)]
 pub struct SendHandle {
     inner: Mutex<Option<matrix_sdk::send_queue::SendHandle>>,
+}
+
+impl SendHandle {
+    fn new(handle: matrix_sdk::send_queue::SendHandle) -> Self {
+        Self { inner: Mutex::new(Some(handle)) }
+    }
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -755,9 +778,31 @@ impl SendHandle {
                 .await
                 .map_err(|err| anyhow::anyhow!("error when saving in store: {err}"))?)
         } else {
-            warn!("trying to abort an send handle that's already been actioned");
+            warn!("trying to abort a send handle that's already been actioned");
             Ok(false)
         }
+    }
+
+    /// Attempt to manually resend messages that failed to send due to issues
+    /// that should now have been fixed.
+    ///
+    /// This is useful for example, when there's a
+    /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity` error;
+    /// the user may have re-verified on a different device and would now
+    /// like to send the failed message that's waiting on this device.
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo that should be unwedged.
+    pub async fn try_resend(self: Arc<Self>) -> Result<(), ClientError> {
+        let locked = self.inner.lock().await;
+        if let Some(handle) = locked.as_ref() {
+            handle.unwedge().await?;
+        } else {
+            warn!("trying to unwedge a send handle that's been aborted");
+        }
+        Ok(())
     }
 }
 
@@ -1295,5 +1340,11 @@ impl LazyTimelineItemProvider {
             original_json: self.0.original_json().map(|raw| raw.json().get().to_owned()),
             latest_edit_json: self.0.latest_edit_json().map(|raw| raw.json().get().to_owned()),
         }
+    }
+
+    /// For local echoes, return the associated send handle; returns `None` for
+    /// remote echoes.
+    fn get_send_handle(&self) -> Option<Arc<SendHandle>> {
+        self.0.local_echo_send_handle().map(|handle| Arc::new(SendHandle::new(handle)))
     }
 }

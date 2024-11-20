@@ -194,7 +194,7 @@ pub struct Client {
 impl Client {
     pub async fn new(
         sdk_client: MatrixClient,
-        cross_process_refresh_lock_id: Option<String>,
+        enable_oidc_refresh_lock: bool,
         session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
     ) -> Result<Self, ClientError> {
         let session_verification_controller: Arc<
@@ -210,19 +210,27 @@ impl Client {
             }
         });
 
+        let cross_process_store_locks_holder_name =
+            sdk_client.cross_process_store_locks_holder_name().to_owned();
+
         let client = Client {
             inner: AsyncRuntimeDropped::new(sdk_client),
             delegate: RwLock::new(None),
             session_verification_controller,
         };
 
-        if let Some(process_id) = cross_process_refresh_lock_id {
+        if enable_oidc_refresh_lock {
             if session_delegate.is_none() {
                 return Err(anyhow::anyhow!(
                     "missing session delegates when enabling the cross-process lock"
                 ))?;
             }
-            client.inner.oidc().enable_cross_process_refresh_lock(process_id.clone()).await?;
+
+            client
+                .inner
+                .oidc()
+                .enable_cross_process_refresh_lock(cross_process_store_locks_holder_name)
+                .await?;
         }
 
         if let Some(session_delegate) = session_delegate {
@@ -704,7 +712,7 @@ impl Client {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<String, ClientError> {
         let mime_type: mime::Mime = mime_type.parse().context("Parsing mime type")?;
-        let request = self.inner.media().upload(&mime_type, data);
+        let request = self.inner.media().upload(&mime_type, data, None);
 
         if let Some(progress_watcher) = progress_watcher {
             let mut subscriber = request.subscribe_to_send_progress();
@@ -1139,21 +1147,27 @@ impl Client {
         Ok(())
     }
 
-    /// Checks if a room alias is available in the current homeserver.
+    /// Checks if a room alias is not in use yet.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the room alias is available.
+    /// - `Ok(false)` if it's not (the resolve alias request returned a `404`
+    ///   status code).
+    /// - An `Err` otherwise.
     pub async fn is_room_alias_available(&self, alias: String) -> Result<bool, ClientError> {
         let alias = RoomAliasId::parse(alias)?;
-        match self.inner.resolve_room_alias(&alias).await {
-            // The room alias was resolved, so it's already in use.
-            Ok(_) => Ok(false),
-            Err(HttpError::Reqwest(error)) => {
-                match error.status() {
-                    // The room alias wasn't found, so it's available.
-                    Some(StatusCode::NOT_FOUND) => Ok(true),
-                    _ => Err(HttpError::Reqwest(error).into()),
-                }
-            }
-            Err(error) => Err(error.into()),
-        }
+        self.inner.is_room_alias_available(&alias).await.map_err(Into::into)
+    }
+
+    /// Creates a new room alias associated with the provided room id.
+    pub async fn create_room_alias(
+        &self,
+        room_alias: String,
+        room_id: String,
+    ) -> Result<(), ClientError> {
+        let room_alias = RoomAliasId::parse(room_alias)?;
+        let room_id = RoomId::parse(room_id)?;
+        self.inner.create_room_alias(&room_alias, &room_id).await.map_err(Into::into)
     }
 }
 

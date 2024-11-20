@@ -17,7 +17,7 @@
 use std::{
     collections::{btree_map, BTreeMap},
     fmt::{self, Debug},
-    future::Future,
+    future::{ready, Future},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
 };
@@ -33,7 +33,7 @@ use imbl::Vector;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
-    event_cache_store::EventCacheStoreLock,
+    event_cache::store::EventCacheStoreLock,
     store::{DynStateStore, ServerCapabilities},
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
@@ -45,13 +45,14 @@ use ruma::{
     api::{
         client::{
             account::whoami,
-            alias::get_alias,
+            alias::{create_alias, get_alias},
             device::{delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
                 get_capabilities::{self, Capabilities},
                 get_supported_versions,
             },
+            error::ErrorKind,
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             knock::knock_room,
             membership::{join_room_by_id, join_room_by_id_or_alias},
@@ -87,7 +88,8 @@ use crate::{
     error::{HttpError, HttpResult},
     event_cache::EventCache,
     event_handler::{
-        EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
+        EventHandler, EventHandlerContext, EventHandlerDropGuard, EventHandlerHandle,
+        EventHandlerStore, ObservableEventHandler, SyncEvent,
     },
     http_client::HttpClient,
     matrix_auth::MatrixAuth,
@@ -274,6 +276,17 @@ pub(crate) struct ClientInner {
     /// deduplicate multiple calls to a method.
     pub(crate) locks: ClientLocks,
 
+    /// The cross-process store locks holder name.
+    ///
+    /// The SDK provides cross-process store locks (see
+    /// [`matrix_sdk_common::store_locks::CrossProcessStoreLock`]). The
+    /// `holder_name` is the value used for all cross-process store locks
+    /// used by this `Client`.
+    ///
+    /// If multiple `Client`s are running in different processes, this
+    /// value MUST be different for each `Client`.
+    cross_process_store_locks_holder_name: String,
+
     /// A mapping of the times at which the current user sent typing notices,
     /// keyed by room.
     pub(crate) typing_notice_times: StdRwLock<BTreeMap<OwnedRoomId, Instant>>,
@@ -340,6 +353,7 @@ impl ClientInner {
         event_cache: OnceCell<EventCache>,
         send_queue: Arc<SendQueueData>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
+        cross_process_store_locks_holder_name: String,
     ) -> Arc<Self> {
         let client = Self {
             server,
@@ -350,6 +364,7 @@ impl ClientInner {
             http_client,
             base_client,
             locks: Default::default(),
+            cross_process_store_locks_holder_name,
             server_capabilities: RwLock::new(server_capabilities),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
@@ -422,6 +437,16 @@ impl Client {
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
+    }
+
+    /// The cross-process store locks holder name.
+    ///
+    /// The SDK provides cross-process store locks (see
+    /// [`matrix_sdk_common::store_locks::CrossProcessStoreLock`]). The
+    /// `holder_name` is the value used for all cross-process store locks
+    /// used by this `Client`.
+    pub fn cross_process_store_locks_holder_name(&self) -> &str {
+        &self.inner.cross_process_store_locks_holder_name
     }
 
     /// Change the homeserver URL used by this client.
@@ -657,8 +682,6 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// # use url::Url;
-    /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// use matrix_sdk::{
     ///     deserialized_responses::EncryptionInfo,
     ///     event_handler::Ctx,
@@ -675,14 +698,7 @@ impl Client {
     /// };
     /// use serde::{Deserialize, Serialize};
     ///
-    /// # futures_executor::block_on(async {
-    /// # let client = matrix_sdk::Client::builder()
-    /// #     .homeserver_url(homeserver)
-    /// #     .server_versions([ruma::api::MatrixVersion::V1_0])
-    /// #     .build()
-    /// #     .await
-    /// #     .unwrap();
-    /// #
+    /// # async fn example(client: Client) {
     /// client.add_event_handler(
     ///     |ev: SyncRoomMessageEvent, room: Room, client: Client| async move {
     ///         // Common usage: Room event plus room and client.
@@ -748,11 +764,11 @@ impl Client {
     /// client.add_event_handler(move |ev: SyncRoomMessageEvent | async move {
     ///     println!("Calling the handler with identifier {data}");
     /// });
-    /// # });
+    /// # }
     /// ```
     pub fn add_event_handler<Ev, Ctx, H>(&self, handler: H) -> EventHandlerHandle
     where
-        Ev: SyncEvent + DeserializeOwned + Send + 'static,
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + 'static,
         H: EventHandler<Ev, Ctx>,
     {
         self.add_event_handler_impl(handler, None)
@@ -774,10 +790,131 @@ impl Client {
         handler: H,
     ) -> EventHandlerHandle
     where
-        Ev: SyncEvent + DeserializeOwned + Send + 'static,
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + 'static,
         H: EventHandler<Ev, Ctx>,
     {
         self.add_event_handler_impl(handler, Some(room_id.to_owned()))
+    }
+
+    /// Observe a specific event type.
+    ///
+    /// `Ev` represents the kind of event that will be observed. `Ctx`
+    /// represents the context that will come with the event. It relies on the
+    /// same mechanism as [`Client::add_event_handler`]. The main difference is
+    /// that it returns an [`ObservableEventHandler`] and doesn't require a
+    /// user-defined closure. It is possible to subscribe to the
+    /// [`ObservableEventHandler`] to get an [`EventHandlerSubscriber`], which
+    /// implements a [`Stream`]. The `Stream::Item` will be of type `(Ev,
+    /// Ctx)`.
+    ///
+    /// # Example
+    ///
+    /// Let's see a classical usage:
+    ///
+    /// ```
+    /// use futures_util::StreamExt as _;
+    /// use matrix_sdk::{
+    ///     ruma::{events::room::message::SyncRoomMessageEvent, push::Action},
+    ///     Client, Room,
+    /// };
+    ///
+    /// # async fn example(client: Client) -> Option<()> {
+    /// let observer =
+    ///     client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>)>();
+    ///
+    /// let mut subscriber = observer.subscribe();
+    ///
+    /// let (event, (room, push_actions)) = subscriber.next().await?;
+    /// # Some(())
+    /// # }
+    /// ```
+    ///
+    /// Now let's see how to get several contexts that can be useful for you:
+    ///
+    /// ```
+    /// use matrix_sdk::{
+    ///     deserialized_responses::EncryptionInfo,
+    ///     ruma::{
+    ///         events::room::{
+    ///             message::SyncRoomMessageEvent, topic::SyncRoomTopicEvent,
+    ///         },
+    ///         push::Action,
+    ///     },
+    ///     Client, Room,
+    /// };
+    ///
+    /// # async fn example(client: Client) {
+    /// // Observe `SyncRoomMessageEvent` and fetch `Room` + `Client`.
+    /// let _ = client.observe_events::<SyncRoomMessageEvent, (Room, Client)>();
+    ///
+    /// // Observe `SyncRoomMessageEvent` and fetch `Room` + `EncryptionInfo`
+    /// // to distinguish between unencrypted events and events that were decrypted
+    /// // by the SDK.
+    /// let _ = client
+    ///     .observe_events::<SyncRoomMessageEvent, (Room, Option<EncryptionInfo>)>(
+    ///     );
+    ///
+    /// // Observe `SyncRoomMessageEvent` and fetch `Room` + push actions.
+    /// // For example, an event with `Action::SetTweak(Tweak::Highlight(true))`
+    /// // should be highlighted in the timeline.
+    /// let _ =
+    ///     client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>)>();
+    ///
+    /// // Observe `SyncRoomTopicEvent` and fetch nothing else.
+    /// let _ = client.observe_events::<SyncRoomTopicEvent, ()>();
+    /// # }
+    /// ```
+    ///
+    /// [`EventHandlerSubscriber`]: crate::event_handler::EventHandlerSubscriber
+    pub fn observe_events<Ev, Ctx>(&self) -> ObservableEventHandler<(Ev, Ctx)>
+    where
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + SyncOutsideWasm + 'static,
+        Ctx: EventHandlerContext + SendOutsideWasm + SyncOutsideWasm + 'static,
+    {
+        self.observe_room_events_impl(None)
+    }
+
+    /// Observe a specific room, and event type.
+    ///
+    /// This method works the same way as [`Client::observe_events`], except
+    /// that the observability will only be applied for events in the room with
+    /// the specified ID. See that method for more details.
+    pub fn observe_room_events<Ev, Ctx>(
+        &self,
+        room_id: &RoomId,
+    ) -> ObservableEventHandler<(Ev, Ctx)>
+    where
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + SyncOutsideWasm + 'static,
+        Ctx: EventHandlerContext + SendOutsideWasm + SyncOutsideWasm + 'static,
+    {
+        self.observe_room_events_impl(Some(room_id.to_owned()))
+    }
+
+    /// Shared implementation for `Client::observe_events` and
+    /// `Client::observe_room_events`.
+    fn observe_room_events_impl<Ev, Ctx>(
+        &self,
+        room_id: Option<OwnedRoomId>,
+    ) -> ObservableEventHandler<(Ev, Ctx)>
+    where
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + SyncOutsideWasm + 'static,
+        Ctx: EventHandlerContext + SendOutsideWasm + SyncOutsideWasm + 'static,
+    {
+        // The default value is `None`. It becomes `Some((Ev, Ctx))` once it has a
+        // new value.
+        let shared_observable = SharedObservable::new(None);
+
+        ObservableEventHandler::new(
+            shared_observable.clone(),
+            self.event_handler_drop_guard(self.add_event_handler_impl(
+                move |event: Ev, context: Ctx| {
+                    shared_observable.set(Some((event, context)));
+
+                    ready(())
+                },
+                room_id,
+            )),
+        )
     }
 
     /// Remove the event handler associated with the handle.
@@ -1036,6 +1173,34 @@ impl Client {
     ) -> HttpResult<get_alias::v3::Response> {
         let request = get_alias::v3::Request::new(room_alias.to_owned());
         self.send(request, None).await
+    }
+
+    /// Checks if a room alias is not in use yet.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the room alias is available.
+    /// - `Ok(false)` if it's not (the resolve alias request returned a `404`
+    ///   status code).
+    /// - An `Err` otherwise.
+    pub async fn is_room_alias_available(&self, alias: &RoomAliasId) -> HttpResult<bool> {
+        match self.resolve_room_alias(alias).await {
+            // The room alias was resolved, so it's already in use.
+            Ok(_) => Ok(false),
+            Err(error) => {
+                match error.client_api_error_kind() {
+                    // The room alias wasn't found, so it's available.
+                    Some(ErrorKind::NotFound) => Ok(true),
+                    _ => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Creates a new room alias associated with a room.
+    pub async fn create_room_alias(&self, alias: &RoomAliasId, room_id: &RoomId) -> HttpResult<()> {
+        let request = create_alias::v3::Request::new(alias.to_owned(), room_id.to_owned());
+        self.send(request, None).await?;
+        Ok(())
     }
 
     /// Update the homeserver from the login response well-known if needed.
@@ -2201,7 +2366,15 @@ impl Client {
     }
 
     /// Create a new specialized `Client` that can process notifications.
-    pub async fn notification_client(&self) -> Result<Client> {
+    ///
+    /// See [`CrossProcessStoreLock::new`] to learn more about
+    /// `cross_process_store_locks_holder_name`.
+    ///
+    /// [`CrossProcessStoreLock::new`]: matrix_sdk_common::store_locks::CrossProcessStoreLock::new
+    pub async fn notification_client(
+        &self,
+        cross_process_store_locks_holder_name: String,
+    ) -> Result<Client> {
         let client = Client {
             inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
@@ -2210,13 +2383,17 @@ impl Client {
                 #[cfg(feature = "experimental-sliding-sync")]
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
-                self.inner.base_client.clone_with_in_memory_state_store().await?,
+                self.inner
+                    .base_client
+                    .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name)
+                    .await?,
                 self.inner.server_capabilities.read().await.clone(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
                 self.inner.send_queue_data.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,
+                cross_process_store_locks_holder_name,
             )
             .await,
         };
@@ -2328,7 +2505,7 @@ pub(crate) mod tests {
         api::{client::room::create_room::v3::Request as CreateRoomRequest, MatrixVersion},
         assign,
         events::ignored_user_list::IgnoredUserListEventContent,
-        owned_room_id, room_id, RoomId, ServerName, UserId,
+        owned_room_id, room_alias_id, room_id, RoomId, ServerName, UserId,
     };
     use serde_json::json;
     use tokio::{
@@ -2346,8 +2523,8 @@ pub(crate) mod tests {
         client::WeakClient,
         config::{RequestConfig, SyncSettings},
         test_utils::{
-            logged_in_client, no_retry_test_client, set_client_session, test_client_builder,
-            test_client_builder_with_server,
+            logged_in_client, mocks::MatrixMockServer, no_retry_test_client, set_client_session,
+            test_client_builder, test_client_builder_with_server,
         },
         Error,
     };
@@ -2739,7 +2916,10 @@ pub(crate) mod tests {
         let memory_store = Arc::new(MemoryStore::new());
         let client = Client::builder()
             .insecure_server_name_no_tls(server_name)
-            .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            .store_config(
+                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                    .state_store(memory_store.clone()),
+            )
             .build()
             .await
             .unwrap();
@@ -2758,7 +2938,10 @@ pub(crate) mod tests {
 
         let client = Client::builder()
             .insecure_server_name_no_tls(server_name)
-            .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            .store_config(
+                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                    .state_store(memory_store.clone()),
+            )
             .build()
             .await
             .unwrap();
@@ -2914,5 +3097,59 @@ pub(crate) mod tests {
         timeout(Duration::from_secs(1), client.await_room_remote_echo(room.room_id()))
             .await
             .unwrap_err();
+    }
+
+    #[async_test]
+    async fn test_is_room_alias_available_if_alias_is_not_resolved() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_directory_resolve_alias().not_found().expect(1).mount().await;
+
+        let ret = client.is_room_alias_available(room_alias_id!("#some_alias:matrix.org")).await;
+        assert_matches!(ret, Ok(true));
+    }
+
+    #[async_test]
+    async fn test_is_room_alias_available_if_alias_is_resolved() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_room_directory_resolve_alias()
+            .ok("!some_room_id:matrix.org", Vec::new())
+            .expect(1)
+            .mount()
+            .await;
+
+        let ret = client.is_room_alias_available(room_alias_id!("#some_alias:matrix.org")).await;
+        assert_matches!(ret, Ok(false));
+    }
+
+    #[async_test]
+    async fn test_is_room_alias_available_if_error_found() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_directory_resolve_alias().error500().expect(1).mount().await;
+
+        let ret = client.is_room_alias_available(room_alias_id!("#some_alias:matrix.org")).await;
+        assert_matches!(ret, Err(_));
+    }
+
+    #[async_test]
+    async fn test_create_room_alias() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_create_room_alias().ok().expect(1).mount().await;
+
+        let ret = client
+            .create_room_alias(
+                room_alias_id!("#some_alias:matrix.org"),
+                room_id!("!some_room:matrix.org"),
+            )
+            .await;
+        assert_matches!(ret, Ok(()));
     }
 }

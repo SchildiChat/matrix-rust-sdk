@@ -14,24 +14,14 @@
 
 use std::cmp::Ordering;
 
-use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+pub use matrix_sdk_base::event_cache::{Event, Gap};
+use matrix_sdk_common::linked_chunk::{
+    Chunk, ChunkIdentifier, EmptyChunk, Error, Iter, LinkedChunk, Position,
+};
 use ruma::OwnedEventId;
 use tracing::{debug, error, warn};
 
-use super::super::{
-    deduplicator::{Decoration, Deduplicator},
-    linked_chunk::{Chunk, ChunkIdentifier, EmptyChunk, Error, Iter, LinkedChunk, Position},
-};
-
-/// An alias for the real event type.
-pub(crate) type Event = SyncTimelineEvent;
-
-#[derive(Clone, Debug)]
-pub struct Gap {
-    /// The token to use in the query, extracted from a previous "from" /
-    /// "end" field of a `/messages` response.
-    pub prev_token: String,
-}
+use super::super::deduplicator::{Decoration, Deduplicator};
 
 const DEFAULT_CHUNK_CAPACITY: usize = 128;
 

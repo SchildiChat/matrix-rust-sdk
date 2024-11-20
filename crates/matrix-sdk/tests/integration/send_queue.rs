@@ -1,33 +1,22 @@
-use std::{
-    ops::Not as _,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
-    },
-    time::Duration,
-};
+use std::{ops::Not as _, sync::Arc, time::Duration};
 
 use assert_matches2::{assert_let, assert_matches};
 use matrix_sdk::{
     attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo, BaseThumbnailInfo, Thumbnail},
-    config::{RequestConfig, StoreConfig},
+    config::StoreConfig,
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     send_queue::{
-        LocalEcho, LocalEchoContent, RoomSendQueueError, RoomSendQueueStorageError,
-        RoomSendQueueUpdate,
+        LocalEcho, LocalEchoContent, RoomSendQueue, RoomSendQueueError, RoomSendQueueStorageError,
+        RoomSendQueueUpdate, SendHandle,
     },
     test_utils::{
-        events::EventFactory, logged_in_client, logged_in_client_with_server, set_client_session,
+        events::EventFactory,
+        mocks::{MatrixMock, MatrixMockServer},
     },
     Client, MemoryStore,
 };
-use matrix_sdk_test::{
-    async_test,
-    mocks::{mock_encryption_state, mock_redaction},
-    InvitedRoomBuilder, JoinedRoomBuilder, LeftRoomBuilder,
-};
+use matrix_sdk_test::{async_test, InvitedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder};
 use ruma::{
-    api::MatrixVersion,
     event_id,
     events::{
         poll::unstable_start::{
@@ -35,66 +24,101 @@ use ruma::{
             UnstablePollStartContentBlock, UnstablePollStartEventContent,
         },
         room::{
-            message::{MessageType, RoomMessageEventContent},
+            message::{ImageMessageEventContent, MessageType, RoomMessageEventContent},
             MediaSource,
         },
         AnyMessageLikeEventContent, EventContent as _, Mentions,
     },
     mxc_uri, owned_user_id, room_id,
     serde::Raw,
-    uint, EventId, MxcUri, OwnedEventId, TransactionId,
+    uint, MxcUri, OwnedEventId, OwnedTransactionId, TransactionId,
 };
 use serde_json::json;
 use tokio::{
-    sync::Mutex,
+    sync::{broadcast::Receiver, Mutex},
+    task::yield_now,
     time::{sleep, timeout},
 };
-use wiremock::{
-    matchers::{header, method, path, path_regex},
-    Mock, Request, ResponseTemplate,
-};
+use wiremock::{Request, ResponseTemplate};
 
-use crate::mock_sync_with_new_room;
+/// Queues an attachment whenever the actual data/mime type etc. don't matter.
+///
+/// Returns the filename, for sanity check purposes.
+async fn queue_attachment_no_thumbnail(q: &RoomSendQueue) -> (SendHandle, &'static str) {
+    let filename = "surprise.jpeg.exe";
+    let content_type = mime::IMAGE_JPEG;
+    let data = b"hello world".to_vec();
+    let config = AttachmentConfig::new().info(AttachmentInfo::Image(BaseImageInfo {
+        height: Some(uint!(13)),
+        width: Some(uint!(37)),
+        size: Some(uint!(42)),
+        blurhash: None,
+    }));
+    let handle = q
+        .send_attachment(filename, content_type, data, config)
+        .await
+        .expect("queuing the attachment works");
+    (handle, filename)
+}
 
-// TODO put into the MatrixMockServer
-fn mock_jpeg_upload(mxc: &MxcUri, lock: Arc<Mutex<()>>) -> Mock {
+/// Queues an attachment whenever the actual data/mime type etc. don't matter,
+/// along with a thumbnail.
+///
+/// Returns the filename, for sanity check purposes.
+async fn queue_attachment_with_thumbnail(q: &RoomSendQueue) -> (SendHandle, &'static str) {
+    let filename = "surprise.jpeg.exe";
+    let content_type = mime::IMAGE_JPEG;
+    let data = b"hello world".to_vec();
+
+    let thumbnail = Thumbnail {
+        data: b"thumbnail".to_vec(),
+        content_type: content_type.clone(),
+        info: Some(BaseThumbnailInfo {
+            height: Some(uint!(13)),
+            width: Some(uint!(37)),
+            size: Some(uint!(42)),
+        }),
+    };
+
+    let config =
+        AttachmentConfig::with_thumbnail(thumbnail).info(AttachmentInfo::Image(BaseImageInfo {
+            height: Some(uint!(13)),
+            width: Some(uint!(37)),
+            size: Some(uint!(42)),
+            blurhash: None,
+        }));
+
+    let handle = q
+        .send_attachment(filename, content_type, data, config)
+        .await
+        .expect("queuing the attachment works");
+
+    // Let the background task pick up the request.
+    yield_now().await;
+
+    (handle, filename)
+}
+
+fn mock_jpeg_upload<'a>(
+    mock: &'a MatrixMockServer,
+    mxc: &MxcUri,
+    lock: Arc<Mutex<()>>,
+) -> MatrixMock<'a> {
     let mxc = mxc.to_owned();
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/r0/upload"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/jpeg"))
-        .respond_with(move |_req: &Request| {
-            // Wait for the signal from the main task that we can process this query.
-            let mock_lock = lock.clone();
-            std::thread::spawn(move || {
-                tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    drop(mock_lock.lock().await);
-                });
-            })
-            .join()
-            .unwrap();
-            ResponseTemplate::new(200).set_body_json(json!({
-              "content_uri": mxc
-            }))
+    mock.mock_upload().expect_mime_type("image/jpeg").respond_with(move |_req: &Request| {
+        // Wait for the signal from the main task that we can process this query.
+        let mock_lock = lock.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                drop(mock_lock.lock().await);
+            });
         })
-}
-
-fn mock_send_event(returned_event_id: &EventId) -> Mock {
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "event_id": returned_event_id,
-        })))
-}
-
-/// Return a mock that will fail all requests to /rooms/ROOM_ID/send with a
-/// transient 500 error.
-fn mock_send_transient_failure() -> Mock {
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(500))
+        .join()
+        .unwrap();
+        ResponseTemplate::new(200).set_body_json(json!({
+          "content_uri": mxc
+        }))
+    })
 }
 
 // A macro to assert on a stream of `RoomSendQueueUpdate`s.
@@ -238,20 +262,12 @@ macro_rules! assert_update {
 
 #[async_test]
 async fn test_cant_send_invited_room() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // When I'm invited to a room,
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_invited_room(InvitedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_room(&client, InvitedRoomBuilder::new(room_id)).await;
 
     // I can't send message to it with the send queue.
     assert_matches!(
@@ -262,20 +278,30 @@ async fn test_cant_send_invited_room() {
 
 #[async_test]
 async fn test_cant_send_left_room() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // When I've left a room,
     let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_room(&client, LeftRoomBuilder::new(room_id)).await;
 
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_left_room(LeftRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    // I can't send message to it with the send queue.
+    assert_matches!(
+        room.send_queue()
+            .send(RoomMessageEventContent::text_plain("Farewell, World!").into())
+            .await,
+        Err(RoomSendQueueError::RoomNotJoined)
+    );
+}
+
+#[async_test]
+async fn test_cant_send_knocked_room() {
+    let mock = MatrixMockServer::new().await;
+
+    // When I've knocked into a room,
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_room(&client, KnockedRoomBuilder::new(room_id)).await;
 
     // I can't send message to it with the send queue.
     assert_matches!(
@@ -288,24 +314,16 @@ async fn test_cant_send_left_room() {
 
 #[async_test]
 async fn test_nothing_sent_when_disabled() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     // When I disable the send queue,
     let event_id = event_id!("$1");
-    mock_send_event(event_id).expect(0).mount(&server).await;
+    mock.mock_room_send().ok(event_id).expect(0).mount().await;
 
     client.send_queue().set_enabled(false).await;
 
@@ -316,11 +334,10 @@ async fn test_nothing_sent_when_disabled() {
         .unwrap();
 
     // But I can still send it with room.send().
-    server.verify().await;
-    server.reset().await;
+    mock.verify_and_reset().await;
 
-    mock_encryption_state(&server, false).await;
-    mock_send_event(event_id).expect(1).mount(&server).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id).expect(1).mount().await;
 
     let response = room.send(RoomMessageEventContent::text_plain("Hello, World!")).await.unwrap();
     assert_eq!(response.event_id, event_id);
@@ -328,20 +345,13 @@ async fn test_nothing_sent_when_disabled() {
 
 #[async_test]
 async fn test_smoke() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
 
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -357,11 +367,9 @@ async fn test_smoke() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -378,7 +386,7 @@ async fn test_smoke() {
             }))
         })
         .expect(1)
-        .mount(&server)
+        .mount()
         .await;
 
     room.send_queue().send(RoomMessageEventContent::text_plain("1").into()).await.unwrap();
@@ -403,20 +411,12 @@ async fn test_smoke() {
 
 #[async_test]
 async fn test_smoke_raw() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -427,8 +427,8 @@ async fn test_smoke_raw() {
     // When the queue is enabled and I send message in some order, it does send it.
     let event_id = event_id!("$1");
 
-    mock_encryption_state(&server, false).await;
-    mock_send_event(event_id!("$1")).mount(&server).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id).mount().await;
 
     let json_content = r#"{"baguette": 42}"#.to_owned();
     let event = Raw::from_json_string(json_content.clone()).unwrap();
@@ -456,8 +456,9 @@ async fn test_smoke_raw() {
 
 #[async_test]
 async fn test_error_then_locally_reenabling() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
+    let client = mock.client_builder().build().await;
     let mut errors = client.send_queue().subscribe_errors();
 
     // Starting with a globally enabled queue.
@@ -466,16 +467,7 @@ async fn test_error_then_locally_reenabling() {
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -488,11 +480,10 @@ async fn test_error_then_locally_reenabling() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    let scoped_send = mock
+        .mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -507,7 +498,7 @@ async fn test_error_then_locally_reenabling() {
             ResponseTemplate::new(500)
         })
         .expect(3)
-        .mount(&server)
+        .mount_as_scoped()
         .await;
 
     q.send(RoomMessageEventContent::text_plain("1").into()).await.unwrap();
@@ -548,8 +539,8 @@ async fn test_error_then_locally_reenabling() {
     // But the room send queue is disabled.
     assert!(!room.send_queue().is_enabled());
 
-    server.reset().await;
-    mock_send_event(event_id!("$42")).expect(1).mount(&server).await;
+    drop(scoped_send);
+    mock.mock_room_send().ok(event_id!("$42")).expect(1).mount().await;
 
     // Re-enabling the *room* queue will re-send the same message in that room.
     room.send_queue().set_enabled(true);
@@ -567,8 +558,9 @@ async fn test_error_then_locally_reenabling() {
 
 #[async_test]
 async fn test_error_then_globally_reenabling() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
+    let client = mock.client_builder().build().await;
     let mut errors = client.send_queue().subscribe_errors();
 
     // Starting with a globally enabled queue.
@@ -577,16 +569,7 @@ async fn test_error_then_globally_reenabling() {
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -594,9 +577,9 @@ async fn test_error_then_globally_reenabling() {
     assert!(local_echoes.is_empty());
     assert!(watch.is_empty());
 
-    server.reset().await;
-    mock_encryption_state(&server, false).await;
-    mock_send_transient_failure().expect(3).mount(&server).await;
+    mock.verify_and_reset().await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().error500().expect(3).mount().await;
 
     q.send(RoomMessageEventContent::text_plain("1").into()).await.unwrap();
 
@@ -622,9 +605,9 @@ async fn test_error_then_globally_reenabling() {
 
     assert!(watch.is_empty());
 
-    server.reset().await;
-    mock_encryption_state(&server, false).await;
-    mock_send_event(event_id!("$42")).expect(1).mount(&server).await;
+    mock.verify_and_reset().await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$42")).expect(1).mount().await;
 
     // Re-enabling the global queue will cause the event to be sent.
     client.send_queue().set_enabled(true).await;
@@ -640,20 +623,12 @@ async fn test_error_then_globally_reenabling() {
 
 #[async_test]
 async fn test_reenabling_queue() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let errors = client.send_queue().subscribe_errors();
 
@@ -694,25 +669,11 @@ async fn test_reenabling_queue() {
 
     assert!(watch.is_empty());
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    let num_request = std::sync::Mutex::new(1);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(move |_req: &Request| {
-            let mut num_request = num_request.lock().unwrap();
-
-            let event_id = format!("${}", *num_request);
-            *num_request += 1;
-
-            ResponseTemplate::new(200).set_body_json(json!({
-                "event_id": event_id,
-            }))
-        })
-        .expect(3)
-        .mount(&server)
-        .await;
+    mock.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
+    mock.mock_room_send().ok(event_id!("$2")).mock_once().mount().await;
+    mock.mock_room_send().ok(event_id!("$3")).mock_once().mount().await;
 
     // But when reenabling the queue globally,
     client.send_queue().set_enabled(true).await;
@@ -733,23 +694,15 @@ async fn test_reenabling_queue() {
 
 #[async_test]
 async fn test_disjoint_enabled_status() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id1 = room_id!("!a:b.c");
     let room_id2 = room_id!("!b:b.c");
-    let room1 = mock_sync_with_new_room(
-        |builder| {
-            builder
-                .add_joined_room(JoinedRoomBuilder::new(room_id1))
-                .add_joined_room(JoinedRoomBuilder::new(room_id2));
-        },
-        &client,
-        &server,
-        room_id1,
-    )
-    .await;
-    let room2 = client.get_room(room_id2).unwrap();
+
+    let client = mock.client_builder().build().await;
+    let room1 = mock.sync_joined_room(&client, room_id1).await;
+    let room2 = mock.sync_joined_room(&client, room_id2).await;
 
     // When I start with a disabled send queue,
     client.send_queue().set_enabled(false).await;
@@ -778,20 +731,12 @@ async fn test_disjoint_enabled_status() {
 
 #[async_test]
 async fn test_cancellation() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -805,12 +750,10 @@ async fn test_cancellation() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
     let num_request = std::sync::Mutex::new(1);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -832,11 +775,11 @@ async fn test_cancellation() {
             }))
         })
         .expect(2)
-        .mount(&server)
+        .mount()
         .await;
 
     // The redact of txn1 will happen because we asked for it previously.
-    mock_redaction(event_id!("$1")).expect(1).mount(&server).await;
+    mock.mock_room_redact().ok(event_id!("$1")).mount().await;
 
     let handle1 = q.send(RoomMessageEventContent::text_plain("msg1").into()).await.unwrap();
     let handle2 = q.send(RoomMessageEventContent::text_plain("msg2").into()).await.unwrap();
@@ -853,7 +796,7 @@ async fn test_cancellation() {
     assert!(watch.is_empty());
 
     // Let the background task start now.
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // While the first item is being sent, the system records the intent to abort
     // it.
@@ -905,20 +848,12 @@ async fn test_edit() {
     // to edit a local echo, since if the cancellation test passes, all ways
     // would work here too similarly.
 
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -932,12 +867,10 @@ async fn test_edit() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
     let num_request = std::sync::Mutex::new(1);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -959,27 +892,21 @@ async fn test_edit() {
             }))
         })
         .expect(3)
-        .mount(&server)
+        .mount()
         .await;
 
     // The /event endpoint is used to retrieve the original event, during creation
     // of the edit event.
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/event/"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                EventFactory::new()
-                    .text_msg("msg1")
-                    .sender(client.user_id().unwrap())
-                    .room(room_id)
-                    .into_raw_timeline()
-                    .json(),
-            ),
-        )
+    mock.mock_room_event()
+        .room(room_id)
+        .ok(EventFactory::new()
+            .text_msg("msg1")
+            .sender(client.user_id().unwrap())
+            .room(room_id)
+            .into_timeline())
         .expect(1)
-        .named("get_event")
-        .mount(&server)
+        .named("room_event")
+        .mount()
         .await;
 
     let handle1 = q.send(RoomMessageEventContent::text_plain("msg1").into()).await.unwrap();
@@ -991,7 +918,7 @@ async fn test_edit() {
     assert!(watch.is_empty());
 
     // Let the background task start now.
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // While the first item is being sent, the system remembers the intent to edit
     // it, and will send it later.
@@ -1013,32 +940,27 @@ async fn test_edit() {
     // Let the server process the responses.
     drop(lock_guard);
 
-    // Now the server will process the messages in order.
+    // The queue sends the first event, without the edit.
     assert_update!(watch => sent { txn = txn1, });
-    assert_update!(watch => sent { txn = txn2, });
 
-    // Let a bit of time to process the edit event sent to the server for txn1.
+    // The queue sends the edit; we can't check the transaction id because it's
+    // unknown.
     assert_update!(watch => sent {});
+
+    // The queue sends the second event.
+    assert_update!(watch => sent { txn = txn2, });
 
     assert!(watch.is_empty());
 }
 
 #[async_test]
 async fn test_edit_with_poll_start() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -1052,12 +974,10 @@ async fn test_edit_with_poll_start() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
     let num_request = std::sync::Mutex::new(1);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -1080,27 +1000,20 @@ async fn test_edit_with_poll_start() {
         })
         .named("send_event")
         .expect(2)
-        .mount(&server)
+        .mount()
         .await;
 
     // The /event endpoint is used to retrieve the original event, during creation
     // of the edit event.
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/event/"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                EventFactory::new()
-                    .poll_start("poll_start", "question", vec!["Answer A"])
-                    .sender(client.user_id().unwrap())
-                    .room(room_id)
-                    .into_raw_timeline()
-                    .json(),
-            ),
-        )
+    mock.mock_room_event()
+        .ok(EventFactory::new()
+            .poll_start("poll_start", "question", vec!["Answer A"])
+            .sender(client.user_id().unwrap())
+            .room(room_id)
+            .into_timeline())
         .expect(1)
         .named("get_event")
-        .mount(&server)
+        .mount()
         .await;
 
     let poll_answers: UnstablePollAnswers =
@@ -1129,7 +1042,7 @@ async fn test_edit_with_poll_start() {
     assert!(watch.is_empty());
 
     // Let the background task start now.
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // Edit the poll start event
     let poll_answers: UnstablePollAnswers =
@@ -1170,20 +1083,12 @@ async fn test_edit_with_poll_start() {
 
 #[async_test]
 async fn test_edit_while_being_sent_and_fails() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -1197,11 +1102,9 @@ async fn test_edit_while_being_sent_and_fails() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -1216,7 +1119,7 @@ async fn test_edit_while_being_sent_and_fails() {
             ResponseTemplate::new(500)
         })
         .expect(3) // reattempts, because of short_retry()
-        .mount(&server)
+        .mount()
         .await;
 
     let handle = q.send(RoomMessageEventContent::text_plain("yo").into()).await.unwrap();
@@ -1226,7 +1129,7 @@ async fn test_edit_while_being_sent_and_fails() {
     assert!(watch.is_empty());
 
     // Let the background task start now.
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // While the first item is being sent, the system remembers the intent to edit
     // it, and will send it later.
@@ -1261,20 +1164,12 @@ async fn test_edit_while_being_sent_and_fails() {
 
 #[async_test]
 async fn test_edit_wakes_the_sending_task() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -1283,18 +1178,9 @@ async fn test_edit_wakes_the_sending_task() {
     assert!(local_echoes.is_empty());
     assert!(watch.is_empty());
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    let send_mock_scope = Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(413).set_body_json(json!({
-            // From https://spec.matrix.org/v1.10/client-server-api/#standard-error-response
-            "errcode": "M_TOO_LARGE",
-        })))
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+    let send_mock_scope = mock.mock_room_send().error_too_large().expect(1).mount_as_scoped().await;
 
     let handle =
         q.send(RoomMessageEventContent::text_plain("welcome to my ted talk").into()).await.unwrap();
@@ -1304,14 +1190,14 @@ async fn test_edit_wakes_the_sending_task() {
     assert!(watch.is_empty());
 
     // Let the background task start now.
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     assert_update!(watch => error { recoverable = false, txn = txn });
     assert!(watch.is_empty());
 
     // Now edit the event's content (imagine we make it "shorter").
     drop(send_mock_scope);
-    mock_send_event(event_id!("$1")).mount(&server).await;
+    mock.mock_room_send().ok(event_id!("$1")).mount().await;
 
     let edited = handle
         .edit(RoomMessageEventContent::text_plain("here's the summary of my ted talk").into())
@@ -1328,20 +1214,12 @@ async fn test_edit_wakes_the_sending_task() {
 
 #[async_test]
 async fn test_abort_after_disable() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let mut errors = client.send_queue().subscribe_errors();
 
@@ -1359,12 +1237,12 @@ async fn test_abort_after_disable() {
     assert!(local_echoes.is_empty());
     assert!(watch.is_empty());
 
-    server.reset().await;
+    mock.verify_and_reset().await;
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
     // Respond to /send with a transient 500 error.
-    mock_send_transient_failure().expect(3).mount(&server).await;
+    mock.mock_room_send().error500().expect(3).mount().await;
 
     // One message is queued.
     let handle = q.send(RoomMessageEventContent::text_plain("hey there").into()).await.unwrap();
@@ -1394,20 +1272,12 @@ async fn test_abort_after_disable() {
 
 #[async_test]
 async fn test_abort_or_edit_after_send() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     // Start with an enabled sending queue.
     client.send_queue().set_enabled(true).await;
@@ -1418,9 +1288,9 @@ async fn test_abort_or_edit_after_send() {
     assert!(local_echoes.is_empty());
     assert!(watch.is_empty());
 
-    server.reset().await;
-    mock_encryption_state(&server, false).await;
-    mock_send_event(event_id!("$1")).mount(&server).await;
+    mock.verify_and_reset().await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$1")).mount().await;
 
     let handle = q.send(RoomMessageEventContent::text_plain("hey there").into()).await.unwrap();
 
@@ -1445,20 +1315,12 @@ async fn test_abort_or_edit_after_send() {
 
 #[async_test]
 async fn test_abort_while_being_sent_and_fails() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -1472,11 +1334,9 @@ async fn test_abort_while_being_sent_and_fails() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -1491,7 +1351,7 @@ async fn test_abort_while_being_sent_and_fails() {
             ResponseTemplate::new(500)
         })
         .expect(3) // reattempts, because of short_retry()
-        .mount(&server)
+        .mount()
         .await;
 
     let handle = q.send(RoomMessageEventContent::text_plain("yo").into()).await.unwrap();
@@ -1501,7 +1361,7 @@ async fn test_abort_while_being_sent_and_fails() {
     assert!(watch.is_empty());
 
     // Let the background task start now.
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // While the item is being sent, the system remembers the intent to redact it
     // later.
@@ -1524,20 +1384,12 @@ async fn test_abort_while_being_sent_and_fails() {
 
 #[async_test]
 async fn test_unrecoverable_errors() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let mut errors = client.send_queue().subscribe_errors();
 
@@ -1555,33 +1407,14 @@ async fn test_unrecoverable_errors() {
     assert!(local_echoes.is_empty());
     assert!(watch.is_empty());
 
-    server.reset().await;
+    mock.verify_and_reset().await;
 
-    mock_encryption_state(&server, false).await;
-
-    let respond_with_unrecoverable = AtomicBool::new(true);
+    mock.mock_room_state_encryption().plain().mount().await;
 
     // Respond to the first /send with an unrecoverable error.
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(move |_req: &Request| {
-            // The first message gets M_TOO_LARGE, subsequent messages will encounter a
-            // great success.
-            if respond_with_unrecoverable.swap(false, Ordering::SeqCst) {
-                ResponseTemplate::new(413).set_body_json(json!({
-                    // From https://spec.matrix.org/v1.10/client-server-api/#standard-error-response
-                    "errcode": "M_TOO_LARGE",
-                }))
-            } else {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "event_id": "$42",
-                }))
-            }
-        })
-        .expect(2)
-        .mount(&server)
-        .await;
+    mock.mock_room_send().error_too_large().mock_once().mount().await;
+    // Respond to the second /send with an OK response.
+    mock.mock_room_send().ok(event_id!("$42")).mock_once().mount().await;
 
     // Queue two messages.
     q.send(RoomMessageEventContent::text_plain("i'm too big for ya").into()).await.unwrap();
@@ -1613,20 +1446,12 @@ async fn test_unrecoverable_errors() {
 
 #[async_test]
 async fn test_unwedge_unrecoverable_errors() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let mut errors = client.send_queue().subscribe_errors();
 
@@ -1644,36 +1469,18 @@ async fn test_unwedge_unrecoverable_errors() {
     assert!(local_echoes.is_empty());
     assert!(watch.is_empty());
 
-    server.reset().await;
+    mock.verify_and_reset().await;
 
-    mock_encryption_state(&server, false).await;
-
-    let respond_with_unrecoverable = AtomicBool::new(true);
+    mock.mock_room_state_encryption().plain().mount().await;
 
     // Respond to the first /send with an unrecoverable error.
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(move |_req: &Request| {
-            // The first message gets M_TOO_LARGE, subsequent messages will encounter a
-            // great success.
-            if respond_with_unrecoverable.swap(false, Ordering::SeqCst) {
-                ResponseTemplate::new(413).set_body_json(json!({
-                    // From https://spec.matrix.org/v1.10/client-server-api/#standard-error-response
-                    "errcode": "M_TOO_LARGE",
-                }))
-            } else {
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "event_id": "$42",
-                }))
-            }
-        })
-        .expect(2)
-        .mount(&server)
-        .await;
+    mock.mock_room_send().error_too_large().mock_once().mount().await;
+    // Respond to the second /send with an OK response.
+    mock.mock_room_send().ok(event_id!("$42")).mock_once().mount().await;
 
     // Queue the unrecoverable message.
-    q.send(RoomMessageEventContent::text_plain("i'm too big for ya").into()).await.unwrap();
+    let send_handle =
+        q.send(RoomMessageEventContent::text_plain("i'm too big for ya").into()).await.unwrap();
 
     // Message is seen as a local echo.
     let (txn1, _) = assert_update!(watch => local echo { body = "i'm too big for ya" });
@@ -1693,7 +1500,7 @@ async fn test_unwedge_unrecoverable_errors() {
     assert!(client.send_queue().is_enabled());
 
     // Unwedge the previously failed message and try sending it again
-    q.unwedge(&txn1).await.unwrap();
+    send_handle.unwedge().await.unwrap();
 
     // The message should be retried
     assert_update!(watch => retry { txn=txn1 });
@@ -1709,25 +1516,16 @@ async fn test_no_network_access_error_is_recoverable() {
     // server in a static. Using the line below will create a "bare" server,
     // which is effectively dropped upon `drop()`.
     let server = wiremock::MockServer::builder().start().await;
-
-    let client = logged_in_client(Some(server.uri().to_string())).await;
+    let mock = MatrixMockServer::from_server(server);
+    let client = mock.client_builder().build().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     // Dropping the server: any subsequent attempt to connect mimics an unreachable
     // server, which might be caused by missing network.
-    drop(server);
+    drop(mock);
 
     let mut errors = client.send_queue().subscribe_errors();
     assert!(errors.is_empty());
@@ -1773,30 +1571,20 @@ async fn test_reloading_rooms_with_unsent_events() {
     let room_id2 = room_id!("!d:e.f");
 
     let server = wiremock::MockServer::start().await;
-    let client = Client::builder()
-        .homeserver_url(server.uri())
-        .server_versions([MatrixVersion::V1_0])
-        .store_config(StoreConfig::new().state_store(store.clone()))
-        .request_config(RequestConfig::new().disable_retry())
+    let mock = MatrixMockServer::from_server(server);
+
+    let client = mock
+        .client_builder()
+        .store_config(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                .state_store(store.clone()),
+        )
         .build()
-        .await
-        .unwrap();
-    set_client_session(&client).await;
+        .await;
 
     // Mark two rooms as joined.
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder
-                .add_joined_room(JoinedRoomBuilder::new(room_id))
-                .add_joined_room(JoinedRoomBuilder::new(room_id2));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
-
-    let room2 = client.get_room(room_id2).unwrap();
+    let room = mock.sync_joined_room(&client, room_id).await;
+    let room2 = mock.sync_joined_room(&client, room_id2).await;
 
     // Globally disable the send queue.
     let q = client.send_queue();
@@ -1819,7 +1607,7 @@ async fn test_reloading_rooms_with_unsent_events() {
     sleep(Duration::from_millis(300)).await;
     assert!(watch.is_empty());
 
-    server.reset().await;
+    mock.verify_and_reset().await;
 
     {
         // Kill the client, let it close background tasks.
@@ -1832,59 +1620,36 @@ async fn test_reloading_rooms_with_unsent_events() {
     // Create a new client with the same memory backend. As the send queues are
     // enabled by default, it will respawn tasks for sending events to those two
     // rooms in the background.
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    let event_id = StdMutex::new(0);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(move |_req: &Request| {
-            let mut event_id_guard = event_id.lock().unwrap();
-            let event_id = *event_id_guard;
-            *event_id_guard += 1;
-            ResponseTemplate::new(200).set_body_json(json!({
-                "event_id": event_id
-            }))
-        })
-        .expect(2)
-        .mount(&server)
+    mock.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
+    mock.mock_room_send().ok(event_id!("$2")).mock_once().mount().await;
+
+    let new_client = mock
+        .client_builder()
+        .store_config(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()).state_store(store),
+        )
+        .build()
         .await;
 
-    let client = Client::builder()
-        .homeserver_url(server.uri())
-        .server_versions([MatrixVersion::V1_0])
-        .store_config(StoreConfig::new().state_store(store))
-        .request_config(RequestConfig::new().disable_retry())
-        .build()
-        .await
-        .unwrap();
-    set_client_session(&client).await;
-
-    client.send_queue().respawn_tasks_for_rooms_with_unsent_requests().await;
+    new_client.send_queue().respawn_tasks_for_rooms_with_unsent_requests().await;
 
     // Let the sending queues process events.
     sleep(Duration::from_secs(1)).await;
 
     // The real assertion is on the expect(2) on the above Mock.
-    server.verify().await;
+    mock.verify_and_reset().await;
 }
 
 #[async_test]
 async fn test_reactions() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -1897,11 +1662,9 @@ async fn test_reactions() {
 
     let mock_lock = lock.clone();
 
-    mock_encryption_state(&server, false).await;
+    mock.mock_room_state_encryption().plain().mount().await;
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
+    mock.mock_room_send()
         .respond_with(move |_req: &Request| {
             // Wait for the signal from the main thread that we can process this query.
             let mock_lock = mock_lock.clone();
@@ -1921,18 +1684,12 @@ async fn test_reactions() {
             }))
         })
         .expect(3)
-        .mount(&server)
+        .mount()
         .await;
 
     // Sending of the second emoji has started; abort it, it will result in a redact
     // request.
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/redact/.*?/.*?"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$3"})))
-        .expect(1)
-        .mount(&server)
-        .await;
+    mock.mock_room_redact().ok(event_id!("$3")).expect(1).mount().await;
 
     // Send a message.
     let msg_handle =
@@ -2010,20 +1767,12 @@ async fn test_reactions() {
 
 #[async_test]
 async fn test_media_uploads() {
-    let (client, server) = logged_in_client_with_server().await;
+    let mock = MatrixMockServer::new().await;
 
     // Mark the room as joined.
     let room_id = room_id!("!a:b.c");
-
-    let room = mock_sync_with_new_room(
-        |builder| {
-            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-        },
-        &client,
-        &server,
-        room_id,
-    )
-    .await;
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
 
     let q = room.send_queue();
 
@@ -2063,21 +1812,19 @@ async fn test_media_uploads() {
 
     // ----------------------
     // Prepare endpoints.
-    mock_encryption_state(&server, false).await;
-    mock_send_event(event_id!("$1")).expect(1).mount(&server).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
 
     let allow_upload_lock = Arc::new(Mutex::new(()));
     let block_upload = allow_upload_lock.lock().await;
 
-    mock_jpeg_upload(mxc_uri!("mxc://sdk.rs/thumbnail"), allow_upload_lock.clone())
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
+    mock_jpeg_upload(&mock, mxc_uri!("mxc://sdk.rs/thumbnail"), allow_upload_lock.clone())
+        .mock_once()
+        .mount()
         .await;
-    mock_jpeg_upload(mxc_uri!("mxc://sdk.rs/media"), allow_upload_lock.clone())
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
+    mock_jpeg_upload(&mock, mxc_uri!("mxc://sdk.rs/media"), allow_upload_lock.clone())
+        .mock_once()
+        .mount()
         .await;
 
     // ----------------------
@@ -2163,13 +1910,8 @@ async fn test_media_uploads() {
     // ----------------------
     // Send handle operations.
 
-    // Operations on the send handle haven't been implemented yet.
-    assert_matches!(
-        send_handle.abort().await,
-        Err(RoomSendQueueStorageError::OperationNotImplementedYet)
-    );
-    // (and this operation would be invalid, we shouldn't turn a media into a
-    // message).
+    // This operation should be invalid, we shouldn't turn a media into a
+    // message.
     assert_matches!(
         send_handle.edit(RoomMessageEventContent::text_plain("hi").into()).await,
         Err(RoomSendQueueStorageError::OperationNotImplementedYet)
@@ -2233,6 +1975,753 @@ async fn test_media_uploads() {
         txn = transaction_id,
         event_id = event_id!("$1")
     });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_media_uploads_no_caching_of_thumbnails_of_unknown_sizes() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // ----------------------
+    // Create the media to send, with a thumbnail that has unknown dimensions.
+    let filename = "surprise.jpeg.exe";
+    let content_type = mime::IMAGE_JPEG;
+    let data = b"hello world".to_vec();
+
+    let thumbnail = Thumbnail {
+        data: b"thumbnail".to_vec(),
+        content_type: content_type.clone(),
+        info: Some(BaseThumbnailInfo::default()),
+    };
+
+    let attachment_info = AttachmentInfo::Image(BaseImageInfo {
+        height: Some(uint!(14)),
+        width: Some(uint!(38)),
+        size: Some(uint!(43)),
+        blurhash: None,
+    });
+
+    let config = AttachmentConfig::with_thumbnail(thumbnail).info(attachment_info);
+
+    // ----------------------
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
+
+    mock.mock_upload().ok(mxc_uri!("mxc://sdk.rs/thumbnail")).mock_once().mount().await;
+    mock.mock_upload().ok(mxc_uri!("mxc://sdk.rs/media")).mock_once().mount().await;
+
+    // ----------------------
+    // Send the media.
+    assert!(watch.is_empty());
+    q.send_attachment(filename, content_type, data, config)
+        .await
+        .expect("queuing the attachment works");
+
+    // ----------------------
+    // Observe the local echo
+    let (txn, _send_handle, content) = assert_update!(watch => local echo event);
+
+    // Sanity-check metadata.
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.filename(), filename);
+
+    let info = img_content.info.unwrap();
+    assert_eq!(info.height, Some(uint!(14)));
+    assert_eq!(info.width, Some(uint!(38)));
+    assert_eq!(info.size, Some(uint!(43)));
+    assert_eq!(info.mimetype.as_deref(), Some("image/jpeg"));
+
+    // Check the data source: it should reference the send queue local storage.
+    let local_source = img_content.source;
+    assert_let!(MediaSource::Plain(mxc) = &local_source);
+    assert!(mxc.to_string().starts_with("mxc://send-queue.localhost/"), "{mxc}");
+
+    // The media is immediately available from the cache.
+    let file_media = client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters { source: local_source, format: MediaFormat::File },
+            true,
+        )
+        .await
+        .expect("media should be found");
+    assert_eq!(file_media, b"hello world");
+
+    // ----------------------
+    // Thumbnail.
+
+    // Check metadata.
+    let tinfo = info.thumbnail_info.unwrap();
+    assert_eq!(tinfo.height, None);
+    assert_eq!(tinfo.width, None);
+    assert_eq!(tinfo.size, None);
+    assert_eq!(tinfo.mimetype.as_deref(), Some("image/jpeg"));
+
+    // Check the thumbnail source: it should reference the send queue local storage.
+    let local_thumbnail_source = info.thumbnail_source.unwrap();
+    assert_let!(MediaSource::Plain(mxc) = &local_thumbnail_source);
+    assert!(mxc.to_string().starts_with("mxc://send-queue.localhost/"), "{mxc}");
+
+    let thumbnail_media = client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters {
+                source: local_thumbnail_source,
+                format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(uint!(0), uint!(0))),
+            },
+            true,
+        )
+        .await
+        .expect("media should be found");
+    assert_eq!(thumbnail_media, b"thumbnail");
+
+    // ----------------------
+    // Let the upload progress.
+
+    assert_update!(watch => uploaded { related_to = txn, mxc = mxc_uri!("mxc://sdk.rs/thumbnail") });
+    assert_update!(watch => uploaded { related_to = txn, mxc = mxc_uri!("mxc://sdk.rs/media") });
+
+    let edit_msg = assert_update!(watch => edit local echo { txn = txn });
+    assert_let!(MessageType::Image(new_content) = edit_msg.msgtype);
+    assert_let!(MediaSource::Plain(new_uri) = &new_content.source);
+    assert_eq!(new_uri, mxc_uri!("mxc://sdk.rs/media"));
+
+    let file_media = client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters { source: new_content.source, format: MediaFormat::File },
+            true,
+        )
+        .await
+        .expect("media should be found with its final MXC uri in the cache");
+    assert_eq!(file_media, b"hello world");
+
+    let new_thumbnail_source = new_content.info.unwrap().thumbnail_source.unwrap();
+    assert_let!(MediaSource::Plain(new_uri) = &new_thumbnail_source);
+    assert_eq!(new_uri, mxc_uri!("mxc://sdk.rs/thumbnail"));
+
+    // Retrieving the thumbnail should NOT work, since it doesn't make sense to
+    // cache it with a size of 0.
+    client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters {
+                source: new_thumbnail_source,
+                format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(uint!(0), uint!(0))),
+            },
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    // The event is sent, at some point.
+    assert_update!(watch => sent { event_id = event_id!("$1") });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_media_upload_retry() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    // Fail for the first three attempts.
+    mock.mock_upload()
+        .expect_mime_type("image/jpeg")
+        .error500()
+        .up_to_n_times(3)
+        .expect(3)
+        .mount()
+        .await;
+
+    // Send the media.
+    assert!(watch.is_empty());
+    let (_handle, filename) = queue_attachment_no_thumbnail(&q).await;
+
+    // Observe the local echo.
+    let (event_txn, _send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.body, filename);
+
+    // Let the upload stumble and the queue disable itself.
+    let error = assert_update!(watch => error { recoverable=true, txn=event_txn });
+    let error = error.as_client_api_error().unwrap();
+    assert_eq!(error.status_code, 500);
+    assert!(q.is_enabled().not());
+
+    // Mount the mock for the upload and sending the event.
+    mock.mock_upload()
+        .expect_mime_type("image/jpeg")
+        .ok(mxc_uri!("mxc://sdk.rs/media"))
+        .mock_once()
+        .mount()
+        .await;
+    mock.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
+
+    // Restart the send queue.
+    q.set_enabled(true);
+
+    assert_update!(watch => uploaded {
+        related_to = event_txn,
+        mxc = mxc_uri!("mxc://sdk.rs/media")
+    });
+
+    let edit_msg = assert_update!(watch => edit local echo {
+        txn = event_txn
+    });
+    assert_let!(MessageType::Image(new_content) = edit_msg.msgtype);
+    assert_let!(MediaSource::Plain(new_uri) = &new_content.source);
+    assert_eq!(new_uri, mxc_uri!("mxc://sdk.rs/media"));
+
+    // The event is sent, at some point.
+    assert_update!(watch => sent {
+        txn = event_txn,
+        event_id = event_id!("$1")
+    });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_unwedging_media_upload() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    // Fail for the first attempt with an error indicating the media's too large,
+    // wedging the upload.
+    mock.mock_upload().error_too_large().mock_once().mount().await;
+
+    // Send the media.
+    assert!(watch.is_empty());
+    let (_handle, filename) = queue_attachment_no_thumbnail(&q).await;
+
+    // Observe the local echo.
+    let (event_txn, send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.body, filename);
+
+    // Although the actual error happens on the file upload transaction id, it must
+    // be reported with the *event* transaction id.
+    let error = assert_update!(watch => error { recoverable=false, txn=event_txn });
+    let error = error.as_client_api_error().unwrap();
+    assert_eq!(error.status_code, 413);
+    assert!(q.is_enabled());
+
+    // Mount the mock for the upload and sending the event.
+    mock.mock_upload().ok(mxc_uri!("mxc://sdk.rs/media")).mock_once().mount().await;
+    mock.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
+
+    // Unwedge the upload.
+    send_handle.unwedge().await.unwrap();
+
+    // Observe the notification for the retry itself.
+    assert_update!(watch => retry { txn = event_txn });
+
+    // Observe the upload succeeding at some point.
+    assert_update!(watch => uploaded { related_to = event_txn, mxc = mxc_uri!("mxc://sdk.rs/media") });
+
+    let edit_msg = assert_update!(watch => edit local echo { txn = event_txn });
+    assert_let!(MessageType::Image(new_content) = edit_msg.msgtype);
+    assert_let!(MediaSource::Plain(new_uri) = &new_content.source);
+    assert_eq!(new_uri, mxc_uri!("mxc://sdk.rs/media"));
+
+    // The event is sent, at some point.
+    assert_update!(watch => sent { txn = event_txn, event_id = event_id!("$1") });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+/// Aborts an ongoing media upload and checks post-conditions:
+/// - we could abort
+/// - we get the notification about the aborted upload
+/// - the medias aren't present in the cache store
+async fn abort_and_verify(
+    client: &Client,
+    watch: &mut Receiver<RoomSendQueueUpdate>,
+    img_content: ImageMessageEventContent,
+    upload_handle: SendHandle,
+    upload_txn: OwnedTransactionId,
+) {
+    let file_source = img_content.source;
+    let info = img_content.info.unwrap();
+    let thumbnail_source = info.thumbnail_source.unwrap();
+    let thumbnail_info = info.thumbnail_info.unwrap();
+
+    let aborted = upload_handle.abort().await.unwrap();
+    assert!(aborted, "upload must have been aborted");
+
+    assert_update!(watch => cancelled { txn = upload_txn });
+
+    // The event cache doesn't contain the medias anymore.
+    client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters { source: file_source, format: MediaFormat::File },
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters {
+                source: thumbnail_source,
+                format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
+                    thumbnail_info.width.unwrap(),
+                    thumbnail_info.height.unwrap(),
+                )),
+            },
+            true,
+        )
+        .await
+        .unwrap_err();
+}
+
+#[async_test]
+async fn test_media_event_is_sent_in_order() {
+    // Test that despite happening in multiple requests, sending a media maintains
+    // the ordering.
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_upload().ok(mxc_uri!("mxc://sdk.rs/media")).mock_once().mount().await;
+
+    assert!(watch.is_empty());
+
+    {
+        // 1. Send a text message that will get wedged.
+        mock.mock_room_send().error_too_large().mock_once().mount().await;
+        q.send(RoomMessageEventContent::text_plain("error").into()).await.unwrap();
+        let (text_txn, _send_handle) = assert_update!(watch => local echo { body = "error" });
+        assert_update!(watch => error { recoverable = false, txn = text_txn });
+    }
+
+    // We'll then send a media event, and then a text event with success.
+    mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
+    mock.mock_room_send().ok(event_id!("$text")).mock_once().mount().await;
+
+    // 2. Queue the media.
+    let (_handle, filename) = queue_attachment_no_thumbnail(&q).await;
+
+    // 3. Queue the message.
+    q.send(RoomMessageEventContent::text_plain("hello world").into()).await.unwrap();
+
+    // Observe the local echo for the media.
+    let (event_txn, _send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.body, filename);
+
+    // Observe the local echo for the message.
+    let (text_txn, _send_handle) = assert_update!(watch => local echo { body = "hello world" });
+
+    // The media gets uploaded.
+    assert_update!(watch => uploaded { related_to = event_txn, mxc = mxc_uri!("mxc://sdk.rs/media") });
+
+    // The media event gets updated with the final MXC IDs.
+    assert_update!(watch => edit local echo { txn = event_txn });
+
+    // This is the main thing we're testing: the media must be effectively sent
+    // *before* the text message, despite implementation details (the media is
+    // sent over multiple send queue requests).
+
+    assert_update!(watch => sent { txn = event_txn, event_id = event_id!("$media") });
+    assert_update!(watch => sent { txn = text_txn, event_id = event_id!("$text") });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+
+    // When reopening the send queue, we still see the wedged event.
+    let (local_echoes, _watch) = q.subscribe().await.unwrap();
+    assert_eq!(local_echoes.len(), 1);
+    assert_let!(LocalEchoContent::Event { send_error, .. } = &local_echoes[0].content);
+    assert!(send_error.is_some());
+}
+
+#[async_test]
+async fn test_cancel_upload_before_active() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    mock.mock_room_send()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)).set_body_json(
+            json!({
+              "event_id": event_id!("$msg")
+            }),
+        ))
+        .mock_once()
+        .mount()
+        .await;
+
+    // Send an event which sending will be "slow" (blocked by mutex).
+    q.send(RoomMessageEventContent::text_plain("hey").into()).await.unwrap();
+    let (msg_txn, _handle) = assert_update!(watch => local echo { body = "hey" });
+
+    // Send the media.
+    assert!(watch.is_empty());
+
+    let (upload_handle, filename) = queue_attachment_with_thumbnail(&q).await;
+
+    let (upload_txn, _send_handle, content) = assert_update!(watch => local echo event);
+
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.filename(), filename);
+
+    // Abort the upload.
+    abort_and_verify(&client, &mut watch, img_content, upload_handle, upload_txn).await;
+
+    // Let the sending progress.
+    assert!(watch.is_empty());
+    sleep(Duration::from_secs(1)).await;
+
+    // The text event is sent, at some point.
+    assert_update!(watch => sent { txn = msg_txn, });
+
+    // Wait a bit of time for things to settle.
+    sleep(Duration::from_millis(500)).await;
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_cancel_upload_with_thumbnail_active() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$msg")).mock_once().mount().await;
+
+    // Have the thumbnail upload take forever and time out, if continued. This will
+    // be interrupted when aborting, so this will never have to complete.
+    mock.mock_upload()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .expect(1)
+        .mount()
+        .await;
+
+    // Send the media.
+    assert!(watch.is_empty());
+
+    let (upload_handle, filename) = queue_attachment_with_thumbnail(&q).await;
+
+    let (upload_txn, _send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.filename(), filename);
+
+    // Let the upload request start.
+    sleep(Duration::from_millis(500)).await;
+
+    // Abort the upload.
+    abort_and_verify(&client, &mut watch, img_content, upload_handle, upload_txn).await;
+
+    // To prove we're not waiting for the upload to finish, send a message and
+    // observe it's immediately sent.
+    q.send(RoomMessageEventContent::text_plain("hi").into()).await.unwrap();
+    let (msg_txn, _handle) = assert_update!(watch => local echo { body = "hi" });
+    assert_update!(watch => sent { txn = msg_txn, });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_cancel_upload_with_uploaded_thumbnail_and_file_active() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$msg")).mock_once().named("send event").mount().await;
+
+    // Have the thumbnail upload finish early.
+    mock.mock_upload()
+        .ok(mxc_uri!("mxc://sdk.rs/thumbnail"))
+        .mock_once()
+        .named("thumbnail upload")
+        .mount()
+        .await;
+
+    // Have the file upload take forever and time out, if continued. This will
+    // be interrupted when aborting, so this will never have to complete.
+    mock.mock_upload()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .expect(1)
+        .named("file upload")
+        .mount()
+        .await;
+
+    // Send the media.
+    assert!(watch.is_empty());
+
+    let (upload_handle, filename) = queue_attachment_with_thumbnail(&q).await;
+
+    let (upload_txn, _send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.filename(), filename);
+
+    // The thumbnail uploads just fine.
+    assert_update!(watch => uploaded { related_to = upload_txn, mxc = mxc_uri!("mxc://sdk.rs/thumbnail") });
+
+    // Let the file upload request start.
+    sleep(Duration::from_millis(500)).await;
+
+    // Abort the upload.
+    abort_and_verify(&client, &mut watch, img_content, upload_handle, upload_txn).await;
+
+    // To prove we're not waiting for the upload to finish, send a message and
+    // observe it's immediately sent.
+    q.send(RoomMessageEventContent::text_plain("hi").into()).await.unwrap();
+    let (msg_txn, _handle) = assert_update!(watch => local echo { body = "hi" });
+    assert_update!(watch => sent { txn = msg_txn, });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_cancel_upload_only_file_with_file_active() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+    mock.mock_room_send().ok(event_id!("$msg")).mock_once().named("send event").mount().await;
+
+    // Have the file upload take forever and time out, if continued. This will
+    // be interrupted when aborting, so this will never have to complete.
+    mock.mock_upload()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .expect(1)
+        .named("file upload")
+        .mount()
+        .await;
+
+    // Send the media.
+    assert!(watch.is_empty());
+
+    let (upload_handle, filename) = queue_attachment_no_thumbnail(&q).await;
+
+    let (upload_txn, _send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(img_content) = content.msgtype);
+    assert_eq!(img_content.filename(), filename);
+
+    // Let the upload request start.
+    sleep(Duration::from_millis(500)).await;
+
+    // Abort the upload.
+    let aborted = upload_handle.abort().await.unwrap();
+    assert!(aborted, "upload must have been aborted");
+
+    assert_update!(watch => cancelled { txn = upload_txn });
+
+    // The event cache doesn't contain the medias anymore.
+    client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters { source: img_content.source, format: MediaFormat::File },
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    // To prove we're not waiting for the upload to finish, send a message and
+    // observe it's immediately sent.
+    q.send(RoomMessageEventContent::text_plain("hi").into()).await.unwrap();
+    let (msg_txn, _handle) = assert_update!(watch => local echo { body = "hi" });
+    assert_update!(watch => sent { txn = msg_txn, });
+
+    // That's all, folks!
+    assert!(watch.is_empty());
+}
+
+#[async_test]
+async fn test_cancel_upload_while_sending_event() {
+    let mock = MatrixMockServer::new().await;
+
+    // Mark the room as joined.
+    let room_id = room_id!("!a:b.c");
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, room_id).await;
+
+    let q = room.send_queue();
+
+    let (local_echoes, mut watch) = q.subscribe().await.unwrap();
+    assert!(local_echoes.is_empty());
+
+    // Prepare endpoints.
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    // File upload will succeed immediately.
+    mock.mock_upload()
+        .ok(mxc_uri!("mxc://sdk.rs/media"))
+        .mock_once()
+        .named("file upload")
+        .mount()
+        .await;
+
+    // Sending of the media event will take 1 second, so we can abort it while it's
+    // happening.
+    mock.mock_room_send()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)).set_body_json(
+            json!({
+              "event_id": "$media"
+            }),
+        ))
+        .mock_once()
+        .named("send event")
+        .mock_once()
+        .mount()
+        .await;
+
+    // A redaction will happen because the abort happens after the event is getting
+    // sent.
+    mock.mock_room_redact().ok(event_id!("$redaction")).mock_once().mount().await;
+
+    // Send the media.
+    assert!(watch.is_empty());
+
+    let (upload_handle, filename) = queue_attachment_no_thumbnail(&q).await;
+
+    let (upload_txn, _send_handle, content) = assert_update!(watch => local echo event);
+    assert_let!(MessageType::Image(local_content) = content.msgtype);
+    assert_eq!(local_content.filename(), filename);
+
+    assert_update!(watch => uploaded { related_to = upload_txn, mxc = mxc_uri!("mxc://sdk.rs/media") });
+
+    let edit_msg = assert_update!(watch => edit local echo { txn = upload_txn });
+    assert_let!(MessageType::Image(remote_content) = edit_msg.msgtype);
+    assert_let!(MediaSource::Plain(new_uri) = &remote_content.source);
+    assert_eq!(new_uri, mxc_uri!("mxc://sdk.rs/media"));
+
+    // Let the upload request start.
+    sleep(Duration::from_millis(250)).await;
+
+    // Abort the upload.
+    let aborted = upload_handle.abort().await.unwrap();
+    assert!(aborted, "upload must have been aborted");
+
+    // We get a local echo for the cancelled media event…
+    assert_update!(watch => cancelled { txn = upload_txn });
+    // …But the event is still sent, before getting redacted.
+    assert_update!(watch => sent { txn = upload_txn, });
+
+    // The event cache doesn't contain the media with the local URI.
+    client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters { source: local_content.source, format: MediaFormat::File },
+            true,
+        )
+        .await
+        .unwrap_err();
+
+    // But it does contain the media with the remote URI, which hasn't been removed
+    // from the remote server.
+    client
+        .media()
+        .get_media_content(
+            &MediaRequestParameters { source: remote_content.source, format: MediaFormat::File },
+            true,
+        )
+        .await
+        .unwrap();
+
+    // Let things settle (and the redaction endpoint be called).
+    sleep(Duration::from_secs(1)).await;
+
+    // Trying to abort after it's been sent/redacted is a no-op
+    let aborted = upload_handle.abort().await.unwrap();
+    assert!(aborted.not());
 
     // That's all, folks!
     assert!(watch.is_empty());

@@ -20,9 +20,9 @@ use super::{capabilities::assert_capabilities_dance, parse_msg, WIDGET_ID};
 use crate::widget::machine::{Action, IncomingMessage, WidgetMachine};
 
 #[test]
-fn machine_sends_error_for_unknown_request() {
+fn test_machine_sends_error_for_unknown_request() {
     let room_id = owned_room_id!("!a98sd12bjh:example.org");
-    let (mut machine, _) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, true, None);
+    let (mut machine, _) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, true);
 
     let actions = machine.process(IncomingMessage::WidgetMessage(json_string!({
         "api": "fromWidget",
@@ -46,13 +46,9 @@ fn machine_sends_error_for_unknown_request() {
 }
 
 #[test]
-fn read_messages_without_capabilities() {
-    let (mut machine, _) = WidgetMachine::new(
-        WIDGET_ID.to_owned(),
-        owned_room_id!("!a98sd12bjh:example.org"),
-        true,
-        None,
-    );
+fn test_read_messages_without_capabilities() {
+    let (mut machine, _) =
+        WidgetMachine::new(WIDGET_ID.to_owned(), owned_room_id!("!a98sd12bjh:example.org"), true);
 
     let actions = machine.process(IncomingMessage::WidgetMessage(json_string!({
         "api": "fromWidget",
@@ -77,9 +73,9 @@ fn read_messages_without_capabilities() {
 }
 
 #[test]
-fn read_request_for_non_allowed_message_like_events() {
+fn test_read_request_for_non_allowed_message_like_events() {
     let room_id = owned_room_id!("!a98sd12bjh:example.org");
-    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false);
     assert_capabilities_dance(&mut machine, actions, None);
 
     let actions = machine.process(IncomingMessage::WidgetMessage(json_string!({
@@ -98,13 +94,16 @@ fn read_request_for_non_allowed_message_like_events() {
     assert_eq!(request_id, "get-me-some-messages");
     assert_eq!(msg["api"], "fromWidget");
     assert_eq!(msg["action"], "org.matrix.msc2876.read_events");
-    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed");
+    assert_eq!(
+        msg["response"]["error"]["message"].as_str().unwrap(),
+        "Not allowed to read message like event"
+    );
 }
 
 #[test]
-fn read_request_for_non_allowed_state_events() {
+fn test_read_request_for_non_allowed_state_events() {
     let room_id = owned_room_id!("!a98sd12bjh:example.org");
-    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false);
     assert_capabilities_dance(&mut machine, actions, None);
 
     let actions = machine.process(IncomingMessage::WidgetMessage(json_string!({
@@ -124,13 +123,16 @@ fn read_request_for_non_allowed_state_events() {
     assert_eq!(request_id, "get-me-some-messages");
     assert_eq!(msg["api"], "fromWidget");
     assert_eq!(msg["action"], "org.matrix.msc2876.read_events");
-    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed");
+    assert_eq!(
+        msg["response"]["error"]["message"].as_str().unwrap(),
+        "Not allowed to read state event"
+    );
 }
 
 #[test]
-fn send_request_for_non_allowed_state_events() {
+fn test_send_request_for_non_allowed_state_events() {
     let room_id = owned_room_id!("!a98sd12bjh:example.org");
-    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false);
     assert_capabilities_dance(
         &mut machine,
         actions,
@@ -156,13 +158,13 @@ fn send_request_for_non_allowed_state_events() {
     assert_eq!(request_id, "send-me-a-message");
     assert_eq!(msg["api"], "fromWidget");
     assert_eq!(msg["action"], "send_event");
-    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed");
+    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed to send event");
 }
 
 #[test]
-fn send_request_for_non_allowed_message_like_events() {
+fn test_send_request_for_non_allowed_message_like_events() {
     let room_id = owned_room_id!("!a98sd12bjh:example.org");
-    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false);
     assert_capabilities_dance(
         &mut machine,
         actions,
@@ -188,13 +190,13 @@ fn send_request_for_non_allowed_message_like_events() {
     assert_eq!(request_id, "send-me-a-message");
     assert_eq!(msg["api"], "fromWidget");
     assert_eq!(msg["action"], "send_event");
-    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed");
+    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed to send event");
 }
 
 #[test]
-fn read_request_for_message_like_with_disallowed_msg_type_fails() {
+fn test_read_request_for_message_like_with_disallowed_msg_type_fails() {
     let room_id = owned_room_id!("!a98sd12bjh:example.org");
-    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false);
     assert_capabilities_dance(
         &mut machine,
         actions,
@@ -218,5 +220,8 @@ fn read_request_for_message_like_with_disallowed_msg_type_fails() {
     assert_eq!(request_id, "get-me-some-messages");
     assert_eq!(msg["api"], "fromWidget");
     assert_eq!(msg["action"], "org.matrix.msc2876.read_events");
-    assert_eq!(msg["response"]["error"]["message"].as_str().unwrap(), "Not allowed");
+    assert_eq!(
+        msg["response"]["error"]["message"].as_str().unwrap(),
+        "Not allowed to read message like event"
+    );
 }

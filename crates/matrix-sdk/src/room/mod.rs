@@ -2052,7 +2052,7 @@ impl Room {
     ) -> MessageType {
         // If caption is set, use it as body, and filename as the file name; otherwise,
         // body is the filename, and the filename is not set.
-        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
+        // https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
         let (body, filename) = match caption {
             Some(caption) => (caption, Some(filename.to_owned())),
             None => (filename.to_owned(), None),
@@ -2263,7 +2263,7 @@ impl Room {
     ) -> Result<send_state_event::v3::Response> {
         self.ensure_room_joined()?;
 
-        let upload_response = self.client.media().upload(mime, data).await?;
+        let upload_response = self.client.media().upload(mime, data, None).await?;
         let mut info = info.unwrap_or_default();
         info.blurhash = upload_response.blurhash;
         info.mimetype = Some(mime.to_string());
@@ -2972,6 +2972,10 @@ impl Room {
     ///  - is this a group with more than one other member -> notify
     pub async fn send_call_notification_if_needed(&self) -> Result<()> {
         if self.has_active_room_call() {
+            return Ok(());
+        }
+
+        if !self.can_user_trigger_room_notification(self.own_user_id()).await? {
             return Ok(());
         }
 

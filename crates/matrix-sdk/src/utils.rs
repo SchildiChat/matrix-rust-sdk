@@ -21,9 +21,12 @@ use std::sync::{Arc, RwLock};
 use futures_core::Stream;
 #[cfg(feature = "e2e-encryption")]
 use futures_util::StreamExt;
+#[cfg(feature = "markdown")]
+use ruma::events::room::message::FormattedBody;
 use ruma::{
     events::{AnyMessageLikeEventContent, AnyStateEventContent},
     serde::Raw,
+    RoomAliasId,
 };
 use serde_json::value::{RawValue as RawJsonValue, Value as JsonValue};
 #[cfg(feature = "e2e-encryption")]
@@ -190,8 +193,61 @@ impl IntoRawStateEventContent for &Box<RawJsonValue> {
     }
 }
 
+const INVALID_ROOM_ALIAS_NAME_CHARS: &str = "#,:{}\\";
+
+/// Verifies the passed `String` matches the expected room alias format:
+///
+/// This means it's lowercase, with no whitespace chars, has a single leading
+/// `#` char and a single `:` separator between the local and domain parts, and
+/// the local part only contains characters that can't be percent encoded.
+pub fn is_room_alias_format_valid(alias: String) -> bool {
+    let alias_parts: Vec<&str> = alias.split(':').collect();
+    if alias_parts.len() != 2 {
+        return false;
+    }
+
+    let local_part = alias_parts[0];
+    let has_valid_format = local_part.chars().skip(1).all(|c| {
+        c.is_ascii()
+            && !c.is_whitespace()
+            && !c.is_control()
+            && !INVALID_ROOM_ALIAS_NAME_CHARS.contains(c)
+    });
+
+    let is_lowercase = alias.to_lowercase() == alias;
+
+    // Checks both the local part and the domain part
+    has_valid_format && is_lowercase && RoomAliasId::parse(alias).is_ok()
+}
+
+/// Given a pair of optional `body` and `formatted_body` parameters,
+/// returns a formatted body.
+///
+/// Return the formatted body if available, or interpret the `body` parameter as
+/// markdown, if provided.
+#[cfg(feature = "markdown")]
+pub fn formatted_body_from(
+    body: Option<&str>,
+    formatted_body: Option<FormattedBody>,
+) -> Option<FormattedBody> {
+    if formatted_body.is_some() {
+        formatted_body
+    } else {
+        body.and_then(FormattedBody::markdown)
+    }
+}
+
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "markdown")]
+    use assert_matches2::{assert_let, assert_matches};
+    #[cfg(feature = "markdown")]
+    use ruma::events::room::message::FormattedBody;
+
+    #[cfg(feature = "markdown")]
+    use crate::utils::formatted_body_from;
+    use crate::utils::is_room_alias_format_valid;
+
     #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_channel_observable_get_set() {
@@ -201,5 +257,101 @@ mod test {
         assert_eq!(observable.set(1), 0);
         assert_eq!(observable.set(10), 1);
         assert_eq!(observable.get(), 10);
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_it_has_no_leading_hash_char_is_not_valid() {
+        assert!(!is_room_alias_format_valid("alias:domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_it_has_several_colon_chars_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#alias:something:domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_it_has_no_colon_chars_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#alias.domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_server_part_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#alias:".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_name_part_has_whitespace_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#alias with whitespace:domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_name_part_has_control_char_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#alias\u{0009}:domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_name_part_has_invalid_char_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#a#lias,{t\\est}:domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_name_part_is_not_lowercase_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#Alias:domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_server_part_is_not_lowercase_is_not_valid() {
+        assert!(!is_room_alias_format_valid("#alias:Domain.org".to_owned()))
+    }
+
+    #[test]
+    fn test_is_room_alias_format_valid_when_has_valid_format() {
+        assert!(is_room_alias_format_valid("#alias.test:domain.org".to_owned()))
+    }
+
+    #[test]
+    #[cfg(feature = "markdown")]
+    fn test_formatted_body_from_nothing_returns_none() {
+        assert_matches!(formatted_body_from(None, None), None);
+    }
+
+    #[test]
+    #[cfg(feature = "markdown")]
+    fn test_formatted_body_from_only_formatted_body_returns_the_formatted_body() {
+        let formatted_body = FormattedBody::html(r"<h1>Hello!</h1>");
+
+        assert_let!(
+            Some(result_formatted_body) = formatted_body_from(None, Some(formatted_body.clone()))
+        );
+
+        assert_eq!(formatted_body.body, result_formatted_body.body);
+        assert_eq!(result_formatted_body.format, result_formatted_body.format);
+    }
+
+    #[test]
+    #[cfg(feature = "markdown")]
+    fn test_formatted_body_from_markdown_body_returns_a_processed_formatted_body() {
+        let markdown_body = Some(r"# Parsed");
+
+        assert_let!(Some(result_formatted_body) = formatted_body_from(markdown_body, None));
+
+        let expected_formatted_body = FormattedBody::html("<h1>Parsed</h1>\n".to_owned());
+        assert_eq!(expected_formatted_body.body, result_formatted_body.body);
+        assert_eq!(expected_formatted_body.format, result_formatted_body.format);
+    }
+
+    #[test]
+    #[cfg(feature = "markdown")]
+    fn test_formatted_body_from_body_and_formatted_body_returns_the_formatted_body() {
+        let markdown_body = Some(r"# Markdown");
+        let formatted_body = FormattedBody::html(r"<h1>HTML</h1>");
+
+        assert_let!(
+            Some(result_formatted_body) =
+                formatted_body_from(markdown_body, Some(formatted_body.clone()))
+        );
+
+        assert_eq!(formatted_body.body, result_formatted_body.body);
+        assert_eq!(formatted_body.format, result_formatted_body.format);
     }
 }

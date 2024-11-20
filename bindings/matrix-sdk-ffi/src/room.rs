@@ -25,8 +25,7 @@ use ruma::{
         },
         TimelineEventType,
     },
-    EventId, Int, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomAliasId, TransactionId,
-    UserId,
+    EventId, Int, OwnedDeviceId, OwnedUserId, RoomAliasId, UserId,
 };
 use tokio::sync::RwLock;
 use tracing::error;
@@ -41,7 +40,7 @@ use crate::{
     room_member::RoomMember,
     ruma::{ImageInfo, Mentions, NotifyType},
     space_child_info::{SpaceChildInfo, space_children_info},
-    timeline::{FocusEventError, ReceiptType, Timeline},
+    timeline::{FocusEventError, ReceiptType, SendHandle, Timeline},
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -806,10 +805,8 @@ impl Room {
     pub async fn withdraw_verification_and_resend(
         &self,
         user_ids: Vec<String>,
-        transaction_id: String,
+        send_handle: Arc<SendHandle>,
     ) -> Result<(), ClientError> {
-        let transaction_id: OwnedTransactionId = transaction_id.into();
-
         let user_ids: Vec<OwnedUserId> =
             user_ids.iter().map(UserId::parse).collect::<Result<_, _>>()?;
 
@@ -821,7 +818,7 @@ impl Room {
             }
         }
 
-        self.inner.send_queue().unwedge(&transaction_id).await?;
+        send_handle.try_resend().await?;
 
         Ok(())
     }
@@ -839,10 +836,8 @@ impl Room {
     pub async fn ignore_device_trust_and_resend(
         &self,
         devices: HashMap<String, Vec<String>>,
-        transaction_id: String,
+        send_handle: Arc<SendHandle>,
     ) -> Result<(), ClientError> {
-        let transaction_id: OwnedTransactionId = transaction_id.into();
-
         let encryption = self.inner.client().encryption();
 
         for (user_id, device_ids) in devices.iter() {
@@ -857,26 +852,8 @@ impl Room {
             }
         }
 
-        self.inner.send_queue().unwedge(&transaction_id).await?;
+        send_handle.try_resend().await?;
 
-        Ok(())
-    }
-
-    /// Attempt to manually resend messages that failed to send due to issues
-    /// that should now have been fixed.
-    ///
-    /// This is useful for example, when there's a
-    /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity` error;
-    /// the user may have re-verified on a different device and would now
-    /// like to send the failed message that's waiting on this device.
-    ///
-    /// # Arguments
-    ///
-    /// * `transaction_id` - The send queue transaction identifier of the local
-    ///   echo that should be unwedged.
-    pub async fn try_resend(&self, transaction_id: String) -> Result<(), ClientError> {
-        let transaction_id: &TransactionId = transaction_id.as_str().into();
-        self.inner.send_queue().unwedge(transaction_id).await?;
         Ok(())
     }
 }
