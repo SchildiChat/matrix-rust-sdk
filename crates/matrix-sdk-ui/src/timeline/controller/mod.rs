@@ -22,7 +22,7 @@ use imbl::Vector;
 #[cfg(test)]
 use matrix_sdk::crypto::OlmMachine;
 use matrix_sdk::{
-    deserialized_responses::SyncTimelineEvent,
+    deserialized_responses::{SyncTimelineEvent, TimelineEventKind as SdkTimelineEventKind},
     event_cache::{paginator::Paginator, RoomEventCache},
     send_queue::{
         LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendHandle, SendReactionHandle,
@@ -52,8 +52,8 @@ use tracing::{
 };
 
 pub(super) use self::state::{
-    EventMeta, FullEventMeta, PendingEdit, PendingEditKind, TimelineEnd, TimelineMetadata,
-    TimelineState, TimelineStateTransaction,
+    AllRemoteEvents, FullEventMeta, PendingEdit, PendingEditKind, TimelineMetadata,
+    TimelineNewItemPosition, TimelineState, TimelineStateTransaction,
 };
 use super::{
     event_handler::TimelineEventKind,
@@ -303,7 +303,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
                 let has_events = !events.is_empty();
 
-                self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
+                self.replace_with_initial_remote_events(
+                    events.into_iter(),
+                    RemoteEventOrigin::Cache,
+                )
+                .await;
 
                 Ok(has_events)
             }
@@ -320,7 +324,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 let has_events = !start_from_result.events.is_empty();
 
                 self.replace_with_initial_remote_events(
-                    start_from_result.events.into_iter().map(Into::into).collect(),
+                    start_from_result.events.into_iter(),
                     RemoteEventOrigin::Pagination,
                 )
                 .await;
@@ -336,7 +340,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 let has_events = !loaded_events.is_empty();
 
                 self.replace_with_initial_remote_events(
-                    loaded_events,
+                    loaded_events.into_iter(),
                     RemoteEventOrigin::Pagination,
                 )
                 .await;
@@ -404,8 +408,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 .map_err(PaginationError::Paginator)?,
         };
 
-        self.add_events_at(pagination.events, TimelineEnd::Front, RemoteEventOrigin::Pagination)
-            .await;
+        self.add_events_at(
+            pagination.events.into_iter(),
+            TimelineNewItemPosition::Start { origin: RemoteEventOrigin::Pagination },
+        )
+        .await;
 
         Ok(pagination.hit_end_of_timeline)
     }
@@ -428,8 +435,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 .map_err(PaginationError::Paginator)?,
         };
 
-        self.add_events_at(pagination.events, TimelineEnd::Back, RemoteEventOrigin::Pagination)
-            .await;
+        self.add_events_at(
+            pagination.events.into_iter(),
+            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Pagination },
+        )
+        .await;
 
         Ok(pagination.hit_end_of_timeline)
     }
@@ -509,7 +519,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
         let Some(prev_status) = prev_status else {
             match &item.kind {
                 EventTimelineItemKind::Local(local) => {
-                    if let Some(send_handle) = local.send_handle.clone() {
+                    if let Some(send_handle) = &local.send_handle {
                         if send_handle
                             .react(key.to_owned())
                             .await
@@ -630,26 +640,21 @@ impl<P: RoomDataProvider> TimelineController<P> {
     /// is the most recent.
     ///
     /// Returns the number of timeline updates that were made.
-    pub(super) async fn add_events_at(
+    pub(super) async fn add_events_at<Events>(
         &self,
-        events: Vec<impl Into<SyncTimelineEvent>>,
-        position: TimelineEnd,
-        origin: RemoteEventOrigin,
-    ) -> HandleManyEventsResult {
-        if events.is_empty() {
+        events: Events,
+        position: TimelineNewItemPosition,
+    ) -> HandleManyEventsResult
+    where
+        Events: IntoIterator + ExactSizeIterator,
+        <Events as IntoIterator>::Item: Into<SyncTimelineEvent>,
+    {
+        if events.len() == 0 {
             return Default::default();
         }
 
         let mut state = self.state.write().await;
-        state
-            .add_remote_events_at(
-                events,
-                position,
-                origin,
-                &self.room_data_provider,
-                &self.settings,
-            )
-            .await
+        state.add_remote_events_at(events, position, &self.room_data_provider, &self.settings).await
     }
 
     pub(super) async fn clear(&self) {
@@ -663,11 +668,14 @@ impl<P: RoomDataProvider> TimelineController<P> {
     ///
     /// This is all done with a single lock guard, since we don't want the state
     /// to be modified between the clear and re-insertion of new events.
-    pub(super) async fn replace_with_initial_remote_events(
+    pub(super) async fn replace_with_initial_remote_events<Events>(
         &self,
-        events: Vec<SyncTimelineEvent>,
+        events: Events,
         origin: RemoteEventOrigin,
-    ) {
+    ) where
+        Events: IntoIterator + ExactSizeIterator,
+        <Events as IntoIterator>::Item: Into<SyncTimelineEvent>,
+    {
         let mut state = self.state.write().await;
 
         let track_read_markers = self.settings.track_read_receipts;
@@ -683,12 +691,11 @@ impl<P: RoomDataProvider> TimelineController<P> {
         // Previously we just had to check the new one wasn't empty because
         // we did a clear operation before so the current one would always be empty, but
         // now we may want to replace a populated timeline with an empty one.
-        if !state.items.is_empty() || !events.is_empty() {
+        if !state.items.is_empty() || events.len() > 0 {
             state
                 .replace_with_remote_events(
                     events,
-                    TimelineEnd::Back,
-                    origin,
+                    TimelineNewItemPosition::End { origin },
                     &self.room_data_provider,
                     &self.settings,
                 )
@@ -1068,16 +1075,22 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
                     match decryptor.decrypt_event_impl(original_json).await {
                         Ok(event) => {
-                            trace!(
-                                "Successfully decrypted event that previously failed to decrypt"
-                            );
+                            if let SdkTimelineEventKind::UnableToDecrypt { utd_info, .. } =
+                                event.kind
+                            {
+                                info!(
+                                    "Failed to decrypt event after receiving room key: {:?}",
+                                    utd_info.reason
+                                );
+                                None
+                            } else {
+                                // Notify observers that we managed to eventually decrypt an event.
+                                if let Some(hook) = unable_to_decrypt_hook {
+                                    hook.on_late_decrypt(&remote_event.event_id, *utd_cause).await;
+                                }
 
-                            // Notify observers that we managed to eventually decrypt an event.
-                            if let Some(hook) = unable_to_decrypt_hook {
-                                hook.on_late_decrypt(&remote_event.event_id, *utd_cause).await;
+                                Some(event)
                             }
-
-                            Some(event)
                         }
                         Err(e) => {
                             info!("Failed to decrypt event after receiving room key: {e}");
@@ -1520,7 +1533,7 @@ impl TimelineController {
     /// it's folded into another timeline item.
     pub(crate) async fn latest_event_id(&self) -> Option<OwnedEventId> {
         let state = self.state.read().await;
-        state.meta.all_events.back().map(|event_meta| &event_meta.event_id).cloned()
+        state.meta.all_remote_events.last().map(|event_meta| &event_meta.event_id).cloned()
     }
 }
 

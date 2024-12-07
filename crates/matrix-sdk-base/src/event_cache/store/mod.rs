@@ -36,14 +36,14 @@ pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 pub use self::integration_tests::EventCacheStoreIntegrationTests;
 pub use self::{
     memory_store::MemoryStore,
-    traits::{DynEventCacheStore, EventCacheStore, IntoEventCacheStore},
+    traits::{DynEventCacheStore, EventCacheStore, IntoEventCacheStore, DEFAULT_CHUNK_CAPACITY},
 };
 
 /// The high-level public type to represent an `EventCacheStore` lock.
 #[derive(Clone)]
 pub struct EventCacheStoreLock {
     /// The inner cross process lock that is used to lock the `EventCacheStore`.
-    cross_process_lock: CrossProcessStoreLock<LockableEventCacheStore>,
+    cross_process_lock: Arc<CrossProcessStoreLock<LockableEventCacheStore>>,
 
     /// The store itself.
     ///
@@ -70,11 +70,11 @@ impl EventCacheStoreLock {
         let store = store.into_event_cache_store();
 
         Self {
-            cross_process_lock: CrossProcessStoreLock::new(
+            cross_process_lock: Arc::new(CrossProcessStoreLock::new(
                 LockableEventCacheStore(store.clone()),
                 "default".to_owned(),
                 holder,
-            ),
+            )),
             store,
         }
     }
@@ -100,13 +100,13 @@ pub struct EventCacheStoreLockGuard<'a> {
 }
 
 #[cfg(not(tarpaulin_include))]
-impl<'a> fmt::Debug for EventCacheStoreLockGuard<'a> {
+impl fmt::Debug for EventCacheStoreLockGuard<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("EventCacheStoreLockGuard").finish_non_exhaustive()
     }
 }
 
-impl<'a> Deref for EventCacheStoreLockGuard<'a> {
+impl Deref for EventCacheStoreLockGuard<'_> {
     type Target = DynEventCacheStore;
 
     fn deref(&self) -> &Self::Target {
@@ -138,12 +138,23 @@ pub enum EventCacheStoreError {
     #[error("Error encoding or decoding data from the event cache store: {0}")]
     Codec(#[from] Utf8Error),
 
+    /// The store failed to serialize or deserialize some data.
+    #[error("Error serializing or deserializing data from the event cache store: {0}")]
+    Serialization(#[from] serde_json::Error),
+
     /// The database format has changed in a backwards incompatible way.
     #[error(
         "The database format of the event cache store changed in an incompatible way, \
          current version: {0}, latest version: {1}"
     )]
     UnsupportedDatabaseVersion(usize, usize),
+
+    /// The store contains invalid data.
+    #[error("The store contains invalid data: {details}")]
+    InvalidData {
+        /// Details why the data contained in the store was invalid.
+        details: String,
+    },
 }
 
 impl EventCacheStoreError {

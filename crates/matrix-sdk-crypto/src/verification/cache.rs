@@ -24,13 +24,28 @@ use tracing::debug;
 use tracing::{trace, warn};
 
 use super::{event_enums::OutgoingContent, FlowId, Sas, Verification};
+use crate::types::requests::{
+    OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+};
 #[cfg(feature = "qrcode")]
 use crate::QrVerification;
-use crate::{OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest};
 
 #[derive(Clone, Debug, Default)]
 pub struct VerificationCache {
     inner: Arc<VerificationCacheInner>,
+}
+
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Sync for VerificationCache {}
+
+#[cfg(feature = "test-send-sync")]
+#[test]
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+fn test_send_sync_for_room() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<VerificationCache>();
 }
 
 #[derive(Debug, Default)]

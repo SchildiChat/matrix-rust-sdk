@@ -1,6 +1,8 @@
 // TODO: target-os conditional would be good.
 
 #![allow(unused_qualifications, clippy::new_without_default)]
+#![allow(clippy::empty_line_after_doc_comments)] // Needed because uniffi macros contain empty
+                                                 // lines after docs.
 
 mod authentication;
 mod chunk_iterator;
@@ -34,13 +36,11 @@ mod utils;
 mod widget;
 
 use async_compat::TOKIO1 as RUNTIME;
-use matrix_sdk::ruma::events::room::{
-    message::RoomMessageEventContentWithoutRelation, MediaSource,
-};
+use matrix_sdk::ruma::events::room::message::RoomMessageEventContentWithoutRelation;
 
 use self::{
     error::ClientError,
-    ruma::{MediaSourceExt, Mentions, RoomMessageEventContentWithoutRelationExt},
+    ruma::{Mentions, RoomMessageEventContentWithoutRelationExt},
     task_handle::TaskHandle,
 };
 

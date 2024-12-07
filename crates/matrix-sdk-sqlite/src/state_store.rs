@@ -509,6 +509,7 @@ trait SqliteConnectionStateStoreExt {
     fn remove_display_name(&self, room_id: &[u8], name: &[u8]) -> rusqlite::Result<()>;
     fn remove_room_display_names(&self, room_id: &[u8]) -> rusqlite::Result<()>;
     fn remove_room_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+    fn remove_room_dependent_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionStateStoreExt for rusqlite::Connection {
@@ -718,6 +719,12 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
 
     fn remove_room_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()> {
         self.prepare("DELETE FROM send_queue_events WHERE room_id = ?")?.execute((room_id,))?;
+        Ok(())
+    }
+
+    fn remove_room_dependent_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()> {
+        self.prepare("DELETE FROM dependent_send_queue_events WHERE room_id = ?")?
+            .execute((room_id,))?;
         Ok(())
     }
 }
@@ -1726,6 +1733,10 @@ impl StateStore for SqliteStateStore {
                 let send_queue_room_id = this.encode_key(keys::SEND_QUEUE, &room_id);
                 txn.remove_room_send_queue(&send_queue_room_id)?;
 
+                let dependent_send_queue_room_id =
+                    this.encode_key(keys::DEPENDENTS_SEND_QUEUE, &room_id);
+                txn.remove_room_dependent_send_queue(&dependent_send_queue_room_id)?;
+
                 Ok(())
             })
             .await
@@ -1914,6 +1925,39 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn update_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let content = self.serialize_json(&new_content)?;
+
+        // See comment in `save_send_queue_event`.
+        let own_txn_id = own_transaction_id.to_string();
+
+        let num_updated = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    r#"UPDATE dependent_send_queue_events
+                       SET content = ?
+                       WHERE own_transaction_id = ?
+                       AND room_id = ?"#,
+                )?
+                .execute((content, own_txn_id, room_id))
+            })
+            .await?;
+
+        if num_updated > 1 {
+            return Err(Error::InconsistentUpdate);
+        }
+
+        Ok(num_updated == 1)
+    }
+
+    async fn mark_dependent_queued_requests_as_ready(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,

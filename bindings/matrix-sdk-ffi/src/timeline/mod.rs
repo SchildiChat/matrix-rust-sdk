@@ -24,7 +24,7 @@ use matrix_sdk::crypto::CollectStrategy;
 use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
-        BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
+        BaseVideoInfo, Thumbnail,
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
     room::edit::EditedContent as SdkEditedContent,
@@ -53,7 +53,7 @@ use ruma::{
         },
         AnyMessageLikeEventContent,
     },
-    EventId,
+    EventId, UInt,
 };
 use tokio::{
     sync::Mutex,
@@ -144,19 +144,26 @@ fn build_thumbnail_info(
             let thumbnail_data =
                 fs::read(thumbnail_url).map_err(|_| RoomError::InvalidThumbnailData)?;
 
-            let base_thumbnail_info = BaseThumbnailInfo::try_from(&thumbnail_info)
-                .map_err(|_| RoomError::InvalidAttachmentData)?;
+            let height = thumbnail_info
+                .height
+                .and_then(|u| UInt::try_from(u).ok())
+                .ok_or(RoomError::InvalidAttachmentData)?;
+            let width = thumbnail_info
+                .width
+                .and_then(|u| UInt::try_from(u).ok())
+                .ok_or(RoomError::InvalidAttachmentData)?;
+            let size = thumbnail_info
+                .size
+                .and_then(|u| UInt::try_from(u).ok())
+                .ok_or(RoomError::InvalidAttachmentData)?;
 
             let mime_str =
                 thumbnail_info.mimetype.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
             let mime_type =
                 mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
 
-            let thumbnail = Thumbnail {
-                data: thumbnail_data,
-                content_type: mime_type,
-                info: Some(base_thumbnail_info),
-            };
+            let thumbnail =
+                Thumbnail { data: thumbnail_data, content_type: mime_type, height, width, size };
 
             Ok(AttachmentConfig::with_thumbnail(thumbnail))
         }
@@ -568,6 +575,7 @@ impl Timeline {
             .await
         {
             Ok(()) => Ok(()),
+
             Err(timeline::Error::EventNotInTimeline(_)) => {
                 // If we couldn't edit, assume it was an (remote) event that wasn't in the
                 // timeline, and try to edit it via the room itself.
@@ -583,7 +591,8 @@ impl Timeline {
                 room.send_queue().send(edit_event).await?;
                 Ok(())
             }
-            Err(err) => Err(err)?,
+
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -1301,6 +1310,7 @@ impl From<ReceiptType> for ruma::api::client::receipt::create_receipt::v3::Recei
 #[derive(Clone, uniffi::Enum)]
 pub enum EditedContent {
     RoomMessage { content: Arc<RoomMessageEventContentWithoutRelation> },
+    MediaCaption { caption: Option<String>, formatted_caption: Option<FormattedBody> },
     PollStart { poll_data: PollData },
 }
 
@@ -1311,6 +1321,12 @@ impl TryFrom<EditedContent> for SdkEditedContent {
             EditedContent::RoomMessage { content } => {
                 Ok(SdkEditedContent::RoomMessage((*content).clone()))
             }
+            EditedContent::MediaCaption { caption, formatted_caption } => {
+                Ok(SdkEditedContent::MediaCaption {
+                    caption,
+                    formatted_caption: formatted_caption.map(Into::into),
+                })
+            }
             EditedContent::PollStart { poll_data } => {
                 let block: UnstablePollStartContentBlock = poll_data.clone().try_into()?;
                 Ok(SdkEditedContent::PollStart {
@@ -1319,6 +1335,23 @@ impl TryFrom<EditedContent> for SdkEditedContent {
                 })
             }
         }
+    }
+}
+
+/// Create a caption edit.
+///
+/// If no `formatted_caption` is provided, then it's assumed the `caption`
+/// represents valid Markdown that can be used as the formatted caption.
+#[matrix_sdk_ffi_macros::export]
+fn create_caption_edit(
+    caption: Option<String>,
+    formatted_caption: Option<FormattedBody>,
+) -> EditedContent {
+    let formatted_caption =
+        formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
+    EditedContent::MediaCaption {
+        caption,
+        formatted_caption: formatted_caption.as_ref().map(Into::into),
     }
 }
 

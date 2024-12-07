@@ -521,7 +521,7 @@ impl ClientBuilder {
 
         let auth_ctx = Arc::new(AuthCtx {
             handle_refresh_tokens: self.handle_refresh_tokens,
-            refresh_token_lock: Mutex::new(Ok(())),
+            refresh_token_lock: Arc::new(Mutex::new(Ok(()))),
             session_change_sender: broadcast::Sender::new(1),
             auth_data: OnceCell::default(),
             reload_session_callback: OnceCell::default(),
@@ -650,6 +650,7 @@ async fn build_indexeddb_store_config(
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "indexeddb"))]
+#[allow(clippy::unused_async)]
 async fn build_indexeddb_store_config(
     _name: &str,
     _passphrase: Option<&str>,

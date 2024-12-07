@@ -34,6 +34,7 @@ use std::{
 };
 
 use as_variant::as_variant;
+use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
 use ruma::{
     serde::StringEnum, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, UserId,
 };
@@ -47,6 +48,7 @@ mod device_keys;
 pub mod events;
 mod one_time_keys;
 pub mod qr_login;
+pub mod requests;
 
 pub use self::{backup::*, cross_signing::*, device_keys::*, one_time_keys::*};
 use crate::store::BackupDecryptionKey;
@@ -421,20 +423,6 @@ impl Algorithm for OwnedDeviceKeyId {
 impl Algorithm for DeviceKeyAlgorithm {
     fn algorithm(&self) -> DeviceKeyAlgorithm {
         self.to_owned()
-    }
-}
-
-// Wrapper around `Box<str>` that cannot be used in a meaningful way outside of
-// this crate. Used for string enums because their `_Custom` variant can't be
-// truly private (only `#[doc(hidden)]`).
-#[doc(hidden)]
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PrivOwnedStr(Box<str>);
-
-#[cfg(not(tarpaulin_include))]
-impl std::fmt::Debug for PrivOwnedStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
     }
 }
 

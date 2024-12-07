@@ -2672,7 +2672,7 @@ mod tests {
             .unwrap(),
             UnableToDecryptInfo {
                 session_id: Some("".to_owned()),
-                reason: UnableToDecryptReason::MissingMegolmSession,
+                reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
             },
         )
     }

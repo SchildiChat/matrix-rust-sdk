@@ -17,8 +17,9 @@
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
 use as_variant::as_variant;
-use matrix_sdk_base::deserialized_responses::{SyncTimelineEvent, TimelineEvent};
-use matrix_sdk_common::deserialized_responses::UnableToDecryptReason;
+use matrix_sdk_common::deserialized_responses::{
+    SyncTimelineEvent, TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
+};
 use ruma::{
     events::{
         message::TextContentBlock,
@@ -34,13 +35,17 @@ use ruma::{
         relation::{Annotation, InReplyTo, Replacement, Thread},
         room::{
             encrypted::{EncryptedEventScheme, RoomEncryptedEventContent},
-            message::{Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+            member::{MembershipState, RoomMemberEventContent},
+            message::{
+                FormattedBody, ImageMessageEventContent, MessageType, Relation,
+                RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+            },
             redaction::RoomRedactionEventContent,
         },
         AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
     },
     serde::Raw,
-    server_name, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
+    server_name, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde::Serialize;
@@ -171,6 +176,15 @@ where
         Raw::new(map).unwrap().cast()
     }
 
+    /// Build an event from the [`EventBuilder`] and convert it into a
+    /// serialized and [`Raw`] event.
+    ///
+    /// The generic argument `T` allows you to automatically cast the [`Raw`]
+    /// event into any desired type.
+    pub fn into_raw<T>(self) -> Raw<T> {
+        self.construct_json(true)
+    }
+
     pub fn into_raw_timeline(self) -> Raw<AnyTimelineEvent> {
         self.construct_json(true)
     }
@@ -197,9 +211,9 @@ impl EventBuilder<RoomEncryptedEventContent> {
 
         SyncTimelineEvent::new_utd_event(
             self.into(),
-            crate::deserialized_responses::UnableToDecryptInfo {
+            UnableToDecryptInfo {
                 session_id,
-                reason: UnableToDecryptReason::MissingMegolmSession,
+                reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
             },
         )
     }
@@ -230,6 +244,37 @@ impl EventBuilder<RoomMessageEventContent> {
     ) -> Self {
         self.content.relates_to =
             Some(Relation::Replacement(Replacement::new(edited_event_id.to_owned(), new_content)));
+        self
+    }
+
+    /// Adds a caption to a media event.
+    ///
+    /// Will crash if the event isn't a media room message.
+    pub fn caption(
+        mut self,
+        caption: Option<String>,
+        formatted_caption: Option<FormattedBody>,
+    ) -> Self {
+        match &mut self.content.msgtype {
+            MessageType::Image(image) => {
+                let filename = image.filename().to_owned();
+                if let Some(caption) = caption {
+                    image.body = caption;
+                    image.filename = Some(filename);
+                } else {
+                    image.body = filename;
+                    image.filename = None;
+                }
+                image.formatted = formatted_caption;
+            }
+
+            MessageType::Audio(_) | MessageType::Video(_) | MessageType::File(_) => {
+                unimplemented!();
+            }
+
+            _ => panic!("unexpected event type for a caption"),
+        }
+
         self
     }
 }
@@ -309,6 +354,49 @@ impl EventFactory {
     /// Create a new plain text `m.room.message`.
     pub fn text_msg(&self, content: impl Into<String>) -> EventBuilder<RoomMessageEventContent> {
         self.event(RoomMessageEventContent::text_plain(content.into()))
+    }
+
+    /// Create a new `m.room.member` event for the given member.
+    ///
+    /// The given member will be used as the `sender` as well as the `state_key`
+    /// of the `m.room.member` event, unless the `sender` was already using
+    /// [`EventFactory::sender()`], in that case only the state key will be
+    /// set to the given `member`.
+    ///
+    /// The `membership` field of the content is set to
+    /// [`MembershipState::Join`].
+    ///
+    /// ```
+    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// use ruma::{
+    ///     events::{
+    ///         room::member::{MembershipState, RoomMemberEventContent},
+    ///         SyncStateEvent,
+    ///     },
+    ///     room_id,
+    ///     serde::Raw,
+    ///     user_id,
+    /// };
+    ///
+    /// let factory = EventFactory::new().room(room_id!("!test:localhost"));
+    ///
+    /// let event: Raw<SyncStateEvent<RoomMemberEventContent>> = factory
+    ///     .member(user_id!("@alice:localhost"))
+    ///     .display_name("Alice")
+    ///     .into_raw();
+    /// ```
+    pub fn member(&self, member: &UserId) -> EventBuilder<RoomMemberEventContent> {
+        let mut event = self.event(RoomMemberEventContent::new(MembershipState::Join));
+
+        if self.sender.is_some() {
+            event.sender = self.sender.clone();
+        } else {
+            event.sender = Some(member.to_owned());
+        }
+
+        event.state_key = Some(member.to_string());
+
+        event
     }
 
     /// Create a new plain/html `m.room.message`.
@@ -413,10 +501,38 @@ impl EventFactory {
         self.event(poll_end_content)
     }
 
+    /// Creates a plain (unencrypted) image event content referencing the given
+    /// MXC ID.
+    pub fn image(
+        &self,
+        filename: String,
+        url: OwnedMxcUri,
+    ) -> EventBuilder<RoomMessageEventContent> {
+        let image_event_content = ImageMessageEventContent::plain(filename, url);
+        self.event(RoomMessageEventContent::new(MessageType::Image(image_event_content)))
+    }
+
     /// Set the next server timestamp.
     ///
     /// Timestamps will continue to increase by 1 (millisecond) from that value.
     pub fn set_next_ts(&self, value: u64) {
         self.next_ts.store(value, SeqCst);
+    }
+}
+
+impl EventBuilder<RoomMemberEventContent> {
+    /// Set the `membership` of the `m.room.member` event to the given
+    /// [`MembershipState`].
+    ///
+    /// The default is [`MembershipState::Join`].
+    pub fn membership(mut self, state: MembershipState) -> Self {
+        self.content.membership = state;
+        self
+    }
+
+    /// Set the display name of the `m.room.member` event.
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.content.displayname = Some(display_name.into());
+        self
     }
 }

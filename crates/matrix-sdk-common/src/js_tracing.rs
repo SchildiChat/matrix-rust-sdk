@@ -306,7 +306,7 @@ impl<'a> JsFieldVisitor<'a> {
     }
 }
 
-impl<'a> tracing::field::Visit for JsFieldVisitor<'a> {
+impl tracing::field::Visit for JsFieldVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
         if self.result.is_err() {
             return;
@@ -351,7 +351,7 @@ pub fn make_tracing_subscriber(logger: Option<JsLogger>) -> JsLoggingSubscriber 
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_test_macros::async_test;
     use tracing::{debug, subscriber::with_default};
     use wasm_bindgen::{JsCast, JsValue};
 

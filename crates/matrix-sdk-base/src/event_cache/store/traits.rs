@@ -15,11 +15,21 @@
 use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
-use matrix_sdk_common::AsyncTraitDeps;
-use ruma::MxcUri;
+use matrix_sdk_common::{
+    linked_chunk::{LinkedChunk, Update},
+    AsyncTraitDeps,
+};
+use ruma::{MxcUri, RoomId};
 
 use super::EventCacheStoreError;
-use crate::media::MediaRequestParameters;
+use crate::{
+    event_cache::{Event, Gap},
+    media::MediaRequestParameters,
+};
+
+/// A default capacity for linked chunks, when manipulating in conjunction with
+/// an `EventCacheStore` implementation.
+pub const DEFAULT_CHUNK_CAPACITY: usize = 128;
 
 /// An abstract trait that can be used to implement different store backends
 /// for the event cache of the SDK.
@@ -36,6 +46,21 @@ pub trait EventCacheStore: AsyncTraitDeps {
         key: &str,
         holder: &str,
     ) -> Result<bool, Self::Error>;
+
+    /// An [`Update`] reflects an operation that has happened inside a linked
+    /// chunk. The linked chunk is used by the event cache to store the events
+    /// in-memory. This method aims at forwarding this update inside this store.
+    async fn handle_linked_chunk_updates(
+        &self,
+        room_id: &RoomId,
+        updates: Vec<Update<Event, Gap>>,
+    ) -> Result<(), Self::Error>;
+
+    /// Reconstruct a full linked chunk by reloading it from storage.
+    async fn reload_linked_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>, Self::Error>;
 
     /// Add a media file's content in the media store.
     ///
@@ -129,6 +154,21 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         holder: &str,
     ) -> Result<bool, Self::Error> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await.map_err(Into::into)
+    }
+
+    async fn handle_linked_chunk_updates(
+        &self,
+        room_id: &RoomId,
+        updates: Vec<Update<Event, Gap>>,
+    ) -> Result<(), Self::Error> {
+        self.0.handle_linked_chunk_updates(room_id, updates).await.map_err(Into::into)
+    }
+
+    async fn reload_linked_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>, Self::Error> {
+        self.0.reload_linked_chunk(room_id).await.map_err(Into::into)
     }
 
     async fn add_media_content(

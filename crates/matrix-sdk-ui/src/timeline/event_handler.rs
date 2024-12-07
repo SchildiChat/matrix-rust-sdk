@@ -47,7 +47,6 @@ use ruma::{
     },
     serde::Raw,
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    RoomVersionId,
 };
 use tracing::{debug, error, field::debug, info, instrument, trace, warn};
 
@@ -71,6 +70,7 @@ use crate::{
         controller::PendingEdit,
         event_item::{ReactionInfo, ReactionStatus},
         reactions::PendingReaction,
+        traits::RoomDataProvider,
         RepliedToEvent,
     },
 };
@@ -118,6 +118,7 @@ impl Flow {
 pub(super) struct TimelineEventContext {
     pub(super) sender: OwnedUserId,
     pub(super) sender_profile: Option<Profile>,
+    /// The event's `origin_server_ts` field (or creation time for local echo).
     pub(super) timestamp: MilliSecondsSinceUnixEpoch,
     pub(super) is_own_event: bool,
     pub(super) read_receipts: IndexMap<OwnedUserId, Receipt>,
@@ -141,10 +142,7 @@ pub(super) enum TimelineEventKind {
     },
 
     /// An encrypted event that could not be decrypted
-    UnableToDecrypt {
-        content: RoomEncryptedEventContent,
-        unable_to_decrypt_info: UnableToDecryptInfo,
-    },
+    UnableToDecrypt { content: RoomEncryptedEventContent, utd_cause: UtdCause },
 
     /// Some remote event that was redacted a priori, i.e. we never had the
     /// original content, so we'll just display a dummy redacted timeline
@@ -180,15 +178,27 @@ pub(super) enum TimelineEventKind {
 }
 
 impl TimelineEventKind {
-    /// Creates a new `TimelineEventKind` with the given event and room version.
-    pub fn from_event(
+    /// Creates a new `TimelineEventKind`.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - The event for which we should create a `TimelineEventKind`.
+    /// * `raw_event` - The [`Raw`] JSON for `event`. (Required so that we can
+    ///   access `unsigned` data.)
+    /// * `room_data_provider` - An object which will provide information about
+    ///   the room containing the event.
+    /// * `unable_to_decrypt_info` - If `event` represents a failure to decrypt,
+    ///   information about that failure. Otherwise, `None`.
+    pub async fn from_event<P: RoomDataProvider>(
         event: AnySyncTimelineEvent,
-        room_version: &RoomVersionId,
+        raw_event: &Raw<AnySyncTimelineEvent>,
+        room_data_provider: &P,
         unable_to_decrypt_info: Option<UnableToDecryptInfo>,
     ) -> Self {
+        let room_version = room_data_provider.room_version();
         match event {
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(ev)) => {
-                if let Some(redacts) = ev.redacts(room_version).map(ToOwned::to_owned) {
+                if let Some(redacts) = ev.redacts(&room_version).map(ToOwned::to_owned) {
                     Self::Redaction { redacts }
                 } else {
                     Self::RedactedMessage { event_type: ev.event_type() }
@@ -198,7 +208,12 @@ impl TimelineEventKind {
                 Some(AnyMessageLikeEventContent::RoomEncrypted(content)) => {
                     // An event which is still encrypted.
                     if let Some(unable_to_decrypt_info) = unable_to_decrypt_info {
-                        Self::UnableToDecrypt { content, unable_to_decrypt_info }
+                        let utd_cause = UtdCause::determine(
+                            raw_event,
+                            room_data_provider.crypto_context_info().await,
+                            &unable_to_decrypt_info,
+                        );
+                        Self::UnableToDecrypt { content, utd_cause }
                     } else {
                         // If we get here, it means that some part of the code has created a
                         // `SyncTimelineEvent` containing an `m.room.encrypted` event
@@ -269,17 +284,26 @@ impl TimelineEventKind {
 pub(super) enum TimelineItemPosition {
     /// One or more items are prepended to the timeline (i.e. they're the
     /// oldest).
-    Start { origin: RemoteEventOrigin },
+    Start {
+        /// The origin of the new item(s).
+        origin: RemoteEventOrigin,
+    },
 
     /// One or more items are appended to the timeline (i.e. they're the most
     /// recent).
-    End { origin: RemoteEventOrigin },
+    End {
+        /// The origin of the new item(s).
+        origin: RemoteEventOrigin,
+    },
 
     /// A single item is updated, after it's been successfully decrypted.
     ///
     /// This happens when an item that was a UTD must be replaced with the
     /// decrypted event.
-    UpdateDecrypted(usize),
+    UpdateDecrypted {
+        /// The index of the **timeline item**.
+        timeline_item_index: usize,
+    },
 }
 
 /// The outcome of handling a single event with
@@ -417,17 +441,15 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 }
             },
 
-            TimelineEventKind::UnableToDecrypt { content, unable_to_decrypt_info } => {
+            TimelineEventKind::UnableToDecrypt { content, utd_cause } => {
                 // TODO: Handle replacements if the replaced event is also UTD
-                let raw_event = self.ctx.flow.raw_event();
-                let cause = UtdCause::determine(raw_event, &unable_to_decrypt_info);
-                self.add_item(TimelineItemContent::unable_to_decrypt(content, cause), None);
+                self.add_item(TimelineItemContent::unable_to_decrypt(content, utd_cause), None);
 
                 // Let the hook know that we ran into an unable-to-decrypt that is added to the
                 // timeline.
                 if let Some(hook) = self.meta.unable_to_decrypt_hook.as_ref() {
                     if let Some(event_id) = &self.ctx.flow.event_id() {
-                        hook.on_utd(event_id, cause).await;
+                        hook.on_utd(event_id, utd_cause).await;
                     }
                 }
             }
@@ -481,8 +503,10 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         if !self.result.item_added {
             trace!("No new item added");
 
-            if let Flow::Remote { position: TimelineItemPosition::UpdateDecrypted(idx), .. } =
-                self.ctx.flow
+            if let Flow::Remote {
+                position: TimelineItemPosition::UpdateDecrypted { timeline_item_index: idx },
+                ..
+            } = self.ctx.flow
             {
                 // If add was not called, that means the UTD event is one that
                 // wouldn't normally be visible. Remove it.
@@ -576,7 +600,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         replacement: PendingEdit,
     ) {
         match position {
-            TimelineItemPosition::Start { .. } | TimelineItemPosition::UpdateDecrypted(_) => {
+            TimelineItemPosition::Start { .. } | TimelineItemPosition::UpdateDecrypted { .. } => {
                 // Only insert the edit if there wasn't any other edit
                 // before.
                 //
@@ -1012,7 +1036,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     | TimelineItemPosition::End { origin } => origin,
 
                     // For updates, reuse the origin of the encrypted event.
-                    TimelineItemPosition::UpdateDecrypted(idx) => self.items[idx]
+                    TimelineItemPosition::UpdateDecrypted { timeline_item_index: idx } => self
+                        .items[idx]
                         .as_event()
                         .and_then(|ev| Some(ev.as_remote()?.origin))
                         .unwrap_or_else(|| {
@@ -1162,7 +1187,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
             Flow::Remote {
                 event_id: decrypted_event_id,
-                position: TimelineItemPosition::UpdateDecrypted(idx),
+                position: TimelineItemPosition::UpdateDecrypted { timeline_item_index: idx },
                 ..
             } => {
                 trace!("Updating timeline item at position {idx}");

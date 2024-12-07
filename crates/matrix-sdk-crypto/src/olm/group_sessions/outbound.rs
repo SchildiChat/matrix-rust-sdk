@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+use matrix_sdk_common::deserialized_responses::WithheldCode;
 use ruma::{
     events::{
         room::{encryption::RoomEncryptionEventContent, history_visibility::HistoryVisibility},
@@ -54,11 +55,12 @@ use crate::{
                 MegolmV1AesSha2Content, RoomEncryptedEventContent, RoomEventEncryptionScheme,
             },
             room_key::{MegolmV1AesSha2Content as MegolmV1AesSha2RoomKeyContent, RoomKeyContent},
-            room_key_withheld::{RoomKeyWithheldContent, WithheldCode},
+            room_key_withheld::RoomKeyWithheldContent,
         },
+        requests::ToDeviceRequest,
         EventEncryptionAlgorithm,
     },
-    DeviceData, ToDeviceRequest,
+    DeviceData,
 };
 
 const ONE_HOUR: Duration = Duration::from_secs(60 * 60);

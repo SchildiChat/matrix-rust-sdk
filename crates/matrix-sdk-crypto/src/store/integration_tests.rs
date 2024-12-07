@@ -28,7 +28,6 @@
 ///     cryptostore_integration_tests!();
 /// }
 /// ```
-
 #[allow(unused_macros)]
 #[macro_export]
 macro_rules! cryptostore_integration_tests {
@@ -45,6 +44,7 @@ macro_rules! cryptostore_integration_tests {
             };
             use serde_json::value::to_raw_value;
             use serde_json::json;
+            use matrix_sdk_common::deserialized_responses::WithheldCode;
             use $crate::{
                 olm::{
                     Account, Curve25519PublicKey, InboundGroupSession, OlmMessageHash,
@@ -62,18 +62,17 @@ macro_rules! cryptostore_integration_tests {
                         room_key_request::MegolmV1AesSha2Content,
                         room_key_withheld::{
                             CommonWithheldCodeContent, MegolmV1AesSha2WithheldContent,
-                            RoomKeyWithheldContent, WithheldCode,
+                            RoomKeyWithheldContent,
                         },
                         secret_send::SecretSendContent,
                         ToDeviceEvent,
                     },
+                    requests::ToDeviceRequest,
                     DeviceKeys,
                     EventEncryptionAlgorithm,
                 },
-                GossippedSecret, LocalTrust, DeviceData, SecretInfo, ToDeviceRequest, TrackedUser,
-                vodozemac::{
-                    megolm::{GroupSession, SessionConfig},
-                },
+                vodozemac::megolm::{GroupSession, SessionConfig}, DeviceData, GossippedSecret, LocalTrust,  SecretInfo,
+                TrackedUser,
             };
 
             use super::get_store;

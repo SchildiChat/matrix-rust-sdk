@@ -101,6 +101,12 @@ pub enum Error {
 
     #[error("Redaction failed: {0}")]
     Redaction(#[source] ruma::canonical_json::RedactionError),
+
+    #[error("An update keyed by unique ID touched more than one entry")]
+    InconsistentUpdate,
+
+    #[error("The store contains invalid data: {details}")]
+    InvalidData { details: String },
 }
 
 macro_rules! impl_from {

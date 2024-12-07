@@ -18,10 +18,10 @@ use eyeball::Subscriber;
 use futures_util::FutureExt as _;
 use indexmap::IndexMap;
 #[cfg(test)]
-use matrix_sdk::crypto::{DecryptionSettings, TrustRequirement};
+use matrix_sdk::crypto::{DecryptionSettings, RoomEventDecryptionResult, TrustRequirement};
 use matrix_sdk::{
-    deserialized_responses::TimelineEvent, event_cache::paginator::PaginableRoom, BoxFuture,
-    Result, Room,
+    crypto::types::events::CryptoContextInfo, deserialized_responses::TimelineEvent,
+    event_cache::paginator::PaginableRoom, BoxFuture, Result, Room,
 };
 use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo};
 use ruma::{
@@ -76,6 +76,8 @@ pub(super) trait RoomDataProvider:
     fn own_user_id(&self) -> &UserId;
     fn room_version(&self) -> RoomVersionId;
 
+    fn crypto_context_info(&self) -> BoxFuture<'_, CryptoContextInfo>;
+
     fn profile_from_user_id<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, Option<Profile>>;
     fn profile_from_latest_event(&self, latest_event: &LatestEvent) -> Option<Profile>;
 
@@ -119,6 +121,10 @@ impl RoomDataProvider for Room {
 
     fn room_version(&self) -> RoomVersionId {
         (**self).clone_info().room_version_or_default()
+    }
+
+    fn crypto_context_info(&self) -> BoxFuture<'_, CryptoContextInfo> {
+        async move { self.crypto_context_info().await }.boxed()
     }
 
     fn profile_from_user_id<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, Option<Profile>> {
@@ -302,8 +308,14 @@ impl Decryptor for (matrix_sdk_base::crypto::OlmMachine, ruma::OwnedRoomId) {
         let (olm_machine, room_id) = self;
         let decryption_settings =
             DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
-        let event =
-            olm_machine.decrypt_room_event(raw.cast_ref(), room_id, &decryption_settings).await?;
-        Ok(event.into())
+        match olm_machine
+            .try_decrypt_room_event(raw.cast_ref(), room_id, &decryption_settings)
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => Ok(decrypted.into()),
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                Ok(TimelineEvent::new_utd_event(raw.clone(), utd_info))
+            }
+        }
     }
 }

@@ -29,6 +29,9 @@ use super::{ChunkIdentifier, Position};
 ///
 /// These updates are useful to store a `LinkedChunk` in another form of
 /// storage, like a database or something similar.
+///
+/// [`LinkedChunk`]: super::LinkedChunk
+/// [`LinkedChunk::updates`]: super::LinkedChunk::updates
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update<Item, Gap> {
     /// A new chunk of kind Items has been created.
@@ -96,11 +99,17 @@ pub enum Update<Item, Gap> {
 
     /// Reattaching items (see [`Self::StartReattachItems`]) is finished.
     EndReattachItems,
+
+    /// All chunks have been cleared, i.e. all items and all gaps have been
+    /// dropped.
+    Clear,
 }
 
 /// A collection of [`Update`]s that can be observed.
 ///
 /// Get a value for this type with [`LinkedChunk::updates`].
+///
+/// [`LinkedChunk::updates`]: super::LinkedChunk::updates
 #[derive(Debug)]
 pub struct ObservableUpdates<Item, Gap> {
     pub(super) inner: Arc<RwLock<UpdatesInner<Item, Gap>>>,
@@ -120,7 +129,7 @@ impl<Item, Gap> ObservableUpdates<Item, Gap> {
     /// Take new updates.
     ///
     /// Updates that have been taken will not be read again.
-    pub(super) fn take(&mut self) -> Vec<Update<Item, Gap>>
+    pub fn take(&mut self) -> Vec<Update<Item, Gap>>
     where
         Item: Clone,
         Gap: Clone,
@@ -375,7 +384,21 @@ mod tests {
             other_token
         };
 
-        // There is no new update yet.
+        // There is an initial update.
+        {
+            let updates = linked_chunk.updates().unwrap();
+
+            assert_eq!(
+                updates.take(),
+                &[NewItemsChunk { previous: None, new: ChunkIdentifier(0), next: None }],
+            );
+            assert_eq!(
+                updates.inner.write().unwrap().take_with_token(other_token),
+                &[NewItemsChunk { previous: None, new: ChunkIdentifier(0), next: None }],
+            );
+        }
+
+        // No new update.
         {
             let updates = linked_chunk.updates().unwrap();
 
@@ -608,7 +631,16 @@ mod tests {
         let updates_subscriber = linked_chunk.updates().unwrap().subscribe();
         pin_mut!(updates_subscriber);
 
-        // No update, stream is pending.
+        // Initial update, stream is ready.
+        assert_matches!(
+            updates_subscriber.as_mut().poll_next(&mut context),
+            Poll::Ready(Some(items)) => {
+                assert_eq!(
+                    items,
+                    &[NewItemsChunk { previous: None, new: ChunkIdentifier(0), next: None }]
+                );
+            }
+        );
         assert_matches!(updates_subscriber.as_mut().poll_next(&mut context), Poll::Pending);
         assert_eq!(*counter_waker.number_of_wakeup.lock().unwrap(), 0);
 
@@ -642,6 +674,7 @@ mod tests {
         assert_eq!(
             linked_chunk.updates().unwrap().take(),
             &[
+                NewItemsChunk { previous: None, new: ChunkIdentifier(0), next: None },
                 PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a'] },
                 PushItems { at: Position(ChunkIdentifier(0), 1), items: vec!['b'] },
                 PushItems { at: Position(ChunkIdentifier(0), 2), items: vec!['c'] },
@@ -692,9 +725,28 @@ mod tests {
             let updates_subscriber2 = linked_chunk.updates().unwrap().subscribe();
             pin_mut!(updates_subscriber2);
 
-            // No update, streams are pending.
+            // Initial updates, streams are ready.
+            assert_matches!(
+                updates_subscriber1.as_mut().poll_next(&mut context1),
+                Poll::Ready(Some(items)) => {
+                    assert_eq!(
+                        items,
+                        &[NewItemsChunk { previous: None, new: ChunkIdentifier(0), next: None }]
+                    );
+                }
+            );
             assert_matches!(updates_subscriber1.as_mut().poll_next(&mut context1), Poll::Pending);
             assert_eq!(*counter_waker1.number_of_wakeup.lock().unwrap(), 0);
+
+            assert_matches!(
+                updates_subscriber2.as_mut().poll_next(&mut context2),
+                Poll::Ready(Some(items)) => {
+                    assert_eq!(
+                        items,
+                        &[NewItemsChunk { previous: None, new: ChunkIdentifier(0), next: None }]
+                    );
+                }
+            );
             assert_matches!(updates_subscriber2.as_mut().poll_next(&mut context2), Poll::Pending);
             assert_eq!(*counter_waker2.number_of_wakeup.lock().unwrap(), 0);
 

@@ -4,7 +4,10 @@ use ruma::{room::RoomType as RumaRoomType, space::SpaceRoomJoinRule};
 use tracing::warn;
 
 use crate::{
-    client::JoinRule, error::ClientError, room::Membership, room_member::RoomMember,
+    client::JoinRule,
+    error::ClientError,
+    room::{Membership, RoomHero},
+    room_member::RoomMember,
     utils::AsyncRuntimeDropped,
 };
 
@@ -38,6 +41,10 @@ impl RoomPreview {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("unhandled SpaceRoomJoinRule kind"))?,
             is_direct: info.is_direct,
+            heroes: info
+                .heroes
+                .as_ref()
+                .map(|heroes| heroes.iter().map(|h| h.to_owned().into()).collect()),
         })
     }
 
@@ -85,13 +92,15 @@ pub struct RoomPreviewInfo {
     /// The room type (space, custom) or nothing, if it's a regular room.
     pub room_type: RoomType,
     /// Is the history world-readable for this room?
-    pub is_history_world_readable: bool,
+    pub is_history_world_readable: Option<bool>,
     /// The membership state for the current user, if known.
     pub membership: Option<Membership>,
     /// The join rule for this room (private, public, knock, etc.).
     pub join_rule: JoinRule,
     /// Whether the room is direct or not, if known.
     pub is_direct: Option<bool>,
+    /// Room heroes.
+    pub heroes: Option<Vec<RoomHero>>,
 }
 
 impl TryFrom<SpaceRoomJoinRule> for JoinRule {

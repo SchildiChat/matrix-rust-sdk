@@ -90,6 +90,8 @@ pub trait StateStoreIntegrationTests {
     async fn test_send_queue_priority(&self);
     /// Test operations related to send queue dependents.
     async fn test_send_queue_dependents(&self);
+    /// Test an update to a send queue dependent request.
+    async fn test_update_send_queue_dependent(&self);
     /// Test saving/restoring server capabilities.
     async fn test_server_capabilities_saving(&self);
 }
@@ -972,6 +974,24 @@ impl StateStoreIntegrationTests for DynStateStore {
 
         self.populate().await?;
 
+        {
+            // Add a send queue request in that room.
+            let txn = TransactionId::new();
+            let ev =
+                SerializableEventContent::new(&RoomMessageEventContent::text_plain("sup").into())
+                    .unwrap();
+            self.save_send_queue_request(room_id, txn.clone(), ev.into(), 0).await?;
+
+            // Add a single dependent queue request.
+            self.save_dependent_queued_request(
+                room_id,
+                &txn,
+                ChildTransactionId::new(),
+                DependentQueuedRequestKind::RedactEvent,
+            )
+            .await?;
+        }
+
         self.remove_room(room_id).await?;
 
         assert_eq!(self.get_room_infos().await?.len(), 1, "room is still there");
@@ -1023,6 +1043,8 @@ impl StateStoreIntegrationTests for DynStateStore {
             .is_empty(),
             "still event recepts in the store"
         );
+        assert!(self.load_send_queue_requests(room_id).await?.is_empty());
+        assert!(self.load_dependent_queued_requests(room_id).await?.is_empty());
 
         self.remove_room(stripped_room_id).await?;
 
@@ -1458,7 +1480,7 @@ impl StateStoreIntegrationTests for DynStateStore {
         // Update the event id.
         let event_id = owned_event_id!("$1");
         let num_updated = self
-            .update_dependent_queued_request(
+            .mark_dependent_queued_requests_as_ready(
                 room_id,
                 &txn0,
                 SentRequestKey::Event(event_id.clone()),
@@ -1527,6 +1549,54 @@ impl StateStoreIntegrationTests for DynStateStore {
         // This has removed none of the dependent events.
         let dependents = self.load_dependent_queued_requests(room_id).await.unwrap();
         assert_eq!(dependents.len(), 2);
+    }
+
+    async fn test_update_send_queue_dependent(&self) {
+        let room_id = room_id!("!test_send_queue_dependents:localhost");
+
+        let txn = TransactionId::new();
+
+        // Save a dependent redaction for an event.
+        let child_txn = ChildTransactionId::new();
+
+        self.save_dependent_queued_request(
+            room_id,
+            &txn,
+            child_txn.clone(),
+            DependentQueuedRequestKind::RedactEvent,
+        )
+        .await
+        .unwrap();
+
+        // It worked.
+        let dependents = self.load_dependent_queued_requests(room_id).await.unwrap();
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].parent_transaction_id, txn);
+        assert_eq!(dependents[0].own_transaction_id, child_txn);
+        assert!(dependents[0].parent_key.is_none());
+        assert_matches!(dependents[0].kind, DependentQueuedRequestKind::RedactEvent);
+
+        // Make it a reaction, instead of a redaction.
+        self.update_dependent_queued_request(
+            room_id,
+            &child_txn,
+            DependentQueuedRequestKind::ReactEvent { key: "👍".to_owned() },
+        )
+        .await
+        .unwrap();
+
+        // It worked.
+        let dependents = self.load_dependent_queued_requests(room_id).await.unwrap();
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].parent_transaction_id, txn);
+        assert_eq!(dependents[0].own_transaction_id, child_txn);
+        assert!(dependents[0].parent_key.is_none());
+        assert_matches!(
+            &dependents[0].kind,
+            DependentQueuedRequestKind::ReactEvent { key } => {
+                assert_eq!(key, "👍");
+            }
+        );
     }
 }
 
@@ -1685,6 +1755,12 @@ macro_rules! statestore_integration_tests {
             async fn test_send_queue_dependents() {
                 let store = get_store().await.expect("creating store failed").into_state_store();
                 store.test_send_queue_dependents().await;
+            }
+
+            #[async_test]
+            async fn test_update_send_queue_dependent() {
+                let store = get_store().await.expect("creating store failed").into_state_store();
+                store.test_update_send_queue_dependent().await;
             }
         }
     };

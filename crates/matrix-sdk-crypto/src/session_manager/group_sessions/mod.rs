@@ -22,7 +22,7 @@ use std::{
 
 use futures_util::future::join_all;
 use itertools::Itertools;
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{deserialized_responses::WithheldCode, executor::spawn};
 use ruma::{
     events::{AnyMessageLikeEventContent, ToDeviceEventType},
     serde::Raw,
@@ -41,8 +41,8 @@ use crate::{
         ShareInfo, ShareState,
     },
     store::{Changes, CryptoStoreWrapper, Result as StoreResult, Store},
-    types::events::{room::encrypted::RoomEncryptedEventContent, room_key_withheld::WithheldCode},
-    Device, DeviceData, EncryptionSettings, OlmError, ToDeviceRequest,
+    types::{events::room::encrypted::RoomEncryptedEventContent, requests::ToDeviceRequest},
+    Device, DeviceData, EncryptionSettings, OlmError,
 };
 
 #[derive(Clone, Debug)]
@@ -779,6 +779,7 @@ mod tests {
     };
 
     use assert_matches2::assert_let;
+    use matrix_sdk_common::deserialized_responses::WithheldCode;
     use matrix_sdk_test::{async_test, ruma_response_from_json};
     use ruma::{
         api::client::{
@@ -801,14 +802,12 @@ mod tests {
         types::{
             events::{
                 room::encrypted::EncryptedToDeviceEvent,
-                room_key_withheld::{
-                    RoomKeyWithheldContent::{self, MegolmV1AesSha2},
-                    WithheldCode,
-                },
+                room_key_withheld::RoomKeyWithheldContent::{self, MegolmV1AesSha2},
             },
+            requests::ToDeviceRequest,
             DeviceKeys, EventEncryptionAlgorithm,
         },
-        EncryptionSettings, LocalTrust, OlmMachine, ToDeviceRequest,
+        EncryptionSettings, LocalTrust, OlmMachine,
     };
 
     fn alice_id() -> &'static UserId {

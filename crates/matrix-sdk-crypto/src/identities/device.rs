@@ -21,6 +21,7 @@ use std::{
     },
 };
 
+use matrix_sdk_common::deserialized_responses::WithheldCode;
 use ruma::{
     api::client::keys::upload_signatures::v3::Request as SignatureUploadRequest,
     events::{key::verification::VerificationMethod, AnyToDeviceEventContent},
@@ -48,13 +49,13 @@ use crate::{
     types::{
         events::{
             forwarded_room_key::ForwardedRoomKeyContent,
-            room::encrypted::ToDeviceEncryptedEventContent, room_key_withheld::WithheldCode,
-            EventType,
+            room::encrypted::ToDeviceEncryptedEventContent, EventType,
         },
+        requests::{OutgoingVerificationRequest, ToDeviceRequest},
         DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures, SignedKey,
     },
     verification::VerificationMachine,
-    Account, OutgoingVerificationRequest, Sas, ToDeviceRequest, VerificationRequest,
+    Account, Sas, VerificationRequest,
 };
 
 pub enum MaybeEncryptedRoomKey {

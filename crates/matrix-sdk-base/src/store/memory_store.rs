@@ -796,6 +796,8 @@ impl StateStore for MemoryStore {
         self.stripped_members.write().unwrap().remove(room_id);
         self.room_user_receipts.write().unwrap().remove(room_id);
         self.room_event_receipts.write().unwrap().remove(room_id);
+        self.send_queue_events.write().unwrap().remove(room_id);
+        self.dependent_send_queue_events.write().unwrap().remove(room_id);
 
         Ok(())
     }
@@ -915,7 +917,7 @@ impl StateStore for MemoryStore {
         Ok(())
     }
 
-    async fn update_dependent_queued_request(
+    async fn mark_dependent_queued_requests_as_ready(
         &self,
         room: &RoomId,
         parent_txn_id: &TransactionId,
@@ -929,6 +931,23 @@ impl StateStore for MemoryStore {
             num_updated += 1;
         }
         Ok(num_updated)
+    }
+
+    async fn update_dependent_queued_request(
+        &self,
+        room: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool, Self::Error> {
+        let mut dependent_send_queue_events = self.dependent_send_queue_events.write().unwrap();
+        let dependents = dependent_send_queue_events.entry(room.to_owned()).or_default();
+        for d in dependents.iter_mut() {
+            if d.own_transaction_id == *own_transaction_id {
+                d.kind = new_content;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn remove_dependent_queued_request(
