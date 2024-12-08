@@ -25,7 +25,7 @@ use ruma::{
         },
         AnyMessageLikeEventContent, AnySyncTimelineEvent, TimelineEventType,
     },
-    EventId, Int, OwnedDeviceId, OwnedUserId, RoomAliasId, UserId,
+    EventId, Int, OwnedDeviceId, OwnedUserId, RoomAliasId, UserId, RoomId,
 };
 use tokio::sync::RwLock;
 use tracing::error;
@@ -743,6 +743,17 @@ impl Room {
         let event_id = EventId::parse(event_id)?;
         Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_string())
     }
+
+    /// SC start
+    pub async fn add_space_child(&self, child_room_id: String)-> Result<(), ClientError> {
+        let child_room_id = RoomId::parse(child_room_id)?;
+        Ok(self.inner.add_space_child(child_room_id).await?)
+    }
+    pub async fn remove_space_child(&self, child_room_id: String)-> Result<(), ClientError> {
+        let child_room_id = RoomId::parse(child_room_id)?;
+        Ok(self.inner.remove_space_child(child_room_id).await?)
+    }
+    /// SC end
 
     /// This will only send a call notification event if appropriate.
     ///

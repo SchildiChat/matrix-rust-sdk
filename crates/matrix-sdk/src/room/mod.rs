@@ -2700,6 +2700,37 @@ impl Room {
         Ok(self.room_id().matrix_to_event_uri_via(event_id, via))
     }
 
+    // SC start
+    /// Add a room to this space by sending a child state event.
+    pub async fn add_space_child(
+        &self,
+        child_room_id: impl Into<OwnedRoomId>,
+    ) -> Result<()> {
+        // TODO safeguard if is space?
+        let child_room = self.client().get_room(&child_room_id.into())
+            .ok_or_else(|| Error::InsufficientData)?;
+        let via = child_room.route().await?;
+        self.send_state_event_for_key(
+            child_room.room_id(),
+            SpaceChildEventContent::new(via),
+        ).await?;
+        Ok(())
+    }
+    /// Remove a room from this space by clearing the child state event.
+    pub async fn remove_space_child(
+        &self,
+        child_room_id: impl Into<OwnedRoomId>,
+    ) -> Result<()> {
+        // TODO safeguard if state event for this key already exists?
+        self.send_state_event_for_key(
+            &(child_room_id.into()),
+            // Empty via => empty event content (TODO is there a cleaner approach?)
+            SpaceChildEventContent::new(Vec::new()),
+        ).await?;
+        Ok(())
+    }
+    // SC end
+
     /// Get a `matrix:` permalink to an event in this room.
     ///
     /// We try to use the synced members in the room for [routing] the room ID.
