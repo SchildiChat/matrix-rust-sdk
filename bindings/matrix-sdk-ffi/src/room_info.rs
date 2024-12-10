@@ -9,6 +9,7 @@ use crate::{
     room::{Membership, RoomHero},
     room_member::RoomMember,
     space_child_info::{SpaceChildInfo, space_children_info},
+    event::StateEventType,
 };
 
 #[derive(uniffi::Record)]
@@ -50,6 +51,7 @@ pub struct RoomInfo {
     active_room_call_participants: Vec<String>,
     /// SC: Space-specific fields
     space_children: Vec<SpaceChildInfo>,
+    can_user_manage_spaces: bool,
     /// Whether this room has been explicitly marked as unread
     is_marked_unread: bool,
     /// "Interesting" messages received in that room, independently of the
@@ -85,6 +87,20 @@ impl RoomInfo {
             warn!("Failed to parse join rule: {:?}", e);
         }
 
+        // Some SC spaces things
+        let is_space = room.is_space();
+        let can_user_manage_spaces = if is_space {
+            match room.can_user_send_state(room.own_user_id(), StateEventType::SpaceChild.into()).await {
+                Ok(can_send) => can_send,
+                Err(e) => {
+                    warn!("Failed to check if user can manage space: {:?}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         Ok(Self {
             id: room.room_id().to_string(),
             creator: room.creator().as_ref().map(ToString::to_string),
@@ -94,7 +110,7 @@ impl RoomInfo {
             avatar_url: room.avatar_url().map(Into::into),
             is_direct: room.is_direct().await?,
             is_public: room.is_public(),
-            is_space: room.is_space(),
+            is_space,
             is_tombstoned: room.is_tombstoned(),
             is_favourite: room.is_favourite(),
             is_low_priority: room.is_low_priority(),
@@ -132,6 +148,7 @@ impl RoomInfo {
                 .collect(),
             is_marked_unread: room.is_marked_unread(),
             space_children: space_children_info(&room),
+            can_user_manage_spaces,
             num_unread_messages: room.num_unread_messages(),
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),
