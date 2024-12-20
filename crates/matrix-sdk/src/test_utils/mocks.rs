@@ -29,8 +29,12 @@ use matrix_sdk_test::{
 };
 use ruma::{
     directory::PublicRoomsChunk,
-    events::{AnyStateEvent, AnyTimelineEvent, MessageLikeEventType, StateEventType},
+    events::{
+        room::member::RoomMemberEvent, AnyStateEvent, AnyTimelineEvent, MessageLikeEventType,
+        StateEventType,
+    },
     serde::Raw,
+    time::Duration,
     MxcUri, OwnedEventId, OwnedRoomId, RoomId, ServerName,
 };
 use serde::Deserialize;
@@ -578,7 +582,7 @@ impl MatrixMockServer {
     /// mock_server.mock_room_keys_version().exists().expect(1).mount().await;
     ///
     /// let exists =
-    ///     client.encryption().backups().exists_on_server().await.unwrap();
+    ///     client.encryption().backups().fetch_exists_on_server().await.unwrap();
     ///
     /// assert!(exists);
     /// # });
@@ -589,6 +593,154 @@ impl MatrixMockServer {
             .and(path_regex(r"_matrix/client/v3/room_keys/version"))
             .and(header("authorization", "Bearer 1234"));
         MockEndpoint { mock, server: &self.server, endpoint: RoomKeysVersionEndpoint }
+    }
+
+    /// Create a prebuilt mock for adding key storage backups via POST
+    pub fn mock_add_room_keys_version(&self) -> MockEndpoint<'_, AddRoomKeysVersionEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path_regex(r"_matrix/client/v3/room_keys/version"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: AddRoomKeysVersionEndpoint }
+    }
+
+    /// Create a prebuilt mock for adding key storage backups via POST
+    pub fn mock_delete_room_keys_version(&self) -> MockEndpoint<'_, DeleteRoomKeysVersionEndpoint> {
+        let mock = Mock::given(method("DELETE"))
+            .and(path_regex(r"_matrix/client/v3/room_keys/version/[^/]*"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: DeleteRoomKeysVersionEndpoint }
+    }
+
+    /// Create a prebuilt mock for getting the room members in a room.
+    ///
+    /// # Examples
+    ///
+    /// ``` #
+    /// tokio_test::block_on(async {
+    /// use matrix_sdk_base::RoomMemberships;
+    /// use ruma::events::room::member::MembershipState;
+    /// use ruma::events::room::member::RoomMemberEventContent;
+    /// use ruma::user_id;
+    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// use matrix_sdk::{
+    ///     ruma::{event_id, room_id},
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    /// let event_id = event_id!("$id");
+    /// let room_id = room_id!("!room_id:localhost");
+    ///
+    /// let f = EventFactory::new().room(room_id);
+    /// let alice_user_id = user_id!("@alice:b.c");
+    /// let alice_knock_event = f
+    ///     .event(RoomMemberEventContent::new(MembershipState::Knock))
+    ///     .event_id(event_id)
+    ///     .sender(alice_user_id)
+    ///     .state_key(alice_user_id)
+    ///     .into_raw_timeline()
+    ///     .cast();
+    ///
+    /// mock_server.mock_get_members().ok(vec![alice_knock_event]).mock_once().mount().await;
+    /// let room = mock_server.sync_joined_room(&client, room_id).await;
+    ///
+    /// let members = room.members(RoomMemberships::all()).await.unwrap();
+    /// assert_eq!(members.len(), 1);
+    /// # });
+    /// ```
+    pub fn mock_get_members(&self) -> MockEndpoint<'_, GetRoomMembersEndpoint> {
+        let mock =
+            Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/v3/rooms/.*/members$"));
+        MockEndpoint { mock, server: &self.server, endpoint: GetRoomMembersEndpoint }
+    }
+
+    /// Creates a prebuilt mock for inviting a user to a room by its id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ruma::user_id;
+    /// tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::room_id,
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_invite_user_by_id().ok().mock_once().mount().await;
+    ///
+    /// let room = mock_server
+    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
+    ///     .await;
+    ///
+    /// room.invite_user_by_id(user_id!("@alice:localhost")).await.unwrap();
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn mock_invite_user_by_id(&self) -> MockEndpoint<'_, InviteUserByIdEndpoint> {
+        let mock =
+            Mock::given(method("POST")).and(path_regex(r"^/_matrix/client/v3/rooms/.*/invite$"));
+        MockEndpoint { mock, server: &self.server, endpoint: InviteUserByIdEndpoint }
+    }
+
+    /// Creates a prebuilt mock for kicking a user from a room.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ruma::user_id;
+    /// tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::room_id,
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_kick_user().ok().mock_once().mount().await;
+    ///
+    /// let room = mock_server
+    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
+    ///     .await;
+    ///
+    /// room.kick_user(user_id!("@alice:localhost"), None).await.unwrap();
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn mock_kick_user(&self) -> MockEndpoint<'_, KickUserEndpoint> {
+        let mock =
+            Mock::given(method("POST")).and(path_regex(r"^/_matrix/client/v3/rooms/.*/kick"));
+        MockEndpoint { mock, server: &self.server, endpoint: KickUserEndpoint }
+    }
+
+    /// Creates a prebuilt mock for banning a user from a room.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ruma::user_id;
+    /// tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::room_id,
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_ban_user().ok().mock_once().mount().await;
+    ///
+    /// let room = mock_server
+    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
+    ///     .await;
+    ///
+    /// room.ban_user(user_id!("@alice:localhost"), None).await.unwrap();
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn mock_ban_user(&self) -> MockEndpoint<'_, BanUserEndpoint> {
+        let mock = Mock::given(method("POST")).and(path_regex(r"^/_matrix/client/v3/rooms/.*/ban"));
+        MockEndpoint { mock, server: &self.server, endpoint: BanUserEndpoint }
     }
 }
 
@@ -952,6 +1104,72 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
         }
     }
 
+    /// Ensures the event was sent as a delayed event.
+    ///
+    /// Note: works with *any* room.
+    ///
+    /// # Examples
+    ///
+    /// see also [`MatrixMockServer::mock_room_send`] for more context.
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::{
+    ///         api::client::delayed_events::{delayed_message_event, DelayParameters},
+    ///         events::{message::MessageEventContent, AnyMessageLikeEventContent},
+    ///         room_id,
+    ///         time::Duration,
+    ///         TransactionId,
+    ///     },
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    /// use serde_json::json;
+    /// use wiremock::ResponseTemplate;
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_room_state_encryption().plain().mount().await;
+    ///
+    /// let room = mock_server.sync_joined_room(&client, room_id!("!room_id:localhost")).await;
+    ///
+    /// mock_server
+    ///     .mock_room_send()
+    ///     .with_delay(Duration::from_millis(500))
+    ///     .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delay_id":"$some_id"})))
+    ///     .mock_once()
+    ///     .mount()
+    ///     .await;
+    ///
+    /// let response_not_mocked =
+    ///     room.send_raw("m.room.message", json!({ "body": "Hello world" })).await;
+    ///
+    /// // A non delayed event should not be mocked by the server.
+    /// assert!(response_not_mocked.is_err());
+    ///
+    /// let r = delayed_message_event::unstable::Request::new(
+    ///     room.room_id().to_owned(),
+    ///     TransactionId::new(),
+    ///     DelayParameters::Timeout { timeout: Duration::from_millis(500) },
+    ///     &AnyMessageLikeEventContent::Message(MessageEventContent::plain("hello world")),
+    /// )
+    /// .unwrap();
+    ///
+    /// let response = room.client().send(r, None).await.unwrap();
+    /// // The delayed `m.room.message` event type should be mocked by the server.
+    /// assert_eq!("$some_id", response.delay_id);
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn with_delay(self, delay: Duration) -> Self {
+        Self {
+            mock: self
+                .mock
+                .and(query_param("org.matrix.msc4140.delay", delay.as_millis().to_string())),
+            ..self
+        }
+    }
+
     /// Returns a send endpoint that emulates success, i.e. the event has been
     /// sent with the given event id.
     ///
@@ -1115,6 +1333,69 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
         // Note: we may have already defined a path, but this one ought to be more
         // specialized (unless for_key/for_type were called multiple times).
         Self { mock: self.mock.and(path_regex(Self::generate_path_regexp(&self.endpoint))), ..self }
+    }
+
+    /// Ensures the event was sent as a delayed event.
+    ///
+    /// Note: works with *any* room.
+    ///
+    /// # Examples
+    ///
+    /// see also [`MatrixMockServer::mock_room_send`] for more context.
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::{
+    ///         api::client::delayed_events::{delayed_state_event, DelayParameters},
+    ///         events::{room::create::RoomCreateEventContent, AnyStateEventContent},
+    ///         room_id,
+    ///         time::Duration,
+    ///     },
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    /// use wiremock::ResponseTemplate;
+    /// use serde_json::json;
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_room_state_encryption().plain().mount().await;
+    ///
+    /// let room = mock_server.sync_joined_room(&client, room_id!("!room_id:localhost")).await;
+    ///
+    /// mock_server
+    ///     .mock_room_send_state()
+    ///     .with_delay(Duration::from_millis(500))
+    ///     .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delay_id":"$some_id"})))
+    ///     .mock_once()
+    ///     .mount()
+    ///     .await;
+    ///
+    /// let response_not_mocked = room.send_state_event(RoomCreateEventContent::new_v11()).await;
+    /// // A non delayed event should not be mocked by the server.
+    /// assert!(response_not_mocked.is_err());
+    ///
+    /// let r = delayed_state_event::unstable::Request::new(
+    ///     room.room_id().to_owned(),
+    ///     "".to_owned(),
+    ///     DelayParameters::Timeout { timeout: Duration::from_millis(500) },
+    ///     &AnyStateEventContent::RoomCreate(RoomCreateEventContent::new_v11()),
+    /// )
+    /// .unwrap();
+    /// let response = room.client().send(r, None).await.unwrap();
+    /// // The delayed `m.room.message` event type should be mocked by the server.
+    /// assert_eq!("$some_id", response.delay_id);
+    ///
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn with_delay(self, delay: Duration) -> Self {
+        Self {
+            mock: self
+                .mock
+                .and(query_param("org.matrix.msc4140.delay", delay.as_millis().to_string())),
+            ..self
+        }
     }
 
     ///
@@ -1406,6 +1687,11 @@ impl<'a> MockEndpoint<'a, RoomMessagesEndpoint> {
         Self { mock: self.mock.and(query_param("limit", limit.to_string())), ..self }
     }
 
+    /// Expects an optional `from` to be set on the request.
+    pub fn from(self, from: &str) -> Self {
+        Self { mock: self.mock.and(query_param("from", from)), ..self }
+    }
+
     /// Returns a messages endpoint that emulates success, i.e. the messages
     /// provided as `response` could be retrieved.
     ///
@@ -1416,13 +1702,13 @@ impl<'a> MockEndpoint<'a, RoomMessagesEndpoint> {
         start: String,
         end: Option<String>,
         chunk: Vec<impl Into<Raw<AnyTimelineEvent>>>,
-        state: Vec<impl Into<Raw<AnyStateEvent>>>,
+        state: Vec<Raw<AnyStateEvent>>,
     ) -> MatrixMock<'a> {
         let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "start": start,
             "end": end,
             "chunk": chunk.into_iter().map(|ev| ev.into()).collect::<Vec<_>>(),
-            "state": state.into_iter().map(|ev| ev.into()).collect::<Vec<_>>(),
+            "state": state,
         })));
         MatrixMock { server: self.server, mock }
     }
@@ -1534,7 +1820,8 @@ impl<'a> MockEndpoint<'a, PublicRoomsEndpoint> {
     }
 }
 
-/// A prebuilt mock for `room_keys/version`: storage ("backup") of room keys.
+/// A prebuilt mock for `GET room_keys/version`: storage ("backup") of room
+/// keys.
 pub struct RoomKeysVersionEndpoint;
 
 impl<'a> MockEndpoint<'a, RoomKeysVersionEndpoint> {
@@ -1575,6 +1862,83 @@ impl<'a> MockEndpoint<'a, RoomKeysVersionEndpoint> {
     /// Returns an endpoint that 404 errors when we get it
     pub fn error404(self) -> MatrixMock<'a> {
         let mock = self.mock.respond_with(ResponseTemplate::new(404));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST room_keys/version`: adding room key backups.
+pub struct AddRoomKeysVersionEndpoint;
+
+impl<'a> MockEndpoint<'a, AddRoomKeysVersionEndpoint> {
+    /// Returns an endpoint that may be used to add room key backups
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self
+            .mock
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+              "version": "1"
+            })))
+            .named("POST for the backup creation");
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `DELETE room_keys/version/xxx`: deleting room key
+/// backups.
+pub struct DeleteRoomKeysVersionEndpoint;
+
+impl<'a> MockEndpoint<'a, DeleteRoomKeysVersionEndpoint> {
+    /// Returns an endpoint that allows deleting room key backups
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self
+            .mock
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .named("DELETE for the backup deletion");
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `GET /members` request.
+pub struct GetRoomMembersEndpoint;
+
+impl<'a> MockEndpoint<'a, GetRoomMembersEndpoint> {
+    /// Returns a successful get members request with a list of members.
+    pub fn ok(self, members: Vec<Raw<RoomMemberEvent>>) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk": members,
+        })));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /invite` request.
+pub struct InviteUserByIdEndpoint;
+
+impl<'a> MockEndpoint<'a, InviteUserByIdEndpoint> {
+    /// Returns a successful invite user by id request.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({})));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /kick` request.
+pub struct KickUserEndpoint;
+
+impl<'a> MockEndpoint<'a, KickUserEndpoint> {
+    /// Returns a successful kick user request.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({})));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /ban` request.
+pub struct BanUserEndpoint;
+
+impl<'a> MockEndpoint<'a, BanUserEndpoint> {
+    /// Returns a successful ban user request.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({})));
         MatrixMock { server: self.server, mock }
     }
 }

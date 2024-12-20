@@ -23,12 +23,13 @@ use matrix_sdk::{
 };
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
 use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{info, info_span, trace, warn, Instrument, Span};
 
 use super::{
     controller::{TimelineController, TimelineSettings},
     to_device::{handle_forwarded_room_key_event, handle_room_key_event},
-    Error, Timeline, TimelineDropHandle, TimelineFocus,
+    DateDividerMode, Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
 use crate::{
     timeline::{controller::TimelineNewItemPosition, event_item::RemoteEventOrigin},
@@ -86,6 +87,13 @@ impl TimelineBuilder {
     /// timeline IDs for this timeline.
     pub fn with_internal_id_prefix(mut self, prefix: String) -> Self {
         self.internal_id_prefix = Some(prefix);
+        self
+    }
+
+    /// Chose when to insert the date separators, either in between each day
+    /// or each month.
+    pub fn with_date_divider_mode(mut self, mode: DateDividerMode) -> Self {
+        self.settings.date_divider_mode = mode;
         self
     }
 
@@ -426,6 +434,47 @@ impl TimelineBuilder {
             })
         };
 
+        // TODO: Technically, this should be the only stream we need to listen to get
+        // notified when we should retry to decrypt an event. We sadly can't do that,
+        // since the cross-process support kills the `OlmMachine` which then in
+        // turn kills this stream. Once this is solved remove all the other ways we
+        // listen for room keys.
+        let room_keys_received_join_handle = {
+            let inner = controller.clone();
+            let stream = client.encryption().room_keys_received_stream().await.expect(
+                "We should be logged in by now, so we should have access to an OlmMachine \
+                 to be able to listen to this stream",
+            );
+
+            spawn(async move {
+                pin_mut!(stream);
+
+                while let Some(room_keys) = stream.next().await {
+                    let session_ids = match room_keys {
+                        Ok(room_keys) => {
+                            let session_ids: BTreeSet<String> = room_keys
+                                .into_iter()
+                                .filter(|info| info.room_id == inner.room().room_id())
+                                .map(|info| info.session_id)
+                                .collect();
+
+                            Some(session_ids)
+                        }
+                        Err(BroadcastStreamRecvError::Lagged(missed_updates)) => {
+                            // We lagged, let's retry to decrypt anything we have, maybe something
+                            // was received.
+                            warn!(missed_updates, "The room keys stream has lagged, retrying to decrypt the whole timeline");
+
+                            None
+                        }
+                    };
+
+                    let room = inner.room();
+                    inner.retry_event_decryption(room, session_ids).await;
+                }
+            })
+        };
+
         let timeline = Timeline {
             controller,
             event_cache: room_event_cache,
@@ -436,6 +485,7 @@ impl TimelineBuilder {
                 pinned_events_join_handle,
                 room_key_from_backups_join_handle,
                 room_key_backup_enabled_join_handle,
+                room_keys_received_join_handle,
                 local_echo_listener_handle,
                 _event_cache_drop_handle: event_cache_drop,
                 encryption_changes_handle,

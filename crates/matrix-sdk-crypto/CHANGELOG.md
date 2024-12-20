@@ -6,10 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.9.0] - 2024-12-18
+
+- Expose new API `DehydratedDevices::get_dehydrated_device_pickle_key`, `DehydratedDevices::save_dehydrated_device_pickle_key`
+  and `DehydratedDevices::delete_dehydrated_device_pickle_key` to store/load the dehydrated device pickle key.
+  This allows client to automatically rotate the dehydrated device to avoid one-time-keys exhaustion and to_device accumulation.
+  [**breaking**] `DehydratedDevices::keys_for_upload` and `DehydratedDevices::rehydrate` now use the `DehydratedDeviceKey`
+  as parameter instead of a raw byte array. Use `DehydratedDeviceKey::from_bytes` to migrate.
+  ([#4383](https://github.com/matrix-org/matrix-rust-sdk/pull/4383))
+
+- Add extra logging in `OtherUserIdentity::pin_current_master_key` and
+  `OtherUserIdentity::withdraw_verification`.
+  ([#4415](https://github.com/matrix-org/matrix-rust-sdk/pull/4415))
+
 - Added new `UtdCause` variants `WithheldForUnverifiedOrInsecureDevice` and `WithheldBySender`.
-  These variants provide clearer categorization for expected Unable-To-Decrypt (UTD) errors 
+  These variants provide clearer categorization for expected Unable-To-Decrypt (UTD) errors
   when the sender either did not wish to share or was unable to share the room_key.
   ([#4305](https://github.com/matrix-org/matrix-rust-sdk/pull/4305))
+
+- `UtdCause` has two new variants that replace the existing `HistoricalMessage`:
+  `HistoricalMessageAndBackupIsDisabled` and `HistoricalMessageAndDeviceIsUnverified`.
+  These give more detail about what went wrong and allow us to suggest to users
+  what actions they can take to fix the problem. See the doc comments on these
+  variants for suggested wording.
+  ([#4384](https://github.com/matrix-org/matrix-rust-sdk/pull/4384))
 
 ## [0.8.0] - 2024-11-19
 
@@ -74,6 +94,12 @@ All notable changes to this project will be documented in this file.
 
 
 ### Refactor
+
+- Fix [#4424](https://github.com/matrix-org/matrix-rust-sdk/issues/4424) Failed
+  storage upgrade for "PreviouslyVerifiedButNoLonger". This bug caused errors to
+  occur when loading crypto information from storage, which typically prevented
+  apps from starting correctly.
+  ([#4430](https://github.com/matrix-org/matrix-rust-sdk/pull/4430))
 
 - Add new method `OlmMachine::try_decrypt_room_event`.
   ([#4116](https://github.com/matrix-org/matrix-rust-sdk/pull/4116))

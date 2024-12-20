@@ -57,6 +57,7 @@ use ruma::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{info, warn};
 use vodozemac::{base64_encode, megolm::SessionOrdering, Curve25519PublicKey};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -96,7 +97,10 @@ use matrix_sdk_common::{store_locks::CrossProcessStoreLock, timeout::timeout};
 pub use memorystore::MemoryStore;
 pub use traits::{CryptoStore, DynCryptoStore, IntoCryptoStore};
 
-pub use crate::gossiping::{GossipRequest, SecretInfo};
+pub use crate::{
+    dehydrated_devices::DehydrationError,
+    gossiping::{GossipRequest, SecretInfo},
+};
 
 /// A wrapper for our CryptoStore trait object.
 ///
@@ -518,6 +522,7 @@ pub struct Changes {
     pub private_identity: Option<PrivateCrossSigningIdentity>,
     pub backup_version: Option<String>,
     pub backup_decryption_key: Option<BackupDecryptionKey>,
+    pub dehydrated_device_pickle_key: Option<DehydratedDeviceKey>,
     pub sessions: Vec<Session>,
     pub message_hashes: Vec<OlmMessageHash>,
     pub inbound_group_sessions: Vec<InboundGroupSession>,
@@ -550,6 +555,7 @@ impl Changes {
         self.private_identity.is_none()
             && self.backup_version.is_none()
             && self.backup_decryption_key.is_none()
+            && self.dehydrated_device_pickle_key.is_none()
             && self.sessions.is_empty()
             && self.message_hashes.is_empty()
             && self.inbound_group_sessions.is_empty()
@@ -746,6 +752,76 @@ impl BackupDecryptionKey {
 impl Debug for BackupDecryptionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("BackupDecryptionKey").field(&"...").finish()
+    }
+}
+
+/// The pickle key used to safely store the dehydrated device pickle.
+///
+/// This input key material will be expanded using HKDF into an AES key, MAC
+/// key, and an initialization vector (IV).
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct DehydratedDeviceKey {
+    pub(crate) inner: Box<[u8; DehydratedDeviceKey::KEY_SIZE]>,
+}
+
+impl DehydratedDeviceKey {
+    /// The number of bytes the encryption key will hold.
+    pub const KEY_SIZE: usize = 32;
+
+    /// Generates a new random pickle key.
+    pub fn new() -> Result<Self, rand::Error> {
+        let mut rng = rand::thread_rng();
+
+        let mut key = Box::new([0u8; Self::KEY_SIZE]);
+        rand::Fill::try_fill(key.as_mut_slice(), &mut rng)?;
+
+        Ok(Self { inner: key })
+    }
+
+    /// Creates a new dehydration pickle key from the given slice.
+    ///
+    /// Fail if the slice length is not 32.
+    pub fn from_slice(slice: &[u8]) -> Result<Self, DehydrationError> {
+        if slice.len() == 32 {
+            let mut key = Box::new([0u8; 32]);
+            key.copy_from_slice(slice);
+            Ok(DehydratedDeviceKey { inner: key })
+        } else {
+            Err(DehydrationError::PickleKeyLength(slice.len()))
+        }
+    }
+
+    /// Creates a dehydration pickle key from the given bytes.
+    pub fn from_bytes(raw_key: &[u8; 32]) -> Self {
+        let mut inner = Box::new([0u8; Self::KEY_SIZE]);
+        inner.copy_from_slice(raw_key);
+
+        Self { inner }
+    }
+
+    /// Export the [`DehydratedDeviceKey`] as a base64 encoded string.
+    pub fn to_base64(&self) -> String {
+        base64_encode(self.inner.as_slice())
+    }
+}
+
+impl From<&[u8; 32]> for DehydratedDeviceKey {
+    fn from(value: &[u8; 32]) -> Self {
+        DehydratedDeviceKey { inner: Box::new(*value) }
+    }
+}
+
+impl From<DehydratedDeviceKey> for Vec<u8> {
+    fn from(key: DehydratedDeviceKey) -> Self {
+        key.inner.to_vec()
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl Debug for DehydratedDeviceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DehydratedDeviceKey").field(&"...").finish()
     }
 }
 
@@ -1518,12 +1594,14 @@ impl Store {
     /// the stream. Updates that happen at the same time are batched into a
     /// [`Vec`].
     ///
-    /// If the reader of the stream lags too far behind, a warning will be
-    /// logged and items will be dropped.
+    /// If the reader of the stream lags too far behind an error will be sent to
+    /// the reader.
     ///
     /// The stream will terminate once all references to the underlying
     /// `CryptoStoreWrapper` are dropped.
-    pub fn room_keys_received_stream(&self) -> impl Stream<Item = Vec<RoomKeyInfo>> {
+    pub fn room_keys_received_stream(
+        &self,
+    ) -> impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> {
         self.inner.store.room_keys_received_stream()
     }
 
@@ -1945,7 +2023,10 @@ mod tests {
     use matrix_sdk_test::async_test;
     use ruma::{room_id, user_id};
 
-    use crate::{machine::test_helpers::get_machine_pair, types::EventEncryptionAlgorithm};
+    use crate::{
+        machine::test_helpers::get_machine_pair, store::DehydratedDeviceKey,
+        types::EventEncryptionAlgorithm,
+    };
 
     #[async_test]
     async fn test_import_room_keys_notifies_stream() {
@@ -1965,7 +2046,8 @@ mod tests {
             .next()
             .now_or_never()
             .flatten()
-            .expect("We should have received an update of room key infos");
+            .expect("We should have received an update of room key infos")
+            .unwrap();
         assert_eq!(room_keys.len(), 1);
         assert_eq!(room_keys[0].room_id, "!room1:localhost");
     }
@@ -2081,5 +2163,30 @@ mod tests {
         assert!(identity.is_verified(), "The public identity should be marked as verified.");
 
         assert!(status.is_complete(), "We should have imported all the cross-signing keys");
+    }
+
+    #[async_test]
+    async fn test_create_dehydrated_device_key() {
+        let pickle_key = DehydratedDeviceKey::new()
+            .expect("Should be able to create a random dehydrated device key");
+
+        let to_vec = pickle_key.inner.to_vec();
+        let pickle_key_from_slice = DehydratedDeviceKey::from_slice(to_vec.as_slice())
+            .expect("Should be able to create a dehydrated device key from slice");
+
+        assert_eq!(pickle_key_from_slice.to_base64(), pickle_key.to_base64());
+    }
+
+    #[async_test]
+    async fn test_create_dehydrated_errors() {
+        let too_small = [0u8; 22];
+        let pickle_key = DehydratedDeviceKey::from_slice(&too_small);
+
+        assert!(pickle_key.is_err());
+
+        let too_big = [0u8; 40];
+        let pickle_key = DehydratedDeviceKey::from_slice(&too_big);
+
+        assert!(pickle_key.is_err());
     }
 }

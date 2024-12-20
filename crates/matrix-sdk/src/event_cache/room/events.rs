@@ -18,15 +18,18 @@ use eyeball_im::VectorDiff;
 pub use matrix_sdk_base::event_cache::{Event, Gap};
 use matrix_sdk_base::{
     event_cache::store::DEFAULT_CHUNK_CAPACITY,
-    linked_chunk::{AsVector, ObservableUpdates},
+    linked_chunk::{AsVector, IterBackward, ObservableUpdates},
 };
 use matrix_sdk_common::linked_chunk::{
-    Chunk, ChunkIdentifier, EmptyChunk, Error, Iter, LinkedChunk, Position,
+    Chunk, ChunkIdentifier, EmptyChunk, Error, LinkedChunk, Position,
 };
 use ruma::OwnedEventId;
 use tracing::{debug, error, warn};
 
-use super::super::deduplicator::{Decoration, Deduplicator};
+use super::{
+    super::deduplicator::{Decoration, Deduplicator},
+    chunk_debug_string,
+};
 
 /// This type represents all events of a single room.
 #[derive(Debug)]
@@ -76,6 +79,11 @@ impl RoomEvents {
         Self { chunks, chunks_updates_as_vectordiffs, deduplicator }
     }
 
+    /// Returns whether the room has at least one event.
+    pub fn is_empty(&self) -> bool {
+        self.chunks.num_items() == 0
+    }
+
     /// Clear all events.
     ///
     /// All events, all gaps, everything is dropped, move into the void, into
@@ -106,7 +114,7 @@ impl RoomEvents {
 
     /// Push a gap after all events or gaps.
     pub fn push_gap(&mut self, gap: Gap) {
-        self.chunks.push_gap_back(gap)
+        self.chunks.push_gap_back(gap);
     }
 
     /// Insert events at a specified position.
@@ -137,13 +145,13 @@ impl RoomEvents {
     /// Because the `gap_identifier` can represent non-gap chunk, this method
     /// returns a `Result`.
     ///
-    /// This method returns a reference to the (first if many) newly created
-    /// `Chunk` that contains the `items`.
+    /// This method returns either the position of the first chunk that's been
+    /// created, or the next insert position if the chunk has been removed.
     pub fn replace_gap_at<I>(
         &mut self,
         events: I,
         gap_identifier: ChunkIdentifier,
-    ) -> Result<&Chunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>, Error>
+    ) -> Result<Option<Position>, Error>
     where
         I: IntoIterator<Item = Event>,
     {
@@ -157,8 +165,14 @@ impl RoomEvents {
         // because of the removals.
         self.remove_events(duplicated_event_ids);
 
-        // Replace the gap by new events.
-        self.chunks.replace_gap_at(unique_events, gap_identifier)
+        if unique_events.is_empty() {
+            // There are no new events, so there's no need to create a new empty items
+            // chunk; instead, remove the gap.
+            self.chunks.remove_gap_at(gap_identifier)
+        } else {
+            // Replace the gap by new events.
+            Ok(Some(self.chunks.replace_gap_at(unique_events, gap_identifier)?.first_position()))
+        }
     }
 
     /// Search for a chunk, and return its identifier.
@@ -172,8 +186,17 @@ impl RoomEvents {
     /// Iterate over the chunks, forward.
     ///
     /// The oldest chunk comes first.
-    pub fn chunks(&self) -> Iter<'_, DEFAULT_CHUNK_CAPACITY, Event, Gap> {
+    pub fn chunks(
+        &self,
+    ) -> matrix_sdk_common::linked_chunk::Iter<'_, DEFAULT_CHUNK_CAPACITY, Event, Gap> {
         self.chunks.chunks()
+    }
+
+    /// Iterate over the chunks, backward.
+    ///
+    /// The most recent chunk comes first.
+    pub fn rchunks(&self) -> IterBackward<'_, DEFAULT_CHUNK_CAPACITY, Event, Gap> {
+        self.chunks.rchunks()
     }
 
     /// Iterate over the events, backward.
@@ -246,6 +269,18 @@ impl RoomEvents {
             .collect();
 
         (deduplicated_events, duplicated_event_ids)
+    }
+
+    /// Return a nice debug string (a vector of lines) for the linked chunk of
+    /// events for this room.
+    pub fn debug_string(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for c in self.chunks() {
+            let content = chunk_debug_string(c.content());
+            let line = format!("chunk #{}: {content}", c.identifier().index());
+            result.push(line);
+        }
+        result
     }
 }
 
@@ -682,9 +717,8 @@ mod tests {
 
         let chunk_identifier_of_gap = room_events
             .chunks()
-            .find_map(|chunk| chunk.is_gap().then_some(chunk.first_position()))
-            .unwrap()
-            .chunk_identifier();
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
 
         room_events.replace_gap_at([event_1, event_2], chunk_identifier_of_gap).unwrap();
 
@@ -723,9 +757,8 @@ mod tests {
 
         let chunk_identifier_of_gap = room_events
             .chunks()
-            .find_map(|chunk| chunk.is_gap().then_some(chunk.first_position()))
-            .unwrap()
-            .chunk_identifier();
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
 
         assert_events_eq!(
             room_events.events(),
@@ -759,6 +792,40 @@ mod tests {
 
             assert!(chunks.next().is_none());
         }
+    }
+
+    #[test]
+    fn test_replace_gap_at_with_no_new_events() {
+        let (_, event_0) = new_event("$ev0");
+        let (_, event_1) = new_event("$ev1");
+        let (_, event_2) = new_event("$ev2");
+
+        let mut room_events = RoomEvents::new();
+
+        room_events.push_events([event_0, event_1]);
+        room_events.push_gap(Gap { prev_token: "middle".to_owned() });
+        room_events.push_events([event_2]);
+        room_events.push_gap(Gap { prev_token: "end".to_owned() });
+
+        // Remove the first gap.
+        let first_gap_id = room_events
+            .chunks()
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
+
+        // The next insert position is the next chunk's start.
+        let pos = room_events.replace_gap_at([], first_gap_id).unwrap();
+        assert_eq!(pos, Some(Position::new(ChunkIdentifier::new(2), 0)));
+
+        // Remove the second gap.
+        let second_gap_id = room_events
+            .chunks()
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
+
+        // No next insert position.
+        let pos = room_events.replace_gap_at([], second_gap_id).unwrap();
+        assert!(pos.is_none());
     }
 
     #[test]
