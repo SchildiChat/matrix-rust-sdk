@@ -855,6 +855,12 @@ impl Client {
         Ok(())
     }
 
+    /// SC: request url preview json data from the homeserver
+    pub async fn get_url_preview_json(&self, url: String) -> Result<String, ClientError> {
+        let result = self.inner.get_url_preview_json(url).await?;
+        Ok(result)
+    }
+
     /// The homeserver this client is configured to use.
     pub fn homeserver(&self) -> String {
         self.inner.homeserver().to_string()

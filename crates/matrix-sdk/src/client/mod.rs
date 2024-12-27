@@ -645,6 +645,15 @@ impl Client {
         Pusher::new(self.clone())
     }
 
+    /// SC: request url preview json data from the homeserver
+    pub async fn get_url_preview_json(&self, url: String) -> Result<String> {
+        let request = ruma::api::client::authenticated_media::get_media_preview::v1::Request::new(url);
+        let request_config = Some(self.request_config().force_matrix_version(MatrixVersion::V1_11));
+        let result = self.send(request, request_config).await?;
+        let json = serde_json::to_string(&result.data)?;
+        Ok(json)
+    }
+
     /// Access the OpenID Connect API of the client.
     #[cfg(feature = "experimental-oidc")]
     pub fn oidc(&self) -> Oidc {
