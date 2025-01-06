@@ -131,6 +131,8 @@ struct ComputedSummary {
     /// The list of display names that will be used to calculate the room
     /// display name.
     heroes: Vec<String>,
+    /// SC: The avatar matching to a display name for DMs.
+    avatar_url: Option<OwnedMxcUri>,
     /// The number of joined service members in the room.
     num_service_members: u64,
     /// The number of joined and invited members, not including any service
@@ -657,21 +659,28 @@ impl Room {
             }
         };
 
-        let display_name = match display_name_or_summary {
+        let (display_name, avatar_url) = match display_name_or_summary {
             DisplayNameOrSummary::Summary(summary) => {
                 self.compute_display_name_from_summary(summary).await?
             }
-            DisplayNameOrSummary::DisplayName(display_name) => display_name,
+            DisplayNameOrSummary::DisplayName(display_name) => (display_name, None),
         };
 
         // Update the cached display name before we return the newly computed value.
         self.inner.update_if(|info| {
-            if info.cached_display_name.as_ref() != Some(&display_name) {
+            let name_changed = if info.cached_display_name.as_ref() != Some(&display_name) {
                 info.cached_display_name = Some(display_name.clone());
                 true
             } else {
                 false
-            }
+            };
+            let avatar_changed = if avatar_url != info.cached_avatar_url {
+                info.cached_avatar_url = avatar_url;
+                true
+            } else {
+                false
+            };
+            name_changed || avatar_changed
         });
 
         Ok(display_name)
@@ -681,14 +690,14 @@ impl Room {
     async fn compute_display_name_from_summary(
         &self,
         summary: RoomSummary,
-    ) -> StoreResult<RoomDisplayName> {
+    ) -> StoreResult<(RoomDisplayName, Option<OwnedMxcUri>)> {
         let computed_summary = if !summary.room_heroes.is_empty() {
             self.extract_and_augment_summary(&summary).await?
         } else {
             self.compute_summary().await?
         };
 
-        let ComputedSummary { heroes, num_service_members, num_joined_invited_guess } =
+        let ComputedSummary { heroes, avatar_url, num_service_members, num_joined_invited_guess } =
             computed_summary;
 
         let summary_member_count = (summary.joined_member_count + summary.invited_member_count)
@@ -717,7 +726,7 @@ impl Room {
             heroes.iter().map(|hero| hero.as_str()).collect(),
         );
 
-        Ok(display_name)
+        Ok((display_name, avatar_url))
     }
 
     /// Extracts and enhances the [`RoomSummary`] provided by the homeserver.
@@ -787,7 +796,7 @@ impl Room {
             num_joined_invited_guess
         };
 
-        Ok(ComputedSummary { heroes: names, num_service_members, num_joined_invited_guess })
+        Ok(ComputedSummary { heroes: names, avatar_url: None, num_service_members, num_joined_invited_guess })
     }
 
     /// Compute the room summary with the data present in the store.
@@ -831,24 +840,32 @@ impl Room {
         // Make the ordering deterministic.
         members.sort_unstable_by(|lhs, rhs| lhs.name().cmp(rhs.name()));
 
-        let heroes = members
+        let hero_members: Vec<_> = members
             .into_iter()
             .filter(heroes_filter)
             .take(NUM_HEROES)
-            .map(|u| u.name().to_owned())
+            //.map(|u| u.name().to_owned())
             .collect();
+        let heroes: Vec<_> = hero_members.clone().into_iter().map(|u| u.name().to_owned()).collect();
 
         trace!(
             ?heroes,
             num_joined_invited,
             num_service_members,
+            room_id = ?self.room_id(),
             "Computed a room summary since we didn't receive one."
         );
 
         let num_service_members = num_service_members as u64;
         let num_joined_invited_guess = num_joined_invited as u64;
 
-        Ok(ComputedSummary { heroes, num_service_members, num_joined_invited_guess })
+        let avatar_url = if hero_members.len() == 1 && self.is_direct().await.unwrap_or_default() {
+            hero_members[0].avatar_url().map(|a| a.to_owned())
+        } else {
+            None
+        };
+
+        Ok(ComputedSummary { heroes, avatar_url, num_service_members, num_joined_invited_guess })
     }
 
     async fn get_member_hints(&self) -> StoreResult<MemberHintsEventContent> {
@@ -1356,6 +1373,10 @@ pub struct RoomInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_display_name: Option<RoomDisplayName>,
 
+    /// SC: cached avatar_url, following [`cached_display_name`] logic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cached_avatar_url: Option<OwnedMxcUri>,
+
     /// Cached user defined notification mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_user_defined_notification_mode: Option<RoomNotificationMode>,
@@ -1409,6 +1430,7 @@ impl RoomInfo {
             base_info: Box::new(BaseRoomInfo::new()),
             warned_about_unknown_room_version: Arc::new(false.into()),
             cached_display_name: None,
+            cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             #[cfg(feature = "experimental-sliding-sync")]
             recency_stamp: None,
@@ -1580,10 +1602,10 @@ impl RoomInfo {
 
     /// Returns the current room avatar.
     pub fn avatar_url(&self) -> Option<&MxcUri> {
-        self.base_info
-            .avatar
-            .as_ref()
-            .and_then(|e| e.as_original().and_then(|e| e.content.url.as_deref()))
+        match self.base_info.avatar.as_ref() {
+            Some(e) => e.as_original().and_then(|e| e.content.url.as_deref()),
+            None => self.cached_avatar_url.as_deref()
+        }
     }
 
     /// Update the room avatar.
@@ -2190,6 +2212,7 @@ mod tests {
             read_receipts: Default::default(),
             warned_about_unknown_room_version: Arc::new(false.into()),
             cached_display_name: None,
+            cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: Some(42),
         };
