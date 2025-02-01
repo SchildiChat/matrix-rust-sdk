@@ -4,14 +4,13 @@ use anyhow::{Context, Result};
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     crypto::LocalTrust,
-    event_cache::paginator::PaginatorError,
     room::{
         edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
     },
     ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
     RoomHero as SdkRoomHero, RoomMemberships, RoomState,
 };
-use matrix_sdk_ui::timeline::{default_event_filter, PaginationError, RoomExt, TimelineFocus};
+use matrix_sdk_ui::timeline::{default_event_filter, RoomExt};
 use mime::Mime;
 use ruma::{
     api::client::room::report_content,
@@ -20,7 +19,8 @@ use ruma::{
         call::notify,
         room::{
             avatar::ImageInfo as RumaAvatarImageInfo,
-            message::RoomMessageEventContentWithoutRelation,
+            history_visibility::HistoryVisibility as RumaHistoryVisibility,
+            join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
             power_levels::RoomPowerLevels as RumaPowerLevels, MediaSource,
         },
         AnyMessageLikeEventContent, AnySyncTimelineEvent, TimelineEventType,
@@ -33,14 +33,18 @@ use tracing::error;
 use super::RUNTIME;
 use crate::{
     chunk_iterator::ChunkIterator,
-    error::{ClientError, MediaInfoError, RoomError},
-    event::{MessageLikeEventType, RoomMessageEventMessageType, StateEventType},
+    client::{JoinRule, RoomVisibility},
+    error::{ClientError, MediaInfoError, NotYetImplemented, RoomError},
+    event::{MessageLikeEventType, StateEventType},
     identity_status_change::IdentityStatusChange,
     room_info::RoomInfo,
     room_member::RoomMember,
     ruma::{ImageInfo, Mentions, NotifyType},
     space_child_info::{SpaceChildInfo, space_children_info},
-    timeline::{DateDividerMode, FocusEventError, ReceiptType, SendHandle, Timeline},
+    timeline::{
+        configuration::{AllowedMessageTypes, TimelineConfiguration},
+        ReceiptType, SendHandle, Timeline,
+    },
     utils::u64_to_uint,
     TaskHandle,
 };
@@ -86,10 +90,6 @@ impl Room {
 
 #[matrix_sdk_ffi_macros::export]
 impl Room {
-    pub fn id(&self) -> String {
-        self.inner.room_id().to_string()
-    }
-
     /// Returns the room's name from the state event if available, otherwise
     /// compute a room name based on the room's nature (DM or not) and number of
     /// members.
@@ -203,113 +203,42 @@ impl Room {
         }
     }
 
-    /// Returns a timeline focused on the given event.
-    ///
-    /// Note: this timeline is independent from that returned with
-    /// [`Self::timeline`], and as such it is not cached.
-    pub async fn timeline_focused_on_event(
+    /// Build a new timeline instance with the given configuration.
+    pub async fn timeline_with_configuration(
         &self,
-        event_id: String,
-        num_context_events: u16,
-        internal_id_prefix: Option<String>,
-    ) -> Result<Arc<Timeline>, FocusEventError> {
-        let parsed_event_id = EventId::parse(&event_id).map_err(|err| {
-            FocusEventError::InvalidEventId { event_id: event_id.clone(), err: err.to_string() }
-        })?;
-
-        let room = &self.inner;
-
-        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(room);
-
-        if let Some(internal_id_prefix) = internal_id_prefix {
-            builder = builder.with_internal_id_prefix(internal_id_prefix);
-        }
-
-        let timeline = match builder
-            .with_focus(TimelineFocus::Event { target: parsed_event_id, num_context_events })
-            .build()
-            .await
-        {
-            Ok(t) => t,
-            Err(err) => {
-                if let matrix_sdk_ui::timeline::Error::PaginationError(
-                    PaginationError::Paginator(PaginatorError::EventNotFound(..)),
-                ) = err
-                {
-                    return Err(FocusEventError::EventNotFound { event_id: event_id.to_string() });
-                }
-                return Err(FocusEventError::Other { msg: err.to_string() });
-            }
-        };
-
-        Ok(Timeline::new(timeline))
-    }
-
-    pub async fn pinned_events_timeline(
-        &self,
-        internal_id_prefix: Option<String>,
-        max_events_to_load: u16,
-        max_concurrent_requests: u16,
-    ) -> Result<Arc<Timeline>, ClientError> {
-        let room = &self.inner;
-
-        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(room);
-
-        if let Some(internal_id_prefix) = internal_id_prefix {
-            builder = builder.with_internal_id_prefix(internal_id_prefix);
-        }
-
-        let timeline = builder
-            .with_focus(TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests })
-            .build()
-            .await?;
-
-        Ok(Timeline::new(timeline))
-    }
-
-    /// A timeline instance that can be configured to only include RoomMessage
-    /// type events and filter those further based on their message type.
-    ///
-    /// Virtual timeline items will still be provided and the
-    /// `default_event_filter` will be applied before everything else.
-    ///
-    /// # Arguments
-    ///
-    /// * `internal_id_prefix` - An optional String that will be prepended to
-    ///   all the timeline item's internal IDs, making it possible to
-    ///   distinguish different timeline instances from each other.
-    ///
-    /// * `allowed_message_types` - A list of `RoomMessageEventMessageType` that
-    ///   will be allowed to appear in the timeline
-    pub async fn message_filtered_timeline(
-        &self,
-        internal_id_prefix: Option<String>,
-        allowed_message_types: Vec<RoomMessageEventMessageType>,
-        date_divider_mode: DateDividerMode,
+        configuration: TimelineConfiguration,
     ) -> Result<Arc<Timeline>, ClientError> {
         let mut builder = matrix_sdk_ui::timeline::Timeline::builder(&self.inner);
 
-        if let Some(internal_id_prefix) = internal_id_prefix {
+        builder = builder.with_focus(configuration.focus.try_into()?);
+
+        if let AllowedMessageTypes::Only { types } = configuration.allowed_message_types {
+            builder = builder.event_filter(move |event, room_version_id| {
+                default_event_filter(event, room_version_id)
+                    && match event {
+                        AnySyncTimelineEvent::MessageLike(msg) => match msg.original_content() {
+                            Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
+                                types.contains(&content.msgtype.into())
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+            });
+        }
+
+        if let Some(internal_id_prefix) = configuration.internal_id_prefix {
             builder = builder.with_internal_id_prefix(internal_id_prefix);
         }
 
-        builder = builder.with_date_divider_mode(date_divider_mode.into());
-
-        builder = builder.event_filter(move |event, room_version_id| {
-            default_event_filter(event, room_version_id)
-                && match event {
-                    AnySyncTimelineEvent::MessageLike(msg) => match msg.original_content() {
-                        Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
-                            allowed_message_types.contains(&content.msgtype.into())
-                        }
-                        _ => false,
-                    },
-                    _ => false,
-                }
-        });
+        builder = builder.with_date_divider_mode(configuration.date_divider_mode.into());
 
         let timeline = builder.build().await?;
         Ok(Timeline::new(timeline))
+    }
+
+    pub fn id(&self) -> String {
+        self.inner.room_id().to_string()
     }
 
     pub fn is_encrypted(&self) -> Result<bool, ClientError> {
@@ -350,7 +279,7 @@ impl Room {
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        Ok(RoomInfo::new(&self.inner).await?)
+        RoomInfo::new(&self.inner).await
     }
 
     pub fn subscribe_to_room_info_updates(
@@ -454,15 +383,12 @@ impl Room {
         let int_score = score.map(|value| value.into());
         self.inner
             .client()
-            .send(
-                report_content::v3::Request::new(
-                    self.inner.room_id().into(),
-                    event_id,
-                    int_score,
-                    reason,
-                ),
-                None,
-            )
+            .send(report_content::v3::Request::new(
+                self.inner.room_id().into(),
+                event_id,
+                int_score,
+                reason,
+            ))
             .await?;
         Ok(())
     }
@@ -951,13 +877,15 @@ impl Room {
         self: Arc<Self>,
         listener: Box<dyn KnockRequestsListener>,
     ) -> Result<Arc<TaskHandle>, ClientError> {
-        let stream = self.inner.subscribe_to_knock_requests().await?;
+        let (stream, seen_ids_cleanup_handle) = self.inner.subscribe_to_knock_requests().await?;
 
         let handle = Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
             pin_mut!(stream);
             while let Some(requests) = stream.next().await {
                 listener.call(requests.into_iter().map(Into::into).collect());
             }
+            // Cancel the seen ids cleanup task
+            seen_ids_cleanup_handle.abort();
         })));
 
         Ok(handle)
@@ -968,6 +896,105 @@ impl Room {
     pub async fn room_events_debug_string(&self) -> Result<Vec<String>, ClientError> {
         let (cache, _drop_guards) = self.inner.event_cache().await?;
         Ok(cache.debug_string().await)
+    }
+
+    /// Update the canonical alias of the room.
+    ///
+    /// Note that publishing the alias in the room directory is done separately.
+    pub async fn update_canonical_alias(
+        &self,
+        alias: Option<String>,
+        alt_aliases: Vec<String>,
+    ) -> Result<(), ClientError> {
+        let new_alias = alias.map(TryInto::try_into).transpose()?;
+        let new_alt_aliases =
+            alt_aliases.into_iter().map(RoomAliasId::parse).collect::<Result<_, _>>()?;
+        self.inner
+            .privacy_settings()
+            .update_canonical_alias(new_alias, new_alt_aliases)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Publish a new room alias for this room in the room directory.
+    ///
+    /// Returns:
+    /// - `true` if the room alias didn't exist and it's now published.
+    /// - `false` if the room alias was already present so it couldn't be
+    ///   published.
+    pub async fn publish_room_alias_in_room_directory(
+        &self,
+        alias: String,
+    ) -> Result<bool, ClientError> {
+        let new_alias = RoomAliasId::parse(alias)?;
+        self.inner
+            .privacy_settings()
+            .publish_room_alias_in_room_directory(&new_alias)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Remove an existing room alias for this room in the room directory.
+    ///
+    /// Returns:
+    /// - `true` if the room alias was present and it's now removed from the
+    ///   room directory.
+    /// - `false` if the room alias didn't exist so it couldn't be removed.
+    pub async fn remove_room_alias_from_room_directory(
+        &self,
+        alias: String,
+    ) -> Result<bool, ClientError> {
+        let alias = RoomAliasId::parse(alias)?;
+        self.inner
+            .privacy_settings()
+            .remove_room_alias_from_room_directory(&alias)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Enable End-to-end encryption in this room.
+    pub async fn enable_encryption(&self) -> Result<(), ClientError> {
+        self.inner.enable_encryption().await.map_err(Into::into)
+    }
+
+    /// Update room history visibility for this room.
+    pub async fn update_history_visibility(
+        &self,
+        visibility: RoomHistoryVisibility,
+    ) -> Result<(), ClientError> {
+        let visibility: RumaHistoryVisibility = visibility.try_into()?;
+        self.inner
+            .privacy_settings()
+            .update_room_history_visibility(visibility)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Update the join rule for this room.
+    pub async fn update_join_rules(&self, new_rule: JoinRule) -> Result<(), ClientError> {
+        let new_rule: RumaJoinRule = new_rule.try_into()?;
+        self.inner.privacy_settings().update_join_rule(new_rule).await.map_err(Into::into)
+    }
+
+    /// Update the room's visibility in the room directory.
+    pub async fn update_room_visibility(
+        &self,
+        visibility: RoomVisibility,
+    ) -> Result<(), ClientError> {
+        self.inner
+            .privacy_settings()
+            .update_room_visibility(visibility.into())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Returns the visibility for this room in the room directory.
+    ///
+    /// [Public](`RoomVisibility::Public`) rooms are listed in the room
+    /// directory and can be found using it.
+    pub async fn get_room_visibility(&self) -> Result<RoomVisibility, ClientError> {
+        let visibility = self.inner.privacy_settings().get_room_visibility().await?;
+        Ok(visibility.into())
     }
 }
 
@@ -1280,5 +1307,64 @@ impl TryFrom<ComposerDraftType> for SdkComposerDraftType {
         };
 
         Ok(draft_type)
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum RoomHistoryVisibility {
+    /// Previous events are accessible to newly joined members from the point
+    /// they were invited onwards.
+    ///
+    /// Events stop being accessible when the member's state changes to
+    /// something other than *invite* or *join*.
+    Invited,
+
+    /// Previous events are accessible to newly joined members from the point
+    /// they joined the room onwards.
+    /// Events stop being accessible when the member's state changes to
+    /// something other than *join*.
+    Joined,
+
+    /// Previous events are always accessible to newly joined members.
+    ///
+    /// All events in the room are accessible, even those sent when the member
+    /// was not a part of the room.
+    Shared,
+
+    /// All events while this is the `HistoryVisibility` value may be shared by
+    /// any participating homeserver with anyone, regardless of whether they
+    /// have ever joined the room.
+    WorldReadable,
+
+    /// A custom visibility value.
+    Custom { value: String },
+}
+
+impl TryFrom<RumaHistoryVisibility> for RoomHistoryVisibility {
+    type Error = NotYetImplemented;
+    fn try_from(value: RumaHistoryVisibility) -> Result<Self, Self::Error> {
+        match value {
+            RumaHistoryVisibility::Invited => Ok(RoomHistoryVisibility::Invited),
+            RumaHistoryVisibility::Shared => Ok(RoomHistoryVisibility::Shared),
+            RumaHistoryVisibility::WorldReadable => Ok(RoomHistoryVisibility::WorldReadable),
+            RumaHistoryVisibility::Joined => Ok(RoomHistoryVisibility::Joined),
+            RumaHistoryVisibility::_Custom(_) => {
+                Ok(RoomHistoryVisibility::Custom { value: value.to_string() })
+            }
+            _ => Err(NotYetImplemented),
+        }
+    }
+}
+
+impl TryFrom<RoomHistoryVisibility> for RumaHistoryVisibility {
+    type Error = NotYetImplemented;
+    fn try_from(value: RoomHistoryVisibility) -> Result<Self, Self::Error> {
+        match value {
+            RoomHistoryVisibility::Invited => Ok(RumaHistoryVisibility::Invited),
+            RoomHistoryVisibility::Shared => Ok(RumaHistoryVisibility::Shared),
+            RoomHistoryVisibility::Joined => Ok(RumaHistoryVisibility::Joined),
+            RoomHistoryVisibility::WorldReadable => Ok(RumaHistoryVisibility::WorldReadable),
+            RoomHistoryVisibility::Custom { .. } => Err(NotYetImplemented),
+        }
     }
 }

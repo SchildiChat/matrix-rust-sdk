@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt};
 
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
-use serde::{Deserialize, Serialize};
+use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize};
 use vodozemac::Ed25519PublicKey;
 
-use crate::types::DeviceKeys;
+use crate::types::{serialize_ed25519_key, DeviceKeys};
 
 /// Information about the sender of a megolm session where we know the
 /// cross-signing identity of the sender.
@@ -33,7 +33,71 @@ pub struct KnownSenderData {
     pub device_id: Option<OwnedDeviceId>,
 
     /// The cross-signing key of the user who established this session.
+    #[serde(
+        serialize_with = "serialize_ed25519_key",
+        deserialize_with = "deserialize_sender_msk_base64_or_array"
+    )]
     pub master_key: Box<Ed25519PublicKey>,
+}
+
+/// In an initial version the master key was serialized as an array of number,
+/// it is now exported in base64. This code adds backward compatibility.
+pub(crate) fn deserialize_sender_msk_base64_or_array<'de, D>(
+    de: D,
+) -> Result<Box<Ed25519PublicKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct KeyVisitor;
+
+    impl<'de> Visitor<'de> for KeyVisitor {
+        type Value = Box<Ed25519PublicKey>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a base64 string or an array of 32 bytes")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let decoded = Ed25519PublicKey::from_base64(v)
+                .map_err(|_| de::Error::custom("Base64 decoding error"))?;
+            Ok(Box::new(decoded))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut buf = [0u8; Ed25519PublicKey::LENGTH];
+
+            for (i, item) in buf.iter_mut().enumerate() {
+                *item = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+            }
+
+            let key = Ed25519PublicKey::from_slice(&buf).map_err(|e| de::Error::custom(&e))?;
+
+            Ok(Box::new(key))
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if v.len() == Ed25519PublicKey::LENGTH {
+                let mut buf = [0u8; Ed25519PublicKey::LENGTH];
+                buf.copy_from_slice(v);
+
+                let key = Ed25519PublicKey::from_slice(&buf).map_err(|e| de::Error::custom(&e))?;
+                Ok(Box::new(key))
+            } else {
+                Err(de::Error::invalid_length(v.len(), &self))
+            }
+        }
+    }
+
+    de.deserialize_any(KeyVisitor)
 }
 
 /// Information on the device and user that sent the megolm session data to us
@@ -283,13 +347,17 @@ mod tests {
     use std::{cmp::Ordering, collections::BTreeMap};
 
     use assert_matches2::assert_let;
-    use ruma::{device_id, owned_device_id, owned_user_id, user_id};
-    use vodozemac::Ed25519PublicKey;
+    use insta::assert_json_snapshot;
+    use ruma::{
+        device_id, owned_device_id, owned_user_id, user_id, DeviceKeyAlgorithm, DeviceKeyId,
+    };
+    use serde_json::json;
+    use vodozemac::{base64_decode, Curve25519PublicKey, Ed25519PublicKey};
 
     use super::SenderData;
     use crate::{
-        olm::KnownSenderData,
-        types::{DeviceKeys, Signatures},
+        olm::{KnownSenderData, PickledInboundGroupSession},
+        types::{DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures},
     };
 
     #[test]
@@ -478,5 +546,106 @@ mod tests {
         );
         assert_eq!(sender_unverified.compare_trust_level(&sender_verified), Ordering::Less);
         assert_eq!(sender_verified.compare_trust_level(&sender_unverified), Ordering::Greater);
+    }
+
+    #[test]
+    fn snapshot_sender_data() {
+        assert_json_snapshot!(SenderData::UnknownDevice {
+            legacy_session: false,
+            owner_check_failed: true,
+        });
+
+        assert_json_snapshot!(SenderData::UnknownDevice {
+            legacy_session: true,
+            owner_check_failed: false,
+        });
+
+        assert_json_snapshot!(SenderData::DeviceInfo {
+            device_keys: DeviceKeys::new(
+                owned_user_id!("@foo:bar.baz"),
+                owned_device_id!("DEV"),
+                vec![
+                    EventEncryptionAlgorithm::MegolmV1AesSha2,
+                    EventEncryptionAlgorithm::OlmV1Curve25519AesSha2
+                ],
+                BTreeMap::from_iter(vec![(
+                    DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, device_id!("ABCDEFGH")),
+                    DeviceKey::Curve25519(Curve25519PublicKey::from_bytes([0u8; 32])),
+                )]),
+                Default::default(),
+            ),
+            legacy_session: false,
+        });
+
+        assert_json_snapshot!(SenderData::VerificationViolation(KnownSenderData {
+            user_id: owned_user_id!("@foo:bar.baz"),
+            device_id: Some(owned_device_id!("DEV")),
+            master_key: Box::new(Ed25519PublicKey::from_slice(&[0u8; 32]).unwrap()),
+        }));
+
+        assert_json_snapshot!(SenderData::SenderUnverified(KnownSenderData {
+            user_id: owned_user_id!("@foo:bar.baz"),
+            device_id: None,
+            master_key: Box::new(Ed25519PublicKey::from_slice(&[1u8; 32]).unwrap()),
+        }));
+
+        assert_json_snapshot!(SenderData::SenderVerified(KnownSenderData {
+            user_id: owned_user_id!("@foo:bar.baz"),
+            device_id: None,
+            master_key: Box::new(Ed25519PublicKey::from_slice(&[1u8; 32]).unwrap()),
+        }));
+    }
+
+    #[test]
+    fn test_sender_known_data_migration() {
+        let old_format = json!(
+        {
+            "SenderVerified": {
+                "user_id": "@foo:bar.baz",
+                "device_id": null,
+                "master_key": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }
+        });
+
+        let migrated: SenderData = serde_json::from_value(old_format).unwrap();
+
+        assert_let!(SenderData::SenderVerified(KnownSenderData { master_key, .. }) = migrated);
+
+        assert_eq!(
+            master_key.to_base64(),
+            Ed25519PublicKey::from_slice(&[0u8; 32]).unwrap().to_base64()
+        );
+    }
+
+    #[test]
+    fn test_sender_known_data_migration_with_efficient_bytes_array() {
+        // This is an serialized PickledInboundGroupSession as rmp_serde will generate.
+        //
+        // This export usse a more efficient serialization format for bytes. This was
+        // exported when the `KnownSenderData` master_key was serialized as an byte
+        // array instead of a base64 encoded string.
+        const SERIALIZED_B64: &str =
+            "iaZwaWNrbGWEr2luaXRpYWxfcmF0Y2hldIKlaW5uZXLcAIABYMzfSnBRzMlPKF1uKjYbzLtkzNJ4RcylzN0HzP\
+             9DzON1Tm05zO7M2MzFQsy9Acz9zPnMqDvM4syQzNrMzxF5KzbM4sy9zPUbBWfM7m4/zJzM18zDzMESKgfMkE7M\
+             yszIHszqWjYyQURbzKTMkx7M58zANsy+AGPM2A8tbcyFYczge8ykzMFdbVxJMMyAzN8azJEXGsy8zPJazMMaP8\
+             ziDszmWwfM+My2ajLMr8y+eczTRm9TFadjb3VudGVyAKtzaWduaW5nX2tlecQgefpCr6Duu7QUWzKIeMOFmxv/\
+             NjfcsYwZz8IN2ZOhdaS0c2lnbmluZ19rZXlfdmVyaWZpZWTDpmNvbmZpZ4GndmVyc2lvbqJWMapzZW5kZXJfa2\
+             V52StoMkIySDg2ajFpYmk2SW13ak9UUkhzbTVMamtyT2kyUGtiSXVUb0w0TWtFq3NpZ25pbmdfa2V5gadlZDI1\
+             NTE52StUWHJqNS9UYXpia3Yram1CZDl4UlB4NWNVaFFzNUNnblc1Q1pNRjgvNjZzq3NlbmRlcl9kYXRhgbBTZW\
+             5kZXJVbnZlcmlmaWVkg6d1c2VyX2lks0B2YWxvdTM1Om1hdHJpeC5vcmepZGV2aWNlX2lkqkZJQlNaRlJLUE2q\
+             bWFzdGVyX2tlecQgkOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuGncm9vbV9pZL4hRWt5VEtGdkViYl\
+             B6SmxhaUhFOm1hdHJpeC5vcmeoaW1wb3J0ZWTCqWJhY2tlZF91cMKyaGlzdG9yeV92aXNpYmlsaXR5wKlhbGdv\
+             cml0aG20bS5tZWdvbG0udjEuYWVzLXNoYTI";
+
+        let input = base64_decode(SERIALIZED_B64).unwrap();
+        let sender_data: PickledInboundGroupSession = rmp_serde::from_slice(&input)
+            .expect("Should be able to deserialize serialized inbound group session");
+
+        assert_let!(
+            SenderData::SenderUnverified(KnownSenderData { master_key, .. }) =
+                sender_data.sender_data
+        );
+
+        assert_eq!(master_key.to_base64(), "kOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuE");
     }
 }

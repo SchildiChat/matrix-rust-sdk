@@ -5,8 +5,9 @@ use tracing::warn;
 
 use crate::{
     client::JoinRule,
+    error::ClientError,
     notification_settings::RoomNotificationMode,
-    room::{Membership, RoomHero},
+    room::{Membership, RoomHero, RoomHistoryVisibility},
     room_member::RoomMember,
     space_child_info::{SpaceChildInfo, space_children_info},
     event::StateEventType,
@@ -67,10 +68,12 @@ pub struct RoomInfo {
     pinned_event_ids: Vec<String>,
     /// The join rule for this room, if known.
     join_rule: Option<JoinRule>,
+    /// The history visibility for this room, if known.
+    history_visibility: RoomHistoryVisibility,
 }
 
 impl RoomInfo {
-    pub(crate) async fn new(room: &matrix_sdk::Room) -> matrix_sdk::Result<Self> {
+    pub(crate) async fn new(room: &matrix_sdk::Room) -> Result<Self, ClientError> {
         let unread_notification_counts = room.unread_notification_counts();
         let unread_count = room.unread_count();
 
@@ -154,6 +157,7 @@ impl RoomInfo {
             num_unread_mentions: room.num_unread_mentions(),
             pinned_event_ids,
             join_rule: join_rule.ok(),
+            history_visibility: room.history_visibility_or_default().try_into()?,
         })
     }
 }

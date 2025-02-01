@@ -14,8 +14,6 @@
 
 //! A sqlite-based backend for the [`EventCacheStore`].
 
-#![allow(dead_code)] // Most of the unused code may be used soonish.
-
 use std::{borrow::Cow, fmt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
@@ -142,28 +140,6 @@ impl SqliteEventCacheStore {
             row.get::<_, Option<u64>>(2)?,
             row.get::<_, String>(3)?,
         ))
-    }
-
-    async fn load_chunk_with_id(
-        &self,
-        room_id: &RoomId,
-        chunk_id: ChunkIdentifier,
-    ) -> Result<RawChunk<Event, Gap>> {
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
-
-        let this = self.clone();
-
-        self
-            .acquire()
-            .await?
-            .with_transaction(move |txn| -> Result<_> {
-                let (id, previous, next, chunk_type) = txn.query_row(
-                    "SELECT id, previous, next, type FROM linked_chunks WHERE room_id = ? AND chunk_id = ?", 
-                    (&hashed_room_id, chunk_id.index()),
-                    Self::map_row_to_chunk
-                )?;
-                txn.rebuild_chunk(&this, &hashed_room_id, previous, id, next, chunk_type.as_str())
-            }).await
     }
 }
 
@@ -481,6 +457,28 @@ impl EventCacheStore for SqliteEventCacheStore {
                                     (chunk_id, &hashed_room_id, event_id, content, index),
                                 )?;
                             }
+                        }
+
+                        Update::ReplaceItem { at, item: event } => {
+                            let chunk_id = at.chunk_identifier().index();
+                            let index = at.index();
+
+                            trace!(%room_id, "replacing item @ {chunk_id}:{index}");
+
+                            let serialized = serde_json::to_vec(&event)?;
+                            let content = this.encode_value(serialized)?;
+
+                            // The event id should be the same, but just in case it changed…
+                            let event_id = event.event_id().map(|event_id| event_id.to_string());
+
+                            txn.execute(
+                                r#"
+                                UPDATE events
+                                SET content = ?, event_id = ?
+                                WHERE room_id = ? AND chunk_id = ? AND position = ?
+                            "#,
+                                (content, event_id, &hashed_room_id, chunk_id, index,)
+                            )?;
                         }
 
                         Update::RemoveItem { at } => {
@@ -999,6 +997,52 @@ mod tests {
         assert_eq!(c.next, None);
         assert_matches!(c.content, ChunkContent::Gap(gap) => {
             assert_eq!(gap.prev_token, "raclette");
+        });
+    }
+
+    #[async_test]
+    async fn test_linked_chunk_replace_item() {
+        let store = get_event_cache_store().await.expect("creating cache store failed");
+
+        let room_id = &DEFAULT_TEST_ROOM_ID;
+
+        store
+            .handle_linked_chunk_updates(
+                room_id,
+                vec![
+                    Update::NewItemsChunk {
+                        previous: None,
+                        new: ChunkIdentifier::new(42),
+                        next: None,
+                    },
+                    Update::PushItems {
+                        at: Position::new(ChunkIdentifier::new(42), 0),
+                        items: vec![
+                            make_test_event(room_id, "hello"),
+                            make_test_event(room_id, "world"),
+                        ],
+                    },
+                    Update::ReplaceItem {
+                        at: Position::new(ChunkIdentifier::new(42), 1),
+                        item: make_test_event(room_id, "yolo"),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let mut chunks = store.reload_linked_chunk(room_id).await.unwrap();
+
+        assert_eq!(chunks.len(), 1);
+
+        let c = chunks.remove(0);
+        assert_eq!(c.identifier, ChunkIdentifier::new(42));
+        assert_eq!(c.previous, None);
+        assert_eq!(c.next, None);
+        assert_matches!(c.content, ChunkContent::Items(events) => {
+            assert_eq!(events.len(), 2);
+            check_test_event(&events[0], "hello");
+            check_test_event(&events[1], "yolo");
         });
     }
 

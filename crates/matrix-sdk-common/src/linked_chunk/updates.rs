@@ -79,6 +79,18 @@ pub enum Update<Item, Gap> {
         items: Vec<Item>,
     },
 
+    /// An item has been replaced in the linked chunk.
+    ///
+    /// The `at` position MUST resolve to the actual position an existing *item*
+    /// (not a gap).
+    ReplaceItem {
+        /// The position of the item that's being replaced.
+        at: Position,
+
+        /// The new value for the item.
+        item: Item,
+    },
+
     /// An item has been removed inside a chunk of kind Items.
     RemoveItem {
         /// The [`Position`] of the item.
@@ -138,6 +150,7 @@ impl<Item, Gap> ObservableUpdates<Item, Gap> {
     }
 
     /// Subscribe to updates by using a [`Stream`].
+    #[cfg(test)]
     pub(super) fn subscribe(&mut self) -> UpdatesSubscriber<Item, Gap> {
         // A subscriber is a new update reader, it needs its own token.
         let token = self.new_reader_token();
@@ -264,6 +277,7 @@ impl<Item, Gap> UpdatesInner<Item, Gap> {
     }
 
     /// Return the number of updates in the buffer.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.updates.len()
     }
@@ -302,6 +316,7 @@ pub(super) struct UpdatesSubscriber<Item, Gap> {
 
 impl<Item, Gap> UpdatesSubscriber<Item, Gap> {
     /// Create a new [`Self`].
+    #[cfg(test)]
     fn new(updates: Weak<RwLock<UpdatesInner<Item, Gap>>>, token: ReaderToken) -> Self {
         Self { updates, token }
     }

@@ -20,7 +20,7 @@ use eyeball_im_util::vector::VectorObserverExt;
 use futures_core::Stream;
 use imbl::Vector;
 #[cfg(test)]
-use matrix_sdk::crypto::OlmMachine;
+use matrix_sdk::{crypto::OlmMachine, SendOutsideWasm};
 use matrix_sdk::{
     deserialized_responses::{SyncTimelineEvent, TimelineEventKind as SdkTimelineEventKind},
     event_cache::{paginator::Paginator, RoomEventCache},
@@ -64,28 +64,29 @@ pub(super) use self::{
     },
 };
 use super::{
+    algorithms::{rfind_event_by_id, rfind_event_item},
     event_handler::TimelineEventKind,
     event_item::{ReactionStatus, RemoteEventOrigin},
     item::TimelineUniqueId,
     traits::{Decryptor, RoomDataProvider},
-    util::{rfind_event_by_id, rfind_event_item, RelativePosition},
     DateDividerMode, Error, EventSendState, EventTimelineItem, InReplyToDetails, Message,
     PaginationError, Profile, ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId,
     TimelineFocus, TimelineItem, TimelineItemContent, TimelineItemKind,
 };
 use crate::{
     timeline::{
+        algorithms::rfind_event_by_item_id,
         date_dividers::DateDividerAdjuster,
         event_item::EventTimelineItemKind,
         pinned_events_loader::{PinnedEventsLoader, PinnedEventsLoaderError},
         reactions::FullReactionKey,
-        util::rfind_event_by_item_id,
         TimelineEventFilterFn,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
 
 mod observable_items;
+mod read_receipts;
 mod state;
 
 /// Data associated to the current timeline focus.
@@ -124,18 +125,21 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room> {
     pub(crate) room_data_provider: P,
 
     /// Settings applied to this timeline.
-    settings: TimelineSettings,
+    pub(super) settings: TimelineSettings,
 }
 
 #[derive(Clone)]
 pub(super) struct TimelineSettings {
     /// Should the read receipts and read markers be handled?
     pub(super) track_read_receipts: bool,
+
     /// Event filter that controls what's rendered as a timeline item (and thus
     /// what can carry read receipts).
     pub(super) event_filter: Arc<TimelineEventFilterFn>,
+
     /// Are unparsable events added as timeline items of their own kind?
     pub(super) add_failed_to_parse: bool,
+
     /// Should the timeline items be grouped by day or month?
     pub(super) date_divider_mode: DateDividerMode,
 }
@@ -477,9 +481,13 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.state.read().await.meta.fully_read_event.clone()
     }
 
+    #[cfg(test)]
     pub(super) async fn subscribe(
         &self,
-    ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + Send) {
+    ) -> (
+        Vector<Arc<TimelineItem>>,
+        impl Stream<Item = VectorDiff<Arc<TimelineItem>>> + SendOutsideWasm,
+    ) {
         trace!("Creating timeline items signal");
         let state = self.state.read().await;
         (state.items.clone_items(), state.items.subscribe().into_stream())
@@ -667,6 +675,27 @@ impl<P: RoomDataProvider> TimelineController<P> {
 
         let mut state = self.state.write().await;
         state.add_remote_events_at(events, position, &self.room_data_provider, &self.settings).await
+    }
+
+    /// Handle updates on events as [`VectorDiff`]s.
+    pub(super) async fn handle_remote_events_with_diffs(
+        &self,
+        diffs: Vec<VectorDiff<SyncTimelineEvent>>,
+        origin: RemoteEventOrigin,
+    ) {
+        if diffs.is_empty() {
+            return;
+        }
+
+        let mut state = self.state.write().await;
+        state
+            .handle_remote_events_with_diffs(
+                diffs,
+                origin,
+                &self.room_data_provider,
+                &self.settings,
+            )
+            .await
     }
 
     pub(super) async fn clear(&self) {
@@ -1627,4 +1656,15 @@ async fn fetch_replied_to_event(
         Err(e) => TimelineDetails::Error(Arc::new(e)),
     };
     Ok(res)
+}
+
+/// Result of comparing events position in the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::timeline) enum RelativePosition {
+    /// Event B is after (more recent than) event A.
+    After,
+    /// They are the same event.
+    Same,
+    /// Event B is before (older than) event A.
+    Before,
 }

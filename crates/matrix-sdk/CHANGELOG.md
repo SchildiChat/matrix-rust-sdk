@@ -6,6 +6,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Allow to set and check whether an image is animated via its `ImageInfo`.
+  ([#4503](https://github.com/matrix-org/matrix-rust-sdk/pull/4503))
+
+- Implement `Default` for `BaseImageInfo`, `BaseVideoInfo`, `BaseAudioInfo` and
+  `BaseFileInfo`.
+  ([#4503](https://github.com/matrix-org/matrix-rust-sdk/pull/4503))
+
+- Expose `Client::server_versions()` publicly to allow users of the library to
+  get the versions of Matrix supported by the homeserver.
+  ([#4519](https://github.com/matrix-org/matrix-rust-sdk/pull/4519))
+
+- Create `RoomPrivacySettings` helper to group room settings functionality
+  related to room access and visibility.
+  ([#4401](https://github.com/matrix-org/matrix-rust-sdk/pull/4401))
+
+- Enable HTTP/2 support in the HTTP client.
+  ([#4566](https://github.com/matrix-org/matrix-rust-sdk/pull/4566))
+
+### Refactor
+
+- [**breaking**] Move the optional `RequestConfig` argument of the
+  `Client::send()` method to the `with_request_config()` builder method. You
+  should call `Client::send(request).with_request_config(request_config).await`
+  now instead.
+  ([#4443](https://github.com/matrix-org/matrix-rust-sdk/pull/4443))
+
+- [**breaking**] Remove the `AttachmentConfig::with_thumbnail()` constructor and
+  replace it with the `AttachmentConfig::thumbnail()` builder method. You should
+  call `AttachmentConfig::new().thumbnail(thumbnail)` now instead.
+  ([#4452](https://github.com/matrix-org/matrix-rust-sdk/pull/4452))
+
+- [**breaking**] `Room::send_attachment()` and `RoomSendQueue::send_attachment()`
+  now take any type that implements `Into<String>` for the filename.
+  ([#4451](https://github.com/matrix-org/matrix-rust-sdk/pull/4451))
+
+- [**breaking**] `Recovery::are_we_the_last_man_standing()` has been renamed to `is_last_device()`.
+  ([#4522](https://github.com/matrix-org/matrix-rust-sdk/pull/4522))
+
 ## [0.9.0] - 2024-12-18
 
 ### Bug Fixes

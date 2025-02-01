@@ -349,8 +349,7 @@ impl Oidc {
     ///
     /// [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
     pub async fn fetch_authentication_issuer(&self) -> Result<String, HttpError> {
-        let response =
-            self.client.send(get_authentication_issuer::msc2965::Request::new(), None).await?;
+        let response = self.client.send(get_authentication_issuer::msc2965::Request::new()).await?;
 
         Ok(response.issuer)
     }
@@ -1161,8 +1160,7 @@ impl Oidc {
                 #[cfg(feature = "e2e-encryption")]
                 None,
             )
-            .await
-            .map_err(crate::Error::from)?;
+            .await?;
         // At this point the Olm machine has been set up.
 
         // Enable the cross-process lock for refreshes, if needs be.
@@ -1314,8 +1312,7 @@ impl Oidc {
                 refresh_token.clone(),
                 latest_id_token.clone(),
             )
-            .await
-            .map_err(OidcError::from)?;
+            .await?;
 
         trace!(
             "Token refresh: new refresh_token: {} / access_token: {:x}",
@@ -1588,7 +1585,7 @@ pub struct OidcSessionTokens {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for OidcSessionTokens {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionTokens").finish_non_exhaustive()
+        f.debug_struct("OidcSessionTokens").finish_non_exhaustive()
     }
 }
 

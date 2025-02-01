@@ -29,7 +29,7 @@ use ruma::{
 };
 
 /// Base metadata about an image.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseImageInfo {
     /// The height of the image in pixels.
     pub height: Option<UInt>,
@@ -39,10 +39,12 @@ pub struct BaseImageInfo {
     pub size: Option<UInt>,
     /// The [BlurHash](https://blurha.sh/) for this image.
     pub blurhash: Option<String>,
+    /// Whether this image is animated.
+    pub is_animated: Option<bool>,
 }
 
 /// Base metadata about a video.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseVideoInfo {
     /// The duration of the video.
     pub duration: Option<Duration>,
@@ -57,7 +59,7 @@ pub struct BaseVideoInfo {
 }
 
 /// Base metadata about an audio clip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseAudioInfo {
     /// The duration of the audio clip.
     pub duration: Option<Duration>,
@@ -66,7 +68,7 @@ pub struct BaseAudioInfo {
 }
 
 /// Base metadata about a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseFileInfo {
     /// The size of the file in bytes.
     pub size: Option<UInt>,
@@ -100,6 +102,7 @@ impl From<AttachmentInfo> for ImageInfo {
                 width: info.width,
                 size: info.size,
                 blurhash: info.blurhash,
+                is_animated: info.is_animated,
             }),
             _ => ImageInfo::new(),
         }
@@ -188,21 +191,21 @@ pub struct AttachmentConfig {
 }
 
 impl AttachmentConfig {
-    /// Create a new default `AttachmentConfig` without providing a thumbnail.
-    ///
-    /// To provide a thumbnail use [`AttachmentConfig::with_thumbnail()`].
+    /// Create a new empty `AttachmentConfig`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new default `AttachmentConfig` with a `thumbnail`.
+    /// Set the thumbnail to send.
     ///
     /// # Arguments
     ///
     /// * `thumbnail` - The thumbnail of the media. If the `content_type` does
-    ///   not support it (eg audio clips), it is ignored.
-    pub fn with_thumbnail(thumbnail: Thumbnail) -> Self {
-        Self { thumbnail: Some(thumbnail), ..Default::default() }
+    ///   not support it (e.g. audio clips), it is ignored.
+    #[must_use]
+    pub fn thumbnail(mut self, thumbnail: Option<Thumbnail>) -> Self {
+        self.thumbnail = thumbnail;
+        self
     }
 
     /// Set the transaction ID to send.

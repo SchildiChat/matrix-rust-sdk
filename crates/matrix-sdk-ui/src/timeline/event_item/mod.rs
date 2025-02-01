@@ -268,6 +268,14 @@ impl EventTimelineItem {
         as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.send_state)
     }
 
+    /// Get the time that the local event was pushed in the send queue at.
+    pub fn local_created_at(&self) -> Option<MilliSecondsSinceUnixEpoch> {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => local.send_handle.as_ref().map(|s| s.created_at),
+            EventTimelineItemKind::Remote(_) => None,
+        }
+    }
+
     /// Get the unique identifier of this item.
     ///
     /// Returns the transaction ID for a local echo item that has not been sent
@@ -518,6 +526,16 @@ impl EventTimelineItem {
     /// Clone the current event item, and update its `sender_profile`.
     pub(super) fn with_sender_profile(&self, sender_profile: TimelineDetails<Profile>) -> Self {
         Self { sender_profile, ..self.clone() }
+    }
+
+    /// Clone the current event item, and update its `encryption_info`.
+    pub(super) fn with_encryption_info(&self, encryption_info: Option<EncryptionInfo>) -> Self {
+        let mut new = self.clone();
+        if let EventTimelineItemKind::Remote(r) = &mut new.kind {
+            r.encryption_info = encryption_info;
+        }
+
+        new
     }
 
     /// Create a clone of the current item, with content that's been redacted.

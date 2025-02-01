@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         (login(&data_dir, &session_file).await?, None)
     };
 
-    sync(client, sync_token, &session_file).await.map_err(Into::into)
+    sync(client, sync_token, &session_file).await
 }
 
 /// Restore a previous session.
@@ -297,7 +297,7 @@ async fn on_room_message(event: OriginalSyncRoomMessageEvent, room: Room) {
     }
     let MessageType::Text(text_content) = &event.content.msgtype else { return };
 
-    let room_name = match room.compute_display_name().await {
+    let room_name = match room.display_name().await {
         Ok(room_name) => room_name.to_string(),
         Err(error) => {
             println!("Error getting room display name: {error}");

@@ -26,9 +26,9 @@ use mime::Mime;
 use ruma::{
     events::{
         room::message::{FormattedBody, MessageType, RoomMessageEventContent},
-        AnyMessageLikeEventContent,
+        AnyMessageLikeEventContent, Mentions,
     },
-    OwnedTransactionId, TransactionId,
+    MilliSecondsSinceUnixEpoch, OwnedTransactionId, TransactionId,
 };
 use tracing::{debug, error, instrument, trace, warn, Span};
 
@@ -105,7 +105,7 @@ impl RoomSendQueue {
     #[instrument(skip_all, fields(event_txn))]
     pub async fn send_attachment(
         &self,
-        filename: &str,
+        filename: impl Into<String>,
         content_type: Mime,
         data: Vec<u8>,
         mut config: AttachmentConfig,
@@ -118,6 +118,7 @@ impl RoomSendQueue {
             return Err(RoomSendQueueError::RoomNotJoined);
         }
 
+        let filename = filename.into();
         let upload_file_txn = TransactionId::new();
         let send_event_txn = config.txn_id.map_or_else(ChildTransactionId::new, Into::into);
 
@@ -184,6 +185,8 @@ impl RoomSendQueue {
             config.mentions,
         );
 
+        let created_at = MilliSecondsSinceUnixEpoch::now();
+
         // Save requests in the queue storage.
         self.inner
             .queue
@@ -191,6 +194,7 @@ impl RoomSendQueue {
                 event_content.clone(),
                 content_type,
                 send_event_txn.clone().into(),
+                created_at,
                 upload_file_txn.clone(),
                 file_media_request,
                 queue_thumbnail_info,
@@ -205,6 +209,7 @@ impl RoomSendQueue {
             room: self.clone(),
             transaction_id: send_event_txn.clone().into(),
             media_handles: Some(MediaHandles { upload_thumbnail_txn, upload_file_txn }),
+            created_at,
         };
 
         let _ = self.inner.updates.send(RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
@@ -305,6 +310,7 @@ impl QueueStorage {
             .save_send_queue_request(
                 &self.room_id,
                 event_txn,
+                MilliSecondsSinceUnixEpoch::now(),
                 new_content.into(),
                 Self::HIGH_PRIORITY,
             )
@@ -349,7 +355,13 @@ impl QueueStorage {
 
         client
             .store()
-            .save_send_queue_request(&self.room_id, next_upload_txn, request, Self::HIGH_PRIORITY)
+            .save_send_queue_request(
+                &self.room_id,
+                next_upload_txn,
+                MilliSecondsSinceUnixEpoch::now(),
+                request,
+                Self::HIGH_PRIORITY,
+            )
             .await
             .map_err(RoomSendQueueStorageError::StateStoreError)?;
 
@@ -488,6 +500,7 @@ impl QueueStorage {
         txn: &TransactionId,
         caption: Option<String>,
         formatted_caption: Option<FormattedBody>,
+        mentions: Option<Mentions>,
     ) -> Result<Option<AnyMessageLikeEventContent>, RoomSendQueueStorageError> {
         // This error will be popular here.
         use RoomSendQueueStorageError::InvalidMediaCaptionEdit;
@@ -522,7 +535,7 @@ impl QueueStorage {
                     return Err(InvalidMediaCaptionEdit);
                 };
 
-                if !update_media_caption(&mut local_echo, caption, formatted_caption) {
+                if !update_media_caption(&mut local_echo, caption, formatted_caption, mentions) {
                     return Err(InvalidMediaCaptionEdit);
                 }
 
@@ -561,7 +574,7 @@ impl QueueStorage {
             return Err(InvalidMediaCaptionEdit);
         };
 
-        if !update_media_caption(&mut content, caption, formatted_caption) {
+        if !update_media_caption(&mut content, caption, formatted_caption, mentions) {
             return Err(InvalidMediaCaptionEdit);
         }
 
@@ -577,6 +590,7 @@ impl QueueStorage {
                         &self.room_id,
                         txn,
                         ChildTransactionId::new(),
+                        MilliSecondsSinceUnixEpoch::now(),
                         DependentQueuedRequestKind::EditEvent { new_content: new_serialized },
                     )
                     .await?;

@@ -21,8 +21,8 @@ use futures_util::StreamExt;
 use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server, Error};
 use matrix_sdk_base::store::QueueWedgeError;
 use matrix_sdk_test::{
-    async_test, mocks::mock_encryption_state, EventBuilder, JoinedRoomBuilder, SyncResponseBuilder,
-    ALICE,
+    async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
+    SyncResponseBuilder, ALICE,
 };
 use matrix_sdk_ui::timeline::{EventItemOrigin, EventSendState, RoomExt};
 use ruma::{
@@ -314,7 +314,7 @@ async fn test_clear_with_echoes() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
@@ -329,15 +329,20 @@ async fn test_clear_with_echoes() {
 
     // Send a message without mocking the server response.
     {
-        let (_, mut timeline_stream) = timeline.subscribe().await;
+        let (_, mut timeline_stream) = timeline.subscribe_batched().await;
 
         timeline.send(RoomMessageEventContent::text_plain("Send failure").into()).await.unwrap();
 
         // Wait for the first message to fail. Don't use time, but listen for the first
         // timeline item diff to get back signalling the error.
-        let _date_divider = timeline_stream.next().await;
-        let _local_echo = timeline_stream.next().await;
-        let _local_echo_replaced_with_failure = timeline_stream.next().await;
+
+        assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+        // 2 updates: date divider and local echo.
+        assert_eq!(timeline_updates.len(), 2);
+
+        assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+        // 1 updates: local echo replaced with failure.
+        assert_eq!(timeline_updates.len(), 1);
     }
 
     // Next message will take "forever" to send.
@@ -355,12 +360,10 @@ async fn test_clear_with_echoes() {
     timeline.send(RoomMessageEventContent::text_plain("Pending").into()).await.unwrap();
 
     // Another message comes in.
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
-        event_builder.make_sync_message_event(
-            &ALICE,
-            RoomMessageEventContent::text_plain("another message"),
-        ),
-    ));
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.text_msg("another message").sender(&ALICE)),
+    );
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     client.sync_once(sync_settings.clone()).await.unwrap();
 
@@ -405,7 +408,7 @@ async fn test_no_duplicate_date_divider() {
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
-    let (_, mut timeline_stream) = timeline.subscribe().await;
+    let (_, mut timeline_stream) = timeline.subscribe_batched().await;
 
     // Response for first message takes 200ms to respond.
     Mock::given(method("PUT"))
@@ -442,86 +445,89 @@ async fn test_no_duplicate_date_divider() {
     // Let the send queue handle the event.
     yield_now().await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 3);
+
     // Local echoes are available as soon as `timeline.send` returns.
-    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
-        assert_eq!(value.as_event().unwrap().content().as_message().unwrap().body(), "First!");
-    });
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
+    assert_eq!(value.as_event().unwrap().content().as_message().unwrap().body(), "First!");
 
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_date_divider());
-    });
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
+    assert!(value.is_date_divider());
 
-    assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
-        assert_eq!(value.as_event().unwrap().content().as_message().unwrap().body(), "Second.");
-    });
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[2]);
+    assert_eq!(value.as_event().unwrap().content().as_message().unwrap().body(), "Second.");
 
     // Wait 200ms for the first msg, 100ms for the second, 200ms for overhead.
     sleep(Duration::from_millis(500)).await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
     // The first item should be updated first.
-    assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => {
-        let value = value.as_event().unwrap();
-        assert_eq!(value.content().as_message().unwrap().body(), "First!");
-        assert_eq!(value.event_id().unwrap(), "$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP");
-    });
+    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[0]);
+    let value = value.as_event().unwrap();
+    assert_eq!(value.content().as_message().unwrap().body(), "First!");
+    assert_eq!(value.event_id().unwrap(), "$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP");
 
     // Then the second one.
-    assert_next_matches!(timeline_stream, VectorDiff::Set { index: 2, value } => {
-        let value = value.as_event().unwrap();
-        assert_eq!(value.content().as_message().unwrap().body(), "Second.");
-        assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
-    });
+    assert_let!(VectorDiff::Set { index: 2, value } = &timeline_updates[1]);
+    let value = value.as_event().unwrap();
+    assert_eq!(value.content().as_message().unwrap().body(), "Second.");
+    assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
 
     assert_pending!(timeline_stream);
 
     // Now have the sync return both events with more data.
-    let ev_builder = EventBuilder::new();
+    let f = EventFactory::new();
 
     let now = MilliSecondsSinceUnixEpoch::now();
-    ev_builder.set_next_ts(now.0.into());
+    f.set_next_ts(now.0.into());
 
     sync_response_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(ev_builder.make_sync_message_event_with_id(
-                client.user_id().unwrap(),
-                event_id!("$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP"),
-                RoomMessageEventContent::text_plain("First!"),
-            ))
-            .add_timeline_event(ev_builder.make_sync_message_event_with_id(
-                client.user_id().unwrap(),
-                event_id!("$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ"),
-                RoomMessageEventContent::text_plain("Second."),
-            )),
+            .add_timeline_event(
+                f.text_msg("First!")
+                    .sender(client.user_id().unwrap())
+                    .event_id(event_id!("$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP")),
+            )
+            .add_timeline_event(
+                f.text_msg("Second.")
+                    .sender(client.user_id().unwrap())
+                    .event_id(event_id!("$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ")),
+            ),
     );
 
     mock_sync(&server, sync_response_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 6);
+
     // The first message is removed -> [DD Second]
-    assert_next_matches!(timeline_stream, VectorDiff::Remove { index: 1 });
+    assert_let!(VectorDiff::Remove { index: 1 } = &timeline_updates[0]);
 
     // The first message is reinserted -> [First DD Second]
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        let value = value.as_event().unwrap();
-        assert_eq!(value.content().as_message().unwrap().body(), "First!");
-        assert_eq!(value.event_id().unwrap(), "$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP");
-    });
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
+    let value = value.as_event().unwrap();
+    assert_eq!(value.content().as_message().unwrap().body(), "First!");
+    assert_eq!(value.event_id().unwrap(), "$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP");
 
-    // The second message is replaced -> [First DD Second]
-    assert_next_matches!(timeline_stream, VectorDiff::Set { index: 2, value } => {
-        let value = value.as_event().unwrap();
-        assert_eq!(value.content().as_message().unwrap().body(), "Second.");
-        assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
-    });
+    // The second message is replaced -> [First Second DD]
+    assert_let!(VectorDiff::Remove { index: 2 } = &timeline_updates[2]);
 
-    // A new date divider is inserted -> [DD First DD Second]
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_date_divider());
-    });
+    assert_let!(VectorDiff::Insert { index: 1, value } = &timeline_updates[3]);
+    let value = value.as_event().unwrap();
+    assert_eq!(value.content().as_message().unwrap().body(), "Second.");
+    assert_eq!(value.event_id().unwrap(), "$5E2kLK/Sg342bgBU9ceEIEPYpbFaqJpZ");
+
+    // A new date divider is inserted -> [DD First Second DD]
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[4]);
+    assert!(value.is_date_divider());
 
     // The useless date divider is removed. -> [DD First Second]
-    assert_next_matches!(timeline_stream, VectorDiff::Remove { index: 2 });
+    assert_let!(VectorDiff::Remove { index: 3 } = &timeline_updates[5]);
 
     assert_pending!(timeline_stream);
 }

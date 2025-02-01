@@ -55,10 +55,6 @@ experimental-oidc = [
     "dep:tower",
     "dep:openidconnect",
 ]
-experimental-sliding-sync = [
-    "matrix-sdk-base/experimental-sliding-sync",
-    "reqwest/gzip",
-]
 experimental-widgets = ["dep:language-tags", "dep:uuid"]
 
 docsrs = ["e2e-encryption", "sqlite", "indexeddb", "sso-login", "qrcode"]
@@ -98,9 +94,18 @@ matrix-sdk-test = { workspace = true, optional = true }
 mime = { workspace = true }
 mime2ext = "0.1.53"
 once_cell = { workspace = true }
+percent-encoding = "2.3.1"
 pin-project-lite = { workspace = true }
 rand = { workspace = true , optional = true }
-ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat", "unstable-msc2867"] }
+ruma = { workspace = true, features = [
+    "rand",
+    "unstable-msc2448",
+    "unstable-msc2965",
+    "unstable-msc3930",
+    "unstable-msc3245-v1-compat",
+    "unstable-msc2867",
+    "unstable-msc4230",
+] }
 serde = { workspace = true }
 serde_html_form = { workspace = true }
 serde_json = { workspace = true }
@@ -119,7 +124,7 @@ zeroize = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { workspace = true, features = ["futures"] }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["gzip", "http2"] }
 tokio = { workspace = true, features = ["macros"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -127,7 +132,7 @@ backoff = { version = "0.4.0", features = ["tokio"] }
 openidconnect = { version = "4.0.0-rc.1", optional = true }
 # only activate reqwest's stream feature on non-wasm, the wasm part seems to not
 # support *sending* streams, which makes it useless for us.
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["stream", "gzip", "http2"] }
 tokio = { workspace = true, features = ["fs", "rt", "macros"] }
 tokio-util = "0.7.12"
 wiremock = { workspace = true, optional = true }

@@ -16,8 +16,9 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{path::PathBuf, pin::Pin, sync::Arc, task::Poll};
+use std::{fs, path::PathBuf, pin::Pin, sync::Arc, task::Poll};
 
+use algorithms::rfind_event_by_item_id;
 use event_item::{extract_room_msg_edit_content, TimelineItemHandle};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
@@ -53,10 +54,13 @@ use ruma::{
 };
 use thiserror::Error;
 use tracing::{error, instrument, trace, warn};
-use util::rfind_event_by_item_id;
 
+use self::{
+    algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
+};
 use crate::timeline::pinned_events_loader::PinnedEventsRoom;
 
+mod algorithms;
 mod builder;
 mod controller;
 mod date_dividers;
@@ -69,12 +73,10 @@ mod item;
 mod pagination;
 mod pinned_events_loader;
 mod reactions;
-mod read_receipts;
 #[cfg(test)]
 mod tests;
 mod to_device;
 mod traits;
-mod util;
 mod virtual_item;
 
 pub use self::{
@@ -94,7 +96,6 @@ pub use self::{
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
-use self::{controller::TimelineController, futures::SendAttachment, util::rfind_event_by_id};
 
 /// Information needed to reply to an event.
 #[derive(Debug, Clone)]
@@ -265,23 +266,10 @@ impl Timeline {
         }
     }
 
-    /// Get the current timeline items, and a stream of changes.
-    ///
-    /// You can poll this stream to receive updates. See
-    /// [`futures_util::StreamExt`] for a high-level API on top of [`Stream`].
-    pub async fn subscribe(
-        &self,
-    ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>) {
-        let (items, stream) = self.controller.subscribe().await;
-        let stream = TimelineStream::new(stream, self.drop_handle.clone());
-        (items, stream)
-    }
-
     /// Get the current timeline items, and a batched stream of changes.
     ///
-    /// In contrast to [`subscribe`](Self::subscribe), this stream can yield
-    /// multiple diffs at once. The batching is done such that no arbitrary
-    /// delays are added.
+    /// This stream can yield multiple diffs at once. The batching is done such
+    /// that no arbitrary delays are added.
     pub async fn subscribe_batched(
         &self,
     ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>>) {
@@ -486,9 +474,9 @@ impl Timeline {
                         }
                     }
 
-                    EditedContent::MediaCaption { caption, formatted_caption } => {
+                    EditedContent::MediaCaption { caption, formatted_caption, mentions } => {
                         if handle
-                            .edit_media_caption(caption, formatted_caption)
+                            .edit_media_caption(caption, formatted_caption, mentions)
                             .await
                             .map_err(RoomSendQueueError::StorageError)?
                         {
@@ -540,7 +528,7 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `path` - The path of the file to be sent.
+    /// * `source` - The source of the attachment to send.
     ///
     /// * `mime_type` - The attachment's mime type.
     ///
@@ -551,11 +539,11 @@ impl Timeline {
     #[instrument(skip_all)]
     pub fn send_attachment(
         &self,
-        path: impl Into<PathBuf>,
+        source: impl Into<AttachmentSource>,
         mime_type: Mime,
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
-        SendAttachment::new(self, path.into(), mime_type, config)
+        SendAttachment::new(self, source.into(), mime_type, config)
     }
 
     /// Redact an event given its [`TimelineEventItemId`] and an optional
@@ -902,3 +890,52 @@ impl<S: Stream> Stream for TimelineStream<S> {
 
 pub type TimelineEventFilterFn =
     dyn Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool + Send + Sync;
+
+/// A source for sending an attachment.
+///
+/// The [`AttachmentSource::File`] variant can be constructed from any type that
+/// implements `Into<PathBuf>`.
+#[derive(Debug, Clone)]
+pub enum AttachmentSource {
+    /// The data of the attachment.
+    Data {
+        /// The bytes of the attachment.
+        bytes: Vec<u8>,
+
+        /// The filename of the attachment.
+        filename: String,
+    },
+
+    /// An attachment loaded from a file.
+    ///
+    /// The bytes and the filename will be read from the file at the given path.
+    File(PathBuf),
+}
+
+impl AttachmentSource {
+    /// Try to convert this attachment source into a `(bytes, filename)` tuple.
+    pub(crate) fn try_into_bytes_and_filename(self) -> Result<(Vec<u8>, String), Error> {
+        match self {
+            Self::Data { bytes, filename } => Ok((bytes, filename)),
+            Self::File(path) => {
+                let filename = path
+                    .file_name()
+                    .ok_or(Error::InvalidAttachmentFileName)?
+                    .to_str()
+                    .ok_or(Error::InvalidAttachmentFileName)?
+                    .to_owned();
+                let bytes = fs::read(&path).map_err(|_| Error::InvalidAttachmentData)?;
+                Ok((bytes, filename))
+            }
+        }
+    }
+}
+
+impl<P> From<P> for AttachmentSource
+where
+    P: Into<PathBuf>,
+{
+    fn from(value: P) -> Self {
+        Self::File(value.into())
+    }
+}

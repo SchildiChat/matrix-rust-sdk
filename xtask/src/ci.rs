@@ -82,6 +82,8 @@ enum WasmFeatureSet {
     MatrixSdkCommon,
     /// Check `matrix-sdk` crate with no default features
     MatrixSdkNoDefault,
+    /// Check `matrix-sdk-ui` crate
+    MatrixSdkUi,
     /// Check `matrix-sdk` crate with `indexeddb` feature (but not
     /// `e2e-encryption`)
     MatrixSdkIndexeddbStoresNoCrypto,
@@ -193,7 +195,7 @@ fn check_clippy() -> Result<()> {
         "rustup run {NIGHTLY} cargo clippy --workspace --all-targets
             --exclude matrix-sdk-crypto --exclude xtask
             --no-default-features
-            --features native-tls,experimental-sliding-sync,sso-login,testing
+            --features native-tls,sso-login,testing
             -- -D warnings"
     )
     .run()?;
@@ -214,10 +216,7 @@ fn check_docs() -> Result<()> {
 
 fn run_feature_tests(cmd: Option<FeatureSet>) -> Result<()> {
     let args = BTreeMap::from([
-        (
-            FeatureSet::NoEncryption,
-            "--no-default-features --features sqlite,native-tls,experimental-sliding-sync,testing",
-        ),
+        (FeatureSet::NoEncryption, "--no-default-features --features sqlite,native-tls,testing"),
         (
             FeatureSet::NoSqlite,
             "--no-default-features --features e2e-encryption,native-tls,testing",
@@ -306,6 +305,7 @@ fn run_wasm_checks(cmd: Option<WasmFeatureSet>) -> Result<()> {
         ),
         (WasmFeatureSet::MatrixSdkBase, "-p matrix-sdk-base --features js,test-send-sync"),
         (WasmFeatureSet::MatrixSdkCommon, "-p matrix-sdk-common --features js"),
+        (WasmFeatureSet::MatrixSdkUi, "-p matrix-sdk-ui --features js"),
         (
             WasmFeatureSet::MatrixSdkIndexeddbStoresNoCrypto,
             "-p matrix-sdk --no-default-features --features js,indexeddb,rustls-tls",

@@ -41,12 +41,13 @@ use matrix_sdk_ui::{
     timeline::{EventSendState, ReactionStatus, RoomExt, TimelineItem, TimelineItemContent},
 };
 use similar_asserts::assert_eq;
+use stream_assert::assert_pending;
 use tokio::{
     spawn,
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::helpers::TestClientBuilder;
 
@@ -54,12 +55,9 @@ use crate::helpers::TestClientBuilder;
 ///
 /// A macro to help lowering compile times and getting better error locations.
 macro_rules! assert_event_is_updated {
-    ($stream:expr, $event_id:expr, $index:expr) => {{
-        assert_let!(
-            Ok(Some(VectorDiff::Set { index: i, value: event })) =
-                timeout(Duration::from_secs(1), $stream.next()).await
-        );
-        assert_eq!(i, $index, "unexpected position for event update, value = {event:?}");
+    ($diff:expr, $event_id:expr, $index:expr) => {{
+        assert_let!(VectorDiff::Set { index: i, value: event } = &$diff);
+        assert_eq!(*i, $index, "unexpected position for event update, value = {event:?}");
 
         let event = event.as_event().unwrap();
         assert_eq!(event.event_id().unwrap(), $event_id);
@@ -93,7 +91,7 @@ async fn test_toggling_reaction() -> Result<()> {
     // waiting for it.
 
     let timeline = room.timeline().await.unwrap();
-    let (mut items, mut stream) = timeline.subscribe().await;
+    let (mut items, mut stream) = timeline.subscribe_batched().await;
 
     let event_id_task: JoinHandle<Result<_>> = spawn(async move {
         let find_event_id = |items: &Vector<Arc<TimelineItem>>| {
@@ -113,9 +111,13 @@ async fn test_toggling_reaction() -> Result<()> {
 
         warn!(?items, "Waiting for updates…");
 
-        while let Some(diff) = stream.next().await {
-            warn!(?diff, "received a diff");
-            diff.apply(&mut items);
+        while let Some(diffs) = stream.next().await {
+            warn!(?diffs, "received diffs");
+
+            for diff in diffs {
+                diff.apply(&mut items);
+            }
+
             if let Some(event_id) = find_event_id(&items) {
                 return Ok(event_id);
             }
@@ -144,12 +146,14 @@ async fn test_toggling_reaction() -> Result<()> {
     // Give a bit of time for the timeline to process all sync updates.
     sleep(Duration::from_secs(1)).await;
 
-    let (mut items, mut stream) = timeline.subscribe().await;
+    let (mut items, mut stream) = timeline.subscribe_batched().await;
 
     // Skip all stream updates that have happened so far.
     debug!("Skipping all other stream updates…");
-    while let Some(Some(diff)) = stream.next().now_or_never() {
-        diff.apply(&mut items);
+    while let Some(Some(diffs)) = stream.next().now_or_never() {
+        for diff in diffs {
+            diff.apply(&mut items);
+        }
     }
 
     let (message_position, item_id) = items
@@ -170,9 +174,14 @@ async fn test_toggling_reaction() -> Result<()> {
         // Add the reaction.
         timeline.toggle_reaction(&item_id, &reaction_key).await.expect("toggling reaction");
 
+        sleep(Duration::from_secs(1)).await;
+
+        assert_let!(Some(timeline_updates) = stream.next().await);
+        assert_eq!(timeline_updates.len(), 2);
+
         // Local echo is added.
         {
-            let event = assert_event_is_updated!(stream, event_id, message_position);
+            let event = assert_event_is_updated!(timeline_updates[0], event_id, message_position);
             let reactions = event.reactions().get(&reaction_key).unwrap();
             let reaction = reactions.get(&user_id).unwrap();
             assert_matches!(reaction.status, ReactionStatus::LocalToRemote(..));
@@ -180,7 +189,7 @@ async fn test_toggling_reaction() -> Result<()> {
 
         // Remote echo is added.
         {
-            let event = assert_event_is_updated!(stream, event_id, message_position);
+            let event = assert_event_is_updated!(timeline_updates[1], event_id, message_position);
 
             let reactions = event.reactions().get(&reaction_key).unwrap();
             assert_eq!(reactions.keys().count(), 1);
@@ -201,11 +210,16 @@ async fn test_toggling_reaction() -> Result<()> {
             .await
             .expect("toggling reaction the second time");
 
+        sleep(Duration::from_secs(1)).await;
+
+        assert_let!(Some(timeline_updates) = stream.next().await);
+        assert_eq!(timeline_updates.len(), 1);
+
         // The reaction is removed.
-        let event = assert_event_is_updated!(stream, event_id, message_position);
+        let event = assert_event_is_updated!(timeline_updates[0], event_id, message_position);
         assert!(event.reactions().is_empty());
 
-        assert!(stream.next().now_or_never().is_none());
+        assert_pending!(stream);
     }
 
     Ok(())
@@ -274,22 +288,44 @@ async fn test_stale_local_echo_time_abort_edit() {
     // - or the remote echo comes up faster.
     //
     // Handle both orderings.
-    while let Ok(Some(vector_diff)) = timeout(Duration::from_secs(3), stream.next()).await {
-        let VectorDiff::Set { index: 0, value: echo } = vector_diff else {
-            panic!("unexpected diff: {vector_diff:#?}");
-        };
+    {
+        let mut diffs = Vec::with_capacity(3);
 
-        if echo.is_local_echo() {
-            // If the sender profile wasn't available, we may receive an update about it;
-            // ignore it.
-            if !has_sender_profile && echo.sender_profile().is_ready() {
-                has_sender_profile = true;
-                continue;
-            }
-            assert_matches!(echo.send_state(), Some(EventSendState::Sent { .. }));
+        while let Ok(Some(vector_diff)) = timeout(Duration::from_secs(15), stream.next()).await {
+            diffs.push(vector_diff);
         }
-        assert!(echo.is_editable());
-        assert_eq!(echo.content().as_message().unwrap().body(), "hi!");
+
+        trace!(?diffs, "Received diffs");
+
+        assert!(diffs.len() >= 2);
+
+        for diff in diffs {
+            match diff {
+                VectorDiff::Set { index: 0, value: event }
+                | VectorDiff::PushBack { value: event }
+                | VectorDiff::Insert { index: 0, value: event } => {
+                    if event.is_local_echo() {
+                        // If the sender profile wasn't available, we may receive an update about
+                        // it; ignore it.
+                        if !has_sender_profile && event.sender_profile().is_ready() {
+                            has_sender_profile = true;
+                            continue;
+                        }
+
+                        assert_matches!(event.send_state(), Some(EventSendState::Sent { .. }));
+                    }
+
+                    assert!(event.is_editable());
+                    assert_eq!(event.content().as_message().unwrap().body(), "hi!");
+                }
+
+                VectorDiff::Remove { index } => assert_eq!(index, 0),
+
+                diff => {
+                    panic!("unexpected diff: {diff:?}");
+                }
+            }
+        }
     }
 
     // Now do a crime: try to edit the local echo.
@@ -310,6 +346,8 @@ async fn test_stale_local_echo_time_abort_edit() {
     assert_eq!(remote_echo.content().as_message().unwrap().body(), "bonjour");
 
     alice_sync.abort();
+
+    assert_pending!(stream);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -417,6 +455,11 @@ async fn test_enabling_backups_retries_decryption() {
         .await
         .expect("We should be able to paginate the timeline to fetch the history");
 
+    // Wait for the event cache and the timeline to do their job.
+    // Timeline triggers a pagination, that inserts events in the event cache, that
+    // then broadcasts new events into the timeline. All this is async.
+    sleep(Duration::from_millis(300)).await;
+
     let item =
         timeline.item_by_event_id(&event_id).await.expect("The event should be in the timeline");
 
@@ -501,6 +544,13 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
         .await
         .expect("We should be able to check that the room is encrypted"));
 
+    // Create stream listening for devices.
+    let devices_stream = alice
+        .encryption()
+        .devices_stream()
+        .await
+        .expect("We should be able to listen to the devices stream");
+
     // Now here comes bob.
     let bob = TestClientBuilder::new("bob").use_sqlite().build().await.unwrap();
     bob.encryption().wait_for_e2ee_initialization_tasks().await;
@@ -544,6 +594,21 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
     assert_eq!(bob_room.state(), RoomState::Joined);
     assert!(bob_room.is_encrypted().await.unwrap());
 
+    // Now we need to wait for Bob's device to turn up.
+    let wait_for_bob_device = async {
+        pin_mut!(devices_stream);
+
+        while let Some(devices) = devices_stream.next().await {
+            if devices.new.contains_key(bob.user_id().unwrap()) {
+                break;
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(5), wait_for_bob_device)
+        .await
+        .expect("We should be able to load the room list");
+
     // Let's stop the sync so we don't receive the room key using the usual channel.
     sync_service.stop().await.expect("We should be able to stop the sync service");
 
@@ -558,24 +623,34 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
     alice_sync.abort();
 
     // Let's get the timeline and backpaginate to load the event.
-    let mut timeline =
+    let timeline =
         bob_room.timeline().await.expect("We should be able to get a timeline for our room");
 
     let mut item = None;
 
     for _ in 0..10 {
+        {
+            // Clear any previously received previous-batch token.
+            let (room_event_cache, _drop_handles) = bob_room.event_cache().await.unwrap();
+            room_event_cache.clear().await.unwrap();
+        }
+
         timeline
             .paginate_backwards(50)
             .await
             .expect("We should be able to paginate the timeline to fetch the history");
 
+        // Wait for the event cache and the timeline to do their job.
+        // Timeline triggers a pagination, that inserts events in the event cache, that
+        // then broadcasts new events into the timeline. All this is async.
+        sleep(Duration::from_millis(300)).await;
+
         if let Some(timeline_item) = timeline.item_by_event_id(&event_id).await {
             item = Some(timeline_item);
             break;
-        } else {
-            timeline = bob_room.timeline().await.expect("We should be able to reset our timeline");
-            sleep(Duration::from_millis(100)).await
         }
+
+        sleep(Duration::from_millis(100)).await
     }
 
     let item = item.expect("The event should be in the timeline by now");
@@ -614,7 +689,7 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
         .expect("We should be able toe get a notification item for the given event");
 
     // Alright, we should now receive an update that the event had been decrypted.
-    let _vector_diff = timeout(Duration::from_secs(5), stream.next()).await.unwrap().unwrap();
+    let _vector_diff = timeout(Duration::from_secs(10), stream.next()).await.unwrap().unwrap();
 
     // Let's fetch the event again.
     let item =

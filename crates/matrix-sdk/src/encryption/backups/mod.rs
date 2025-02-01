@@ -136,7 +136,7 @@ impl Backups {
 
             let algorithm = Raw::new(&backup_info)?.cast();
             let request = create_backup_version::v3::Request::new(algorithm);
-            let response = self.client.send(request, Default::default()).await?;
+            let response = self.client.send(request).await?;
             let version = response.version;
 
             // Reset any state we might have had before the new backup was created.
@@ -454,7 +454,7 @@ impl Backups {
             if let Some(version) = backup_keys.backup_version {
                 let request =
                     get_backup_keys_for_room::v3::Request::new(version.clone(), room_id.to_owned());
-                let response = self.client.send(request, Default::default()).await?;
+                let response = self.client.send(request).await?;
 
                 // Transform response to standard format (map of room ID -> room key).
                 let response = get_backup_keys::v3::Response::new(BTreeMap::from([(
@@ -493,7 +493,7 @@ impl Backups {
                     room_id.to_owned(),
                     session_id.to_owned(),
                 );
-                let response = self.client.send(request, Default::default()).await?;
+                let response = self.client.send(request).await?;
 
                 // Transform response to standard format (map of room ID -> room key).
                 let response = get_backup_keys::v3::Response::new(BTreeMap::from([(
@@ -604,7 +604,7 @@ impl Backups {
         version: String,
     ) -> Result<(), Error> {
         let request = get_backup_keys::v3::Request::new(version.clone());
-        let response = self.client.send(request, Default::default()).await?;
+        let response = self.client.send(request).await?;
 
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
@@ -626,7 +626,7 @@ impl Backups {
     ) -> Result<Option<get_latest_backup_info::v3::Response>, Error> {
         let request = get_latest_backup_info::v3::Request::new();
 
-        match self.client.send(request, None).await {
+        match self.client.send(request).await {
             Ok(r) => Ok(Some(r)),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
@@ -645,7 +645,7 @@ impl Backups {
     async fn delete_backup_from_server(&self, version: String) -> Result<(), Error> {
         let request = ruma::api::client::backup::delete_backup_version::v3::Request::new(version);
 
-        let ret = match self.client.send(request, Default::default()).await {
+        let ret = match self.client.send(request).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 if let Some(kind) = e.client_api_error_kind() {
@@ -679,7 +679,7 @@ impl Backups {
 
         let add_backup_keys = add_backup_keys::v3::Request::new(request.version, request.rooms);
 
-        match self.client.send(add_backup_keys, Default::default()).await {
+        match self.client.send(add_backup_keys).await {
             Ok(response) => {
                 olm_machine.mark_request_as_sent(request_id, &response).await?;
 
@@ -1007,7 +1007,7 @@ impl Backups {
         room_id: OwnedRoomId,
         event: Raw<OriginalSyncRoomEncryptedEvent>,
     ) {
-        let tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+        let tasks = self.client.inner.e2ee.tasks.lock();
         if let Some(task) = tasks.download_room_keys.as_ref() {
             task.trigger_download_for_utd_event(room_id, event);
         }
@@ -1016,7 +1016,7 @@ impl Backups {
     /// Send a notification to the task which is responsible for uploading room
     /// keys to the backup that it might have new room keys to back up.
     pub(crate) fn maybe_trigger_backup(&self) {
-        let tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+        let tasks = self.client.inner.e2ee.tasks.lock();
 
         if let Some(tasks) = tasks.upload_room_keys.as_ref() {
             tasks.trigger_upload();

@@ -18,6 +18,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Insta.rs is run directly via cargo test. We don't want insta.rs to create new snapshots files.
+  # Just want it to run the tests (option `no` instead of `auto`).
+  INSTA_UPDATE: no
 
 jobs:
   xtask:
@@ -221,11 +224,15 @@ jobs:
           - name: '[m]-common'
             cmd: matrix-sdk-common
 
+          - name: '[m], no-default'
+            cmd: matrix-sdk-no-default
+
+          - name: '[m]-ui'
+            cmd: matrix-sdk-ui
+            check_only: true
+
           - name: '[m]-indexeddb'
             cmd: indexeddb
-
-          - name: '[m], no-default, wasm-flags'
-            cmd: matrix-sdk-no-default
 
           - name: '[m], indexeddb stores'
             cmd: matrix-sdk-indexeddb-stores
@@ -245,6 +252,7 @@ jobs:
 
       - name: Install wasm-pack
         uses: qmaru/wasm-pack-action@v0.5.0
+        if: '!matrix.check_only'
         with:
           version: v0.10.3
 
@@ -274,26 +282,9 @@ jobs:
           target/debug/xtask ci wasm ${{ matrix.cmd }}
 
       - name: Wasm-Pack test
+        if: '!matrix.check_only'
         run: |
           target/debug/xtask ci wasm-pack ${{ matrix.cmd }}
-
-  formatting:
-    name: Check Formatting
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout the repo
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2024-11-26
-          components: rustfmt
-
-      - name: Cargo fmt
-        run: |
-          cargo fmt -- --check
 
   typos:
     name: Spell Check with Typos
@@ -304,10 +295,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check the spelling of the files in our repo
-        uses: crate-ci/typos@v1.28.3
+        uses: crate-ci/typos@v1.29.4
 
-  clippy:
-    name: Run clippy
+  lint:
+    name: Lint
     needs: xtask
     runs-on: ubuntu-latest
 
@@ -324,7 +315,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2024-11-26
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Load cache
         uses: Swatinem/rust-cache@v2
@@ -337,6 +328,10 @@ jobs:
           path: target/debug/xtask
           key: "${{ needs.xtask.outputs.cachekey-linux }}"
           fail-on-cache-miss: true
+
+      - name: Check Formatting
+        run: |
+          target/debug/xtask ci style
 
       - name: Clippy
         run: |

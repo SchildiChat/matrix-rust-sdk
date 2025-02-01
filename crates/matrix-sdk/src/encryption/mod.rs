@@ -21,7 +21,7 @@ use std::{
     io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
 };
 
 use eyeball::{SharedObservable, Subscriber};
@@ -37,7 +37,7 @@ use matrix_sdk_base::crypto::{
     },
     CrossSigningBootstrapRequests, OlmMachine,
 };
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
     api::client::{
         keys::{
@@ -131,7 +131,7 @@ impl EncryptionData {
     pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
         let weak_client = WeakClient::from_inner(client);
 
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock();
         tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
 
         if self.encryption_settings.backup_download_strategy
@@ -147,7 +147,7 @@ impl EncryptionData {
     /// This should happen after the usual tasks have been set up and after the
     /// E2EE initialization tasks have been set up.
     pub fn initialize_recovery_state_update_task(&self, client: &Client) {
-        let mut guard = self.tasks.lock().unwrap();
+        let mut guard = self.tasks.lock();
 
         let future = Recovery::update_state_after_backup_state_change(client);
         let join_handle = spawn(future);
@@ -281,7 +281,7 @@ impl CrossSigningResetHandle {
         let mut upload_request = self.upload_request.clone();
         upload_request.auth = auth;
 
-        while let Err(e) = self.client.send(upload_request.clone(), None).await {
+        while let Err(e) = self.client.send(upload_request.clone()).await {
             if *self.is_cancelled.lock().await {
                 return Ok(());
             }
@@ -291,7 +291,7 @@ impl CrossSigningResetHandle {
             }
         }
 
-        self.client.send(self.signatures_request.clone(), None).await?;
+        self.client.send(self.signatures_request.clone()).await?;
 
         Ok(())
     }
@@ -411,7 +411,7 @@ impl Client {
     ) -> Result<get_keys::v3::Response> {
         let request = assign!(get_keys::v3::Request::new(), { device_keys });
 
-        let response = self.send(request, None).await?;
+        let response = self.send(request).await?;
         self.mark_request_as_sent(request_id, &response).await?;
         self.encryption().update_state_after_keys_query(&response).await;
 
@@ -523,7 +523,7 @@ impl Client {
             .get_missing_sessions(users)
             .await?
         {
-            let response = self.send(request, None).await?;
+            let response = self.send(request).await?;
             self.mark_request_as_sent(&request_id, &response).await?;
         }
 
@@ -551,7 +551,7 @@ impl Client {
             "Uploading public encryption keys",
         );
 
-        let response = self.send(request.clone(), None).await?;
+        let response = self.send(request.clone()).await?;
         self.mark_request_as_sent(request_id, &response).await?;
 
         Ok(response)
@@ -582,7 +582,7 @@ impl Client {
             request.messages.clone(),
         );
 
-        self.send(request, None).await
+        self.send(request).await
     }
 
     pub(crate) async fn send_verification_request(
@@ -632,7 +632,7 @@ impl Client {
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
             AnyOutgoingRequest::SignatureUpload(request) => {
-                let response = self.send(request.clone(), None).await?;
+                let response = self.send(request.clone()).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
             AnyOutgoingRequest::RoomMessage(request) => {
@@ -640,7 +640,7 @@ impl Client {
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
             AnyOutgoingRequest::KeysClaim(request) => {
-                let response = self.send(request.clone(), None).await?;
+                let response = self.send(request.clone()).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
         }
@@ -1146,8 +1146,8 @@ impl Encryption {
         if let Some(req) = upload_keys_req {
             self.client.send_outgoing_request(req).await?;
         }
-        self.client.send(upload_signing_keys_req, None).await?;
-        self.client.send(upload_signatures_req, None).await?;
+        self.client.send(upload_signing_keys_req).await?;
+        self.client.send(upload_signatures_req).await?;
 
         Ok(())
     }
@@ -1209,7 +1209,7 @@ impl Encryption {
             self.client.send_outgoing_request(req).await?;
         }
 
-        if let Err(error) = self.client.send(upload_signing_keys_req.clone(), None).await {
+        if let Err(error) = self.client.send(upload_signing_keys_req.clone()).await {
             if let Some(auth_type) = CrossSigningResetAuthType::new(&self.client, &error).await? {
                 let client = self.client.clone();
 
@@ -1223,7 +1223,7 @@ impl Encryption {
                 Err(error.into())
             }
         } else {
-            self.client.send(upload_signatures_req, None).await?;
+            self.client.send(upload_signatures_req).await?;
 
             Ok(None)
         }
@@ -1653,7 +1653,7 @@ impl Encryption {
     ///   allow for the initial upload of cross-signing keys without
     ///   authentication, rendering this parameter obsolete.
     pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
-        let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+        let mut tasks = self.client.inner.e2ee.tasks.lock();
 
         let this = self.clone();
         tasks.setup_e2ee = Some(spawn(async move {
@@ -1679,7 +1679,7 @@ impl Encryption {
     /// Waits for end-to-end encryption initialization tasks to finish, if any
     /// was running in the background.
     pub async fn wait_for_e2ee_initialization_tasks(&self) {
-        let task = self.client.inner.e2ee.tasks.lock().unwrap().setup_e2ee.take();
+        let task = self.client.inner.e2ee.tasks.lock().setup_e2ee.take();
 
         if let Some(task) = task {
             if let Err(err) = task.await {

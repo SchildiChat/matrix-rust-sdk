@@ -16,7 +16,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    future::ready,
     ops::Sub,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -25,7 +24,6 @@ use std::{
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
-use futures_util::FutureExt as _;
 use indexmap::IndexMap;
 use matrix_sdk::{
     config::RequestConfig,
@@ -38,17 +36,14 @@ use matrix_sdk::{
 use matrix_sdk_base::{
     crypto::types::events::CryptoContextInfo, latest_event::LatestEvent, RoomInfo, RoomState,
 };
-use matrix_sdk_test::{
-    event_factory::EventFactory, EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID,
-};
+use matrix_sdk_test::{event_factory::EventFactory, ALICE, BOB, DEFAULT_TEST_ROOM_ID};
 use ruma::{
     event_id,
     events::{
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::{Annotation, RelationType},
-        AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey,
-        RedactedMessageLikeEventContent, RedactedStateEventContent, StaticStateEventContent,
+        AnyMessageLikeEventContent, AnyTimelineEvent,
     },
     int,
     power_levels::NotificationPowerLevels,
@@ -61,11 +56,11 @@ use ruma::{
 use tokio::sync::RwLock;
 
 use super::{
+    algorithms::rfind_event_by_item_id,
     controller::{TimelineNewItemPosition, TimelineSettings},
     event_handler::TimelineEventKind,
     event_item::RemoteEventOrigin,
     traits::RoomDataProvider,
-    util::rfind_event_by_item_id,
     EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
     TimelineItem,
 };
@@ -88,7 +83,6 @@ mod virt;
 
 struct TestTimeline {
     controller: TimelineController<TestRoomDataProvider>,
-    event_builder: EventBuilder,
     /// An [`EventFactory`] that can be used for creating events in this
     /// timeline.
     pub factory: EventFactory,
@@ -113,7 +107,6 @@ impl TestTimeline {
                 None,
                 Some(false),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -127,7 +120,6 @@ impl TestTimeline {
                 None,
                 Some(false),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -141,7 +133,6 @@ impl TestTimeline {
                 Some(hook),
                 Some(true),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -156,7 +147,6 @@ impl TestTimeline {
                 None,
                 Some(encrypted),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -181,61 +171,6 @@ impl TestTimeline {
 
     async fn len(&self) -> usize {
         self.controller.items().await.len()
-    }
-
-    async fn handle_live_redacted_message_event<C>(&self, sender: &UserId, content: C)
-    where
-        C: RedactedMessageLikeEventContent,
-    {
-        let ev = self.event_builder.make_sync_redacted_message_event(sender, content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_state_event<C>(&self, sender: &UserId, content: C, prev_content: Option<C>)
-    where
-        C: StaticStateEventContent<StateKey = EmptyStateKey>,
-    {
-        let ev = self.event_builder.make_sync_state_event(sender, "", content, prev_content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_state_event_with_state_key<C>(
-        &self,
-        sender: &UserId,
-        state_key: C::StateKey,
-        content: C,
-        prev_content: Option<C>,
-    ) where
-        C: StaticStateEventContent,
-    {
-        let ev = self.event_builder.make_sync_state_event(
-            sender,
-            state_key.as_ref(),
-            content,
-            prev_content,
-        );
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_redacted_state_event<C>(&self, sender: &UserId, content: C)
-    where
-        C: RedactedStateEventContent<StateKey = EmptyStateKey>,
-    {
-        let ev = self.event_builder.make_sync_redacted_state_event(sender, "", content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_redacted_state_event_with_state_key<C>(
-        &self,
-        sender: &UserId,
-        state_key: C::StateKey,
-        content: C,
-    ) where
-        C: RedactedStateEventContent,
-    {
-        let ev =
-            self.event_builder.make_sync_redacted_state_event(sender, state_key.as_ref(), content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
     }
 
     async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
@@ -274,7 +209,11 @@ impl TestTimeline {
         &self,
         receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
     ) {
-        let ev_content = self.event_builder.make_receipt_event_content(receipts);
+        let mut read_receipt = self.factory.read_receipts();
+        for (event_id, tyype, user_id, thread) in receipts {
+            read_receipt = read_receipt.add(&event_id, &user_id, tyype, thread);
+        }
+        let ev_content = read_receipt.build();
         self.controller.handle_read_receipts(ev_content).await;
     }
 
@@ -380,8 +319,8 @@ impl RoomDataProvider for TestRoomDataProvider {
         RoomVersionId::V10
     }
 
-    fn crypto_context_info(&self) -> BoxFuture<'_, CryptoContextInfo> {
-        ready(CryptoContextInfo {
+    async fn crypto_context_info(&self) -> CryptoContextInfo {
+        CryptoContextInfo {
             device_creation_ts: MilliSecondsSinceUnixEpoch::from_system_time(
                 SystemTime::now().sub(Duration::from_secs(60 * 3)),
             )
@@ -389,47 +328,42 @@ impl RoomDataProvider for TestRoomDataProvider {
             is_backup_configured: false,
             this_device_is_verified: true,
             backup_exists_on_server: true,
-        })
-        .boxed()
+        }
     }
 
-    fn profile_from_user_id<'a>(&'a self, _user_id: &'a UserId) -> BoxFuture<'a, Option<Profile>> {
-        ready(None).boxed()
+    async fn profile_from_user_id<'a>(&'a self, _user_id: &'a UserId) -> Option<Profile> {
+        None
     }
 
     fn profile_from_latest_event(&self, _latest_event: &LatestEvent) -> Option<Profile> {
         None
     }
 
-    fn load_user_receipt(
-        &self,
+    async fn load_user_receipt<'a>(
+        &'a self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
-        user_id: &UserId,
-    ) -> BoxFuture<'_, Option<(OwnedEventId, Receipt)>> {
-        ready(
-            self.initial_user_receipts
-                .get(&receipt_type)
-                .and_then(|thread_map| thread_map.get(&thread))
-                .and_then(|user_map| user_map.get(user_id))
-                .cloned(),
-        )
-        .boxed()
+        user_id: &'a UserId,
+    ) -> Option<(OwnedEventId, Receipt)> {
+        self.initial_user_receipts
+            .get(&receipt_type)
+            .and_then(|thread_map| thread_map.get(&thread))
+            .and_then(|user_map| user_map.get(user_id))
+            .cloned()
     }
 
-    fn load_event_receipts(
-        &self,
-        event_id: &EventId,
-    ) -> BoxFuture<'_, IndexMap<OwnedUserId, Receipt>> {
-        ready(if event_id == event_id!("$event_with_bob_receipt") {
+    async fn load_event_receipts<'a>(
+        &'a self,
+        event_id: &'a EventId,
+    ) -> IndexMap<OwnedUserId, Receipt> {
+        if event_id == event_id!("$event_with_bob_receipt") {
             [(BOB.to_owned(), Receipt::new(MilliSecondsSinceUnixEpoch(uint!(10))))].into()
         } else {
             IndexMap::new()
-        })
-        .boxed()
+        }
     }
 
-    fn push_rules_and_context(&self) -> BoxFuture<'_, Option<(Ruleset, PushConditionRoomCtx)>> {
+    async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)> {
         let push_rules = Ruleset::server_default(&ALICE);
         let power_levels = PushConditionPowerLevelsCtx {
             users: BTreeMap::new(),
@@ -444,32 +378,26 @@ impl RoomDataProvider for TestRoomDataProvider {
             power_levels: Some(power_levels),
         };
 
-        ready(Some((push_rules, push_context))).boxed()
+        Some((push_rules, push_context))
     }
 
-    fn load_fully_read_marker(&self) -> BoxFuture<'_, Option<OwnedEventId>> {
-        ready(self.fully_read_marker.clone()).boxed()
+    async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
+        self.fully_read_marker.clone()
     }
 
-    fn send(&self, content: AnyMessageLikeEventContent) -> BoxFuture<'_, Result<(), super::Error>> {
-        async move {
-            self.sent_events.write().await.push(content);
-            Ok(())
-        }
-        .boxed()
+    async fn send(&self, content: AnyMessageLikeEventContent) -> Result<(), super::Error> {
+        self.sent_events.write().await.push(content);
+        Ok(())
     }
 
-    fn redact<'a>(
+    async fn redact<'a>(
         &'a self,
         event_id: &'a EventId,
         _reason: Option<&'a str>,
         _transaction_id: Option<OwnedTransactionId>,
-    ) -> BoxFuture<'a, Result<(), super::Error>> {
-        async move {
-            self.redacted.write().await.push(event_id.to_owned());
-            Ok(())
-        }
-        .boxed()
+    ) -> Result<(), super::Error> {
+        self.redacted.write().await.push(event_id.to_owned());
+        Ok(())
     }
 
     fn room_info(&self) -> Subscriber<RoomInfo> {

@@ -281,7 +281,7 @@ impl Encryption {
     }
 
     pub async fn is_last_device(&self) -> Result<bool> {
-        Ok(self.inner.recovery().are_we_the_last_man_standing().await?)
+        Ok(self.inner.recovery().is_last_device().await?)
     }
 
     pub async fn wait_for_backup_upload_steady_state(
@@ -476,6 +476,15 @@ impl UserIdentity {
     /// which is not verified and is in pin violation.
     pub(crate) async fn pin(&self) -> Result<(), ClientError> {
         Ok(self.inner.pin().await?)
+    }
+
+    /// Remove the requirement for this identity to be verified.
+    ///
+    /// If an identity was previously verified and is not anymore it will be
+    /// reported to the user. In order to remove this notice users have to
+    /// verify again or to withdraw the verification requirement.
+    pub(crate) async fn withdraw_verification(&self) -> Result<(), ClientError> {
+        Ok(self.inner.withdraw_verification().await?)
     }
 
     /// Get the public part of the Master key of this user identity.

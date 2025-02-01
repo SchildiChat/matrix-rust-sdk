@@ -1,7 +1,4 @@
-use std::{
-    ops::Not,
-    time::{Duration, Instant},
-};
+use std::ops::Not;
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
@@ -9,8 +6,9 @@ use futures_util::{pin_mut, FutureExt, StreamExt};
 use matrix_sdk::{
     config::RequestConfig,
     test_utils::{
-        logged_in_client_with_server, mocks::MatrixMockServer, set_client_session,
-        test_client_builder,
+        logged_in_client_with_server,
+        mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
+        set_client_session, test_client_builder,
     },
     Client,
 };
@@ -27,8 +25,11 @@ use matrix_sdk_ui::{
     RoomListService,
 };
 use ruma::{
-    api::client::room::create_room::v3::Request as CreateRoomRequest, event_id,
-    events::room::message::RoomMessageEventContent, mxc_uri, room_id,
+    api::client::room::create_room::v3::Request as CreateRoomRequest,
+    event_id,
+    events::room::message::RoomMessageEventContent,
+    mxc_uri, room_id,
+    time::{Duration, Instant},
 };
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
@@ -2429,7 +2430,7 @@ async fn test_room_timeline() -> Result<(), Error> {
     room.init_timeline_with_builder(room.default_room_timeline_builder().await.unwrap()).await?;
     let timeline = room.timeline().unwrap();
 
-    let (previous_timeline_items, mut timeline_items_stream) = timeline.subscribe().await;
+    let (previous_timeline_items, mut timeline_items_stream) = timeline.subscribe_batched().await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2492,7 +2493,7 @@ async fn test_room_empty_timeline() {
     // The room wasn't synced, but it will be available
     let room = room_list.room(&room_id).unwrap();
     let timeline = room.default_room_timeline_builder().await.unwrap().build().await.unwrap();
-    let (prev_items, _) = timeline.subscribe().await;
+    let (prev_items, _) = timeline.subscribe_batched().await;
 
     // However, since the room wasn't synced its timeline won't have any initial
     // items
@@ -2845,16 +2846,9 @@ async fn test_multiple_timeline_init() {
     // Send back-pagination responses with a small delay.
     server
         .mock_room_messages()
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({
-                    "start": "unused-start",
-                    "end": null,
-                    "chunk": vec![f.text_msg("hello").into_raw_timeline()],
-                    "state": [],
-                }))
-                .set_delay(Duration::from_millis(500)),
-        )
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![f.text_msg("hello").into_raw_timeline()])
+            .delayed(Duration::from_millis(500)))
         .mount()
         .await;
 

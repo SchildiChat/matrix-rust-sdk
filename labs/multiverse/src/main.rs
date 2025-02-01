@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     io::{self, stdout, Write},
-    path::PathBuf,
+    path::Path,
     process::exit,
     sync::{Arc, Mutex},
     time::Duration,
@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let config_path = env::args().nth(2).unwrap_or("/tmp/".to_owned());
-    let client = configure_client(server_name, config_path).await?;
+    let client = configure_client(&server_name, &config_path).await?;
 
     let ec = client.event_cache();
     ec.subscribe().unwrap();
@@ -266,7 +266,7 @@ impl App {
 
                     // Save the timeline in the cache.
                     let sdk_timeline = ui_room.timeline().unwrap();
-                    let (items, stream) = sdk_timeline.subscribe().await;
+                    let (items, stream) = sdk_timeline.subscribe_batched().await;
                     let items = Arc::new(Mutex::new(items));
 
                     // Spawn a timeline task that will listen to all the timeline item changes.
@@ -274,9 +274,12 @@ impl App {
                     let timeline_task = spawn(async move {
                         pin_mut!(stream);
                         let items = i;
-                        while let Some(diff) = stream.next().await {
+                        while let Some(diffs) = stream.next().await {
                             let mut items = items.lock().unwrap();
-                            diff.apply(&mut items);
+
+                            for diff in diffs {
+                                diff.apply(&mut items);
+                            }
                         }
                     });
 
@@ -978,10 +981,10 @@ impl<T> StatefulList<T> {
 /// Configure the client so it's ready for sync'ing.
 ///
 /// Will log in or reuse a previous session.
-async fn configure_client(server_name: String, config_path: String) -> anyhow::Result<Client> {
-    let server_name = ServerName::parse(&server_name)?;
+async fn configure_client(server_name: &str, config_path: &str) -> anyhow::Result<Client> {
+    let server_name = ServerName::parse(server_name)?;
 
-    let config_path = PathBuf::from(config_path);
+    let config_path = Path::new(config_path);
     let mut client_builder = Client::builder()
         .store_config(
             StoreConfig::new("multiverse".to_owned())
