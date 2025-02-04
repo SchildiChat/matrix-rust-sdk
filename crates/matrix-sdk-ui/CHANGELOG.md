@@ -24,6 +24,24 @@ All notable changes to this project will be documented in this file.
   implement `Into<PathBuf>` also implement `Into<AttachmentSource>`.
   ([#4451](https://github.com/matrix-org/matrix-rust-sdk/pull/4451))
 
+- [**breaking**] Add an "offline" mode to the `SyncService`. This allows the
+  `SyncService` to attempt to restart the sync automatically. It can be enabled
+  with the `SyncServiceBuilder::with_offline_mode` method. Due to this addition,
+  the `SyncService::stop` method has been made infallible.
+  ([#4592](https://github.com/matrix-org/matrix-rust-sdk/pull/4592))
+
+### Refactor
+
+- [**breaking**] `Timeline::paginate_forwards` and `Timeline::paginate_backwards`
+  are unified to work on a live or focused timeline.
+  `Timeline::live_paginate_*` and `Timeline::focused_paginate_*` have been
+  removed ([#4584](https://github.com/matrix-org/matrix-rust-sdk/pull/4584)).
+- [**breaking**] `Timeline::subscribe_batched` replaces
+  `Timeline::subscribe`. `subscribe` has been removed in
+  [#4567](https://github.com/matrix-org/matrix-rust-sdk/pull/4567),
+  and `subscribe_batched` has been renamed to `subscribe` in
+  [#4585](https://github.com/matrix-org/matrix-rust-sdk/pull/4585).
+
 ## [0.9.0] - 2024-12-18
 
 ### Bug Fixes
@@ -62,7 +80,6 @@ All notable changes to this project will be documented in this file.
 
 - `EncryptionSyncService` and `Notification` are using
   `Client::cross_process_store_locks_holder_name`.
-
 
 ### Refactor
 

@@ -54,13 +54,13 @@ async fn test_new_focused() {
         target_event,
         Some("prev1".to_owned()),
         vec![
-            f.text_msg("i tried so hard").sender(*ALICE).into_timeline(),
-            f.text_msg("and got so far").sender(*ALICE).into_timeline(),
+            f.text_msg("i tried so hard").sender(*ALICE).into_event(),
+            f.text_msg("and got so far").sender(*ALICE).into_event(),
         ],
-        f.text_msg("in the end").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("in the end").event_id(target_event).sender(*BOB).into_event(),
         vec![
-            f.text_msg("it doesn't even").sender(*ALICE).into_timeline(),
-            f.text_msg("matter").sender(*ALICE).into_timeline(),
+            f.text_msg("it doesn't even").sender(*ALICE).into_event(),
+            f.text_msg("matter").sender(*ALICE).into_event(),
         ],
         Some("next1".to_owned()),
         vec![],
@@ -86,7 +86,7 @@ async fn test_new_focused() {
 
     server.reset().await;
 
-    let (items, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (items, mut timeline_stream) = timeline.subscribe().await;
 
     assert_eq!(items.len(), 5 + 1); // event items + a date divider
     assert!(items[0].is_date_divider());
@@ -114,14 +114,14 @@ async fn test_new_focused() {
         None,
         vec![
             // reversed manually here
-            f.text_msg("And even though I tried, it all fell apart").sender(*BOB).into_timeline(),
-            f.text_msg("I kept everything inside").sender(*BOB).into_timeline(),
+            f.text_msg("And even though I tried, it all fell apart").sender(*BOB).into_event(),
+            f.text_msg("I kept everything inside").sender(*BOB).into_event(),
         ],
         vec![],
     )
     .await;
 
-    let hit_start = timeline.focused_paginate_backwards(20).await.unwrap();
+    let hit_start = timeline.paginate_backwards(20).await.unwrap();
     assert!(hit_start);
 
     server.reset().await;
@@ -154,14 +154,14 @@ async fn test_new_focused() {
         "next1".to_owned(),
         Some("next2".to_owned()),
         vec![
-            f.text_msg("I had to fall, to lose it all").sender(*BOB).into_timeline(),
-            f.text_msg("But in the end, it doesn't event matter").sender(*BOB).into_timeline(),
+            f.text_msg("I had to fall, to lose it all").sender(*BOB).into_event(),
+            f.text_msg("But in the end, it doesn't event matter").sender(*BOB).into_event(),
         ],
         vec![],
     )
     .await;
 
-    let hit_start = timeline.focused_paginate_forwards(20).await.unwrap();
+    let hit_start = timeline.paginate_forwards(20).await.unwrap();
     assert!(!hit_start); // because we gave it another next2 token.
 
     server.reset().await;
@@ -208,7 +208,7 @@ async fn test_focused_timeline_reacts() {
         target_event,
         None,
         vec![],
-        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
         vec![],
         None,
         vec![],
@@ -229,7 +229,7 @@ async fn test_focused_timeline_reacts() {
 
     server.reset().await;
 
-    let (items, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (items, mut timeline_stream) = timeline.subscribe().await;
 
     assert_eq!(items.len(), 1 + 1); // event items + a date divider
     assert!(items[0].is_date_divider());
@@ -293,7 +293,7 @@ async fn test_focused_timeline_local_echoes() {
         target_event,
         None,
         vec![],
-        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
         vec![],
         None,
         vec![],
@@ -314,7 +314,7 @@ async fn test_focused_timeline_local_echoes() {
 
     server.reset().await;
 
-    let (items, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (items, mut timeline_stream) = timeline.subscribe().await;
 
     assert_eq!(items.len(), 1 + 1); // event items + a date divider
     assert!(items[0].is_date_divider());
@@ -372,7 +372,7 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
         target_event,
         None,
         vec![],
-        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
         vec![],
         None,
         vec![],
@@ -393,7 +393,7 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
 
     server.reset().await;
 
-    let (items, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (items, mut timeline_stream) = timeline.subscribe().await;
 
     assert_eq!(items.len(), 1 + 1); // event items + a date divider
     assert!(items[0].is_date_divider());

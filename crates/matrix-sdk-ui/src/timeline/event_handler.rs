@@ -211,7 +211,7 @@ impl TimelineEventKind {
                         Self::UnableToDecrypt { content, utd_cause }
                     } else {
                         // If we get here, it means that some part of the code has created a
-                        // `SyncTimelineEvent` containing an `m.room.encrypted` event
+                        // `TimelineEvent` containing an `m.room.encrypted` event
                         // without decrypting it. Possibly this means that encryption has not been
                         // configured.
                         // We treat it the same as any other message-like event.
@@ -1077,11 +1077,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             }
         };
 
-        let is_room_encrypted = if let Ok(is_room_encrypted) = self.meta.is_room_encrypted.read() {
-            is_room_encrypted.unwrap_or_default()
-        } else {
-            false
-        };
+        let is_room_encrypted = self.meta.is_room_encrypted.read().unwrap_or_default();
 
         let mut item = EventTimelineItem::new(
             sender,

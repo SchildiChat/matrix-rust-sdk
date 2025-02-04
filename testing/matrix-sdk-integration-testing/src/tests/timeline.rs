@@ -91,7 +91,7 @@ async fn test_toggling_reaction() -> Result<()> {
     // waiting for it.
 
     let timeline = room.timeline().await.unwrap();
-    let (mut items, mut stream) = timeline.subscribe_batched().await;
+    let (mut items, mut stream) = timeline.subscribe().await;
 
     let event_id_task: JoinHandle<Result<_>> = spawn(async move {
         let find_event_id = |items: &Vector<Arc<TimelineItem>>| {
@@ -146,7 +146,7 @@ async fn test_toggling_reaction() -> Result<()> {
     // Give a bit of time for the timeline to process all sync updates.
     sleep(Duration::from_secs(1)).await;
 
-    let (mut items, mut stream) = timeline.subscribe_batched().await;
+    let (mut items, mut stream) = timeline.subscribe().await;
 
     // Skip all stream updates that have happened so far.
     debug!("Skipping all other stream updates…");
@@ -610,7 +610,7 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
         .expect("We should be able to load the room list");
 
     // Let's stop the sync so we don't receive the room key using the usual channel.
-    sync_service.stop().await.expect("We should be able to stop the sync service");
+    sync_service.stop().await;
 
     debug!("Alice sends the message");
     let event_id = alice_room

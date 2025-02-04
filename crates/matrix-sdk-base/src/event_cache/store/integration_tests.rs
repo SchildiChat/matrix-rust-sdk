@@ -18,7 +18,7 @@ use assert_matches::assert_matches;
 use async_trait::async_trait;
 use matrix_sdk_common::{
     deserialized_responses::{
-        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, SyncTimelineEvent, TimelineEventKind,
+        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, TimelineEvent, TimelineEventKind,
         VerificationState,
     },
     linked_chunk::{
@@ -32,7 +32,7 @@ use ruma::{
     push::Action, room_id, uint, RoomId,
 };
 
-use super::DynEventCacheStore;
+use super::{media::IgnoreMediaRetentionPolicy, DynEventCacheStore};
 use crate::{
     event_cache::{Event, Gap},
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
@@ -42,7 +42,7 @@ use crate::{
 /// correctly stores event data.
 ///
 /// Keep in sync with [`check_test_event`].
-pub fn make_test_event(room_id: &RoomId, content: &str) -> SyncTimelineEvent {
+pub fn make_test_event(room_id: &RoomId, content: &str) -> TimelineEvent {
     let encryption_info = EncryptionInfo {
         sender: (*ALICE).into(),
         sender_device: None,
@@ -60,13 +60,13 @@ pub fn make_test_event(room_id: &RoomId, content: &str) -> SyncTimelineEvent {
         .into_raw_timeline()
         .cast();
 
-    SyncTimelineEvent {
+    TimelineEvent {
         kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
             event,
             encryption_info,
             unsigned_encryption_info: None,
         }),
-        push_actions: vec![Action::Notify],
+        push_actions: Some(vec![Action::Notify]),
     }
 }
 
@@ -75,9 +75,9 @@ pub fn make_test_event(room_id: &RoomId, content: &str) -> SyncTimelineEvent {
 ///
 /// Keep in sync with [`make_test_event`].
 #[track_caller]
-pub fn check_test_event(event: &SyncTimelineEvent, text: &str) {
+pub fn check_test_event(event: &TimelineEvent, text: &str) {
     // Check push actions.
-    let actions = &event.push_actions;
+    let actions = event.push_actions.as_ref().unwrap();
     assert_eq!(actions.len(), 1);
     assert_matches!(&actions[0], Action::Notify);
 
@@ -168,7 +168,9 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         );
 
         // Let's add the media.
-        self.add_media_content(&request_file, content.clone()).await.expect("adding media failed");
+        self.add_media_content(&request_file, content.clone(), IgnoreMediaRetentionPolicy::No)
+            .await
+            .expect("adding media failed");
 
         // Media is present in the cache.
         assert_eq!(
@@ -196,7 +198,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         );
 
         // Let's add the media again.
-        self.add_media_content(&request_file, content.clone())
+        self.add_media_content(&request_file, content.clone(), IgnoreMediaRetentionPolicy::No)
             .await
             .expect("adding media again failed");
 
@@ -207,9 +209,13 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         );
 
         // Let's add the thumbnail media.
-        self.add_media_content(&request_thumbnail, thumbnail_content.clone())
-            .await
-            .expect("adding thumbnail failed");
+        self.add_media_content(
+            &request_thumbnail,
+            thumbnail_content.clone(),
+            IgnoreMediaRetentionPolicy::No,
+        )
+        .await
+        .expect("adding thumbnail failed");
 
         // Media's thumbnail is present.
         assert_eq!(
@@ -225,9 +231,13 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         );
 
         // Let's add another media with a different URI.
-        self.add_media_content(&request_other_file, other_content.clone())
-            .await
-            .expect("adding other media failed");
+        self.add_media_content(
+            &request_other_file,
+            other_content.clone(),
+            IgnoreMediaRetentionPolicy::No,
+        )
+        .await
+        .expect("adding other media failed");
 
         // Other file is present.
         assert_eq!(
@@ -279,7 +289,9 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         assert!(self.get_media_content(&req).await.unwrap().is_none(), "unexpected media found");
 
         // Add the media.
-        self.add_media_content(&req, content.clone()).await.expect("adding media failed");
+        self.add_media_content(&req, content.clone(), IgnoreMediaRetentionPolicy::No)
+            .await
+            .expect("adding media failed");
 
         // Sanity-check: media is found after adding it.
         assert_eq!(self.get_media_content(&req).await.unwrap().unwrap(), b"hello");

@@ -21,7 +21,7 @@ use std::ops::Deref;
 use std::{borrow::Cow, collections::BTreeMap};
 
 #[cfg(feature = "e2e-encryption")]
-use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk_common::deserialized_responses::TimelineEvent;
 use ruma::{
     api::client::sync::sync_events::v3::{self, InvitedRoom, KnockedRoom},
     events::{
@@ -706,7 +706,7 @@ impl BaseClient {
 async fn cache_latest_events(
     room: &Room,
     room_info: &mut RoomInfo,
-    events: &[SyncTimelineEvent],
+    events: &[TimelineEvent],
     changes: Option<&StateChanges>,
     store: Option<&Store>,
 ) {
@@ -916,7 +916,7 @@ mod tests {
     use std::sync::{Arc, RwLock as SyncRwLock};
 
     use assert_matches::assert_matches;
-    use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+    use matrix_sdk_common::deserialized_responses::TimelineEvent;
     #[cfg(feature = "e2e-encryption")]
     use matrix_sdk_common::{
         deserialized_responses::{UnableToDecryptInfo, UnableToDecryptReason},
@@ -2622,7 +2622,7 @@ mod tests {
     }
 
     #[cfg(feature = "e2e-encryption")]
-    async fn choose_event_to_cache(events: &[SyncTimelineEvent]) -> Option<SyncTimelineEvent> {
+    async fn choose_event_to_cache(events: &[TimelineEvent]) -> Option<TimelineEvent> {
         let room = make_room();
         let mut room_info = room.clone_info();
         cache_latest_events(&room, &mut room_info, events, None, None).await;
@@ -2631,11 +2631,11 @@ mod tests {
     }
 
     #[cfg(feature = "e2e-encryption")]
-    fn rawev_id(event: SyncTimelineEvent) -> String {
+    fn rawev_id(event: TimelineEvent) -> String {
         event.event_id().unwrap().to_string()
     }
 
-    fn ev_id(event: Option<SyncTimelineEvent>) -> String {
+    fn ev_id(event: Option<TimelineEvent>) -> String {
         event.unwrap().event_id().unwrap().to_string()
     }
 
@@ -2645,7 +2645,7 @@ mod tests {
     }
 
     #[cfg(feature = "e2e-encryption")]
-    fn evs_ids(events: &[SyncTimelineEvent]) -> Vec<String> {
+    fn evs_ids(events: &[TimelineEvent]) -> Vec<String> {
         events.iter().map(|e| e.event_id().unwrap().to_string()).collect()
     }
 
@@ -2677,13 +2677,13 @@ mod tests {
     }
 
     #[cfg(feature = "e2e-encryption")]
-    fn make_event(typ: &str, id: &str) -> SyncTimelineEvent {
-        SyncTimelineEvent::new(make_raw_event(typ, id))
+    fn make_event(typ: &str, id: &str) -> TimelineEvent {
+        TimelineEvent::new(make_raw_event(typ, id))
     }
 
     #[cfg(feature = "e2e-encryption")]
-    fn make_encrypted_event(id: &str) -> SyncTimelineEvent {
-        SyncTimelineEvent::new_utd_event(
+    fn make_encrypted_event(id: &str) -> TimelineEvent {
+        TimelineEvent::new_utd_event(
             Raw::from_json_string(
                 json!({
                     "type": "m.room.encrypted",

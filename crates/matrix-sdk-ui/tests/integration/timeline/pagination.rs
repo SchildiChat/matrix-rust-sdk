@@ -63,7 +63,7 @@ async fn test_back_pagination() {
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
-    let (_, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (_, mut timeline_stream) = timeline.subscribe().await;
     let (_, mut back_pagination_status) = timeline.live_back_pagination_status().await.unwrap();
 
     Mock::given(method("GET"))
@@ -76,7 +76,7 @@ async fn test_back_pagination() {
         .await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
         server.reset().await;
     };
     let observe_paginating = async {
@@ -145,7 +145,7 @@ async fn test_back_pagination() {
         .mount(&server)
         .await;
 
-    let hit_start = timeline.live_paginate_backwards(10).await.unwrap();
+    let hit_start = timeline.paginate_backwards(10).await.unwrap();
     assert!(hit_start);
     assert_next_eq!(
         back_pagination_status,
@@ -178,7 +178,7 @@ async fn test_back_pagination_highlighted() {
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
-    let (_, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (_, mut timeline_stream) = timeline.subscribe().await;
 
     let response_json = json!({
         "chunk": [
@@ -218,7 +218,7 @@ async fn test_back_pagination_highlighted() {
         .mount(&server)
         .await;
 
-    timeline.live_paginate_backwards(10).await.unwrap();
+    timeline.paginate_backwards(10).await.unwrap();
     server.reset().await;
 
     assert_let!(Some(timeline_updates) = timeline_stream.next().await);
@@ -289,7 +289,7 @@ async fn test_wait_for_token() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     let observe_paginating = async {
         assert_eq!(back_pagination_status.next().await, Some(LiveBackPaginationStatus::Paginating));
@@ -354,10 +354,10 @@ async fn test_dedup_pagination() {
 
     // If I try to paginate twice at the same time,
     let paginate_1 = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     let paginate_2 = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     timeout(Duration::from_secs(5), join(paginate_1, paginate_2)).await.unwrap();
 
@@ -443,7 +443,7 @@ async fn test_timeline_reset_while_paginating() {
 
     let (_, mut back_pagination_status) = timeline.live_back_pagination_status().await.unwrap();
 
-    let paginate = async { timeline.live_paginate_backwards(10).await.unwrap() };
+    let paginate = async { timeline.paginate_backwards(10).await.unwrap() };
 
     let observe_paginating = async {
         let mut seen_paginating = false;
@@ -579,7 +579,7 @@ async fn test_empty_chunk() {
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
-    let (_, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (_, mut timeline_stream) = timeline.subscribe().await;
     let (_, mut back_pagination_status) = timeline.live_back_pagination_status().await.unwrap();
 
     // It should try to do another request after the empty chunk.
@@ -608,7 +608,7 @@ async fn test_empty_chunk() {
         .await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
         server.reset().await;
     };
     let observe_paginating = async {
@@ -681,7 +681,7 @@ async fn test_until_num_items_with_empty_chunk() {
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
-    let (_, mut timeline_stream) = timeline.subscribe_batched().await;
+    let (_, mut timeline_stream) = timeline.subscribe().await;
     let (_, mut back_pagination_status) = timeline.live_back_pagination_status().await.unwrap();
 
     Mock::given(method("GET"))
@@ -719,7 +719,7 @@ async fn test_until_num_items_with_empty_chunk() {
         .await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     let observe_paginating = async {
         assert_eq!(back_pagination_status.next().await, Some(LiveBackPaginationStatus::Paginating));
@@ -771,7 +771,7 @@ async fn test_until_num_items_with_empty_chunk() {
         assert!(date_divider.is_date_divider());
     }
 
-    timeline.live_paginate_backwards(10).await.unwrap();
+    timeline.paginate_backwards(10).await.unwrap();
 
     assert_let!(Some(timeline_updates) = timeline_stream.next().await);
 
@@ -821,7 +821,7 @@ async fn test_back_pagination_aborted() {
     let paginate = spawn({
         let timeline = timeline.clone();
         async move {
-            timeline.live_paginate_backwards(10).await.unwrap();
+            timeline.paginate_backwards(10).await.unwrap();
         }
     });
 

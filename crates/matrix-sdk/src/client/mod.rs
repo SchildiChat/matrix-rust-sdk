@@ -74,9 +74,11 @@ use url::Url;
 
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
-use crate::oidc::Oidc;
+use crate::authentication::oidc::Oidc;
 use crate::{
-    authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
+    authentication::{
+        matrix::MatrixAuth, AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback,
+    },
     config::RequestConfig,
     deduplicating_handler::DeduplicatingHandler,
     error::{HttpError, HttpResult},
@@ -86,7 +88,6 @@ use crate::{
         EventHandlerStore, ObservableEventHandler, SyncEvent,
     },
     http_client::HttpClient,
-    matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
     room_preview::RoomPreview,
     send_queue::SendQueueData,
@@ -1660,15 +1661,16 @@ impl Client {
     }
 
     /// Fetches server capabilities from network; no caching.
-    async fn fetch_server_capabilities(
+    pub async fn fetch_server_capabilities(
         &self,
+        request_config: Option<RequestConfig>,
     ) -> HttpResult<(Box<[MatrixVersion]>, BTreeMap<String, bool>)> {
         let resp = self
             .inner
             .http_client
             .send(
                 get_supported_versions::Request::new(),
-                None,
+                request_config,
                 self.homeserver().to_string(),
                 None,
                 &[MatrixVersion::V1_0],
@@ -1707,7 +1709,7 @@ impl Client {
             }
         }
 
-        let (versions, unstable_features) = self.fetch_server_capabilities().await?;
+        let (versions, unstable_features) = self.fetch_server_capabilities(None).await?;
 
         // Attempt to cache the result in storage.
         {

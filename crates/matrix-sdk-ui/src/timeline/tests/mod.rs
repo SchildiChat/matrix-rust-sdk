@@ -24,10 +24,11 @@ use std::{
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
+use imbl::vector;
 use indexmap::IndexMap;
 use matrix_sdk::{
     config::RequestConfig,
-    deserialized_responses::{SyncTimelineEvent, TimelineEvent},
+    deserialized_responses::TimelineEvent,
     event_cache::paginator::{PaginableRoom, PaginatorError},
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
@@ -56,11 +57,8 @@ use ruma::{
 use tokio::sync::RwLock;
 
 use super::{
-    algorithms::rfind_event_by_item_id,
-    controller::{TimelineNewItemPosition, TimelineSettings},
-    event_handler::TimelineEventKind,
-    event_item::RemoteEventOrigin,
-    traits::RoomDataProvider,
+    algorithms::rfind_event_by_item_id, controller::TimelineSettings,
+    event_handler::TimelineEventKind, event_item::RemoteEventOrigin, traits::RoomDataProvider,
     EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
     TimelineItem,
 };
@@ -173,12 +171,11 @@ impl TestTimeline {
         self.controller.items().await.len()
     }
 
-    async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
-        let event = event.into();
+    async fn handle_live_event(&self, event: impl Into<TimelineEvent>) {
         self.controller
-            .add_events_at(
-                [event].into_iter(),
-                TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+            .handle_remote_events_with_diffs(
+                vec![VectorDiff::Append { values: vector![event.into()] }],
+                RemoteEventOrigin::Sync,
             )
             .await;
     }
@@ -198,9 +195,9 @@ impl TestTimeline {
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
         self.controller
-            .add_events_at(
-                [timeline_event].into_iter(),
-                TimelineNewItemPosition::Start { origin: RemoteEventOrigin::Pagination },
+            .handle_remote_events_with_diffs(
+                vec![VectorDiff::PushFront { value: timeline_event }],
+                RemoteEventOrigin::Pagination,
             )
             .await;
     }
@@ -297,7 +294,7 @@ impl PinnedEventsRoom for TestRoomDataProvider {
         _event_id: &'a EventId,
         _request_config: Option<RequestConfig>,
         _related_event_filters: Option<Vec<RelationType>>,
-    ) -> BoxFuture<'a, Result<(SyncTimelineEvent, Vec<SyncTimelineEvent>), PaginatorError>> {
+    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), PaginatorError>> {
         unimplemented!();
     }
 

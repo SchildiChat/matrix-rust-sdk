@@ -189,7 +189,7 @@ impl RoomList {
                 let (values, stream) = (raw_values, merged_streams)
                     .filter(filter_fn)
                     .sort_by(sc_sort_order_fn)
-                    .dynamic_limit_with_initial_value(page_size, limit_stream.clone());
+                    .dynamic_head_with_initial_value(page_size, limit_stream.clone());
 
                 // Clearing the stream before chaining with the real stream.
                 yield stream::once(ready(vec![VectorDiff::Reset { values }]))
