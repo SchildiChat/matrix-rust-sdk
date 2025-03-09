@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{HashMap, HashSet};
+
 use eyeball_im::VectorDiff;
 use itertools::Itertools as _;
 use matrix_sdk::deserialized_responses::TimelineEvent;
@@ -29,7 +31,8 @@ use super::{
         event_item::RemoteEventOrigin,
         traits::RoomDataProvider,
     },
-    ObservableItemsTransaction, TimelineFocusKind, TimelineMetadata, TimelineSettings,
+    ObservableItems, ObservableItemsTransaction, TimelineFocusKind, TimelineMetadata,
+    TimelineSettings,
 };
 use crate::events::SyncTimelineEventWithoutContent;
 
@@ -38,19 +41,41 @@ pub(in crate::timeline) struct TimelineStateTransaction<'a> {
     /// until committed.
     pub items: ObservableItemsTransaction<'a>,
 
+    /// Number of items when the transaction has been created/has started.
+    number_of_items_when_transaction_started: usize,
+
     /// A clone of the previous meta, that we're operating on during the
     /// transaction, and that will be committed to the previous meta location in
     /// [`Self::commit`].
     pub meta: TimelineMetadata,
 
     /// Pointer to the previous meta, only used during [`Self::commit`].
-    pub(super) previous_meta: &'a mut TimelineMetadata,
+    previous_meta: &'a mut TimelineMetadata,
 
     /// The kind of focus of this timeline.
     pub(super) timeline_focus: TimelineFocusKind,
 }
 
-impl TimelineStateTransaction<'_> {
+impl<'a> TimelineStateTransaction<'a> {
+    /// Create a new [`TimelineStateTransaction`].
+    pub(super) fn new(
+        items: &'a mut ObservableItems,
+        meta: &'a mut TimelineMetadata,
+        timeline_focus: TimelineFocusKind,
+    ) -> Self {
+        let previous_meta = meta;
+        let meta = previous_meta.clone();
+        let items = items.transaction();
+
+        Self {
+            number_of_items_when_transaction_started: items.len(),
+            items,
+            previous_meta,
+            meta,
+            timeline_focus,
+        }
+    }
+
     /// Handle updates on events as [`VectorDiff`]s.
     pub(super) async fn handle_remote_events_with_diffs<RoomData>(
         &mut self,
@@ -145,7 +170,39 @@ impl TimelineStateTransaction<'_> {
         }
 
         self.adjust_date_dividers(date_divider_adjuster);
+        self.check_invariants();
+    }
+
+    fn check_invariants(&self) {
+        self.check_no_duplicate_read_receipts();
         self.check_no_unused_unique_ids();
+    }
+
+    fn check_no_duplicate_read_receipts(&self) {
+        let mut by_user_id = HashMap::new();
+        let mut duplicates = HashSet::new();
+
+        for item in self.items.iter().filter_map(|item| item.as_event()) {
+            if let Some(event_id) = item.event_id() {
+                for (user_id, _read_receipt) in item.read_receipts() {
+                    if let Some(prev_event_id) = by_user_id.insert(user_id, event_id) {
+                        duplicates.insert((user_id.clone(), prev_event_id, event_id));
+                    }
+                }
+            }
+        }
+
+        if !duplicates.is_empty() {
+            #[cfg(any(debug_assertions, test))]
+            panic!("duplicate read receipts in this timeline:{:?}\n{:?}", duplicates, self.items);
+
+            #[cfg(not(any(debug_assertions, test)))]
+            tracing::error!(
+                "duplicate read receipts in this timeline:{:?}\n{:?}",
+                duplicates,
+                self.items
+            );
+        }
     }
 
     fn check_no_unused_unique_ids(&self) {
@@ -367,7 +424,7 @@ impl TimelineStateTransaction<'_> {
             read_receipts: if settings.track_read_receipts && should_add {
                 self.meta.read_receipts.compute_event_receipts(
                     &event_id,
-                    self.items.all_remote_events(),
+                    &mut self.items,
                     matches!(position, TimelineItemPosition::End { .. }),
                 )
             } else {
@@ -410,7 +467,7 @@ impl TimelineStateTransaction<'_> {
         if let Some(event_meta) = self.items.all_remote_events().get(event_index) {
             // Fetch the `timeline_item_index` associated to the remote event.
             if let Some(timeline_item_index) = event_meta.timeline_item_index {
-                let _removed_timeline_item = self.items.remove(timeline_item_index);
+                let _ = self.items.remove(timeline_item_index);
             }
 
             // Now we can remove the remote event.
@@ -467,15 +524,25 @@ impl TimelineStateTransaction<'_> {
     }
 
     pub(super) fn commit(self) {
-        let Self { items, previous_meta, meta, .. } = self;
+        // Update the `subscriber_skip_count` value.
+        let previous_number_of_items = self.number_of_items_when_transaction_started;
+        let next_number_of_items = self.items.len();
+
+        if previous_number_of_items != next_number_of_items {
+            let count = self
+                .meta
+                .subscriber_skip_count
+                .compute_next(previous_number_of_items, next_number_of_items);
+            self.meta.subscriber_skip_count.update(count, &self.timeline_focus);
+        }
 
         // Replace the pointer to the previous meta with the new one.
-        *previous_meta = meta;
+        *self.previous_meta = self.meta;
 
-        items.commit();
+        self.items.commit();
     }
 
-    /// Add or update a remote  event in the
+    /// Add or update a remote event in the
     /// [`ObservableItems::all_remote_events`] collection.
     ///
     /// This method also adjusts read receipt if needed.
@@ -537,13 +604,17 @@ impl TimelineStateTransaction<'_> {
     /// This method replaces the `is_room_encrypted` value for all timeline
     /// items to its updated version and creates a `VectorDiff::Set` operation
     /// for each item which will be added to this transaction.
-    pub(super) fn update_all_events_is_room_encrypted(&mut self, is_encrypted: Option<bool>) {
+    pub(super) fn mark_all_events_as_encrypted(&mut self) {
         for idx in 0..self.items.len() {
             let item = &self.items[idx];
 
             if let Some(event) = item.as_event() {
+                if event.is_room_encrypted {
+                    continue;
+                }
+
                 let mut cloned_event = event.clone();
-                cloned_event.is_room_encrypted = is_encrypted;
+                cloned_event.is_room_encrypted = true;
 
                 // Replace the existing item with a new version with the right encryption flag
                 let item = item.with_kind(cloned_event);

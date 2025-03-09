@@ -43,12 +43,14 @@ use ruma::{
     user_id,
 };
 use serde_json::{json, value::to_raw_value};
-use stream_assert::assert_next_matches;
+use stream_assert::{assert_next_matches, assert_pending};
 use tokio::time::sleep;
 
 use super::TestTimeline;
 use crate::{
-    timeline::{EncryptedMessage, TimelineDetails, TimelineItemContent},
+    timeline::{
+        tests::TestTimelineBuilder, EncryptedMessage, TimelineDetails, TimelineItemContent,
+    },
     unable_to_decrypt_hook::{UnableToDecryptHook, UnableToDecryptInfo, UtdHookManager},
 };
 
@@ -84,7 +86,7 @@ async fn test_retry_message_decryption() {
     let client = test_client_builder(None).build().await.unwrap();
     let utd_hook = Arc::new(UtdHookManager::new(hook.clone(), client));
 
-    let timeline = TestTimeline::with_unable_to_decrypt_hook(utd_hook.clone());
+    let timeline = TestTimelineBuilder::new().unable_to_decrypt_hook(utd_hook.clone()).build();
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
@@ -154,7 +156,10 @@ async fn test_retry_message_decryption() {
 
     assert_eq!(timeline.controller.items().await.len(), 2);
 
-    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    let item = assert_next_matches_with_timeout!(
+        stream,
+        VectorDiff::Set { index: 1, value } => value
+    );
     let event = item.as_event().unwrap();
     assert_matches!(event.encryption_info(), Some(_));
     assert_let!(TimelineItemContent::Message(message) = event.content());
@@ -185,7 +190,7 @@ async fn test_false_positive_late_decryption_regression() {
     let utd_hook =
         Arc::new(UtdHookManager::new(hook.clone(), client).with_max_delay(Duration::from_secs(1)));
 
-    let timeline = TestTimeline::with_unable_to_decrypt_hook(utd_hook.clone());
+    let timeline = TestTimelineBuilder::new().unable_to_decrypt_hook(utd_hook.clone()).build();
 
     let f = &timeline.factory;
     timeline
@@ -271,7 +276,10 @@ async fn test_retry_edit_decryption() {
 
     let timeline = TestTimeline::new();
     let f = &timeline.factory;
+    let mut stream = timeline.subscribe_events().await;
 
+    // Given there are 2 UTD events in the timeline: one message and one edit of
+    // that message
     let encrypted = EncryptedEventScheme::MegolmV1AesSha2(
         MegolmV1AesSha2ContentInit {
             ciphertext: "\
@@ -295,7 +303,10 @@ async fn test_retry_edit_decryption() {
         .await;
 
     let event_id =
-        timeline.controller.items().await[1].as_event().unwrap().event_id().unwrap().to_owned();
+        assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value } => value)
+            .event_id()
+            .unwrap()
+            .to_owned();
 
     let encrypted = EncryptedEventScheme::MegolmV1AesSha2(
         MegolmV1AesSha2ContentInit {
@@ -323,9 +334,9 @@ async fn test_retry_edit_decryption() {
         )
         .await;
 
-    let items = timeline.controller.items().await;
-    assert_eq!(items.len(), 3);
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { .. });
 
+    // When we provide the keys for them and request redecryption
     let mut keys = decrypt_room_key_export(Cursor::new(SESSION1_KEY), "1234").unwrap();
     keys.extend(decrypt_room_key_export(Cursor::new(SESSION2_KEY), "1234").unwrap());
 
@@ -342,16 +353,23 @@ async fn test_retry_edit_decryption() {
         )
         .await;
 
-    let items = timeline.controller.items().await;
-    assert_eq!(items.len(), 2);
+    // Then first, the first item gets decrypted on its own
+    assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, .. });
 
-    let item = items[1].as_event().unwrap();
+    // And second, they get resolved into a single event after the edit is decrypted
+    let item =
+        assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, value } => value);
+
+    assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 1 });
 
     assert_matches!(item.encryption_info(), Some(_));
     assert_matches!(item.latest_edit_json(), Some(_));
     assert_let!(TimelineItemContent::Message(msg) = item.content());
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "This is Error");
+
+    // (There are no more items)
+    assert_pending!(stream);
 }
 
 #[async_test]
@@ -390,6 +408,10 @@ async fn test_retry_edit_and_more() {
 
     let timeline = TestTimeline::new();
     let f = &timeline.factory;
+    let mut stream = timeline.subscribe().await;
+
+    // Given the timeline contains an event and an edit of that event, and another
+    // event, all UTD.
 
     timeline
         .handle_live_event(
@@ -405,7 +427,12 @@ async fn test_retry_edit_and_more() {
         .await;
 
     let event_id =
-        timeline.controller.items().await[1].as_event().unwrap().event_id().unwrap().to_owned();
+        assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value } => value)
+            .as_event()
+            .unwrap()
+            .event_id()
+            .unwrap()
+            .to_owned();
 
     let msg2 = encrypted_message(
         "AwgEErABt7svMEHDYJTjCQEHypR21l34f9IZLNyFaAbI+EiCIN7C8X5iKmkzuYSmGUodyGKbFRYrW9l5dLj\
@@ -435,7 +462,10 @@ async fn test_retry_edit_and_more() {
         )
         .await;
 
-    assert_eq!(timeline.controller.items().await.len(), 4);
+    // Sanity: these events were added to the timeline
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { .. });
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { .. });
+    assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { .. });
 
     let olm_machine = OlmMachine::new(user_id!("@jptest:matrix.org"), DEVICE_ID.into()).await;
     let keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "testing").unwrap();
@@ -450,16 +480,30 @@ async fn test_retry_edit_and_more() {
         )
         .await;
 
-    let timeline_items = timeline.controller.items().await;
-    assert_eq!(timeline_items.len(), 3);
-    assert!(timeline_items[0].is_date_divider());
-    let timeline_event = timeline_items[1].as_event().unwrap();
-    assert!(timeline_event.latest_edit_json().is_some());
-    assert_eq!(timeline_event.content().as_message().unwrap().body(), "edited");
+    // Then first, the original item got decrypted
+    assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 1, value } => value);
+
+    // And second, the edit was decrypted, resulting in us replacing the
+    // original+edit with one item
+    let edited_item =
+        assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 1, value } => value);
+    assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 2 });
+
+    let edited_event = edited_item.as_event().unwrap();
+    assert!(edited_event.latest_edit_json().is_some());
+    assert_eq!(edited_event.content().as_message().unwrap().body(), "edited");
+
+    // And third, the last item was decrypted
+    let normal_item =
+        assert_next_matches_with_timeout!(stream, VectorDiff::Set { index:2, value } => value);
+
     assert_eq!(
-        timeline_items[2].as_event().unwrap().content().as_message().unwrap().body(),
+        normal_item.as_event().unwrap().content().as_message().unwrap().body(),
         "Another message"
     );
+
+    // (There are no more items)
+    assert_pending!(stream);
 }
 
 #[async_test]
@@ -540,7 +584,8 @@ async fn test_retry_message_decryption_highlighted() {
 
     assert_eq!(timeline.controller.items().await.len(), 2);
 
-    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    let item =
+        assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 1, value } => value);
     let event = item.as_event().unwrap();
     assert_matches!(event.encryption_info(), Some(_));
     assert_let!(TimelineItemContent::Message(message) = event.content());

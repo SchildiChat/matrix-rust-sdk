@@ -90,7 +90,7 @@ fn check_prerequisites() {
 
 fn prepare(version: ReleaseVersion, execute: bool) -> Result<()> {
     let sh = sh();
-    let cmd = cmd!(sh, "cargo release --no-publish --no-tag --no-push");
+    let cmd = cmd!(sh, "cargo release --workspace --no-publish --no-tag --no-push");
 
     let cmd = if execute { cmd.arg("--execute") } else { cmd };
     let cmd = cmd.arg(version.as_str());
@@ -111,15 +111,15 @@ fn prepare(version: ReleaseVersion, execute: bool) -> Result<()> {
 fn publish(execute: bool) -> Result<()> {
     let sh = sh();
 
-    let cmd = cmd!(sh, "cargo release tag");
+    let cmd = cmd!(sh, "cargo release tag --workspace");
     let cmd = if execute { cmd.arg("--execute") } else { cmd };
     cmd.run()?;
 
-    let cmd = cmd!(sh, "cargo release publish");
+    let cmd = cmd!(sh, "cargo release publish --workspace");
     let cmd = if execute { cmd.arg("--execute") } else { cmd };
     cmd.run()?;
 
-    let cmd = cmd!(sh, "cargo release push");
+    let cmd = cmd!(sh, "cargo release push --workspace");
     let cmd = if execute { cmd.arg("--execute") } else { cmd };
     cmd.run()?;
 
@@ -137,7 +137,7 @@ fn weekly_report() -> Result<()> {
     let _env_pager = sh.push_env("GH_PAGER", "");
 
     let header = format!("# This Week in the Matrix Rust SDK ({today})\n\n");
-    let template = "{{range .}}- {{.title}} by @{{.author.login}}{{\"\\n\\n\"}}{{end}}";
+    let template = "{{range .}}- {{.title}} ([#{{.number}}](https://github.com/matrix-org/matrix-rust-sdk/pull/{{.number}})){{\"\\n\\n\"}}{{end}}";
     let template = format!("{header}{template}");
 
     cmd!(

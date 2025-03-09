@@ -12,17 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, num::NonZeroUsize, sync::RwLock as StdRwLock};
+use std::{
+    collections::HashMap,
+    num::NonZeroUsize,
+    sync::{Arc, RwLock as StdRwLock},
+};
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
-    linked_chunk::{relational::RelationalLinkedChunk, RawChunk, Update},
+    linked_chunk::{
+        relational::RelationalLinkedChunk, ChunkIdentifier, ChunkIdentifierGenerator, Position,
+        RawChunk, Update,
+    },
     ring_buffer::RingBuffer,
     store_locks::memory_store_helper::try_take_leased_lock,
 };
 use ruma::{
     time::{Instant, SystemTime},
-    MxcUri, OwnedMxcUri, RoomId,
+    EventId, MxcUri, OwnedEventId, OwnedMxcUri, RoomId,
 };
 
 use super::{
@@ -37,10 +44,9 @@ use crate::{
 /// In-memory, non-persistent implementation of the `EventCacheStore`.
 ///
 /// Default if no other is configured at startup.
-#[allow(clippy::type_complexity)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemoryStore {
-    inner: StdRwLock<MemoryStoreInner>,
+    inner: Arc<StdRwLock<MemoryStoreInner>>,
     media_service: MediaService,
 }
 
@@ -50,6 +56,7 @@ struct MemoryStoreInner {
     leases: HashMap<String, (String, Instant)>,
     events: RelationalLinkedChunk<Event, Gap>,
     media_retention_policy: Option<MediaRetentionPolicy>,
+    last_media_cleanup_time: SystemTime,
 }
 
 /// A media content in the `MemoryStore`.
@@ -71,20 +78,24 @@ struct MediaContent {
     last_access: SystemTime,
 }
 
-// SAFETY: `new_unchecked` is safe because 20 is not zero.
-const NUMBER_OF_MEDIAS: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(20) };
+const NUMBER_OF_MEDIAS: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 
 impl Default for MemoryStore {
     fn default() -> Self {
+        // Given that the store is empty, we won't need to clean it up right away.
+        let last_media_cleanup_time = SystemTime::now();
+        let media_service = MediaService::new();
+        media_service.restore(None, Some(last_media_cleanup_time));
+
         Self {
-            inner: StdRwLock::new(MemoryStoreInner {
+            inner: Arc::new(StdRwLock::new(MemoryStoreInner {
                 media: RingBuffer::new(NUMBER_OF_MEDIAS),
                 leases: Default::default(),
                 events: RelationalLinkedChunk::new(),
                 media_retention_policy: None,
-            }),
-            // No need to call `restore()` since nothing is persisted.
-            media_service: MediaService::new(),
+                last_media_cleanup_time,
+            })),
+            media_service,
         }
     }
 }
@@ -123,20 +134,87 @@ impl EventCacheStore for MemoryStore {
         Ok(())
     }
 
-    async fn reload_linked_chunk(
+    async fn load_all_chunks(
         &self,
         room_id: &RoomId,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
         let inner = self.inner.read().unwrap();
         inner
             .events
-            .reload_chunks(room_id)
+            .load_all_chunks(room_id)
+            .map_err(|err| EventCacheStoreError::InvalidData { details: err })
+    }
+
+    async fn load_last_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .events
+            .load_last_chunk(room_id)
+            .map_err(|err| EventCacheStoreError::InvalidData { details: err })
+    }
+
+    async fn load_previous_chunk(
+        &self,
+        room_id: &RoomId,
+        before_chunk_identifier: ChunkIdentifier,
+    ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .events
+            .load_previous_chunk(room_id, before_chunk_identifier)
             .map_err(|err| EventCacheStoreError::InvalidData { details: err })
     }
 
     async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error> {
         self.inner.write().unwrap().events.clear();
         Ok(())
+    }
+
+    async fn filter_duplicated_events(
+        &self,
+        room_id: &RoomId,
+        mut events: Vec<OwnedEventId>,
+    ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error> {
+        // Collect all duplicated events.
+        let inner = self.inner.read().unwrap();
+
+        let mut duplicated_events = Vec::new();
+
+        for (event, position) in inner.events.unordered_room_items(room_id) {
+            // If `events` is empty, we can short-circuit.
+            if events.is_empty() {
+                break;
+            }
+
+            if let Some(known_event_id) = event.event_id() {
+                // This event is a duplicate!
+                if let Some(index) =
+                    events.iter().position(|new_event_id| &known_event_id == new_event_id)
+                {
+                    duplicated_events.push((events.remove(index), position));
+                }
+            }
+        }
+
+        Ok(duplicated_events)
+    }
+
+    async fn find_event(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<(Position, Event)>, Self::Error> {
+        let inner = self.inner.read().unwrap();
+
+        let event_and_room = inner.events.items().find_map(|(position, event, this_room_id)| {
+            (room_id == this_room_id && event.event_id()? == event_id)
+                .then_some((position, event.clone()))
+        });
+
+        Ok(event_and_room)
     }
 
     async fn add_media_content(
@@ -268,7 +346,7 @@ impl EventCacheStoreMedia for MemoryStore {
 
         let ignore_policy = ignore_policy.is_yes();
 
-        if !ignore_policy && policy.exceeds_max_file_size(data.len()) {
+        if !ignore_policy && policy.exceeds_max_file_size(data.len() as u64) {
             // Do not store it.
             return Ok(());
         };
@@ -374,7 +452,7 @@ impl EventCacheStoreMedia for MemoryStore {
         // First, check media content that exceed the max filesize.
         if policy.computed_max_file_size().is_some() {
             inner.media.retain(|content| {
-                content.ignore_policy || !policy.exceeds_max_file_size(content.data.len())
+                content.ignore_policy || !policy.exceeds_max_file_size(content.data.len() as u64)
             });
         }
 
@@ -392,7 +470,7 @@ impl EventCacheStoreMedia for MemoryStore {
             // to count the number of old items to remove. Items are sorted by last access
             // and old items are at the start.
             let (_, items_to_remove) = inner.media.iter().enumerate().rev().fold(
-                (0usize, Vec::with_capacity(NUMBER_OF_MEDIAS.into())),
+                (0u64, Vec::with_capacity(NUMBER_OF_MEDIAS.into())),
                 |(mut cache_size, mut items_to_remove), (index, content)| {
                     if content.ignore_policy {
                         // Do not count it.
@@ -401,7 +479,7 @@ impl EventCacheStoreMedia for MemoryStore {
 
                     let remove_item = if items_to_remove.is_empty() {
                         // We have not reached the max cache size yet.
-                        if let Some(sum) = cache_size.checked_add(content.data.len()) {
+                        if let Some(sum) = cache_size.checked_add(content.data.len() as u64) {
                             cache_size = sum;
                             // Start removing items if we have exceeded the max cache size.
                             cache_size > max_cache_size
@@ -431,7 +509,13 @@ impl EventCacheStoreMedia for MemoryStore {
             }
         }
 
+        inner.last_media_cleanup_time = current_time;
+
         Ok(())
+    }
+
+    async fn last_media_cleanup_time_inner(&self) -> Result<Option<SystemTime>, Self::Error> {
+        Ok(Some(self.inner.read().unwrap().last_media_cleanup_time))
     }
 }
 

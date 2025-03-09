@@ -13,7 +13,7 @@ use matrix_sdk::{
 use matrix_sdk_ui::timeline::{default_event_filter, RoomExt};
 use mime::Mime;
 use ruma::{
-    api::client::room::report_content,
+    api::client::room::{report_content, report_room},
     assign,
     events::{
         call::notify,
@@ -46,7 +46,7 @@ use crate::{
     room_member::RoomMember,
     ruma::{ImageInfo, LocationContent, Mentions, NotifyType},
     timeline::{
-        configuration::{AllowedMessageTypes, TimelineConfiguration},
+        configuration::{TimelineConfiguration, TimelineFilter},
         ReceiptType, SendHandle, Timeline,
     },
     utils::u64_to_uint,
@@ -214,30 +214,50 @@ impl Room {
     ) -> Result<Arc<Timeline>, ClientError> {
         let mut builder = matrix_sdk_ui::timeline::Timeline::builder(&self.inner);
 
-        builder = builder.with_focus(configuration.focus.try_into()?);
+        builder = builder
+            .with_focus(configuration.focus.try_into()?)
+            .with_date_divider_mode(configuration.date_divider_mode.into());
 
-        if let AllowedMessageTypes::Only { types } = configuration.allowed_message_types {
-            builder = builder.event_filter(move |event, room_version_id| {
-                default_event_filter(event, room_version_id)
-                    && match event {
-                        AnySyncTimelineEvent::MessageLike(msg) => match msg.original_content() {
-                            Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
-                                types.contains(&content.msgtype.into())
+        if configuration.track_read_receipts {
+            builder = builder.track_read_marker_and_receipts();
+        }
+
+        match configuration.filter {
+            TimelineFilter::All => {
+                // #nofilter.
+            }
+
+            TimelineFilter::OnlyMessage { types } => {
+                builder = builder.event_filter(move |event, room_version_id| {
+                    default_event_filter(event, room_version_id)
+                        && match event {
+                            AnySyncTimelineEvent::MessageLike(msg) => {
+                                match msg.original_content() {
+                                    Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
+                                        types.contains(&content.msgtype.into())
+                                    }
+                                    _ => false,
+                                }
                             }
                             _ => false,
-                        },
-                        _ => false,
-                    }
-            });
+                        }
+                });
+            }
+
+            TimelineFilter::EventTypeFilter { filter: event_type_filter } => {
+                builder = builder.event_filter(move |event, room_version_id| {
+                    // Always perform the default filter first
+                    default_event_filter(event, room_version_id) && event_type_filter.filter(event)
+                });
+            }
         }
 
         if let Some(internal_id_prefix) = configuration.internal_id_prefix {
             builder = builder.with_internal_id_prefix(internal_id_prefix);
         }
 
-        builder = builder.with_date_divider_mode(configuration.date_divider_mode.into());
-
         let timeline = builder.build().await?;
+
         Ok(Timeline::new(timeline))
     }
 
@@ -260,13 +280,13 @@ impl Room {
     }
 
     pub async fn member(&self, user_id: String) -> Result<RoomMember, ClientError> {
-        let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+        let user_id = UserId::parse(&*user_id)?;
         let member = self.inner.get_member(&user_id).await?.context("User not found")?;
         Ok(member.try_into().context("Unknown state membership")?)
     }
 
     pub async fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
-        let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+        let user_id = UserId::parse(&*user_id)?;
         let member = self.inner.get_member(&user_id).await?.context("User not found")?;
         let avatar_url_string = member.avatar_url().map(|m| m.to_string());
         Ok(avatar_url_string)
@@ -276,7 +296,7 @@ impl Room {
         &self,
         user_id: String,
     ) -> Result<Option<String>, ClientError> {
-        let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
+        let user_id = UserId::parse(&*user_id)?;
         let member = self.inner.get_member(&user_id).await?.context("User not found")?;
         let avatar_url_string = member.display_name().map(|m| m.to_owned());
         Ok(avatar_url_string)
@@ -394,6 +414,24 @@ impl Room {
                 reason,
             ))
             .await?;
+        Ok(())
+    }
+
+    /// Reports a room as inappropriate to the server.
+    /// The caller is not required to be joined to the room to report it.
+    ///
+    /// # Arguments
+    ///
+    /// * `reason` - The reason the room is being reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not found or on rate limit
+    pub async fn report_room(&self, reason: Option<String>) -> Result<(), ClientError> {
+        let mut request = report_room::v3::Request::new(self.inner.room_id().into());
+        request.reason = reason;
+
+        self.inner.client().send(request).await?;
         Ok(())
     }
 
@@ -1062,6 +1100,16 @@ impl Room {
                 }])
             }
         })))
+    }
+
+    /// Forget this room.
+    ///
+    /// This communicates to the homeserver that it should forget the room.
+    ///
+    /// Only left or banned-from rooms can be forgotten.
+    pub async fn forget(&self) -> Result<(), ClientError> {
+        self.inner.forget().await?;
+        Ok(())
     }
 }
 

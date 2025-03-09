@@ -92,7 +92,7 @@ macro_rules! assert_items_eq {
 }
 
 mod as_vector;
-mod builder;
+pub mod lazy_loader;
 pub mod relational;
 mod updates;
 
@@ -105,7 +105,6 @@ use std::{
 };
 
 pub use as_vector::*;
-pub use builder::*;
 pub use updates::*;
 
 /// Errors of [`LinkedChunk`].
@@ -132,6 +131,18 @@ pub enum Error {
         identifier: ChunkIdentifier,
     },
 
+    /// A chunk is an items chunk, and it was expected to be empty.
+    #[error("The chunk is a non-empty item chunk: `{identifier:?}`")]
+    RemovingNonEmptyItemsChunk {
+        /// The chunk identifier.
+        identifier: ChunkIdentifier,
+    },
+
+    /// We're trying to remove the only chunk in the `LinkedChunk`, and it can't
+    /// be empty.
+    #[error("Trying to remove the only chunk, but a linked chunk can't be empty")]
+    RemovingLastChunk,
+
     /// An item index is invalid.
     #[error("The item index is invalid: `{index}`")]
     InvalidItemIndex {
@@ -155,6 +166,11 @@ impl<const CAP: usize, Item, Gap> Ends<CAP, Item, Gap> {
     /// Get the first chunk, as an immutable reference.
     fn first_chunk(&self) -> &Chunk<CAP, Item, Gap> {
         unsafe { self.first.as_ref() }
+    }
+
+    /// Get the first chunk, as a mutable reference.
+    fn first_chunk_mut(&mut self) -> &mut Chunk<CAP, Item, Gap> {
+        unsafe { self.first.as_mut() }
     }
 
     /// Get the latest chunk, as an immutable reference.
@@ -193,34 +209,36 @@ impl<const CAP: usize, Item, Gap> Ends<CAP, Item, Gap> {
         }
     }
 
-    /// Drop all chunks, and re-create the first one.
-    fn clear(&mut self) {
+    /// Drop all chunks, and replace the first one with the one provided as an
+    /// argument.
+    fn replace_with(&mut self, first_chunk: NonNull<Chunk<CAP, Item, Gap>>) {
         // Loop over all chunks, from the last to the first chunk, and drop them.
-        {
-            // Take the latest chunk.
-            let mut current_chunk_ptr = self.last.or(Some(self.first));
+        // Take the latest chunk.
+        let mut current_chunk_ptr = self.last.or(Some(self.first));
 
-            // As long as we have another chunk…
-            while let Some(chunk_ptr) = current_chunk_ptr {
-                // Fetch the previous chunk pointer.
-                let previous_ptr = unsafe { chunk_ptr.as_ref() }.previous;
+        // As long as we have another chunk…
+        while let Some(chunk_ptr) = current_chunk_ptr {
+            // Fetch the previous chunk pointer.
+            let previous_ptr = unsafe { chunk_ptr.as_ref() }.previous;
 
-                // Re-box the chunk, and let Rust does its job.
-                let _chunk_boxed = unsafe { Box::from_raw(chunk_ptr.as_ptr()) };
+            // Re-box the chunk, and let Rust does its job.
+            let _chunk_boxed = unsafe { Box::from_raw(chunk_ptr.as_ptr()) };
 
-                // Update the `current_chunk_ptr`.
-                current_chunk_ptr = previous_ptr;
-            }
-
-            // At this step, all chunks have been dropped, including
-            // `self.first`.
+            // Update the `current_chunk_ptr`.
+            current_chunk_ptr = previous_ptr;
         }
 
-        // Recreate the first chunk.
-        self.first = Chunk::new_items_leaked(ChunkIdentifierGenerator::FIRST_IDENTIFIER);
-
-        // Reset the last chunk.
+        // At this step, all chunks have been dropped, including `self.first`.
+        self.first = first_chunk;
         self.last = None;
+    }
+
+    /// Drop all chunks, and re-create the default first one.
+    ///
+    /// The default first chunk is an empty items chunk, with the identifier
+    /// [`ChunkIdentifierGenerator::FIRST_IDENTIFIER`].
+    fn clear(&mut self) {
+        self.replace_with(Chunk::new_items_leaked(ChunkIdentifierGenerator::FIRST_IDENTIFIER));
     }
 }
 
@@ -257,7 +275,6 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
     pub fn new() -> Self {
         Self {
             links: Ends {
-                // INVARIANT: The first chunk must always be an Items, not a Gap.
                 first: Chunk::new_items_leaked(ChunkIdentifierGenerator::FIRST_IDENTIFIER),
                 last: None,
             },
@@ -283,11 +300,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         });
 
         Self {
-            links: Ends {
-                // INVARIANT: The first chunk must always be an Items, not a Gap.
-                first: Chunk::new_items_leaked(first_chunk_identifier),
-                last: None,
-            },
+            links: Ends { first: Chunk::new_items_leaked(first_chunk_identifier), last: None },
             chunk_identifier_generator: ChunkIdentifierGenerator::new_from_scratch(),
             updates: Some(updates),
             marker: PhantomData,
@@ -304,7 +317,9 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
         // “Clear” `self.updates`.
         if let Some(updates) = self.updates.as_mut() {
-            // TODO: Optimisation: Do we want to clear all pending `Update`s in `updates`?
+            // Clear the previous updates, as we're about to insert a clear they would be
+            // useless.
+            updates.clear_pending();
             updates.push(Update::Clear);
             updates.push(Update::NewItemsChunk {
                 previous: None,
@@ -336,11 +351,12 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
         debug_assert!(last_chunk.is_last_chunk(), "`last_chunk` must be… the last chunk");
 
-        // We need to update `self.last` if and only if `last_chunk` _is not_ the first
-        // chunk, and _is_ the last chunk (ensured by the `debug_assert!` above).
+        // We need to update `self.links.last` if and only if `last_chunk` _is not_ the
+        // first chunk, and _is_ the last chunk (ensured by the `debug_assert!`
+        // above).
         if last_chunk.is_first_chunk().not() {
-            // Maybe `last_chunk` is the same as the previous `self.last` chunk, but it's
-            // OK.
+            // Maybe `last_chunk` is the same as the previous `self.links.last` chunk, but
+            // it's OK.
             self.links.last = Some(last_chunk.as_ptr());
         }
     }
@@ -437,10 +453,10 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
             }
         };
 
-        // We need to update `self.last` if and only if `chunk` _is not_ the first
+        // We need to update `self.links.last` if and only if `chunk` _is not_ the first
         // chunk, and _is_ the last chunk.
         if chunk.is_first_chunk().not() && chunk.is_last_chunk() {
-            // Maybe `chunk` is the same as the previous `self.last` chunk, but it's
+            // Maybe `chunk` is the same as the previous `self.links.last` chunk, but it's
             // OK.
             self.links.last = Some(chunk.as_ptr());
         }
@@ -454,14 +470,8 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
     /// `Err`.
     ///
     /// The chunk containing the item represented by `position` may be empty
-    /// once the item has been removed. In this case, the chunk can be removed
-    /// if `empty_chunk` contains [`EmptyChunk::Remove`], otherwise the chunk is
-    /// kept if `empty_chunk` contains [`EmptyChunk::Keep`].
-    pub fn remove_item_at(
-        &mut self,
-        position: Position,
-        empty_chunk: EmptyChunk,
-    ) -> Result<Item, Error> {
+    /// once the item has been removed. In this case, the chunk will be removed.
+    pub fn remove_item_at(&mut self, position: Position) -> Result<Item, Error> {
         let chunk_identifier = position.chunk_identifier();
         let item_index = position.index();
 
@@ -499,14 +509,14 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
             // If removing empty chunk is desired, and if the `chunk` can be unlinked, and
             // if the `chunk` is not the first one, we can remove it.
-            if empty_chunk.remove() && can_unlink_chunk && chunk.is_first_chunk().not() {
+            if can_unlink_chunk && chunk.is_first_chunk().not() {
                 // Unlink `chunk`.
-                chunk.unlink(&mut self.updates);
+                chunk.unlink(self.updates.as_mut());
 
                 chunk_ptr = Some(chunk.as_ptr());
 
-                // We need to update `self.last` if and only if `chunk` _is_ the last chunk. The
-                // new last chunk is the chunk before `chunk`.
+                // We need to update `self.links.last` if and only if `chunk` _is_ the last
+                // chunk. The new last chunk is the chunk before `chunk`.
                 if chunk.is_last_chunk() {
                     self.links.last = chunk.previous;
                 }
@@ -586,36 +596,43 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
             .chunk_mut(chunk_identifier)
             .ok_or(Error::InvalidChunkIdentifier { identifier: chunk_identifier })?;
 
-        // If `item_index` is 0, we don't want to split the current items chunk to
-        // insert a new gap chunk, otherwise it would create an empty current items
-        // chunk. Let's handle this case in particular.
-        //
-        // Of course this optimisation applies if there is a previous chunk. Remember
-        // the invariant: a `Gap` cannot be the first chunk.
-        if item_index == 0 && chunk.is_items() && chunk.previous.is_some() {
-            let previous_chunk = chunk
-                .previous_mut()
-                // SAFETY: The `previous` chunk exists because we have tested
-                // `chunk.previous.is_some()` in the `if` statement.
-                .expect("Previous chunk must be present");
-
-            previous_chunk.insert_next(
-                Chunk::new_gap_leaked(self.chunk_identifier_generator.next(), content),
-                &mut self.updates,
-            );
-
-            // We don't need to update `self.last` because we have inserted a new chunk
-            // before `chunk`.
-
-            return Ok(());
-        }
-
         let chunk = match &mut chunk.content {
             ChunkContent::Gap(..) => {
                 return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
             }
 
             ChunkContent::Items(current_items) => {
+                // If `item_index` is 0, we don't want to split the current items chunk to
+                // insert a new gap chunk, otherwise it would create an empty current items
+                // chunk. Let's handle this case in particular.
+                if item_index == 0 {
+                    let chunk_was_first = chunk.is_first_chunk();
+                    let chunk_was_last = chunk.is_last_chunk();
+
+                    let new_chunk = chunk.insert_before(
+                        Chunk::new_gap_leaked(self.chunk_identifier_generator.next(), content),
+                        self.updates.as_mut(),
+                    );
+
+                    let new_chunk_ptr = new_chunk.as_ptr();
+                    let chunk_ptr = chunk.as_ptr();
+
+                    // `chunk` was the first: let's update `self.links.first`.
+                    //
+                    // If `chunk` was not the first but was the last, there is nothing to do,
+                    // `self.links.last` is already up-to-date.
+                    if chunk_was_first {
+                        self.links.first = new_chunk_ptr;
+
+                        // `chunk` was the first __and__ the last: let's set `self.links.last`.
+                        if chunk_was_last {
+                            self.links.last = Some(chunk_ptr);
+                        }
+                    }
+
+                    return Ok(());
+                }
+
                 let current_items_length = current_items.len();
 
                 if item_index >= current_items_length {
@@ -663,10 +680,10 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
             }
         };
 
-        // We need to update `self.last` if and only if `chunk` _is not_ the first
+        // We need to update `self.links.last` if and only if `chunk` _is not_ the first
         // chunk, and _is_ the last chunk.
         if chunk.is_first_chunk().not() && chunk.is_last_chunk() {
-            // Maybe `chunk` is the same as the previous `self.last` chunk, but it's
+            // Maybe `chunk` is the same as the previous `self.links.last` chunk, but it's
             // OK.
             self.links.last = Some(chunk.as_ptr());
         }
@@ -674,34 +691,52 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         Ok(())
     }
 
-    /// Remove a gap with the given identifier.
+    /// Remove a chunk with the given identifier iff it's empty.
+    ///
+    /// A chunk is considered empty if:
+    /// - it's a gap chunk, or
+    /// - it's an items chunk with no items.
     ///
     /// This returns the next insert position, viz. the start of the next
     /// chunk, if any, or none if there was no next chunk.
-    pub fn remove_gap_at(
+    pub fn remove_empty_chunk_at(
         &mut self,
         chunk_identifier: ChunkIdentifier,
     ) -> Result<Option<Position>, Error> {
+        // Check that we're not removing the last chunk.
+        if self.links.first_chunk().is_last_chunk() {
+            return Err(Error::RemovingLastChunk);
+        }
+
         let chunk = self
             .links
             .chunk_mut(chunk_identifier)
             .ok_or(Error::InvalidChunkIdentifier { identifier: chunk_identifier })?;
 
-        if chunk.is_items() {
-            return Err(Error::ChunkIsItems { identifier: chunk_identifier });
-        };
+        if chunk.num_items() > 0 {
+            return Err(Error::RemovingNonEmptyItemsChunk { identifier: chunk_identifier });
+        }
 
-        let next = chunk.next;
+        let chunk_was_first = chunk.is_first_chunk();
+        let chunk_was_last = chunk.is_last_chunk();
+        let next_ptr = chunk.next;
+        let previous_ptr = chunk.previous;
+        let position_of_next = chunk.next().map(|next| next.first_position());
 
-        chunk.unlink(&mut self.updates);
+        chunk.unlink(self.updates.as_mut());
 
         let chunk_ptr = chunk.as_ptr();
 
-        // If this ever changes, we may need to update self.links.first too.
-        debug_assert!(chunk.is_first_chunk().not(), "A gap cannot be the first chunk");
+        // If the chunk is the first one, we need to update `self.links.first`…
+        if chunk_was_first {
+            // … if and only if there is a next chunk.
+            if let Some(next_ptr) = next_ptr {
+                self.links.first = next_ptr;
+            }
+        }
 
-        if chunk.is_last_chunk() {
-            self.links.last = chunk.previous;
+        if chunk_was_last {
+            self.links.last = previous_ptr;
         }
 
         // SAFETY: `chunk` is unlinked and not borrowed anymore. `LinkedChunk` doesn't
@@ -709,10 +744,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         let _chunk_boxed = unsafe { Box::from_raw(chunk_ptr.as_ptr()) };
 
         // Return the first position of the next chunk, if any.
-        Ok(next.map(|next| {
-            let chunk = unsafe { next.as_ref() };
-            chunk.first_position()
-        }))
+        Ok(position_of_next)
     }
 
     /// Replace the gap identified by `chunk_identifier`, by items.
@@ -746,7 +778,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
                 return Err(Error::ChunkIsItems { identifier: chunk_identifier });
             };
 
-            debug_assert!(chunk.is_first_chunk().not(), "A gap cannot be the first chunk");
+            let chunk_was_first = chunk.is_first_chunk();
 
             let maybe_last_chunk_ptr = {
                 let items = items.into_iter();
@@ -769,12 +801,18 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
                 .unwrap();
 
             // Now that new items have been pushed, we can unlink the gap chunk.
-            chunk.unlink(&mut self.updates);
+            chunk.unlink(self.updates.as_mut());
 
             // Get the pointer to `chunk`.
             chunk_ptr = chunk.as_ptr();
 
-            // Update `self.last` if the gap chunk was the last chunk.
+            // Update `self.links.first` if the gap chunk was the first chunk.
+            if chunk_was_first {
+                self.links.first = new_chunk_ptr;
+            }
+
+            // Update `self.links.last` if the gap (so the new) chunk was (is) the last
+            // chunk.
             if let Some(last_chunk_ptr) = maybe_last_chunk_ptr {
                 self.links.last = Some(last_chunk_ptr);
             }
@@ -994,7 +1032,8 @@ unsafe impl<const CAP: usize, Item: Sync, Gap: Sync> Sync for LinkedChunk<CAP, I
 /// (see [`ChunkIdentifier`]). Generating a new unique identifier boils down to
 /// incrementing by one the previous identifier. Note that this is not an index:
 /// it _is_ an identifier.
-struct ChunkIdentifierGenerator {
+#[derive(Debug)]
+pub struct ChunkIdentifierGenerator {
     next: AtomicU64,
 }
 
@@ -1018,7 +1057,7 @@ impl ChunkIdentifierGenerator {
     ///
     /// Note that it can fail if there is no more unique identifier available.
     /// In this case, this method will panic.
-    pub fn next(&self) -> ChunkIdentifier {
+    fn next(&self) -> ChunkIdentifier {
         let previous = self.next.fetch_add(1, Ordering::Relaxed);
 
         // Check for overflows.
@@ -1028,6 +1067,14 @@ impl ChunkIdentifierGenerator {
         }
 
         ChunkIdentifier(previous + 1)
+    }
+
+    /// Get the current chunk identifier.
+    //
+    // This is hidden because it's used only in the tests.
+    #[doc(hidden)]
+    pub fn current(&self) -> ChunkIdentifier {
+        ChunkIdentifier(self.next.load(Ordering::Relaxed))
     }
 }
 
@@ -1160,6 +1207,12 @@ pub struct Chunk<const CAPACITY: usize, Item, Gap> {
     /// The previous chunk.
     previous: Option<NonNull<Chunk<CAPACITY, Item, Gap>>>,
 
+    /// If this chunk is the first one, and if the `LinkedChunk` is loaded
+    /// lazily, chunk-by-chunk, this is the identifier of the previous chunk.
+    /// This previous chunk is not loaded yet, so it's impossible to get a
+    /// pointer to it yet. However we know its identifier.
+    lazy_previous: Option<ChunkIdentifier>,
+
     /// The next chunk.
     next: Option<NonNull<Chunk<CAPACITY, Item, Gap>>>,
 
@@ -1182,7 +1235,7 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
     }
 
     fn new(identifier: ChunkIdentifier, content: ChunkContent<Item, Gap>) -> Self {
-        Self { previous: None, next: None, identifier, content }
+        Self { previous: None, lazy_previous: None, next: None, identifier, content }
     }
 
     /// Create a new chunk given some content, but box it and leak it.
@@ -1224,6 +1277,12 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
         !self.is_gap()
     }
 
+    /// Is this the definitive first chunk, even in the presence of
+    /// lazy-loading?
+    pub fn is_definitive_head(&self) -> bool {
+        self.previous.is_none() && self.lazy_previous.is_none()
+    }
+
     /// Check whether this current chunk is the first chunk.
     fn is_first_chunk(&self) -> bool {
         self.previous.is_none()
@@ -1232,6 +1291,14 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
     /// Check whether this current chunk is the last chunk.
     fn is_last_chunk(&self) -> bool {
         self.next.is_none()
+    }
+
+    /// Return the link to the previous chunk, if it was loaded lazily.
+    ///
+    /// Doc hidden because this is mostly for internal debugging purposes.
+    #[doc(hidden)]
+    pub fn lazy_previous(&self) -> Option<ChunkIdentifier> {
+        self.lazy_previous
     }
 
     /// Get the unique identifier of the chunk.
@@ -1263,10 +1330,10 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
         }
     }
 
-    /// The length of the chunk, i.e. how many items are in it.
+    /// The number of items in the linked chunk.
     ///
     /// It will always return 0 if it's a gap chunk.
-    fn len(&self) -> usize {
+    pub fn num_items(&self) -> usize {
         match &self.content {
             ChunkContent::Gap(..) => 0,
             ChunkContent::Items(items) => items.len(),
@@ -1295,15 +1362,13 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
         Item: Clone,
         Gap: Clone,
     {
-        let number_of_new_items = new_items.len();
-        let chunk_length = self.len();
-
         // A small optimisation. Skip early if there is no new items.
-        if number_of_new_items == 0 {
+        if new_items.len() == 0 {
             return self;
         }
 
         let identifier = self.identifier();
+        let prev_num_items = self.num_items();
 
         match &mut self.content {
             // Cannot push items on a `Gap`. Let's insert a new `Items` chunk to push the
@@ -1319,10 +1384,10 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
 
             ChunkContent::Items(items) => {
                 // Calculate the free space of the current chunk.
-                let free_space = CAPACITY.saturating_sub(chunk_length);
+                let free_space = CAPACITY.saturating_sub(prev_num_items);
 
                 // There is enough space to push all the new items.
-                if number_of_new_items <= free_space {
+                if new_items.len() <= free_space {
                     let start = items.len();
                     items.extend(new_items);
 
@@ -1410,13 +1475,69 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
         new_chunk
     }
 
+    /// Insert a new chunk before the current one.
+    ///
+    /// The respective [`Self::previous`] and [`Self::next`] of the current
+    /// and new chunk will be updated accordingly.
+    fn insert_before(
+        &mut self,
+        mut new_chunk_ptr: NonNull<Self>,
+        updates: Option<&mut ObservableUpdates<Item, Gap>>,
+    ) -> &mut Self
+    where
+        Gap: Clone,
+    {
+        let new_chunk = unsafe { new_chunk_ptr.as_mut() };
+
+        // Update the previous chunk if any.
+        if let Some(previous_chunk) = self.previous_mut() {
+            // Link back to the new chunk.
+            previous_chunk.next = Some(new_chunk_ptr);
+
+            // Link the new chunk to the next chunk.
+            new_chunk.previous = self.previous;
+        }
+        // No previous: `self` is the first! We need to move the `lazy_previous` from `self` to
+        // `new_chunk`.
+        else {
+            new_chunk.lazy_previous = self.lazy_previous.take();
+        }
+
+        // Link to the new chunk.
+        self.previous = Some(new_chunk_ptr);
+        // Link the new chunk to this one.
+        new_chunk.next = Some(self.as_ptr());
+
+        if let Some(updates) = updates {
+            let previous = new_chunk.previous().map(Chunk::identifier).or(new_chunk.lazy_previous);
+            let new = new_chunk.identifier();
+            let next = new_chunk.next().map(Chunk::identifier);
+
+            match new_chunk.content() {
+                ChunkContent::Gap(gap) => {
+                    updates.push(Update::NewGapChunk { previous, new, next, gap: gap.clone() })
+                }
+
+                ChunkContent::Items(..) => {
+                    updates.push(Update::NewItemsChunk { previous, new, next })
+                }
+            }
+        }
+
+        new_chunk
+    }
+
     /// Unlink this chunk.
     ///
     /// Be careful: `self` won't belong to `LinkedChunk` anymore, and should be
     /// dropped appropriately.
-    fn unlink(&mut self, updates: &mut Option<ObservableUpdates<Item, Gap>>) {
+    fn unlink(&mut self, updates: Option<&mut ObservableUpdates<Item, Gap>>) {
         let previous_ptr = self.previous;
         let next_ptr = self.next;
+        // If `self` is not the first, `lazy_previous` might be set on its previous
+        // chunk. Otherwise, if `lazy_previous` is set on `self`, it means it's the
+        // first chunk and it must be moved onto the next chunk.
+        let lazy_previous = self.lazy_previous.take();
 
         if let Some(previous) = self.previous_mut() {
             previous.next = next_ptr;
@@ -1424,9 +1545,10 @@ impl<const CAPACITY: usize, Item, Gap> Chunk<CAPACITY, Item, Gap> {
 
         if let Some(next) = self.next_mut() {
             next.previous = previous_ptr;
+            next.lazy_previous = lazy_previous;
         }
 
-        if let Some(updates) = updates.as_mut() {
+        if let Some(updates) = updates {
             updates.push(Update::RemoveChunk(self.identifier()));
         }
     }
@@ -1484,22 +1606,6 @@ where
     }
 }
 
-/// A type representing what to do when the system has to handle an empty chunk.
-#[derive(Debug)]
-pub enum EmptyChunk {
-    /// Keep the empty chunk.
-    Keep,
-
-    /// Remove the empty chunk.
-    Remove,
-}
-
-impl EmptyChunk {
-    fn remove(&self) -> bool {
-        matches!(self, Self::Remove)
-    }
-}
-
 /// The raw representation of a linked chunk, as persisted in storage.
 ///
 /// It may rebuilt into [`Chunk`] and shares the same internal representation,
@@ -1530,8 +1636,8 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::{
-        Chunk, ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, EmptyChunk, Error,
-        LinkedChunk, Position,
+        Chunk, ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, Error, LinkedChunk,
+        Position,
     };
 
     #[test]
@@ -2166,6 +2272,290 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_items_at_last_chunk() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.push_items_back(['a', 'b', 'c', 'd', 'e', 'f']);
+        assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d', 'e', 'f']);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b', 'c'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(1),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(1), 0), items: vec!['d', 'e', 'f'] },
+            ]
+        );
+
+        // Insert inside the last chunk.
+        let position_of_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
+
+        // Insert 4 elements, so that it overflows the chunk capacity. It's important to
+        // see whether chunks are correctly updated and linked.
+        linked_chunk.insert_items_at(['w', 'x', 'y', 'z'], position_of_e)?;
+
+        assert_items_eq!(
+            linked_chunk,
+            ['a', 'b', 'c'] ['d', 'w', 'x'] ['y', 'z', 'e'] ['f']
+        );
+        assert_eq!(linked_chunk.num_items(), 10);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                DetachLastItems { at: Position(ChunkIdentifier(1), 1) },
+                PushItems { at: Position(ChunkIdentifier(1), 1), items: vec!['w', 'x'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(1)),
+                    new: ChunkIdentifier(2),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['y', 'z'] },
+                StartReattachItems,
+                PushItems { at: Position(ChunkIdentifier(2), 2), items: vec!['e'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(2)),
+                    new: ChunkIdentifier(3),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['f'] },
+                EndReattachItems,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_items_at_first_chunk() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.push_items_back(['a', 'b', 'c', 'd', 'e', 'f']);
+        assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d', 'e', 'f']);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b', 'c'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(1),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(1), 0), items: vec!['d', 'e', 'f'] },
+            ]
+        );
+
+        // Insert inside the first chunk.
+        let position_of_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
+        linked_chunk.insert_items_at(['l', 'm', 'n', 'o'], position_of_a)?;
+
+        assert_items_eq!(
+            linked_chunk,
+            ['l', 'm', 'n'] ['o', 'a', 'b'] ['c'] ['d', 'e', 'f']
+        );
+        assert_eq!(linked_chunk.num_items(), 10);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                DetachLastItems { at: Position(ChunkIdentifier(0), 0) },
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['l', 'm', 'n'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(2),
+                    next: Some(ChunkIdentifier(1)),
+                },
+                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['o'] },
+                StartReattachItems,
+                PushItems { at: Position(ChunkIdentifier(2), 1), items: vec!['a', 'b'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(2)),
+                    new: ChunkIdentifier(3),
+                    next: Some(ChunkIdentifier(1)),
+                },
+                PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['c'] },
+                EndReattachItems,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_items_at_middle_chunk() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.push_items_back(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']);
+        assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d', 'e', 'f'] ['g', 'h']);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b', 'c'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(1),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(1), 0), items: vec!['d', 'e', 'f'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(1)),
+                    new: ChunkIdentifier(2),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['g', 'h'] },
+            ]
+        );
+
+        let position_of_d = linked_chunk.item_position(|item| *item == 'd').unwrap();
+        linked_chunk.insert_items_at(['r', 's'], position_of_d)?;
+
+        assert_items_eq!(
+            linked_chunk,
+            ['a', 'b', 'c'] ['r', 's', 'd'] ['e', 'f'] ['g', 'h']
+        );
+        assert_eq!(linked_chunk.num_items(), 10);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                DetachLastItems { at: Position(ChunkIdentifier(1), 0) },
+                PushItems { at: Position(ChunkIdentifier(1), 0), items: vec!['r', 's'] },
+                StartReattachItems,
+                PushItems { at: Position(ChunkIdentifier(1), 2), items: vec!['d'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(1)),
+                    new: ChunkIdentifier(3),
+                    next: Some(ChunkIdentifier(2)),
+                },
+                PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['e', 'f'] },
+                EndReattachItems,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_items_at_end_of_chunk() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.push_items_back(['a', 'b', 'c', 'd', 'e']);
+        assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d', 'e']);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b', 'c'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(1),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(1), 0), items: vec!['d', 'e'] },
+            ]
+        );
+
+        // Insert at the end of a chunk.
+        let position_of_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
+        let position_after_e =
+            Position(position_of_e.chunk_identifier(), position_of_e.index() + 1);
+
+        linked_chunk.insert_items_at(['p', 'q'], position_after_e)?;
+        assert_items_eq!(
+            linked_chunk,
+            ['a', 'b', 'c'] ['d', 'e', 'p'] ['q']
+        );
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                PushItems { at: Position(ChunkIdentifier(1), 2), items: vec!['p'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(1)),
+                    new: ChunkIdentifier(2),
+                    next: None
+                },
+                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['q'] }
+            ]
+        );
+        assert_eq!(linked_chunk.num_items(), 7);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_items_at_errs() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.push_items_back(['a', 'b', 'c']);
+        linked_chunk.push_gap_back(());
+        assert_items_eq!(linked_chunk, ['a', 'b', 'c'] [-]);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b', 'c'] },
+                NewGapChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(1),
+                    next: None,
+                    gap: (),
+                },
+            ]
+        );
+
+        // Insert in a chunk that does not exist.
+        {
+            assert_matches!(
+                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(128), 0)),
+                Err(Error::InvalidChunkIdentifier { identifier: ChunkIdentifier(128) })
+            );
+            assert!(linked_chunk.updates().unwrap().take().is_empty());
+        }
+
+        // Insert in a chunk that exists, but at an item that does not exist.
+        {
+            assert_matches!(
+                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(0), 128)),
+                Err(Error::InvalidItemIndex { index: 128 })
+            );
+            assert!(linked_chunk.updates().unwrap().take().is_empty());
+        }
+
+        // Insert in a gap.
+        {
+            assert_matches!(
+                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(1), 0)),
+                Err(Error::ChunkIsAGap { identifier: ChunkIdentifier(1) })
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_remove_item_at() -> Result<(), Error> {
         use super::Update::*;
 
@@ -2185,21 +2575,21 @@ mod tests {
         // that. The chunk is removed.
         {
             let position_of_f = linked_chunk.item_position(|item| *item == 'f').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_f, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_f)?;
 
             assert_eq!(removed_item, 'f');
             assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d', 'e'] ['g', 'h', 'i'] ['j', 'k']);
             assert_eq!(linked_chunk.num_items(), 10);
 
             let position_of_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_e, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_e)?;
 
             assert_eq!(removed_item, 'e');
             assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d'] ['g', 'h', 'i'] ['j', 'k']);
             assert_eq!(linked_chunk.num_items(), 9);
 
             let position_of_d = linked_chunk.item_position(|item| *item == 'd').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_d, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_d)?;
 
             assert_eq!(removed_item, 'd');
             assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['g', 'h', 'i'] ['j', 'k']);
@@ -2220,19 +2610,19 @@ mod tests {
         // that. The chunk is NOT removed because it's the first chunk.
         {
             let first_position = linked_chunk.item_position(|item| *item == 'a').unwrap();
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'a');
             assert_items_eq!(linked_chunk, ['b', 'c'] ['g', 'h', 'i'] ['j', 'k']);
             assert_eq!(linked_chunk.num_items(), 7);
 
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'b');
             assert_items_eq!(linked_chunk, ['c'] ['g', 'h', 'i'] ['j', 'k']);
             assert_eq!(linked_chunk.num_items(), 6);
 
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'c');
             assert_items_eq!(linked_chunk, [] ['g', 'h', 'i'] ['j', 'k']);
@@ -2252,19 +2642,19 @@ mod tests {
         // that. The chunk is removed.
         {
             let first_position = linked_chunk.item_position(|item| *item == 'g').unwrap();
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'g');
             assert_items_eq!(linked_chunk, [] ['h', 'i'] ['j', 'k']);
             assert_eq!(linked_chunk.num_items(), 4);
 
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'h');
             assert_items_eq!(linked_chunk, [] ['i'] ['j', 'k']);
             assert_eq!(linked_chunk.num_items(), 3);
 
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'i');
             assert_items_eq!(linked_chunk, [] ['j', 'k']);
@@ -2285,7 +2675,7 @@ mod tests {
         // The chunk is removed.
         {
             let position_of_k = linked_chunk.item_position(|item| *item == 'k').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_k, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_k)?;
 
             assert_eq!(removed_item, 'k');
             #[rustfmt::skip]
@@ -2293,7 +2683,7 @@ mod tests {
             assert_eq!(linked_chunk.num_items(), 1);
 
             let position_of_j = linked_chunk.item_position(|item| *item == 'j').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_j, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_j)?;
 
             assert_eq!(removed_item, 'j');
             assert_items_eq!(linked_chunk, []);
@@ -2327,27 +2717,27 @@ mod tests {
             let _ = linked_chunk.updates().unwrap().take();
 
             let position_of_c = linked_chunk.item_position(|item| *item == 'c').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_c, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_c)?;
 
             assert_eq!(removed_item, 'c');
             assert_items_eq!(linked_chunk, ['a', 'b'] [-] ['d']);
             assert_eq!(linked_chunk.num_items(), 3);
 
             let position_of_d = linked_chunk.item_position(|item| *item == 'd').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position_of_d, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(position_of_d)?;
 
             assert_eq!(removed_item, 'd');
             assert_items_eq!(linked_chunk, ['a', 'b'] [-]);
             assert_eq!(linked_chunk.num_items(), 2);
 
             let first_position = linked_chunk.item_position(|item| *item == 'a').unwrap();
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'a');
             assert_items_eq!(linked_chunk, ['b'] [-]);
             assert_eq!(linked_chunk.num_items(), 1);
 
-            let removed_item = linked_chunk.remove_item_at(first_position, EmptyChunk::Remove)?;
+            let removed_item = linked_chunk.remove_item_at(first_position)?;
 
             assert_eq!(removed_item, 'b');
             assert_items_eq!(linked_chunk, [] [-]);
@@ -2360,114 +2750,6 @@ mod tests {
                     RemoveChunk(ChunkIdentifier(6)),
                     RemoveItem { at: Position(ChunkIdentifier(4), 0) },
                     RemoveChunk(ChunkIdentifier(4)),
-                    RemoveItem { at: Position(ChunkIdentifier(0), 0) },
-                    RemoveItem { at: Position(ChunkIdentifier(0), 0) },
-                ]
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_remove_item_at_and_keep_empty_chunks() -> Result<(), Error> {
-        use super::Update::*;
-
-        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
-
-        // Ignore initial update.
-        let _ = linked_chunk.updates().unwrap().take();
-
-        linked_chunk.push_items_back(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']);
-        assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['d', 'e', 'f'] ['g', 'h']);
-        assert_eq!(linked_chunk.num_items(), 8);
-
-        // Ignore previous updates.
-        let _ = linked_chunk.updates().unwrap().take();
-
-        // Remove all items from the same chunk. The chunk is empty after that. The
-        // chunk is NOT removed because we asked to keep it.
-        {
-            let position = linked_chunk.item_position(|item| *item == 'd').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'd');
-            assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['e', 'f'] ['g', 'h']);
-            assert_eq!(linked_chunk.num_items(), 7);
-
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'e');
-            assert_items_eq!(linked_chunk, ['a', 'b', 'c'] ['f'] ['g', 'h']);
-            assert_eq!(linked_chunk.num_items(), 6);
-
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'f');
-            assert_items_eq!(linked_chunk, ['a', 'b', 'c'] [] ['g', 'h']);
-            assert_eq!(linked_chunk.num_items(), 5);
-
-            assert_eq!(
-                linked_chunk.updates().unwrap().take(),
-                &[
-                    RemoveItem { at: Position(ChunkIdentifier(1), 0) },
-                    RemoveItem { at: Position(ChunkIdentifier(1), 0) },
-                    RemoveItem { at: Position(ChunkIdentifier(1), 0) },
-                ]
-            );
-        }
-
-        // Remove all items from the same chunk. The chunk is empty after that. The
-        // chunk is NOT removed because we asked to keep it.
-        {
-            let position = linked_chunk.item_position(|item| *item == 'g').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'g');
-            assert_items_eq!(linked_chunk, ['a', 'b', 'c'] [] ['h']);
-            assert_eq!(linked_chunk.num_items(), 4);
-
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'h');
-            assert_items_eq!(linked_chunk, ['a', 'b', 'c'] [] []);
-            assert_eq!(linked_chunk.num_items(), 3);
-
-            assert_eq!(
-                linked_chunk.updates().unwrap().take(),
-                &[
-                    RemoveItem { at: Position(ChunkIdentifier(2), 0) },
-                    RemoveItem { at: Position(ChunkIdentifier(2), 0) },
-                ]
-            );
-        }
-
-        // Remove all items from the same chunk. The chunk is empty after that. The
-        // chunk is NOT removed because we asked to keep it.
-        {
-            let position = linked_chunk.item_position(|item| *item == 'a').unwrap();
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'a');
-            assert_items_eq!(linked_chunk, ['b', 'c'] [] []);
-            assert_eq!(linked_chunk.num_items(), 2);
-
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'b');
-            assert_items_eq!(linked_chunk, ['c'] [] []);
-            assert_eq!(linked_chunk.num_items(), 1);
-
-            let removed_item = linked_chunk.remove_item_at(position, EmptyChunk::Keep)?;
-
-            assert_eq!(removed_item, 'c');
-            assert_items_eq!(linked_chunk, [] [] []);
-            assert_eq!(linked_chunk.num_items(), 0);
-
-            assert_eq!(
-                linked_chunk.updates().unwrap().take(),
-                &[
-                    RemoveItem { at: Position(ChunkIdentifier(0), 0) },
                     RemoveItem { at: Position(ChunkIdentifier(0), 0) },
                     RemoveItem { at: Position(ChunkIdentifier(0), 0) },
                 ]
@@ -2529,36 +2811,28 @@ mod tests {
             );
         }
 
-        // Insert at the beginning of a chunk + it's the first chunk.
+        // Insert at the beginning of a chunk. The targeted chunk is the first chunk.
+        // `Ends::first` and `Ends::last` may be updated differently.
         {
             let position_of_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
             linked_chunk.insert_gap_at((), position_of_a)?;
 
-            // A new empty chunk is created as the first chunk.
-            assert_items_eq!(linked_chunk, [] [-] ['a'] [-] ['b', 'c'] ['d', 'e', 'f']);
+            // A new empty chunk is NOT created, i.e. `['a']` is not split into `[]` +
+            // `['a']` because it's a waste of space.
+            assert_items_eq!(linked_chunk, [-] ['a'] [-] ['b', 'c'] ['d', 'e', 'f']);
             assert_eq!(
                 linked_chunk.updates().unwrap().take(),
-                &[
-                    DetachLastItems { at: Position(ChunkIdentifier(0), 0) },
-                    NewGapChunk {
-                        previous: Some(ChunkIdentifier(0)),
-                        new: ChunkIdentifier(4),
-                        next: Some(ChunkIdentifier(2)),
-                        gap: (),
-                    },
-                    StartReattachItems,
-                    NewItemsChunk {
-                        previous: Some(ChunkIdentifier(4)),
-                        new: ChunkIdentifier(5),
-                        next: Some(ChunkIdentifier(2)),
-                    },
-                    PushItems { at: Position(ChunkIdentifier(5), 0), items: vec!['a'] },
-                    EndReattachItems,
-                ]
+                &[NewGapChunk {
+                    previous: None,
+                    new: ChunkIdentifier(4),
+                    next: Some(ChunkIdentifier(0)),
+                    gap: (),
+                },]
             );
         }
 
-        // Insert at the beginning of a chunk.
+        // Insert at the beginning of a chunk. The targeted chunk is not the first
+        // chunk. `Ends::first` and `Ends::last` may be updated differently.
         {
             let position_of_d = linked_chunk.item_position(|item| *item == 'd').unwrap();
             linked_chunk.insert_gap_at((), position_of_d)?;
@@ -2566,26 +2840,16 @@ mod tests {
             // A new empty chunk is NOT created, i.e. `['d', 'e', 'f']` is not
             // split into `[]` + `['d', 'e', 'f']` because it's a waste of
             // space.
-            assert_items_eq!(linked_chunk, [] [-] ['a'] [-] ['b', 'c'] [-] ['d', 'e', 'f']);
+            assert_items_eq!(linked_chunk, [-] ['a'] [-] ['b', 'c'] [-] ['d', 'e', 'f']);
             assert_eq!(
                 linked_chunk.updates().unwrap().take(),
                 &[NewGapChunk {
                     previous: Some(ChunkIdentifier(3)),
-                    new: ChunkIdentifier(6),
+                    new: ChunkIdentifier(5),
                     next: Some(ChunkIdentifier(1)),
                     gap: (),
                 }]
             );
-        }
-
-        // Insert in an empty chunk + it's the first chunk.
-        {
-            let position_of_first_empty_chunk = Position(ChunkIdentifier(0), 0);
-            assert_matches!(
-                linked_chunk.insert_gap_at((), position_of_first_empty_chunk),
-                Err(Error::InvalidItemIndex { index: 0 })
-            );
-            assert!(linked_chunk.updates().unwrap().take().is_empty());
         }
 
         // Insert in an empty chunk.
@@ -2594,28 +2858,29 @@ mod tests {
             let gap_identifier = linked_chunk.chunk_identifier(Chunk::is_gap).unwrap();
             let position = linked_chunk.replace_gap_at([], gap_identifier)?.first_position();
 
-            assert_items_eq!(linked_chunk, [] [-] ['a'] [-] ['b', 'c'] [] ['d', 'e', 'f']);
+            assert_items_eq!(linked_chunk, [-] ['a'] [-] ['b', 'c'] [] ['d', 'e', 'f']);
+
             assert_eq!(
                 linked_chunk.updates().unwrap().take(),
                 &[
                     NewItemsChunk {
-                        previous: Some(ChunkIdentifier(6)),
-                        new: ChunkIdentifier(7),
+                        previous: Some(ChunkIdentifier(5)),
+                        new: ChunkIdentifier(6),
                         next: Some(ChunkIdentifier(1)),
                     },
-                    RemoveChunk(ChunkIdentifier(6)),
+                    RemoveChunk(ChunkIdentifier(5)),
                 ]
             );
 
             linked_chunk.insert_gap_at((), position)?;
 
-            assert_items_eq!(linked_chunk, [] [-] ['a'] [-] ['b', 'c'] [-] [] ['d', 'e', 'f']);
+            assert_items_eq!(linked_chunk, [-] ['a'] [-] ['b', 'c'] [-] [] ['d', 'e', 'f']);
             assert_eq!(
                 linked_chunk.updates().unwrap().take(),
                 &[NewGapChunk {
                     previous: Some(ChunkIdentifier(3)),
-                    new: ChunkIdentifier(8),
-                    next: Some(ChunkIdentifier(7)),
+                    new: ChunkIdentifier(7),
+                    next: Some(ChunkIdentifier(6)),
                     gap: (),
                 }]
             );
@@ -2643,10 +2908,10 @@ mod tests {
         {
             // It is impossible to get the item position inside a gap. It's only possible if
             // the item position is crafted by hand or is outdated.
-            let position_of_a_gap = Position(ChunkIdentifier(4), 0);
+            let position_of_a_gap = Position(ChunkIdentifier(2), 0);
             assert_matches!(
                 linked_chunk.insert_gap_at((), position_of_a_gap),
-                Err(Error::ChunkIsAGap { identifier: ChunkIdentifier(4) })
+                Err(Error::ChunkIsAGap { identifier: ChunkIdentifier(2) })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());
         }
@@ -2657,7 +2922,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_gap_at() -> Result<(), Error> {
+    fn test_replace_gap_at_middle() -> Result<(), Error> {
         use super::Update::*;
 
         let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
@@ -2689,90 +2954,41 @@ mod tests {
         );
 
         // Replace a gap in the middle of the linked chunk.
-        {
-            let gap_identifier = linked_chunk.chunk_identifier(Chunk::is_gap).unwrap();
-            assert_eq!(gap_identifier, ChunkIdentifier(1));
+        let gap_identifier = linked_chunk.chunk_identifier(Chunk::is_gap).unwrap();
+        assert_eq!(gap_identifier, ChunkIdentifier(1));
 
-            let new_chunk =
-                linked_chunk.replace_gap_at(['d', 'e', 'f', 'g', 'h'], gap_identifier)?;
-            assert_eq!(new_chunk.identifier(), ChunkIdentifier(3));
-            assert_items_eq!(
-                linked_chunk,
-                ['a', 'b'] ['d', 'e', 'f'] ['g', 'h'] ['l', 'm']
-            );
-            assert_eq!(
-                linked_chunk.updates().unwrap().take(),
-                &[
-                    NewItemsChunk {
-                        previous: Some(ChunkIdentifier(1)),
-                        new: ChunkIdentifier(3),
-                        next: Some(ChunkIdentifier(2)),
-                    },
-                    PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['d', 'e', 'f'] },
-                    NewItemsChunk {
-                        previous: Some(ChunkIdentifier(3)),
-                        new: ChunkIdentifier(4),
-                        next: Some(ChunkIdentifier(2)),
-                    },
-                    PushItems { at: Position(ChunkIdentifier(4), 0), items: vec!['g', 'h'] },
-                    RemoveChunk(ChunkIdentifier(1)),
-                ]
-            );
-        }
+        let new_chunk = linked_chunk.replace_gap_at(['d', 'e', 'f', 'g', 'h'], gap_identifier)?;
+        assert_eq!(new_chunk.identifier(), ChunkIdentifier(3));
+        assert_items_eq!(
+            linked_chunk,
+            ['a', 'b'] ['d', 'e', 'f'] ['g', 'h'] ['l', 'm']
+        );
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(1)),
+                    new: ChunkIdentifier(3),
+                    next: Some(ChunkIdentifier(2)),
+                },
+                PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['d', 'e', 'f'] },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(3)),
+                    new: ChunkIdentifier(4),
+                    next: Some(ChunkIdentifier(2)),
+                },
+                PushItems { at: Position(ChunkIdentifier(4), 0), items: vec!['g', 'h'] },
+                RemoveChunk(ChunkIdentifier(1)),
+            ]
+        );
 
-        // Replace a gap at the end of the linked chunk.
-        {
-            linked_chunk.push_gap_back(());
-            assert_items_eq!(
-                linked_chunk,
-                ['a', 'b'] ['d', 'e', 'f'] ['g', 'h'] ['l', 'm'] [-]
-            );
-            assert_eq!(
-                linked_chunk.updates().unwrap().take(),
-                &[NewGapChunk {
-                    previous: Some(ChunkIdentifier(2)),
-                    new: ChunkIdentifier(5),
-                    next: None,
-                    gap: (),
-                }]
-            );
-
-            let gap_identifier = linked_chunk.chunk_identifier(Chunk::is_gap).unwrap();
-            assert_eq!(gap_identifier, ChunkIdentifier(5));
-
-            let new_chunk = linked_chunk.replace_gap_at(['w', 'x', 'y', 'z'], gap_identifier)?;
-            assert_eq!(new_chunk.identifier(), ChunkIdentifier(6));
-            assert_items_eq!(
-                linked_chunk,
-                ['a', 'b'] ['d', 'e', 'f'] ['g', 'h'] ['l', 'm'] ['w', 'x', 'y'] ['z']
-            );
-            assert_eq!(
-                linked_chunk.updates().unwrap().take(),
-                &[
-                    NewItemsChunk {
-                        previous: Some(ChunkIdentifier(5)),
-                        new: ChunkIdentifier(6),
-                        next: None,
-                    },
-                    PushItems { at: Position(ChunkIdentifier(6), 0), items: vec!['w', 'x', 'y'] },
-                    NewItemsChunk {
-                        previous: Some(ChunkIdentifier(6)),
-                        new: ChunkIdentifier(7),
-                        next: None,
-                    },
-                    PushItems { at: Position(ChunkIdentifier(7), 0), items: vec!['z'] },
-                    RemoveChunk(ChunkIdentifier(5)),
-                ]
-            );
-        }
-
-        assert_eq!(linked_chunk.num_items(), 13);
+        assert_eq!(linked_chunk.num_items(), 9);
 
         Ok(())
     }
 
     #[test]
-    fn test_remove_gap() -> Result<(), Error> {
+    fn test_replace_gap_at_end() -> Result<(), Error> {
         use super::Update::*;
 
         let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
@@ -2782,9 +2998,7 @@ mod tests {
 
         linked_chunk.push_items_back(['a', 'b']);
         linked_chunk.push_gap_back(());
-        linked_chunk.push_items_back(['l', 'm']);
-        linked_chunk.push_gap_back(());
-        assert_items_eq!(linked_chunk, ['a', 'b'] [-] ['l', 'm'] [-]);
+        assert_items_eq!(linked_chunk, ['a', 'b'] [-]);
         assert_eq!(
             linked_chunk.updates().unwrap().take(),
             &[
@@ -2795,46 +3009,197 @@ mod tests {
                     next: None,
                     gap: (),
                 },
+            ]
+        );
+
+        // Replace a gap at the end of the linked chunk.
+        let gap_identifier = linked_chunk.chunk_identifier(Chunk::is_gap).unwrap();
+        assert_eq!(gap_identifier, ChunkIdentifier(1));
+
+        let new_chunk = linked_chunk.replace_gap_at(['w', 'x', 'y', 'z'], gap_identifier)?;
+        assert_eq!(new_chunk.identifier(), ChunkIdentifier(2));
+        assert_items_eq!(
+            linked_chunk,
+            ['a', 'b'] ['w', 'x', 'y'] ['z']
+        );
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
                 NewItemsChunk {
                     previous: Some(ChunkIdentifier(1)),
                     new: ChunkIdentifier(2),
                     next: None,
                 },
-                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['l', 'm'] },
-                NewGapChunk {
+                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['w', 'x', 'y'] },
+                NewItemsChunk {
                     previous: Some(ChunkIdentifier(2)),
                     new: ChunkIdentifier(3),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['z'] },
+                RemoveChunk(ChunkIdentifier(1)),
+            ]
+        );
+
+        assert_eq!(linked_chunk.num_items(), 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_gap_at_beginning() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.push_items_back(['a', 'b']);
+        assert_items_eq!(linked_chunk, ['a', 'b']);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b'] },]
+        );
+
+        // Replace a gap at the beginning of the linked chunk.
+        let position_of_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
+        linked_chunk.insert_gap_at((), position_of_a).unwrap();
+        assert_items_eq!(
+            linked_chunk,
+            [-] ['a', 'b']
+        );
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[NewGapChunk {
+                previous: None,
+                new: ChunkIdentifier(1),
+                next: Some(ChunkIdentifier(0)),
+                gap: (),
+            }]
+        );
+
+        let gap_identifier = linked_chunk.chunk_identifier(Chunk::is_gap).unwrap();
+        assert_eq!(gap_identifier, ChunkIdentifier(1));
+
+        let new_chunk = linked_chunk.replace_gap_at(['x'], gap_identifier)?;
+        assert_eq!(new_chunk.identifier(), ChunkIdentifier(2));
+        assert_items_eq!(
+            linked_chunk,
+            ['x'] ['a', 'b']
+        );
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(1)),
+                    new: ChunkIdentifier(2),
+                    next: Some(ChunkIdentifier(0)),
+                },
+                PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['x'] },
+                RemoveChunk(ChunkIdentifier(1)),
+            ]
+        );
+
+        assert_eq!(linked_chunk.num_items(), 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_empty_chunk_at() -> Result<(), Error> {
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        linked_chunk.insert_gap_at((), Position(ChunkIdentifier(0), 0)).unwrap();
+        linked_chunk.push_items_back(['a', 'b']);
+        linked_chunk.push_gap_back(());
+        linked_chunk.push_items_back(['l', 'm']);
+        linked_chunk.push_gap_back(());
+        assert_items_eq!(linked_chunk, [-] ['a', 'b'] [-] ['l', 'm'] [-]);
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[
+                NewGapChunk {
+                    previous: None,
+                    new: ChunkIdentifier(1),
+                    next: Some(ChunkIdentifier(0)),
+                    gap: (),
+                },
+                PushItems { at: Position(ChunkIdentifier(0), 0), items: vec!['a', 'b'] },
+                NewGapChunk {
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(2),
+                    next: None,
+                    gap: (),
+                },
+                NewItemsChunk {
+                    previous: Some(ChunkIdentifier(2)),
+                    new: ChunkIdentifier(3),
+                    next: None,
+                },
+                PushItems { at: Position(ChunkIdentifier(3), 0), items: vec!['l', 'm'] },
+                NewGapChunk {
+                    previous: Some(ChunkIdentifier(3)),
+                    new: ChunkIdentifier(4),
                     next: None,
                     gap: (),
                 },
             ]
         );
 
-        // Try to remove a gap that's not a gap.
-        let err = linked_chunk.remove_gap_at(ChunkIdentifier(0)).unwrap_err();
-        assert_matches!(err, Error::ChunkIsItems { .. });
+        // Try to remove a chunk that's not empty.
+        let err = linked_chunk.remove_empty_chunk_at(ChunkIdentifier(0)).unwrap_err();
+        assert_matches!(err, Error::RemovingNonEmptyItemsChunk { .. });
 
         // Try to remove an unknown gap chunk.
-        let err = linked_chunk.remove_gap_at(ChunkIdentifier(42)).unwrap_err();
+        let err = linked_chunk.remove_empty_chunk_at(ChunkIdentifier(42)).unwrap_err();
         assert_matches!(err, Error::InvalidChunkIdentifier { .. });
 
         // Remove the gap in the middle.
-        let maybe_next = linked_chunk.remove_gap_at(ChunkIdentifier(1)).unwrap();
+        let maybe_next = linked_chunk.remove_empty_chunk_at(ChunkIdentifier(2)).unwrap();
         let next = maybe_next.unwrap();
         // The next insert position at the start of the next chunk.
-        assert_eq!(next.chunk_identifier(), ChunkIdentifier(2));
+        assert_eq!(next.chunk_identifier(), ChunkIdentifier(3));
         assert_eq!(next.index(), 0);
-        assert_items_eq!(linked_chunk, ['a', 'b'] ['l', 'm'] [-]);
-        assert_eq!(linked_chunk.updates().unwrap().take(), &[RemoveChunk(ChunkIdentifier(1))]);
+        assert_items_eq!(linked_chunk, [-] ['a', 'b'] ['l', 'm'] [-]);
+        assert_eq!(linked_chunk.updates().unwrap().take(), &[RemoveChunk(ChunkIdentifier(2))]);
 
         // Remove the gap at the end.
-        let next = linked_chunk.remove_gap_at(ChunkIdentifier(3)).unwrap();
+        let next = linked_chunk.remove_empty_chunk_at(ChunkIdentifier(4)).unwrap();
         // It was the last chunk, so there's no next insert position.
         assert!(next.is_none());
+        assert_items_eq!(linked_chunk, [-] ['a', 'b'] ['l', 'm']);
+        assert_eq!(linked_chunk.updates().unwrap().take(), &[RemoveChunk(ChunkIdentifier(4))]);
+
+        // Remove the gap at the beginning.
+        let maybe_next = linked_chunk.remove_empty_chunk_at(ChunkIdentifier(1)).unwrap();
+        let next = maybe_next.unwrap();
+        assert_eq!(next.chunk_identifier(), ChunkIdentifier(0));
+        assert_eq!(next.index(), 0);
         assert_items_eq!(linked_chunk, ['a', 'b'] ['l', 'm']);
-        assert_eq!(linked_chunk.updates().unwrap().take(), &[RemoveChunk(ChunkIdentifier(3))]);
+        assert_eq!(linked_chunk.updates().unwrap().take(), &[RemoveChunk(ChunkIdentifier(1))]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_remove_empty_last_chunk() {
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
+
+        // Ignore initial update.
+        let _ = linked_chunk.updates().unwrap().take();
+
+        assert_items_eq!(linked_chunk, []);
+        assert!(linked_chunk.updates().unwrap().take().is_empty());
+
+        // Try to remove the first chunk.
+        let err = linked_chunk.remove_empty_chunk_at(ChunkIdentifier(0)).unwrap_err();
+        assert_matches!(err, Error::RemovingLastChunk);
     }
 
     #[test]
@@ -2963,27 +3328,240 @@ mod tests {
 
     #[test]
     fn test_replace_item() {
-        let mut linked_chunk = LinkedChunk::<3, char, ()>::new();
+        use super::Update::*;
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()>::new_with_update_history();
 
         linked_chunk.push_items_back(['a', 'b', 'c']);
         linked_chunk.push_gap_back(());
         // Sanity check.
         assert_items_eq!(linked_chunk, ['a', 'b', 'c'] [-]);
 
+        // Drain previous updates.
+        let _ = linked_chunk.updates().unwrap().take();
+
         // Replace item in bounds.
-        linked_chunk.replace_item_at(Position(ChunkIdentifier::new(0), 1), 'B').unwrap();
+        linked_chunk.replace_item_at(Position(ChunkIdentifier(0), 1), 'B').unwrap();
         assert_items_eq!(linked_chunk, ['a', 'B', 'c'] [-]);
+
+        assert_eq!(
+            linked_chunk.updates().unwrap().take(),
+            &[ReplaceItem { at: Position(ChunkIdentifier(0), 1), item: 'B' }]
+        );
 
         // Attempt to replace out-of-bounds.
         assert_matches!(
-            linked_chunk.replace_item_at(Position(ChunkIdentifier::new(0), 3), 'Z'),
+            linked_chunk.replace_item_at(Position(ChunkIdentifier(0), 3), 'Z'),
             Err(Error::InvalidItemIndex { index: 3 })
         );
 
         // Attempt to replace gap.
         assert_matches!(
-            linked_chunk.replace_item_at(Position(ChunkIdentifier::new(1), 0), 'Z'),
+            linked_chunk.replace_item_at(Position(ChunkIdentifier(1), 0), 'Z'),
             Err(Error::ChunkIsAGap { .. })
         );
+    }
+
+    #[test]
+    fn test_lazy_previous() {
+        use std::marker::PhantomData;
+
+        use super::{Ends, ObservableUpdates, Update::*};
+
+        // Imagine the linked chunk is lazily loaded.
+        let first_chunk_identifier = ChunkIdentifier(0);
+        let mut first_loaded_chunk = Chunk::new_items_leaked(ChunkIdentifier(1));
+        unsafe { first_loaded_chunk.as_mut() }.lazy_previous = Some(first_chunk_identifier);
+
+        let mut linked_chunk = LinkedChunk::<3, char, ()> {
+            links: Ends { first: first_loaded_chunk, last: None },
+            chunk_identifier_generator:
+                ChunkIdentifierGenerator::new_from_previous_chunk_identifier(ChunkIdentifier(1)),
+            updates: Some(ObservableUpdates::new()),
+            marker: PhantomData,
+        };
+
+        // Insert items in the first loaded chunk (chunk 1), with an overflow to a new
+        // chunk.
+        {
+            linked_chunk.push_items_back(['a', 'b', 'c', 'd']);
+
+            assert_items_eq!(linked_chunk, ['a', 'b', 'c']['d']);
+
+            // Assert where `lazy_previous` is set.
+            {
+                let mut chunks = linked_chunk.chunks();
+
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 1);
+                    assert_eq!(chunk.lazy_previous, Some(ChunkIdentifier(0)));
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 2);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert!(chunks.next().is_none());
+            }
+
+            // In the updates, we observe nothing else than the usual bits.
+            assert_eq!(
+                linked_chunk.updates().unwrap().take(),
+                &[
+                    PushItems { at: Position(ChunkIdentifier(1), 0), items: vec!['a', 'b', 'c'] },
+                    NewItemsChunk {
+                        previous: Some(ChunkIdentifier(1)),
+                        new: ChunkIdentifier(2),
+                        next: None,
+                    },
+                    PushItems { at: Position(ChunkIdentifier(2), 0), items: vec!['d'] }
+                ]
+            );
+        }
+
+        // Now insert a gap at the head of the loaded linked chunk.
+        {
+            linked_chunk.insert_gap_at((), Position(ChunkIdentifier(1), 0)).unwrap();
+
+            assert_items_eq!(linked_chunk, [-] ['a', 'b', 'c'] ['d']);
+
+            // Assert where `lazy_previous` is set.
+            {
+                let mut chunks = linked_chunk.chunks();
+
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 3);
+                    // `lazy_previous` has moved here!
+                    assert_eq!(chunk.lazy_previous, Some(ChunkIdentifier(0)));
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 1);
+                    // `lazy_previous` has moved from here.
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 2);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert!(chunks.next().is_none());
+            }
+
+            // In the updates, we observe that the new gap **has** a previous chunk!
+            assert_eq!(
+                linked_chunk.updates().unwrap().take(),
+                &[NewGapChunk {
+                    // 0 is the lazy, not-loaded-yet chunk.
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(3),
+                    next: Some(ChunkIdentifier(1)),
+                    gap: ()
+                }]
+            );
+        }
+
+        // Next, replace the gap by items to see how it reacts to unlink.
+        {
+            linked_chunk.replace_gap_at(['w', 'x', 'y', 'z'], ChunkIdentifier(3)).unwrap();
+
+            assert_items_eq!(linked_chunk, ['w', 'x', 'y'] ['z'] ['a', 'b', 'c'] ['d']);
+
+            // Assert where `lazy_previous` is set.
+            {
+                let mut chunks = linked_chunk.chunks();
+
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 4);
+                    // `lazy_previous` has moved here!
+                    assert_eq!(chunk.lazy_previous, Some(ChunkIdentifier(0)));
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 5);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 1);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 2);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert!(chunks.next().is_none());
+            }
+
+            // In the updates, we observe nothing than the usual bits.
+            assert_eq!(
+                linked_chunk.updates().unwrap().take(),
+                &[
+                    // The new chunk is inserted…
+                    NewItemsChunk {
+                        previous: Some(ChunkIdentifier(3)),
+                        new: ChunkIdentifier(4),
+                        next: Some(ChunkIdentifier(1)),
+                    },
+                    // … and new items are pushed in it.
+                    PushItems { at: Position(ChunkIdentifier(4), 0), items: vec!['w', 'x', 'y'] },
+                    // Another new chunk is inserted…
+                    NewItemsChunk {
+                        previous: Some(ChunkIdentifier(4)),
+                        new: ChunkIdentifier(5),
+                        next: Some(ChunkIdentifier(1)),
+                    },
+                    // … and new items are pushed in it.
+                    PushItems { at: Position(ChunkIdentifier(5), 0), items: vec!['z'] },
+                    // Finally, the gap is removed!
+                    RemoveChunk(ChunkIdentifier(3)),
+                ]
+            );
+        }
+
+        // Finally, let's re-insert a gap to ensure the lazy-previous is set
+        // correctly. It is similar to the beginning of this test, but this is a
+        // frequent pattern in how the linked chunk is used.
+        {
+            linked_chunk.insert_gap_at((), Position(ChunkIdentifier(4), 0)).unwrap();
+
+            assert_items_eq!(linked_chunk, [-] ['w', 'x', 'y'] ['z'] ['a', 'b', 'c'] ['d']);
+
+            // Assert where `lazy_previous` is set.
+            {
+                let mut chunks = linked_chunk.chunks();
+
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 6);
+                    // `lazy_previous` has moved here!
+                    assert_eq!(chunk.lazy_previous, Some(ChunkIdentifier(0)));
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 4);
+                    // `lazy_previous` has moved from here.
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 5);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 1);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert_matches!(chunks.next(), Some(chunk) => {
+                    assert_eq!(chunk.identifier(), 2);
+                    assert!(chunk.lazy_previous.is_none());
+                });
+                assert!(chunks.next().is_none());
+            }
+
+            // In the updates, we observe that the new gap **has** a previous chunk!
+            assert_eq!(
+                linked_chunk.updates().unwrap().take(),
+                &[NewGapChunk {
+                    // 0 is the lazy, not-loaded-yet chunk.
+                    previous: Some(ChunkIdentifier(0)),
+                    new: ChunkIdentifier(6),
+                    next: Some(ChunkIdentifier(4)),
+                    gap: ()
+                }]
+            );
+        }
     }
 }

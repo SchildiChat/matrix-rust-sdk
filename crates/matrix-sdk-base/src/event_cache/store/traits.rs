@@ -16,10 +16,10 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
-    linked_chunk::{RawChunk, Update},
+    linked_chunk::{ChunkIdentifier, ChunkIdentifierGenerator, Position, RawChunk, Update},
     AsyncTraitDeps,
 };
-use ruma::{MxcUri, RoomId};
+use ruma::{EventId, MxcUri, OwnedEventId, RoomId};
 
 use super::{
     media::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
@@ -69,16 +69,52 @@ pub trait EventCacheStore: AsyncTraitDeps {
 
     /// Return all the raw components of a linked chunk, so the caller may
     /// reconstruct the linked chunk later.
-    async fn reload_linked_chunk(
+    #[doc(hidden)]
+    async fn load_all_chunks(
         &self,
         room_id: &RoomId,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error>;
+
+    /// Load the last chunk of the `LinkedChunk` holding all events of the room
+    /// identified by `room_id`.
+    ///
+    /// This is used to iteratively load events for the `EventCache`.
+    async fn load_last_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error>;
+
+    /// Load the chunk before the chunk identified by `before_chunk_identifier`
+    /// of the `LinkedChunk` holding all events of the room identified by
+    /// `room_id`
+    ///
+    /// This is used to iteratively load events for the `EventCache`.
+    async fn load_previous_chunk(
+        &self,
+        room_id: &RoomId,
+        before_chunk_identifier: ChunkIdentifier,
+    ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error>;
 
     /// Clear persisted events for all the rooms.
     ///
     /// This will empty and remove all the linked chunks stored previously,
     /// using the above [`Self::handle_linked_chunk_updates`] methods.
     async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error>;
+
+    /// Given a set of event IDs, return the duplicated events along with their
+    /// position if there are any.
+    async fn filter_duplicated_events(
+        &self,
+        room_id: &RoomId,
+        events: Vec<OwnedEventId>,
+    ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error>;
+
+    /// Find an event by its ID.
+    async fn find_event(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<(Position, Event)>, Self::Error>;
 
     /// Add a media file's content in the media store.
     ///
@@ -236,15 +272,46 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         self.0.handle_linked_chunk_updates(room_id, updates).await.map_err(Into::into)
     }
 
-    async fn reload_linked_chunk(
+    async fn load_all_chunks(
         &self,
         room_id: &RoomId,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
-        self.0.reload_linked_chunk(room_id).await.map_err(Into::into)
+        self.0.load_all_chunks(room_id).await.map_err(Into::into)
+    }
+
+    async fn load_last_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error> {
+        self.0.load_last_chunk(room_id).await.map_err(Into::into)
+    }
+
+    async fn load_previous_chunk(
+        &self,
+        room_id: &RoomId,
+        before_chunk_identifier: ChunkIdentifier,
+    ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
+        self.0.load_previous_chunk(room_id, before_chunk_identifier).await.map_err(Into::into)
     }
 
     async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error> {
         self.0.clear_all_rooms_chunks().await.map_err(Into::into)
+    }
+
+    async fn filter_duplicated_events(
+        &self,
+        room_id: &RoomId,
+        events: Vec<OwnedEventId>,
+    ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error> {
+        self.0.filter_duplicated_events(room_id, events).await.map_err(Into::into)
+    }
+
+    async fn find_event(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<(Position, Event)>, Self::Error> {
+        self.0.find_event(room_id, event_id).await.map_err(Into::into)
     }
 
     async fn add_media_content(

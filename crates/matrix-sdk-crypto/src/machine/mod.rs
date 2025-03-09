@@ -877,15 +877,8 @@ impl OlmMachine {
         event: &DecryptedRoomKeyEvent,
         content: &MegolmV1AesSha2Content,
     ) -> OlmResult<Option<InboundGroupSession>> {
-        let session = InboundGroupSession::new(
-            sender_key,
-            event.keys.ed25519,
-            &content.room_id,
-            &content.session_key,
-            SenderData::unknown(),
-            event.content.algorithm(),
-            None,
-        );
+        let session =
+            InboundGroupSession::from_room_key_content(sender_key, event.keys.ed25519, content);
 
         match session {
             Ok(mut session) => {
@@ -1681,17 +1674,6 @@ impl OlmMachine {
         })
     }
 
-    async fn get_megolm_encryption_info(
-        &self,
-        room_id: &RoomId,
-        event: &EncryptedEvent,
-        content: &SupportedEventEncryptionSchemes<'_>,
-    ) -> MegolmResult<EncryptionInfo> {
-        let session =
-            self.get_inbound_group_session_or_error(room_id, content.session_id()).await?;
-        self.get_encryption_info(&session, &event.sender).await
-    }
-
     async fn decrypt_megolm_events(
         &self,
         room_id: &RoomId,
@@ -2089,7 +2071,30 @@ impl OlmMachine {
             }
         };
 
-        self.get_megolm_encryption_info(room_id, &event, &content).await
+        self.get_session_encryption_info(room_id, content.session_id(), &event.sender).await
+    }
+
+    /// Get encryption info for a megolm session.
+    ///
+    /// This recalculates the [`EncryptionInfo`] data that is returned by
+    /// [`OlmMachine::decrypt_room_event`], based on the current
+    /// verification status of the sender, etc.
+    ///
+    /// Returns an error if the session can't be found.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The ID of the room where the session is being used.
+    /// * `session_id` - The ID of the session to get information for.
+    /// * `sender` - The user ID of the sender who created this session.
+    pub async fn get_session_encryption_info(
+        &self,
+        room_id: &RoomId,
+        session_id: &str,
+        sender: &UserId,
+    ) -> MegolmResult<EncryptionInfo> {
+        let session = self.get_inbound_group_session_or_error(room_id, session_id).await?;
+        self.get_encryption_info(&session, sender).await
     }
 
     /// Update the list of tracked users.

@@ -46,6 +46,9 @@ use wiremock::{
     Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
 };
 
+#[cfg(feature = "experimental-oidc")]
+pub mod oauth;
+
 use super::client::MockClientBuilder;
 use crate::{Client, OwnedServerName, Room};
 
@@ -142,6 +145,12 @@ impl MatrixMockServer {
     /// Return the underlying [`wiremock`] server.
     pub fn server(&self) -> &MockServer {
         &self.server
+    }
+
+    /// Get an `OauthMockServer` that uses the same mock server as this one.
+    #[cfg(feature = "experimental-oidc")]
+    pub fn oauth(&self) -> oauth::OauthMockServer<'_> {
+        oauth::OauthMockServer::new(self.server())
     }
 
     /// Overrides the sync/ endpoint with knowledge that the given
@@ -785,16 +794,17 @@ impl MatrixMockServer {
     ///
     /// # Examples
     ///
-    /// ``` #
-    /// tokio_test::block_on(async {
-    /// use matrix_sdk_base::RoomMemberships;
-    /// use ruma::events::room::member::MembershipState;
-    /// use ruma::events::room::member::RoomMemberEventContent;
-    /// use ruma::user_id;
-    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// ```
+    /// # tokio_test::block_on(async {
     /// use matrix_sdk::{
     ///     ruma::{event_id, room_id},
     ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    /// use matrix_sdk_base::RoomMemberships;
+    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// use ruma::{
+    ///     events::room::member::{MembershipState, RoomMemberEventContent},
+    ///     user_id,
     /// };
     /// let mock_server = MatrixMockServer::new().await;
     /// let client = mock_server.client_builder().build().await;
@@ -811,7 +821,12 @@ impl MatrixMockServer {
     ///     .into_raw_timeline()
     ///     .cast();
     ///
-    /// mock_server.mock_get_members().ok(vec![alice_knock_event]).mock_once().mount().await;
+    /// mock_server
+    ///     .mock_get_members()
+    ///     .ok(vec![alice_knock_event])
+    ///     .mock_once()
+    ///     .mount()
+    ///     .await;
     /// let room = mock_server.sync_joined_room(&client, room_id).await;
     ///
     /// let members = room.members(RoomMemberships::all()).await.unwrap();
@@ -917,6 +932,78 @@ impl MatrixMockServer {
     pub fn mock_versions(&self) -> MockEndpoint<'_, VersionsEndpoint> {
         let mock = Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/versions"));
         MockEndpoint { mock, server: &self.server, endpoint: VersionsEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the room summary endpoint [MSC3266](https://github.com/matrix-org/matrix-spec-proposals/pull/3266).
+    pub fn mock_room_summary(&self) -> MockEndpoint<'_, RoomSummaryEndpoint> {
+        let mock = Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/unstable/im.nheko.summary/rooms/.*/summary"));
+        MockEndpoint { mock, server: &self.server, endpoint: RoomSummaryEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to set a room's pinned
+    /// events.
+    pub fn mock_set_room_pinned_events(&self) -> MockEndpoint<'_, SetRoomPinnedEventsEndpoint> {
+        let mock = Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/state/m.room.pinned_events/.*?"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: SetRoomPinnedEventsEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to get information about
+    /// the owner of the current access token.
+    pub fn mock_who_am_i(&self) -> MockEndpoint<'_, WhoAmIEndpoint> {
+        let mock = Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/v3/account/whoami"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: WhoAmIEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to publish end-to-end
+    /// encryption keys.
+    pub fn mock_upload_keys(&self) -> MockEndpoint<'_, UploadKeysEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/v3/keys/upload"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: UploadKeysEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to query end-to-end
+    /// encryption keys.
+    pub fn mock_query_keys(&self) -> MockEndpoint<'_, QueryKeysEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/v3/keys/query"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: QueryKeysEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to discover the URL of a
+    /// homeserver.
+    pub fn mock_well_known(&self) -> MockEndpoint<'_, WellKnownEndpoint> {
+        let mock = Mock::given(method("GET")).and(path_regex(r"^/.well-known/matrix/client"));
+        MockEndpoint { mock, server: &self.server, endpoint: WellKnownEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to publish cross-signing
+    /// keys.
+    pub fn mock_upload_cross_signing_keys(
+        &self,
+    ) -> MockEndpoint<'_, UploadCrossSigningKeysEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/v3/keys/device_signing/upload"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: UploadCrossSigningKeysEndpoint }
+    }
+
+    /// Creates a prebuilt mock for the endpoint used to publish cross-signing
+    /// signatures.
+    pub fn mock_upload_cross_signing_signatures(
+        &self,
+    ) -> MockEndpoint<'_, UploadCrossSigningSignaturesEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/v3/keys/signatures/upload"))
+            .and(header("authorization", "Bearer 1234"));
+        MockEndpoint { mock, server: &self.server, endpoint: UploadCrossSigningSignaturesEndpoint }
     }
 }
 
@@ -1310,6 +1397,8 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
 
     /// Ensures the event was sent as a delayed event.
     ///
+    /// See also [the MSC](https://github.com/matrix-org/matrix-spec-proposals/pull/4140).
+    ///
     /// Note: works with *any* room.
     ///
     /// # Examples
@@ -1340,7 +1429,7 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     ///
     /// mock_server
     ///     .mock_room_send()
-    ///     .with_delay(Duration::from_millis(500))
+    ///     .match_delayed_event(Duration::from_millis(500))
     ///     .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delay_id":"$some_id"})))
     ///     .mock_once()
     ///     .mount()
@@ -1365,7 +1454,7 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     /// assert_eq!("$some_id", response.delay_id);
     /// # anyhow::Ok(()) });
     /// ```
-    pub fn with_delay(self, delay: Duration) -> Self {
+    pub fn match_delayed_event(self, delay: Duration) -> Self {
         Self {
             mock: self
                 .mock
@@ -1541,6 +1630,8 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
 
     /// Ensures the event was sent as a delayed event.
     ///
+    /// See also [the MSC](https://github.com/matrix-org/matrix-spec-proposals/pull/4140).
+    ///
     /// Note: works with *any* room.
     ///
     /// # Examples
@@ -1570,7 +1661,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     ///
     /// mock_server
     ///     .mock_room_send_state()
-    ///     .with_delay(Duration::from_millis(500))
+    ///     .match_delayed_event(Duration::from_millis(500))
     ///     .respond_with(ResponseTemplate::new(200).set_body_json(json!({"delay_id":"$some_id"})))
     ///     .mock_once()
     ///     .mount()
@@ -1593,7 +1684,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     ///
     /// # anyhow::Ok(()) });
     /// ```
-    pub fn with_delay(self, delay: Duration) -> Self {
+    pub fn match_delayed_event(self, delay: Duration) -> Self {
         Self {
             mock: self
                 .mock
@@ -1889,12 +1980,12 @@ pub struct RoomMessagesEndpoint;
 /// A prebuilt mock for getting a room messages in a room.
 impl<'a> MockEndpoint<'a, RoomMessagesEndpoint> {
     /// Expects an optional limit to be set on the request.
-    pub fn limit(self, limit: u32) -> Self {
+    pub fn match_limit(self, limit: u32) -> Self {
         Self { mock: self.mock.and(query_param("limit", limit.to_string())), ..self }
     }
 
     /// Expects an optional `from` to be set on the request.
-    pub fn from(self, from: &str) -> Self {
+    pub fn match_from(self, from: &str) -> Self {
         Self { mock: self.mock.and(query_param("from", from)), ..self }
     }
 
@@ -1949,7 +2040,7 @@ impl RoomMessagesResponseTemplate {
     }
 
     /// Respond with a given delay to the query.
-    pub fn delayed(mut self, delay: Duration) -> Self {
+    pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
         self
     }
@@ -2276,6 +2367,146 @@ impl<'a> MockEndpoint<'a, VersionsEndpoint> {
                 "v1.11"
             ]
         })));
+
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for the room summary endpoint.
+pub struct RoomSummaryEndpoint;
+
+impl<'a> MockEndpoint<'a, RoomSummaryEndpoint> {
+    /// Returns a successful response with some default data for the given room
+    /// id.
+    pub fn ok(self, room_id: &RoomId) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "room_id": room_id,
+            "guest_can_join": true,
+            "num_joined_members": 1,
+            "world_readable": true,
+            "join_rule": "public",
+        })));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock to set a room's pinned events.
+pub struct SetRoomPinnedEventsEndpoint;
+
+impl<'a> MockEndpoint<'a, SetRoomPinnedEventsEndpoint> {
+    /// Returns a successful response with a given event id.
+    /// id.
+    pub fn ok(self, event_id: OwnedEventId) -> MatrixMock<'a> {
+        self.ok_with_event_id(event_id)
+    }
+
+    /// Returns an error response with a generic error code indicating the
+    /// client is not authorized to set pinned events.
+    pub fn unauthorized(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(400));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `GET /account/whoami` request.
+pub struct WhoAmIEndpoint;
+
+impl<'a> MockEndpoint<'a, WhoAmIEndpoint> {
+    /// Returns a successful response with a user ID and device ID.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "user_id": "@joe:example.org",
+            "device_id": "D3V1C31D",
+        })));
+
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /keys/upload` request.
+pub struct UploadKeysEndpoint;
+
+impl<'a> MockEndpoint<'a, UploadKeysEndpoint> {
+    /// Returns a successful response with counts of 10 curve25519 keys and 20
+    /// signed curve25519 keys.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "one_time_key_counts": {
+                "curve25519": 10,
+                "signed_curve25519": 20,
+            },
+        })));
+
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /keys/query` request.
+pub struct QueryKeysEndpoint;
+
+impl<'a> MockEndpoint<'a, QueryKeysEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({})));
+
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `GET /.well-known/matrix/client` request.
+pub struct WellKnownEndpoint;
+
+impl<'a> MockEndpoint<'a, WellKnownEndpoint> {
+    /// Returns a successful response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "m.homeserver": {
+                "base_url": self.server.uri(),
+            },
+        })));
+
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /keys/device_signing/upload` request.
+pub struct UploadCrossSigningKeysEndpoint;
+
+impl<'a> MockEndpoint<'a, UploadCrossSigningKeysEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({})));
+
+        MatrixMock { server: self.server, mock }
+    }
+
+    /// Returns an error response with an OAuth 2.0 UIAA stage.
+    #[cfg(feature = "experimental-oidc")]
+    pub fn uiaa_oauth(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "session": "dummy",
+            "flows": [{
+                "stages": [ "org.matrix.cross_signing_reset" ]
+            }],
+            "params": {
+                "org.matrix.cross_signing_reset": {
+                    "url": format!("{}/account/?action=org.matrix.cross_signing_reset", self.server.uri())
+                }
+            },
+            "msg": "To reset your end-to-end encryption cross-signing identity, you first need to approve it and then try again."
+        })));
+
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for `POST /keys/signatures/upload` request.
+pub struct UploadCrossSigningSignaturesEndpoint;
+
+impl<'a> MockEndpoint<'a, UploadCrossSigningSignaturesEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        let mock = self.mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({})));
 
         MatrixMock { server: self.server, mock }
     }

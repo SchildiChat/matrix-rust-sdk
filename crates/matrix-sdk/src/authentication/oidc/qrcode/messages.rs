@@ -14,8 +14,8 @@
 
 use matrix_sdk_base::crypto::types::SecretsBundle;
 use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
-use openidconnect::{
-    core::CoreDeviceAuthorizationResponse, EndUserVerificationUrl, VerificationUriComplete,
+use oauth2::{
+    EndUserVerificationUrl, StandardDeviceAuthorizationResponse, VerificationUriComplete,
 };
 use ruma::serde::StringEnum;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -23,7 +23,7 @@ use url::Url;
 use vodozemac::Curve25519PublicKey;
 
 #[cfg(doc)]
-use crate::authentication::qrcode::QRCodeLoginError::SecureChannel;
+use super::QRCodeLoginError::SecureChannel;
 
 /// Messages that will be exchanged over the [`SecureChannel`] to log in a new
 /// device using a QR code.
@@ -107,8 +107,8 @@ impl QrAuthMessage {
     }
 }
 
-impl From<&CoreDeviceAuthorizationResponse> for AuthorizationGrant {
-    fn from(value: &CoreDeviceAuthorizationResponse) -> Self {
+impl From<&StandardDeviceAuthorizationResponse> for AuthorizationGrant {
+    fn from(value: &StandardDeviceAuthorizationResponse) -> Self {
         Self {
             verification_uri: value.verification_uri().clone(),
             verification_uri_complete: value.verification_uri_complete().cloned(),

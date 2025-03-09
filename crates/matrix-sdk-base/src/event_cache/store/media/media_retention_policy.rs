@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// [`EventCacheStore`]: crate::event_cache::store::EventCacheStore
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[non_exhaustive]
 pub struct MediaRetentionPolicy {
     /// The maximum authorized size of the overall media cache, in bytes.
@@ -50,7 +51,7 @@ pub struct MediaRetentionPolicy {
     ///
     /// Defaults to 400 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_cache_size: Option<usize>,
+    pub max_cache_size: Option<u64>,
 
     /// The maximum authorized size of a single media content, in bytes.
     ///
@@ -68,7 +69,7 @@ pub struct MediaRetentionPolicy {
     ///
     /// Defaults to 20 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_file_size: Option<usize>,
+    pub max_file_size: Option<u64>,
 
     /// The duration after which unaccessed media content is considered
     /// expired.
@@ -79,6 +80,17 @@ pub struct MediaRetentionPolicy {
     /// Defaults to 60 days.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_access_expiry: Option<Duration>,
+
+    /// The duration between two automatic media cache cleanups.
+    ///
+    /// If this is set, a cleanup will be triggered after the given duration
+    /// is elapsed, at the next call to the media cache API. If this is set to
+    /// zero, each call to the media cache API will trigger a cleanup. If this
+    /// is `None`, cleanups will only occur if they are triggered manually.
+    ///
+    /// Defaults to running cleanups daily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_frequency: Option<Duration>,
 }
 
 impl MediaRetentionPolicy {
@@ -91,17 +103,22 @@ impl MediaRetentionPolicy {
     ///
     /// This means that all media will be cached and cleanups have no effect.
     pub fn empty() -> Self {
-        Self { max_cache_size: None, max_file_size: None, last_access_expiry: None }
+        Self {
+            max_cache_size: None,
+            max_file_size: None,
+            last_access_expiry: None,
+            cleanup_frequency: None,
+        }
     }
 
     /// Set the maximum authorized size of the overall media cache, in bytes.
-    pub fn with_max_cache_size(mut self, size: Option<usize>) -> Self {
+    pub fn with_max_cache_size(mut self, size: Option<u64>) -> Self {
         self.max_cache_size = size;
         self
     }
 
     /// Set the maximum authorized size of a single media content, in bytes.
-    pub fn with_max_file_size(mut self, size: Option<usize>) -> Self {
+    pub fn with_max_file_size(mut self, size: Option<u64>) -> Self {
         self.max_file_size = size;
         self
     }
@@ -110,6 +127,12 @@ impl MediaRetentionPolicy {
     /// expired.
     pub fn with_last_access_expiry(mut self, duration: Option<Duration>) -> Self {
         self.last_access_expiry = duration;
+        self
+    }
+
+    /// Set the duration between two automatic media cache cleanups.
+    pub fn with_cleanup_frequency(mut self, duration: Option<Duration>) -> Self {
+        self.cleanup_frequency = duration;
         self
     }
 
@@ -130,7 +153,7 @@ impl MediaRetentionPolicy {
     /// # Arguments
     ///
     /// * `size` - The overall size of the media cache to check, in bytes.
-    pub fn exceeds_max_cache_size(&self, size: usize) -> bool {
+    pub fn exceeds_max_cache_size(&self, size: u64) -> bool {
         self.max_cache_size.is_some_and(|max_size| size > max_size)
     }
 
@@ -138,7 +161,7 @@ impl MediaRetentionPolicy {
     /// bytes.
     ///
     /// This is the lowest value between `max_cache_size` and `max_file_size`.
-    pub fn computed_max_file_size(&self) -> Option<usize> {
+    pub fn computed_max_file_size(&self) -> Option<u64> {
         match (self.max_cache_size, self.max_file_size) {
             (None, None) => None,
             (None, Some(size)) => Some(size),
@@ -153,7 +176,7 @@ impl MediaRetentionPolicy {
     /// # Arguments
     ///
     /// * `size` - The size of the media content to check, in bytes.
-    pub fn exceeds_max_file_size(&self, size: usize) -> bool {
+    pub fn exceeds_max_file_size(&self, size: u64) -> bool {
         self.computed_max_file_size().is_some_and(|max_size| size > max_size)
     }
 
@@ -178,6 +201,24 @@ impl MediaRetentionPolicy {
                 .is_ok_and(|elapsed| elapsed >= max_duration)
         })
     }
+
+    /// Whether an automatic media cache cleanup should be triggered given the
+    /// time of the last cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_time` - The current time.
+    ///
+    /// * `last_cleanup_time` - The time of the last media cache cleanup.
+    pub fn should_clean_up(&self, current_time: SystemTime, last_cleanup_time: SystemTime) -> bool {
+        self.cleanup_frequency.is_some_and(|max_duration| {
+            current_time
+                .duration_since(last_cleanup_time)
+                // If this returns an error, the last cleanup time is newer than the current time.
+                // This shouldn't happen but in this case no cleanup job is needed.
+                .is_ok_and(|elapsed| elapsed >= max_duration)
+        })
+    }
 }
 
 impl Default for MediaRetentionPolicy {
@@ -189,6 +230,8 @@ impl Default for MediaRetentionPolicy {
             max_file_size: Some(20 * 1024 * 1024),
             // 60 days.
             last_access_expiry: Some(Duration::from_secs(60 * 24 * 60 * 60)),
+            // 1 day.
+            cleanup_frequency: Some(Duration::from_secs(24 * 60 * 60)),
         }
     }
 }
@@ -326,5 +369,37 @@ mod tests {
         assert!(policy.has_content_expired(last_access_time, last_access_time));
         assert!(policy.has_content_expired(epoch_plus_60, last_access_time));
         assert!(policy.has_content_expired(epoch_plus_120, last_access_time));
+    }
+
+    #[test]
+    fn test_media_retention_policy_cleanup_frequency() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        let epoch_plus_60 = epoch + Duration::from_secs(60);
+        let epoch_plus_120 = epoch + Duration::from_secs(120);
+
+        let mut policy = MediaRetentionPolicy::empty();
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_60));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_120));
+
+        policy = policy.with_cleanup_frequency(Some(Duration::from_secs(0)));
+        assert!(policy.should_clean_up(epoch_plus_60, epoch));
+        assert!(policy.should_clean_up(epoch_plus_60, epoch_plus_60));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_120));
+
+        policy = policy.with_cleanup_frequency(Some(Duration::from_secs(30)));
+        assert!(policy.should_clean_up(epoch_plus_60, epoch));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_60));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_120));
+
+        policy = policy.with_cleanup_frequency(Some(Duration::from_secs(60)));
+        assert!(policy.should_clean_up(epoch_plus_60, epoch));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_60));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_120));
+
+        policy = policy.with_cleanup_frequency(Some(Duration::from_secs(90)));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_60));
+        assert!(!policy.should_clean_up(epoch_plus_60, epoch_plus_120));
     }
 }
