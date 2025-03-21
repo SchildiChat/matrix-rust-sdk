@@ -40,7 +40,7 @@ use tokio::sync::{
     broadcast::{Receiver, Sender},
     mpsc, Notify, RwLock,
 };
-use tracing::{error, trace, warn};
+use tracing::{error, instrument, trace, warn};
 
 use super::{
     deduplicator::DeduplicationOutcome, AllEventsCache, AutoShrinkChannelPayload, EventsOrigin,
@@ -239,7 +239,7 @@ impl RoomEventCache {
         // Notify observers about the update.
         let _ = self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
             diffs: updates_as_vector_diffs,
-            origin: EventsOrigin::Sync,
+            origin: EventsOrigin::Cache,
         });
 
         Ok(())
@@ -381,6 +381,7 @@ impl RoomEventCacheInner {
         }
     }
 
+    #[instrument(skip_all, fields(room_id = %self.room_id))]
     pub(super) async fn handle_joined_room_update(
         &self,
         has_storage: bool,
@@ -417,6 +418,7 @@ impl RoomEventCacheInner {
                 timeline.prev_batch,
                 ephemeral_events,
                 ambiguity_changes,
+                EventsOrigin::Sync,
             )
             .await?;
         } else {
@@ -447,6 +449,7 @@ impl RoomEventCacheInner {
         Ok(())
     }
 
+    #[instrument(skip_all, fields(room_id = %self.room_id))]
     pub(super) async fn handle_left_room_update(
         &self,
         has_storage: bool,
@@ -465,6 +468,7 @@ impl RoomEventCacheInner {
         prev_batch: Option<String>,
         ephemeral_events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
+        events_origin: EventsOrigin,
     ) -> Result<()> {
         // Acquire the lock.
         let mut state = self.state.write().await;
@@ -475,7 +479,7 @@ impl RoomEventCacheInner {
         // Propagate to observers.
         let _ = self.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
             diffs: updates_as_vector_diffs,
-            origin: EventsOrigin::Sync,
+            origin: events_origin,
         });
 
         // Push the new events.
@@ -845,6 +849,7 @@ mod private {
             if self.events.events().next().is_some() {
                 // If there's at least one event, this means we've reached the start of the
                 // timeline, since the chunk is fully loaded.
+                trace!("chunk is fully loaded and non-empty: reached_start=true");
                 LoadMoreEventsBackwardsOutcome::StartOfTimeline
             } else if !self.waited_for_initial_prev_token {
                 // There's no events. Since we haven't yet, wait for an initial previous-token.
@@ -918,6 +923,9 @@ mod private {
 
             // We've reached the start on disk, if and only if, there was no chunk prior to
             // the one we just loaded.
+            //
+            // This value is correct, if and only if, it is used for a chunk content of kind
+            // `Items`.
             let reached_start = new_first_chunk.previous.is_none();
 
             if let Err(err) = self.events.insert_new_chunk_as_first(new_first_chunk) {
@@ -939,14 +947,18 @@ mod private {
 
             Ok(match chunk_content {
                 ChunkContent::Gap(gap) => {
+                    trace!("reloaded chunk from disk (gap)");
                     LoadMoreEventsBackwardsOutcome::Gap { prev_token: Some(gap.prev_token) }
                 }
 
-                ChunkContent::Items(events) => LoadMoreEventsBackwardsOutcome::Events {
-                    events,
-                    timeline_event_diffs,
-                    reached_start,
-                },
+                ChunkContent::Items(events) => {
+                    trace!(?reached_start, "reloaded chunk from disk ({} items)", events.len());
+                    LoadMoreEventsBackwardsOutcome::Events {
+                        events,
+                        timeline_event_diffs,
+                        reached_start,
+                    }
+                }
             })
         }
 
@@ -1084,13 +1096,14 @@ mod private {
         /// This method is purposely isolated because it must ensure that
         /// positions are sorted appropriately or it can be disastrous.
         #[must_use = "Updates as `VectorDiff` must probably be propagated via `RoomEventCacheUpdate`"]
+        #[instrument(skip_all)]
         pub(crate) async fn remove_events(
             &mut self,
             in_memory_events: Vec<(OwnedEventId, Position)>,
             in_store_events: Vec<(OwnedEventId, Position)>,
         ) -> Result<Vec<VectorDiff<TimelineEvent>>, EventCacheError> {
             // In-store events.
-            {
+            if !in_store_events.is_empty() {
                 let mut positions = in_store_events
                     .into_iter()
                     .map(|(_event_id, position)| position)
@@ -1108,8 +1121,8 @@ mod private {
             }
 
             // In-memory events.
-            let timeline_event_diffs = self
-                .with_events_mut(|room_events| {
+            let timeline_event_diffs = if !in_memory_events.is_empty() {
+                self.with_events_mut(|room_events| {
                     // `remove_events_by_position` sorts the positions by itself.
                     room_events
                         .remove_events_by_position(
@@ -1122,13 +1135,15 @@ mod private {
 
                     vec![]
                 })
-                .await?;
+                .await?
+            } else {
+                Vec::new()
+            };
 
             Ok(timeline_event_diffs)
         }
 
         /// Propagate changes to the underlying storage.
-        #[instrument(skip_all)]
         async fn propagate_changes(&mut self) -> Result<(), EventCacheError> {
             let updates = self.events.store_updates().take();
             self.send_updates_to_store(updates).await
@@ -1175,7 +1190,7 @@ mod private {
             spawn(async move {
                 let store = store.lock().await?;
 
-                trace!(%room_id, ?updates, "sending linked chunk updates to the store");
+                trace!(?updates, "sending linked chunk updates to the store");
                 store.handle_linked_chunk_updates(&room_id, updates).await?;
                 trace!("linked chunk updates applied");
 
@@ -1208,8 +1223,8 @@ mod private {
             let diff_updates = self.events.updates_as_vector_diffs();
 
             // Ensure the contract defined in the doc comment is true:
-            assert_eq!(diff_updates.len(), 1);
-            assert!(matches!(diff_updates[0], VectorDiff::Clear));
+            debug_assert_eq!(diff_updates.len(), 1);
+            debug_assert!(matches!(diff_updates[0], VectorDiff::Clear));
 
             Ok(diff_updates)
         }
@@ -1261,6 +1276,7 @@ mod private {
         /// writing, all these events are passed to
         /// `Self::maybe_apply_new_redaction`.
         #[must_use = "Updates as `VectorDiff` must probably be propagated via `RoomEventCacheUpdate`"]
+        #[instrument(skip_all, fields(room_id = %self.room))]
         pub async fn with_events_mut<F>(
             &mut self,
             func: F,

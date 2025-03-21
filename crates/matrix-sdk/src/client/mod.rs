@@ -77,7 +77,7 @@ use url::Url;
 
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
-use crate::authentication::oidc::Oidc;
+use crate::authentication::oauth::OAuth;
 use crate::{
     authentication::{
         matrix::MatrixAuth, AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback,
@@ -97,7 +97,7 @@ use crate::{
     sliding_sync::Version as SlidingSyncVersion,
     sync::{RoomUpdate, SyncResponse},
     Account, AuthApi, AuthSession, Error, HttpError, Media, Pusher, RefreshTokenError, Result,
-    Room, TransmissionProgress,
+    Room, SessionTokens, TransmissionProgress,
 };
 #[cfg(feature = "e2e-encryption")]
 use crate::{
@@ -357,7 +357,7 @@ impl ClientInner {
         let caches = ClientCaches {
             server_capabilities: server_capabilities.into(),
             #[cfg(feature = "experimental-oidc")]
-            provider_metadata: Mutex::new(TtlCache::new()),
+            server_metadata: Mutex::new(TtlCache::new()),
         };
 
         let client = Self {
@@ -441,6 +441,10 @@ impl Client {
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
+    }
+
+    pub(crate) fn auth_ctx(&self) -> &AuthCtx {
+        &self.inner.auth_ctx
     }
 
     /// The cross-process store locks holder name.
@@ -578,22 +582,32 @@ impl Client {
         self.session_meta().map(|s| s.device_id.as_ref())
     }
 
-    /// Get the current access token for this session, regardless of the
-    /// authentication API used to log in.
+    /// Get the current access token for this session.
     ///
     /// Will be `None` if the client has not been logged in.
     pub fn access_token(&self) -> Option<String> {
-        self.inner.auth_ctx.auth_data.get()?.access_token()
+        self.auth_ctx().access_token()
+    }
+
+    /// Get the current tokens for this session.
+    ///
+    /// To be notified of changes in the session tokens, use
+    /// [`Client::subscribe_to_session_changes()`] or
+    /// [`Client::set_session_callbacks()`].
+    ///
+    /// Returns `None` if the client has not been logged in.
+    pub fn session_tokens(&self) -> Option<SessionTokens> {
+        self.auth_ctx().session_tokens()
     }
 
     /// Access the authentication API used to log in this client.
     ///
     /// Will be `None` if the client has not been logged in.
     pub fn auth_api(&self) -> Option<AuthApi> {
-        match self.inner.auth_ctx.auth_data.get()? {
-            AuthData::Matrix(_) => Some(AuthApi::Matrix(self.matrix_auth())),
+        match self.auth_ctx().auth_data.get()? {
+            AuthData::Matrix => Some(AuthApi::Matrix(self.matrix_auth())),
             #[cfg(feature = "experimental-oidc")]
-            AuthData::Oidc(_) => Some(AuthApi::Oidc(self.oidc())),
+            AuthData::OAuth(_) => Some(AuthApi::OAuth(self.oauth())),
         }
     }
 
@@ -607,7 +621,7 @@ impl Client {
         match self.auth_api()? {
             AuthApi::Matrix(api) => api.session().map(Into::into),
             #[cfg(feature = "experimental-oidc")]
-            AuthApi::Oidc(api) => api.full_session().map(Into::into),
+            AuthApi::OAuth(api) => api.full_session().map(Into::into),
         }
     }
 
@@ -656,10 +670,10 @@ impl Client {
         Ok(json)
     }
 
-    /// Access the OpenID Connect API of the client.
+    /// Access the OAuth 2.0 API of the client.
     #[cfg(feature = "experimental-oidc")]
-    pub fn oidc(&self) -> Oidc {
-        Oidc::new(self.clone())
+    pub fn oauth(&self) -> OAuth {
+        OAuth::new(self.clone())
     }
 
     /// Register a handler for a specific event type.
@@ -1270,7 +1284,7 @@ impl Client {
         match session {
             AuthSession::Matrix(s) => Box::pin(self.matrix_auth().restore_session(s)).await,
             #[cfg(feature = "experimental-oidc")]
-            AuthSession::Oidc(s) => Box::pin(self.oidc().restore_session(*s)).await,
+            AuthSession::OAuth(s) => Box::pin(self.oauth().restore_session(*s)).await,
         }
     }
 
@@ -1306,8 +1320,8 @@ impl Client {
                 Box::pin(api.refresh_access_token()).await?;
             }
             #[cfg(feature = "experimental-oidc")]
-            AuthApi::Oidc(api) => {
-                trace!("Token refresh: Using OIDC.");
+            AuthApi::OAuth(api) => {
+                trace!("Token refresh: Using OAuth 2.0.");
                 Box::pin(api.refresh_access_token()).await?;
             }
         }
@@ -2379,7 +2393,7 @@ impl Client {
 
     /// Subscribes a new receiver to client SessionChange broadcasts.
     pub fn subscribe_to_session_changes(&self) -> broadcast::Receiver<SessionChange> {
-        let broadcast = &self.inner.auth_ctx.session_change_sender;
+        let broadcast = &self.auth_ctx().session_change_sender;
         broadcast.subscribe()
     }
 
@@ -2432,7 +2446,7 @@ impl Client {
                 self.inner.http_client.clone(),
                 self.inner
                     .base_client
-                    .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name)
+                    .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name, false)
                     .await?,
                 self.inner.caches.server_capabilities.read().await.clone(),
                 self.inner.respect_login_well_known,

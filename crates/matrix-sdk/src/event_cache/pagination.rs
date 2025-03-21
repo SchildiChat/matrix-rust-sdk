@@ -152,6 +152,7 @@ impl RoomPagination {
                 // Notify subscribers that pagination ended.
                 status_observable
                     .set(RoomPaginationStatus::Idle { hit_timeline_start: outcome.reached_start });
+
                 Ok(Some(outcome))
             }
 
@@ -226,7 +227,7 @@ impl RoomPagination {
                         let _ =
                             self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
                                 diffs: timeline_event_diffs,
-                                origin: EventsOrigin::Pagination,
+                                origin: EventsOrigin::Cache,
                             });
                     }
 
@@ -315,7 +316,7 @@ impl RoomPagination {
         prev_gap_id: Option<ChunkIdentifier>,
     ) -> Result<BackPaginationOutcome> {
         // If there's no new previous gap, then we've reached the start of the timeline.
-        let reached_start = new_gap.is_none();
+        let network_reached_start = new_gap.is_none();
 
         let (
             DeduplicationOutcome {
@@ -367,17 +368,15 @@ impl RoomPagination {
             let insert_new_gap_pos = if let Some(gap_id) = prev_gap_id {
                 // There is a prior gap, let's replace it by new events!
                 if all_duplicates {
-                    // All the events were duplicated; don't act upon them, and only remove the
-                    // prior gap that we just filled.
-                    trace!("removing previous gap, as all events have been deduplicated");
-                    room_events.remove_empty_chunk_at(gap_id).expect("gap identifier is a valid gap chunk id we read previously")
-                } else {
-                    trace!("replacing previous gap with the back-paginated events");
-
-                    // Replace the gap with the events we just deduplicated.
-                    room_events.replace_gap_at(reversed_events.clone(), gap_id)
-                        .expect("gap_identifier is a valid chunk id we read previously")
+                    assert!(reversed_events.is_empty());
                 }
+
+                trace!("replacing previous gap with the back-paginated events");
+
+                // Replace the gap with the events we just deduplicated. This might get rid of the
+                // underlying gap, if the conditions are favorable to us.
+                room_events.replace_gap_at(reversed_events.clone(), gap_id)
+                    .expect("gap_identifier is a valid chunk id we read previously")
             } else if let Some(pos) = first_event_pos {
                 // No prior gap, but we had some events: assume we need to prepend events
                 // before those.
@@ -428,12 +427,24 @@ impl RoomPagination {
         // state in priority instead.
         let reached_start = {
             // There are no gaps.
-            !state.events().chunks().any(|chunk| chunk.is_gap()) &&
+            let has_gaps = state.events().chunks().any(|chunk| chunk.is_gap());
+
             // The first chunk has no predecessors.
-            state.events()
-            .chunks()
-            .next()
-            .map_or(reached_start, |chunk| chunk.is_definitive_head())
+            let first_chunk_is_definitive_head =
+                state.events().chunks().next().map(|chunk| chunk.is_definitive_head());
+
+            let reached_start =
+                !has_gaps && first_chunk_is_definitive_head.unwrap_or(network_reached_start);
+
+            trace!(
+                ?network_reached_start,
+                ?has_gaps,
+                ?first_chunk_is_definitive_head,
+                ?reached_start,
+                "finished handling network back-pagination"
+            );
+
+            reached_start
         };
 
         let backpagination_outcome = BackPaginationOutcome { events, reached_start };

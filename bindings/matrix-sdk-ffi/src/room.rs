@@ -1,13 +1,14 @@
 use std::{collections::HashMap, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
+use async_compat::get_runtime_handle;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     crypto::LocalTrust,
     room::{
         edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
     },
-    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType, EncryptionState,
     RoomHero as SdkRoomHero, RoomMemberships, RoomState,
 };
 use matrix_sdk_ui::timeline::{default_event_filter, RoomExt};
@@ -34,7 +35,6 @@ use tracing::{error, warn};
 use crate::space_child_info::{SpaceChildInfo, space_children_info};
 // SC end
 
-use super::RUNTIME;
 use crate::{
     chunk_iterator::ChunkIterator,
     client::{JoinRule, RoomVisibility},
@@ -114,8 +114,8 @@ impl Room {
         self.inner.avatar_url().map(|m| m.to_string())
     }
 
-    pub fn is_direct(&self) -> bool {
-        RUNTIME.block_on(self.inner.is_direct()).unwrap_or(false)
+    pub async fn is_direct(&self) -> bool {
+        self.inner.is_direct().await.unwrap_or(false)
     }
 
     pub fn is_public(&self) -> bool {
@@ -167,21 +167,6 @@ impl Room {
     /// The vector is ordered by oldest membership user to newest.
     pub fn active_room_call_participants(&self) -> Vec<String> {
         self.inner.active_room_call_participants().iter().map(|u| u.to_string()).collect()
-    }
-
-    /// For rooms one is invited to, retrieves the room member information for
-    /// the user who invited the logged-in user to a room.
-    pub async fn inviter(&self) -> Option<RoomMember> {
-        if self.inner.state() == RoomState::Invited {
-            self.inner
-                .invite_details()
-                .await
-                .ok()
-                .and_then(|a| a.inviter)
-                .and_then(|m| m.try_into().ok())
-        } else {
-            None
-        }
     }
 
     /// Forces the currently active room key, which is used to encrypt messages,
@@ -265,8 +250,12 @@ impl Room {
         self.inner.room_id().to_string()
     }
 
-    pub fn is_encrypted(&self) -> Result<bool, ClientError> {
-        Ok(RUNTIME.block_on(self.inner.is_encrypted())?)
+    pub fn encryption_state(&self) -> EncryptionState {
+        self.inner.encryption_state()
+    }
+
+    pub async fn latest_encryption_state(&self) -> Result<EncryptionState, ClientError> {
+        Ok(self.inner.latest_encryption_state().await?)
     }
 
     pub async fn members(&self) -> Result<Arc<RoomMembersIterator>, ClientError> {
@@ -311,7 +300,7 @@ impl Room {
         listener: Box<dyn RoomInfoListener>,
     ) -> Arc<TaskHandle> {
         let mut subscriber = self.inner.subscribe_info();
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             while subscriber.next().await.is_some() {
                 match self.room_info().await {
                     Ok(room_info) => listener.call(room_info),
@@ -615,18 +604,16 @@ impl Room {
     /// store.
     ///
     /// It will be returned as a JSON string.
-    pub fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
-        RUNTIME.block_on(async move {
-            let event = self.inner.account_data(event_type.into()).await?;
-            Ok(event.map(|e| e.json().get().to_owned()))
-        })
+    pub async fn account_data(&self, event_type: String) -> Result<Option<String>, ClientError> {
+        let event = self.inner.account_data(event_type.into()).await?;
+        Ok(event.map(|e| e.json().get().to_owned()))
     }
 
     pub fn subscribe_to_typing_notifications(
         self: Arc<Self>,
         listener: Box<dyn TypingNotificationsListener>,
     ) -> Arc<TaskHandle> {
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             let (_event_handler_drop_guard, mut subscriber) =
                 self.inner.subscribe_to_typing_notifications();
             while let Ok(typing_user_ids) = subscriber.recv().await {
@@ -642,7 +629,7 @@ impl Room {
         listener: Box<dyn IdentityStatusChangeListener>,
     ) -> Arc<TaskHandle> {
         let room = self.inner.clone();
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             let status_changes = room.subscribe_to_identity_status_changes().await;
             if let Ok(status_changes) = status_changes {
                 // TODO: what to do with failures?
@@ -921,7 +908,7 @@ impl Room {
     ) -> Result<Arc<TaskHandle>, ClientError> {
         let (stream, seen_ids_cleanup_handle) = self.inner.subscribe_to_knock_requests().await?;
 
-        let handle = Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        let handle = Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(stream);
             while let Some(requests) = stream.next().await {
                 listener.call(requests.into_iter().map(Into::into).collect());
@@ -1071,7 +1058,7 @@ impl Room {
     ) -> Arc<TaskHandle> {
         let room = self.inner.clone();
 
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             let subscription = room.observe_live_location_shares();
             let mut stream = subscription.subscribe();
             let mut pinned_stream = pin!(stream);

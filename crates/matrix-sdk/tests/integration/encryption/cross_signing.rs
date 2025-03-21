@@ -14,13 +14,11 @@
 
 use assert_matches2::assert_let;
 use matrix_sdk::{
-    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     encryption::CrossSigningResetAuthType,
-    test_utils::no_retry_test_client_with_server,
-    SessionMeta,
+    test_utils::{client::mock_matrix_session, no_retry_test_client_with_server},
 };
 use matrix_sdk_test::async_test;
-use ruma::{api::client::uiaa, device_id, user_id};
+use ruma::{api::client::uiaa, user_id};
 use serde_json::json;
 use wiremock::{
     matchers::{method, path},
@@ -31,10 +29,7 @@ use wiremock::{
 async fn test_reset_legacy_auth() {
     let user_id = user_id!("@example:morpheus.localhost");
 
-    let session = MatrixSession {
-        meta: SessionMeta { user_id: user_id.into(), device_id: device_id!("DEVICEID").to_owned() },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
-    };
+    let session = mock_matrix_session();
 
     let (client, server) = no_retry_test_client_with_server().await;
 
@@ -116,7 +111,7 @@ async fn test_reset_legacy_auth() {
 
 #[cfg(feature = "experimental-oidc")]
 #[async_test]
-async fn test_reset_oidc() {
+async fn test_reset_oauth() {
     use assert_matches2::assert_let;
     use matrix_sdk::{encryption::CrossSigningResetAuthType, test_utils::mocks::MatrixMockServer};
     use similar_asserts::assert_eq;
@@ -168,9 +163,9 @@ async fn test_reset_oidc() {
         .unwrap()
         .expect("We should have received a reset handle");
 
-    assert_let!(CrossSigningResetAuthType::Oidc(oidc_info) = reset_handle.auth_type());
+    assert_let!(CrossSigningResetAuthType::OAuth(oauth_info) = reset_handle.auth_type());
     assert_eq!(
-        oidc_info.approval_url.as_str(),
+        oauth_info.approval_url.as_str(),
         format!("{}/account/?action=org.matrix.cross_signing_reset", server.server().uri())
     );
 

@@ -16,6 +16,7 @@ use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
 
 use anyhow::{Context, Result};
 use as_variant::as_variant;
+use async_compat::get_runtime_handle;
 use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt as _};
@@ -73,7 +74,6 @@ use crate::{
     },
     task_handle::TaskHandle,
     utils::Timestamp,
-    RUNTIME,
 };
 
 pub mod configuration;
@@ -124,7 +124,7 @@ impl Timeline {
             .formatted_caption(formatted_caption)
             .mentions(params.mentions.map(Into::into));
 
-        let handle = SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+        let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
             let mut request =
                 self.inner.send_attachment(params.filename, mime_type, attachment_config);
 
@@ -134,7 +134,7 @@ impl Timeline {
 
             if let Some(progress_watcher) = progress_watcher {
                 let mut subscriber = request.subscribe_to_send_progress();
-                RUNTIME.spawn(async move {
+                get_runtime_handle().spawn(async move {
                     while let Some(progress) = subscriber.next().await {
                         progress_watcher.transmission_progress(progress.into());
                     }
@@ -215,7 +215,7 @@ impl Timeline {
     pub async fn add_listener(&self, listener: Box<dyn TimelineListener>) -> Arc<TaskHandle> {
         let (timeline_items, timeline_stream) = self.inner.subscribe().await;
 
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(timeline_stream);
 
             // It's important that the initial items are passed *before* we forward the
@@ -237,7 +237,7 @@ impl Timeline {
     }
 
     pub fn retry_decryption(self: Arc<Self>, session_ids: Vec<String>) {
-        RUNTIME.spawn(async move {
+        get_runtime_handle().spawn(async move {
             self.inner.retry_decryption(&session_ids).await;
         });
     }
@@ -256,10 +256,14 @@ impl Timeline {
             .await
             .context("can't subscribe to the back-pagination status on a focused timeline")?;
 
-        Ok(Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
-            // Send the current state even if it hasn't changed right away.
-            listener.on_update(initial);
+        // Send the current state even if it hasn't changed right away.
+        //
+        // Note: don't do it in the spawned function, so that the caller is immediately
+        // aware of the current state, and this doesn't depend on the async runtime
+        // having an available worker
+        listener.on_update(initial);
 
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             while let Some(status) = subscriber.next().await {
                 listener.on_update(status);
             }
@@ -293,26 +297,22 @@ impl Timeline {
     }
 
     /// SC: get fully_read marker event ID
-    pub fn fully_read_event_id(&self) -> Option<String> {
-        RUNTIME.block_on(async {
-            self.inner.fully_read_event_id().await.map(Into::into)
-        })
+    pub async fn fully_read_event_id(&self) -> Option<String> {
+        self.inner.fully_read_event_id().await.map(Into::into)
     }
 
     /// SC: same as send_read_receipt(), but with force_
-    pub fn force_send_read_receipt(
+    pub async fn force_send_read_receipt(
         &self,
         receipt_type: ReceiptType,
         event_id: String,
     ) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
 
-        RUNTIME.block_on(async {
-            self.inner
-                .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
-                .await?;
-            Ok(())
-        })
+        self.inner
+            .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
+            .await?;
+        Ok(())
     }
 
     /// Mark the room as read by trying to attach an *unthreaded* read receipt
@@ -475,7 +475,7 @@ impl Timeline {
         let poll_end_event_content = UnstablePollEndEventContent::new(text, poll_start_event_id);
         let event_content = AnyMessageLikeEventContent::UnstablePollEnd(poll_end_event_content);
 
-        RUNTIME.spawn(async move {
+        get_runtime_handle().spawn(async move {
             if let Err(err) = self.inner.send(event_content).await {
                 error!("unable to end poll: {err}");
             }
