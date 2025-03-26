@@ -17,11 +17,14 @@ use std::borrow::Cow;
 use oauth2::{
     basic::BasicClient as OAuthClient, AuthUrl, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope,
 };
-use ruma::{api::client::discovery::get_authorization_server_metadata::msc2965::Prompt, UserId};
+use ruma::{
+    api::client::discovery::get_authorization_server_metadata::msc2965::Prompt, OwnedDeviceId,
+    UserId,
+};
 use tracing::{info, instrument};
 use url::Url;
 
-use super::{OAuth, OAuthError};
+use super::{ClientRegistrationMethod, OAuth, OAuthError};
 use crate::{authentication::oauth::AuthorizationValidationData, Result};
 
 /// Builder type used to configure optional settings for authorization with an
@@ -31,15 +34,31 @@ use crate::{authentication::oauth::AuthorizationValidationData, Result};
 #[allow(missing_debug_implementations)]
 pub struct OAuthAuthCodeUrlBuilder {
     oauth: OAuth,
+    registration_method: ClientRegistrationMethod,
     scopes: Vec<Scope>,
+    device_id: OwnedDeviceId,
     redirect_uri: Url,
     prompt: Option<Vec<Prompt>>,
     login_hint: Option<String>,
 }
 
 impl OAuthAuthCodeUrlBuilder {
-    pub(super) fn new(oauth: OAuth, scopes: Vec<Scope>, redirect_uri: Url) -> Self {
-        Self { oauth, scopes, redirect_uri, prompt: None, login_hint: None }
+    pub(super) fn new(
+        oauth: OAuth,
+        registration_method: ClientRegistrationMethod,
+        scopes: Vec<Scope>,
+        device_id: OwnedDeviceId,
+        redirect_uri: Url,
+    ) -> Self {
+        Self {
+            oauth,
+            registration_method,
+            scopes,
+            device_id,
+            redirect_uri,
+            prompt: None,
+            login_hint: None,
+        }
     }
 
     /// Set the [`Prompt`] of the authorization URL.
@@ -67,24 +86,35 @@ impl OAuthAuthCodeUrlBuilder {
     /// flow.
     ///
     /// This URL should be presented to the user and once they are redirected to
-    /// the `redirect_uri`, the authorization can be completed by calling
-    /// [`OAuth::finish_authorization()`].
+    /// the `redirect_uri`, the login can be completed by calling
+    /// [`OAuth::finish_login()`].
     ///
     /// Returns an error if the client registration was not restored, or if a
     /// request fails.
     #[instrument(target = "matrix_sdk::client", skip_all)]
     pub async fn build(self) -> Result<OAuthAuthorizationData, OAuthError> {
-        let Self { oauth, scopes, redirect_uri, prompt, login_hint } = self;
+        let Self {
+            oauth,
+            registration_method,
+            scopes,
+            device_id,
+            redirect_uri,
+            prompt,
+            login_hint,
+        } = self;
 
-        let data = oauth.data().ok_or(OAuthError::NotAuthenticated)?;
+        let server_metadata = oauth.server_metadata().await?;
+
+        oauth.use_registration_method(&server_metadata, &registration_method).await?;
+
+        let data = oauth.data().expect("OAuth 2.0 data should be set after registration");
         info!(
             issuer = data.issuer.as_str(),
             ?scopes,
             "Authorizing scope via the OAuth 2.0 Authorization Code flow"
         );
 
-        let server_metadata = oauth.server_metadata().await?;
-        let auth_url = AuthUrl::from_url(server_metadata.authorization_endpoint);
+        let auth_url = AuthUrl::from_url(server_metadata.authorization_endpoint.clone());
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
         let redirect_uri = RedirectUrl::from_url(redirect_uri);
@@ -108,10 +138,10 @@ impl OAuthAuthCodeUrlBuilder {
 
         let (url, state) = request.url();
 
-        data.authorization_data
-            .lock()
-            .await
-            .insert(state.clone(), AuthorizationValidationData { redirect_uri, pkce_verifier });
+        data.authorization_data.lock().await.insert(
+            state.clone(),
+            AuthorizationValidationData { server_metadata, device_id, redirect_uri, pkce_verifier },
+        );
 
         Ok(OAuthAuthorizationData { url, state })
     }

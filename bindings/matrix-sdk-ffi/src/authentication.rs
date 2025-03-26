@@ -1,16 +1,15 @@
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
-    path::Path,
+    path::PathBuf,
     sync::Arc,
 };
 
 use matrix_sdk::{
     authentication::oauth::{
-        error::OAuthAuthorizationCodeError,
+        error::{OAuthAuthorizationCodeError, OAuthRegistrationStoreError},
         registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
-        registrations::{ClientId, OidcRegistrations, OidcRegistrationsError},
-        OAuthError as SdkOAuthError,
+        ClientId, OAuthError as SdkOAuthError, OAuthRegistrationStore,
     },
     Error,
 };
@@ -166,23 +165,30 @@ impl OidcConfiguration {
         Raw::new(&metadata).map_err(|_| OidcError::MetadataInvalid)
     }
 
-    pub fn registrations(&self) -> Result<OidcRegistrations, OidcError> {
+    pub async fn registrations(&self) -> Result<OAuthRegistrationStore, OidcError> {
         let client_metadata = self.client_metadata()?;
 
-        let registrations_file = Path::new(&self.dynamic_registrations_file);
-        let static_registrations = self
-            .static_registrations
-            .iter()
-            .filter_map(|(issuer, client_id)| {
-                let Ok(issuer) = Url::parse(issuer) else {
-                    tracing::error!("Failed to parse {:?}", issuer);
-                    return None;
-                };
-                Some((issuer, ClientId::new(client_id.clone())))
-            })
-            .collect();
+        let registrations_file = PathBuf::from(&self.dynamic_registrations_file);
+        let mut registrations =
+            OAuthRegistrationStore::new(registrations_file, client_metadata).await?;
 
-        Ok(OidcRegistrations::new(registrations_file, client_metadata, static_registrations)?)
+        if !self.static_registrations.is_empty() {
+            let static_registrations = self
+                .static_registrations
+                .iter()
+                .filter_map(|(issuer, client_id)| {
+                    let Ok(issuer) = Url::parse(issuer) else {
+                        tracing::error!("Failed to parse {:?}", issuer);
+                        return None;
+                    };
+                    Some((issuer, ClientId::new(client_id.clone())))
+                })
+                .collect();
+
+            registrations = registrations.with_static_registrations(static_registrations);
+        }
+
+        Ok(registrations)
     }
 }
 
@@ -222,10 +228,12 @@ impl From<SdkOAuthError> for OidcError {
     }
 }
 
-impl From<OidcRegistrationsError> for OidcError {
-    fn from(e: OidcRegistrationsError) -> OidcError {
+impl From<OAuthRegistrationStoreError> for OidcError {
+    fn from(e: OAuthRegistrationStoreError) -> OidcError {
         match e {
-            OidcRegistrationsError::InvalidFilePath => OidcError::RegistrationsPathInvalid,
+            OAuthRegistrationStoreError::NotAFilePath | OAuthRegistrationStoreError::File(_) => {
+                OidcError::RegistrationsPathInvalid
+            }
             _ => OidcError::Generic { message: e.to_string() },
         }
     }

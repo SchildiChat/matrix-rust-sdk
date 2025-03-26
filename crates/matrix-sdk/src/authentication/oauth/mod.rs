@@ -62,9 +62,7 @@
 //! provide the URL to present to the user in a web browser. After
 //! authenticating with the server, the user will be redirected to the provided
 //! redirect URI, with a code in the query that will allow to finish the
-//! authorization process by calling [`OAuth::finish_authorization()`].
-//!
-//! When the login is successful, you must then call [`OAuth::finish_login()`].
+//! login process by calling [`OAuth::finish_login()`].
 //!
 //! # Persisting/restoring a session
 //!
@@ -105,8 +103,7 @@
 //!
 //! If refreshing the access token fails, the next step is to try to request a
 //! new login authorization with [`OAuth::login()`], using the device ID from
-//! the session. _Note_ that in this case [`OAuth::finish_login()`] must NOT be
-//! called after [`OAuth::finish_authorization()`].
+//! the session.
 //!
 //! If this fails again, the client should assume to be logged out, and all
 //! local data should be erased.
@@ -123,14 +120,14 @@
 //! # Examples
 //!
 //! Most methods have examples, there is also an example CLI application that
-//! supports all the actions described here, in [`examples/oidc_cli`].
+//! supports all the actions described here, in [`examples/oauth_cli`].
 //!
 //! [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
 //! [areweoidcyet.com]: https://areweoidcyet.com/
 //! [`ClientBuilder::handle_refresh_tokens()`]: crate::ClientBuilder::handle_refresh_tokens()
 //! [`Error`]: ruma::api::client::error::Error
 //! [`ErrorKind::UnknownToken`]: ruma::api::client::error::ErrorKind::UnknownToken
-//! [`examples/oidc_cli`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/oidc_cli
+//! [`examples/oauth_cli`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/oauth_cli
 
 use std::{
     borrow::Cow,
@@ -147,17 +144,17 @@ use error::{
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::types::qr_login::QrCodeData;
 use matrix_sdk_base::{once_cell::sync::OnceCell, SessionMeta};
-pub use oauth2::CsrfToken;
 use oauth2::{
     basic::BasicClient as OAuthClient, AccessToken, PkceCodeVerifier, RedirectUrl, RefreshToken,
     RevocationUrl, Scope, StandardErrorResponse, StandardRevocableToken, TokenResponse, TokenUrl,
 };
+pub use oauth2::{ClientId, CsrfToken};
 use ruma::{
     api::client::discovery::{
         get_authentication_issuer,
         get_authorization_server_metadata::{
             self,
-            msc2965::{AccountManagementAction, AuthorizationServerMetadata, Prompt},
+            msc2965::{AccountManagementAction, AuthorizationServerMetadata},
         },
     },
     serde::Raw,
@@ -178,7 +175,7 @@ mod oidc_discovery;
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 pub mod qrcode;
 pub mod registration;
-pub mod registrations;
+mod registration_store;
 #[cfg(test)]
 mod tests;
 
@@ -189,12 +186,12 @@ use self::{
     oidc_discovery::discover,
     qrcode::LoginWithQrCode,
     registration::{register_client, ClientMetadata, ClientRegistrationResponse},
-    registrations::{ClientId, OidcRegistrations},
 };
 pub use self::{
     account_management_url::AccountManagementActionFull,
     auth_code_builder::{OAuthAuthCodeUrlBuilder, OAuthAuthorizationData},
     error::OAuthError,
+    registration_store::OAuthRegistrationStore,
 };
 use super::{AuthData, SessionTokens};
 use crate::{client::SessionChange, Client, HttpError, RefreshTokenError, Result};
@@ -382,7 +379,7 @@ impl OAuth {
     ///
     /// // Subscribing to the progress is necessary since we need to input the check
     /// // code on the existing device.
-    /// let login = oauth.login_with_qr_code(&qr_code_data, metadata);
+    /// let login = oauth.login_with_qr_code(&qr_code_data, metadata.into());
     /// let mut progress = login.subscribe_to_progress();
     ///
     /// // Create a task which will show us the progress and tell us the check
@@ -414,140 +411,72 @@ impl OAuth {
     pub fn login_with_qr_code<'a>(
         &'a self,
         data: &'a QrCodeData,
-        client_metadata: Raw<ClientMetadata>,
+        registration_method: ClientRegistrationMethod,
     ) -> LoginWithQrCode<'a> {
-        LoginWithQrCode::new(&self.client, client_metadata, data)
+        LoginWithQrCode::new(&self.client, registration_method, data)
     }
 
-    /// A higher level wrapper around the configuration and login methods that
-    /// will take some client metadata, register the client if needed and begin
-    /// the login process, returning the authorization data required to show a
-    /// webview for a user to login to their account. Call
-    /// [`OAuth::login_with_oidc_callback`] to finish the process when the
-    /// webview is complete.
+    /// Restore or register the OAuth 2.0 client for the server with the given
+    /// metadata, with the given [`OAuthRegistrationStore`].
     ///
-    /// # Arguments
+    /// If there is a client ID in the store, it is used to restore the client.
+    /// Otherwise, the client is registered with the metadata in the store.
     ///
-    /// * `registrations` - The storage where the registered client ID will be
-    ///   loaded from, if the client is already registered, or stored into, if
-    ///   the client is not registered yet.
-    ///
-    /// * `redirect_uri` - The URI where the end user will be redirected after
-    ///   authorizing the login. It must be one of the redirect URIs in the
-    ///   client metadata used for registration.
-    ///
-    /// * `prompt` - The desired user experience in the web UI. `None` means
-    ///   that the user wishes to login into an existing account, and
-    ///   `Some(Prompt::Create)` means that the user wishes to register a new
-    ///   account.
-    pub async fn url_for_oidc(
+    /// Returns an error if there is an error while accessing the store, or
+    /// while registering the client.
+    async fn restore_or_register_client(
         &self,
-        registrations: OidcRegistrations,
-        redirect_uri: Url,
-        prompt: Option<Prompt>,
-    ) -> Result<OAuthAuthorizationData, OAuthError> {
-        let server_metadata = self.server_metadata().await?;
+        server_metadata: &AuthorizationServerMetadata,
+        registrations: &OAuthRegistrationStore,
+    ) -> std::result::Result<(), OAuthClientRegistrationError> {
+        if let Some(client_id) = registrations.client_id(&server_metadata.issuer).await? {
+            self.restore_registered_client(server_metadata.issuer.clone(), client_id);
 
-        self.configure(server_metadata.issuer, registrations).await?;
-
-        let mut data_builder = self.login(redirect_uri, None)?;
-
-        if let Some(prompt) = prompt {
-            data_builder = data_builder.prompt(vec![prompt]);
-        }
-
-        let data = data_builder.build().await?;
-
-        Ok(data)
-    }
-
-    /// A higher level wrapper around the methods to complete a login after the
-    /// user has logged in through a webview. This method should be used in
-    /// tandem with [`OAuth::url_for_oidc`].
-    pub async fn login_with_oidc_callback(
-        &self,
-        authorization_data: &OAuthAuthorizationData,
-        callback_url: Url,
-    ) -> Result<()> {
-        let response = AuthorizationResponse::parse_uri(&callback_url)
-            .map_err(OAuthAuthorizationCodeError::from)
-            .map_err(OAuthError::from)?;
-
-        let code = match response {
-            AuthorizationResponse::Success(code) => code,
-            AuthorizationResponse::Error(err) => {
-                return Err(OAuthError::from(OAuthAuthorizationCodeError::from(err.error)).into());
-            }
+            tracing::info!("OAuth 2.0 configuration loaded from disk.");
+            return Ok(());
         };
 
-        // This check will also be done in `finish_authorization`, however it requires
-        // the client to have called `abort_authorization` which we can't guarantee so
-        // lets double check with their supplied authorization data to be safe.
-        if code.state != authorization_data.state {
-            return Err(OAuthError::from(OAuthAuthorizationCodeError::InvalidState).into());
-        };
+        tracing::info!("Registering this client for OAuth 2.0.");
+        let response = self.register_client_inner(server_metadata, &registrations.metadata).await?;
 
-        self.finish_authorization(code).await?;
-        self.finish_login().await?;
+        tracing::info!("Persisting OAuth 2.0 registration data.");
+        registrations
+            .set_and_write_client_id(response.client_id, server_metadata.issuer.clone())
+            .await?;
 
         Ok(())
     }
 
-    /// Higher level wrapper that restores the OAuth 2.0 client with automatic
-    /// static/dynamic client registration.
-    async fn configure(
+    /// Restore or register the OAuth 2.0 client for the server with the given
+    /// metadata, with the given [`ClientRegistrationMethod`].
+    ///
+    /// If we already have a client ID, this is a noop.
+    ///
+    /// Returns an error if there was a problem using the registration method.
+    async fn use_registration_method(
         &self,
-        issuer: Url,
-        registrations: OidcRegistrations,
+        server_metadata: &AuthorizationServerMetadata,
+        method: &ClientRegistrationMethod,
     ) -> std::result::Result<(), OAuthError> {
         if self.client_id().is_some() {
             tracing::info!("OAuth 2.0 is already configured.");
             return Ok(());
         };
 
-        if self.load_client_registration(issuer, &registrations) {
-            tracing::info!("OAuth 2.0 configuration loaded from disk.");
-            return Ok(());
+        match method {
+            ClientRegistrationMethod::None => return Err(OAuthError::NotRegistered),
+            ClientRegistrationMethod::ClientId(client_id) => {
+                self.restore_registered_client(server_metadata.issuer.clone(), client_id.clone());
+            }
+            ClientRegistrationMethod::Metadata(client_metadata) => {
+                self.register_client_inner(server_metadata, client_metadata).await?;
+            }
+            ClientRegistrationMethod::Store(registrations) => {
+                self.restore_or_register_client(server_metadata, registrations).await?
+            }
         }
 
-        tracing::info!("Registering this client for OAuth 2.0.");
-        self.register_client(&registrations.metadata).await?;
-
-        tracing::info!("Persisting OAuth 2.0 registration data.");
-        self.store_client_registration(&registrations)
-            .map_err(|e| OAuthError::UnknownError(Box::new(e)))?;
-
         Ok(())
-    }
-
-    /// Stores the current OAuth 2.0 dynamic client registration so it can be
-    /// re-used if we ever log in via the same issuer again.
-    fn store_client_registration(
-        &self,
-        registrations: &OidcRegistrations,
-    ) -> std::result::Result<(), OAuthError> {
-        let issuer = self.issuer().expect("issuer should be set after registration").to_owned();
-        let client_id = self.client_id().ok_or(OAuthError::NotRegistered)?.to_owned();
-
-        registrations
-            .set_and_write_client_id(client_id, issuer)
-            .map_err(|e| OAuthError::UnknownError(Box::new(e)))?;
-
-        Ok(())
-    }
-
-    /// Attempts to load an existing OAuth 2.0 dynamic client registration for a
-    /// given issuer.
-    ///
-    /// Returns `true` if an existing registration was found and `false` if not.
-    fn load_client_registration(&self, issuer: Url, registrations: &OidcRegistrations) -> bool {
-        let Some(client_id) = registrations.client_id(&issuer) else {
-            return false;
-        };
-
-        self.restore_registered_client(issuer, client_id);
-
-        true
     }
 
     /// The OAuth 2.0 authorization server used for authorization.
@@ -768,7 +697,7 @@ impl OAuth {
     ///
     /// ```no_run
     /// use matrix_sdk::{Client, ServerName};
-    /// use matrix_sdk::authentication::oauth::registrations::ClientId;
+    /// # use matrix_sdk::authentication::oauth::ClientId;
     /// # use matrix_sdk::authentication::oauth::registration::ClientMetadata;
     /// # use ruma::serde::Raw;
     /// # let client_metadata = unimplemented!();
@@ -807,7 +736,14 @@ impl OAuth {
         client_metadata: &Raw<ClientMetadata>,
     ) -> Result<ClientRegistrationResponse, OAuthError> {
         let server_metadata = self.server_metadata().await?;
+        Ok(self.register_client_inner(&server_metadata, client_metadata).await?)
+    }
 
+    async fn register_client_inner(
+        &self,
+        server_metadata: &AuthorizationServerMetadata,
+        client_metadata: &Raw<ClientMetadata>,
+    ) -> Result<ClientRegistrationResponse, OAuthClientRegistrationError> {
         let registration_endpoint = server_metadata
             .registration_endpoint
             .as_ref()
@@ -819,7 +755,7 @@ impl OAuth {
         // The format of the credentials changes according to the client metadata that
         // was sent. Public clients only get a client ID.
         self.restore_registered_client(
-            server_metadata.issuer,
+            server_metadata.issuer.clone(),
             registration_response.client_id.clone(),
         );
 
@@ -960,8 +896,8 @@ impl OAuth {
         Ok(())
     }
 
-    /// The scopes to request for logging in.
-    fn login_scopes(device_id: Option<OwnedDeviceId>) -> [Scope; 2] {
+    /// The scopes to request for logging in and the corresponding device ID.
+    fn login_scopes(device_id: Option<OwnedDeviceId>) -> ([Scope; 2], OwnedDeviceId) {
         /// Scope to grand full access to the client-server API.
         const SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS: &str =
             "urn:matrix:org.matrix.msc2967.client:api:*";
@@ -971,10 +907,13 @@ impl OAuth {
         // Generate the device ID if it is not provided.
         let device_id = device_id.unwrap_or_else(DeviceId::new);
 
-        [
-            Scope::new(SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS.to_owned()),
-            Scope::new(format!("{SCOPE_MATRIX_DEVICE_ID_PREFIX}{device_id}")),
-        ]
+        (
+            [
+                Scope::new(SCOPE_MATRIX_CLIENT_SERVER_API_FULL_ACCESS.to_owned()),
+                Scope::new(format!("{SCOPE_MATRIX_DEVICE_ID_PREFIX}{device_id}")),
+            ],
+            device_id,
+        )
     }
 
     /// Login via OAuth 2.0 with the Authorization Code flow.
@@ -982,11 +921,14 @@ impl OAuth {
     /// This should be called after [`OAuth::register_client()`] or
     /// [`OAuth::restore_registered_client()`].
     ///
-    /// If this is a brand new login, [`OAuth::finish_login()`] must be called
-    /// after [`OAuth::finish_authorization()`], to finish loading the user
-    /// session.
+    /// [`OAuth::finish_login()`] must be called once the user has been
+    /// redirected to the `redirect_uri`. [`OAuth::abort_login()`] should be
+    /// called instead if the authorization should be aborted before completion.
     ///
     /// # Arguments
+    ///
+    /// * `registration_method` - The method to restore or register the client
+    ///   with the server.
     ///
     /// * `redirect_uri` - The URI where the end user will be redirected after
     ///   authorizing the login. It must be one of the redirect URIs sent in the
@@ -997,100 +939,128 @@ impl OAuth {
     ///   device ID from a previous login call. Note that this should be done
     ///   only if the client also holds the corresponding encryption keys.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the device ID is not valid.
-    ///
     /// # Example
     ///
     /// ```no_run
     /// use anyhow::anyhow;
     /// use matrix_sdk::{
     ///     Client,
-    ///     authentication::oauth::AuthorizationResponse,
+    ///     authentication::oauth::OAuthRegistrationStore,
     /// };
+    /// # use ruma::serde::Raw;
+    /// # use matrix_sdk::authentication::oauth::registration::ClientMetadata;
     /// # let homeserver = unimplemented!();
     /// # let redirect_uri = unimplemented!();
     /// # let issuer_info = unimplemented!();
     /// # let client_id = unimplemented!();
+    /// # let store_path = unimplemented!();
     /// # async fn open_uri_and_wait_for_redirect(uri: url::Url) -> url::Url { unimplemented!() };
+    /// # fn client_metadata() -> Raw<ClientMetadata> { unimplemented!() };
     /// # _ = async {
     /// # let client = Client::new(homeserver).await?;
     /// let oauth = client.oauth();
     ///
-    /// oauth.restore_registered_client(
-    ///     issuer_info,
-    ///     client_id,
-    /// );
+    /// let registration_store = OAuthRegistrationStore::new(
+    ///     store_path,
+    ///     client_metadata()
+    /// ).await?;
     ///
-    /// let auth_data = oauth.login(redirect_uri, None)?.build().await?;
+    /// let auth_data = oauth.login(registration_store.into(), redirect_uri, None)
+    ///                      .build()
+    ///                      .await?;
     ///
     /// // Open auth_data.url and wait for response at the redirect URI.
     /// let redirected_to_uri = open_uri_and_wait_for_redirect(auth_data.url).await;
     ///
-    /// let auth_response = AuthorizationResponse::parse_uri(&redirected_to_uri)?;
+    /// oauth.finish_login(redirected_to_uri.into()).await?;
     ///
-    /// let code = match auth_response {
-    ///     AuthorizationResponse::Success(code) => code,
-    ///     AuthorizationResponse::Error(error) => {
-    ///         return Err(anyhow!("Authorization failed: {:?}", error));
-    ///     }
-    /// };
+    /// // The session tokens can be persisted from the
+    /// // `Client::session_tokens()` method.
     ///
-    /// let _tokens_response = oauth.finish_authorization(code).await?;
-    ///
-    /// // Important! Without this we can't access the full session.
-    /// oauth.finish_login().await?;
-    ///
-    /// // The session tokens can be persisted either from the response, or from
-    /// // the `Client::session_tokens()` method.
-    ///
-    /// // You can now make any request compatible with the requested scope.
+    /// // You can now make requests to the Matrix API.
     /// let _me = client.whoami().await?;
     /// # anyhow::Ok(()) }
     /// ```
     pub fn login(
         &self,
+        registration_method: ClientRegistrationMethod,
         redirect_uri: Url,
         device_id: Option<OwnedDeviceId>,
-    ) -> Result<OAuthAuthCodeUrlBuilder, OAuthError> {
-        let scopes = Self::login_scopes(device_id).to_vec();
+    ) -> OAuthAuthCodeUrlBuilder {
+        let (scopes, device_id) = Self::login_scopes(device_id);
 
-        Ok(OAuthAuthCodeUrlBuilder::new(self.clone(), scopes, redirect_uri))
+        OAuthAuthCodeUrlBuilder::new(
+            self.clone(),
+            registration_method,
+            scopes.to_vec(),
+            device_id,
+            redirect_uri,
+        )
     }
 
     /// Finish the login process.
     ///
-    /// Must be called after [`OAuth::finish_authorization()`] after logging
-    /// into a brand new session, to load the last part of the user session
-    /// and complete the initialization of the [`Client`].
+    /// This method should be called after the URL returned by
+    /// [`OAuthAuthCodeUrlBuilder::build()`] has been presented and the user has
+    /// been redirected to the redirect URI after completing the authorization.
     ///
-    /// # Panic
+    /// If the authorization needs to be cancelled before its completion,
+    /// [`OAuth::abort_login()`] should be used instead to clean up the local
+    /// data.
     ///
-    /// Panics if the login was already completed.
-    pub async fn finish_login(&self) -> Result<()> {
+    /// # Arguments
+    ///
+    /// * `url_or_query` - The URI where the user was redirected, or just its
+    ///   query part.
+    ///
+    /// Returns an error if the authorization failed, if a request fails, or if
+    /// the client was already logged in with a different session.
+    pub async fn finish_login(&self, url_or_query: UrlOrQuery) -> Result<()> {
+        let response = AuthorizationResponse::parse_url_or_query(&url_or_query)
+            .map_err(|error| OAuthError::from(OAuthAuthorizationCodeError::from(error)))?;
+
+        let auth_code = match response {
+            AuthorizationResponse::Success(code) => code,
+            AuthorizationResponse::Error(error) => {
+                self.abort_login(&error.state).await;
+                return Err(OAuthError::from(OAuthAuthorizationCodeError::from(error.error)).into());
+            }
+        };
+
+        let device_id = self.finish_authorization(auth_code).await?;
+        self.load_session(device_id).await
+    }
+
+    /// Load the session after login.
+    ///
+    /// Returns an error if the request to get the user ID fails, or if the
+    /// client was already logged in with a different session.
+    pub(crate) async fn load_session(&self, device_id: OwnedDeviceId) -> Result<()> {
         // Get the user ID.
         let whoami_res = self.client.whoami().await.map_err(crate::Error::from)?;
 
-        let session = SessionMeta {
-            user_id: whoami_res.user_id,
-            device_id: whoami_res.device_id.ok_or(OAuthError::MissingDeviceId)?,
-        };
+        let new_session = SessionMeta { user_id: whoami_res.user_id, device_id };
 
-        self.client
-            .set_session_meta(
-                session,
-                #[cfg(feature = "e2e-encryption")]
-                None,
-            )
-            .await?;
-        // At this point the Olm machine has been set up.
+        if let Some(current_session) = self.client.session_meta() {
+            if new_session != *current_session {
+                return Err(OAuthError::SessionMismatch.into());
+            }
+        } else {
+            self.client
+                .set_session_meta(
+                    new_session,
+                    #[cfg(feature = "e2e-encryption")]
+                    None,
+                )
+                .await?;
+            // At this point the Olm machine has been set up.
 
-        // Enable the cross-process lock for refreshes, if needs be.
-        self.enable_cross_process_lock().await.map_err(OAuthError::from)?;
+            // Enable the cross-process lock for refreshes, if needs be.
+            self.enable_cross_process_lock().await.map_err(OAuthError::from)?;
 
-        #[cfg(feature = "e2e-encryption")]
-        self.client.encryption().spawn_initialization_task(None);
+            #[cfg(feature = "e2e-encryption")]
+            self.client.encryption().spawn_initialization_task(None);
+        }
 
         Ok(())
     }
@@ -1128,20 +1098,17 @@ impl OAuth {
     /// [`OAuthAuthCodeUrlBuilder::build()`] has been presented and the user has
     /// been redirected to the redirect URI after a successful authorization.
     ///
-    /// If the authorization has not been successful,
-    /// [`OAuth::abort_authorization()`] should be used instead to clean up the
-    /// local data.
-    ///
     /// # Arguments
     ///
     /// * `auth_code` - The response received as part of the redirect URI when
     ///   the authorization was successful.
     ///
+    /// Returns the device ID used in the authorized scope if it succeeds.
     /// Returns an error if a request fails.
-    pub async fn finish_authorization(
+    async fn finish_authorization(
         &self,
         auth_code: AuthorizationCode,
-    ) -> Result<(), OAuthError> {
+    ) -> Result<OwnedDeviceId, OAuthError> {
         let data = self.data().ok_or(OAuthError::NotAuthenticated)?;
         let client_id = data.client_id.clone();
 
@@ -1152,8 +1119,7 @@ impl OAuth {
             .remove(&auth_code.state)
             .ok_or(OAuthAuthorizationCodeError::InvalidState)?;
 
-        let server_metadata = self.server_metadata().await?;
-        let token_uri = TokenUrl::from_url(server_metadata.token_endpoint);
+        let token_uri = TokenUrl::from_url(validation_data.server_metadata.token_endpoint.clone());
 
         let response = OAuthClient::new(client_id)
             .set_token_uri(token_uri)
@@ -1169,25 +1135,22 @@ impl OAuth {
             refresh_token: response.refresh_token().map(RefreshToken::secret).cloned(),
         });
 
-        Ok(())
+        Ok(validation_data.device_id)
     }
 
-    /// Abort the authorization process.
+    /// Abort the login process.
     ///
-    /// This method should be called after the URL returned by
-    /// [`OAuthAuthCodeUrlBuilder::build()`] has been presented and the user has
-    /// been redirected to the redirect URI after a failed authorization, or if
-    /// the authorization should be aborted before it is completed.
+    /// This method should be called if an authorization should be aborted
+    /// before it is completed.
     ///
-    /// If the authorization has been successful,
-    /// [`OAuth::finish_authorization()`] should be used instead.
+    /// If the authorization has been completed, [`OAuth::finish_login()`]
+    /// should be used instead.
     ///
     /// # Arguments
     ///
-    /// * `state` - The state received as part of the redirect URI when the
-    ///   authorization failed, or the one provided in
-    ///   [`OAuthAuthorizationData`] after building the authorization URL.
-    pub async fn abort_authorization(&self, state: &CsrfToken) {
+    /// * `state` - The state provided in [`OAuthAuthorizationData`] after
+    ///   building the authorization URL.
+    pub async fn abort_login(&self, state: &CsrfToken) {
         if let Some(data) = self.data() {
             data.authorization_data.lock().await.remove(state);
         }
@@ -1198,14 +1161,14 @@ impl OAuth {
     #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
     async fn request_device_authorization(
         &self,
+        server_metadata: &AuthorizationServerMetadata,
         device_id: Option<OwnedDeviceId>,
     ) -> Result<oauth2::StandardDeviceAuthorizationResponse, qrcode::DeviceAuthorizationOAuthError>
     {
-        let scopes = Self::login_scopes(device_id);
+        let (scopes, _) = Self::login_scopes(device_id);
 
         let client_id = self.client_id().ok_or(OAuthError::NotRegistered)?.clone();
 
-        let server_metadata = self.server_metadata().await.map_err(OAuthError::from)?;
         let device_authorization_url = server_metadata
             .device_authorization_endpoint
             .clone()
@@ -1226,14 +1189,14 @@ impl OAuth {
     #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
     async fn exchange_device_code(
         &self,
+        server_metadata: &AuthorizationServerMetadata,
         device_authorization_response: &oauth2::StandardDeviceAuthorizationResponse,
     ) -> Result<(), qrcode::DeviceAuthorizationOAuthError> {
         use oauth2::TokenResponse;
 
         let client_id = self.client_id().ok_or(OAuthError::NotRegistered)?.clone();
 
-        let server_metadata = self.server_metadata().await.map_err(OAuthError::from)?;
-        let token_uri = TokenUrl::from_url(server_metadata.token_endpoint);
+        let token_uri = TokenUrl::from_url(server_metadata.token_endpoint.clone());
 
         let response = OAuthClient::new(client_id)
             .set_token_uri(token_uri)
@@ -1493,6 +1456,12 @@ pub struct UserSession {
 /// Authorization Code flow.
 #[derive(Debug)]
 struct AuthorizationValidationData {
+    /// The metadata of the server,
+    server_metadata: AuthorizationServerMetadata,
+
+    /// The device ID used in the scope.
+    device_id: OwnedDeviceId,
+
     /// The URI where the end-user will be redirected after authorization.
     redirect_uri: RedirectUrl,
 
@@ -1503,7 +1472,7 @@ struct AuthorizationValidationData {
 /// The data returned by the server in the redirect URI after a successful
 /// authorization.
 #[derive(Debug, Clone)]
-pub enum AuthorizationResponse {
+enum AuthorizationResponse {
     /// A successful response.
     Success(AuthorizationCode),
 
@@ -1512,19 +1481,18 @@ pub enum AuthorizationResponse {
 }
 
 impl AuthorizationResponse {
-    /// Deserialize an `AuthorizationResponse` from the given URI.
+    /// Deserialize an `AuthorizationResponse` from a [`UrlOrQuery`].
     ///
-    /// Returns an error if the URL doesn't have the expected format.
-    pub fn parse_uri(uri: &Url) -> Result<Self, RedirectUriQueryParseError> {
-        let Some(query) = uri.query() else { return Err(RedirectUriQueryParseError::MissingQuery) };
-
+    /// Returns an error if the URL or query doesn't have the expected format.
+    fn parse_url_or_query(url_or_query: &UrlOrQuery) -> Result<Self, RedirectUriQueryParseError> {
+        let query = url_or_query.query().ok_or(RedirectUriQueryParseError::MissingQuery)?;
         Self::parse_query(query)
     }
 
     /// Deserialize an `AuthorizationResponse` from the query part of a URI.
     ///
     /// Returns an error if the query doesn't have the expected format.
-    pub fn parse_query(query: &str) -> Result<Self, RedirectUriQueryParseError> {
+    fn parse_query(query: &str) -> Result<Self, RedirectUriQueryParseError> {
         // For some reason deserializing the enum with `serde(untagged)` doesn't work,
         // so let's try both variants separately.
         if let Ok(code) = serde_html_form::from_str(query) {
@@ -1541,24 +1509,94 @@ impl AuthorizationResponse {
 /// The data returned by the server in the redirect URI after a successful
 /// authorization.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AuthorizationCode {
+struct AuthorizationCode {
     /// The code to use to retrieve the access token.
-    pub code: String,
+    code: String,
     /// The unique identifier for this transaction.
-    pub state: CsrfToken,
+    state: CsrfToken,
 }
 
 /// The data returned by the server in the redirect URI after an authorization
 /// error.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AuthorizationError {
+struct AuthorizationError {
     /// The error.
     #[serde(flatten)]
-    pub error: StandardErrorResponse<error::AuthorizationCodeErrorResponseType>,
+    error: StandardErrorResponse<error::AuthorizationCodeErrorResponseType>,
     /// The unique identifier for this transaction.
-    pub state: CsrfToken,
+    state: CsrfToken,
 }
 
 fn hash_str(x: &str) -> impl fmt::LowerHex {
     sha2::Sha256::new().chain_update(x).finalize()
+}
+
+/// The available methods to register or restore a client.
+#[derive(Debug)]
+pub enum ClientRegistrationMethod {
+    /// No registration will be done.
+    ///
+    /// This should only be set if [`OAuth::register_client()`] or
+    /// [`OAuth::restore_registered_client()`] was already called before.
+    None,
+
+    /// The given client ID will be used.
+    ///
+    /// This will call [`OAuth::restore_registered_client()`] internally.
+    ClientId(ClientId),
+
+    /// The client will register using dynamic client registration, with the
+    /// given metadata.
+    ///
+    /// This will call [`OAuth::register_client()`] internally.
+    Metadata(Raw<ClientMetadata>),
+
+    /// Use an [`OAuthRegistrationStore`] to handle registrations.
+    Store(OAuthRegistrationStore),
+}
+
+impl From<ClientId> for ClientRegistrationMethod {
+    fn from(value: ClientId) -> Self {
+        Self::ClientId(value)
+    }
+}
+
+impl From<Raw<ClientMetadata>> for ClientRegistrationMethod {
+    fn from(value: Raw<ClientMetadata>) -> Self {
+        Self::Metadata(value)
+    }
+}
+
+impl From<OAuthRegistrationStore> for ClientRegistrationMethod {
+    fn from(value: OAuthRegistrationStore) -> Self {
+        Self::Store(value)
+    }
+}
+
+/// A full URL or just the query part of a URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlOrQuery {
+    /// A full URL.
+    Url(Url),
+
+    /// The query part of a URL.
+    Query(String),
+}
+
+impl UrlOrQuery {
+    /// Get the query part of this [`UrlOrQuery`].
+    ///
+    /// If this is a [`Url`], this extracts the query.
+    pub fn query(&self) -> Option<&str> {
+        match self {
+            Self::Url(url) => url.query(),
+            Self::Query(query) => Some(query),
+        }
+    }
+}
+
+impl From<Url> for UrlOrQuery {
+    fn from(value: Url) -> Self {
+        Self::Url(value)
+    }
 }

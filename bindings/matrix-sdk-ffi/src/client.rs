@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context as _};
 use async_compat::get_runtime_handle;
 use matrix_sdk::{
     authentication::oauth::{
-        registrations::ClientId, AccountManagementActionFull, OAuthAuthorizationData, OAuthSession,
+        AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
     },
     event_cache::EventCacheError,
     media::{
@@ -407,14 +407,16 @@ impl Client {
         oidc_configuration: &OidcConfiguration,
         prompt: Option<OidcPrompt>,
     ) -> Result<Arc<OAuthAuthorizationData>, OidcError> {
-        let registrations = oidc_configuration.registrations()?;
+        let registrations = oidc_configuration.registrations().await?;
         let redirect_uri = oidc_configuration.redirect_uri()?;
 
-        let data = self
-            .inner
-            .oauth()
-            .url_for_oidc(registrations, redirect_uri, prompt.map(Into::into))
-            .await?;
+        let mut url_builder = self.inner.oauth().login(registrations.into(), redirect_uri, None);
+
+        if let Some(prompt) = prompt {
+            url_builder = url_builder.prompt(vec![prompt.into()]);
+        }
+
+        let data = url_builder.build().await?;
 
         Ok(Arc::new(data))
     }
@@ -422,18 +424,14 @@ impl Client {
     /// Aborts an existing OIDC login operation that might have been cancelled,
     /// failed etc.
     pub async fn abort_oidc_auth(&self, authorization_data: Arc<OAuthAuthorizationData>) {
-        self.inner.oauth().abort_authorization(&authorization_data.state).await;
+        self.inner.oauth().abort_login(&authorization_data.state).await;
     }
 
     /// Completes the OIDC login process.
-    pub async fn login_with_oidc_callback(
-        &self,
-        authorization_data: Arc<OAuthAuthorizationData>,
-        callback_url: String,
-    ) -> Result<(), OidcError> {
+    pub async fn login_with_oidc_callback(&self, callback_url: String) -> Result<(), OidcError> {
         let url = Url::parse(&callback_url).or(Err(OidcError::CallbackUrlInvalid))?;
 
-        self.inner.oauth().login_with_oidc_callback(&authorization_data, url).await?;
+        self.inner.oauth().finish_login(url.into()).await?;
 
         Ok(())
     }

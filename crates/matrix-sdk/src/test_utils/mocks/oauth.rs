@@ -66,6 +66,14 @@ impl<'a> OAuthMockServer<'a> {
     fn mock_endpoint<T>(&self, mock: MockBuilder, endpoint: T) -> MockEndpoint<'a, T> {
         self.server.mock_endpoint(mock, endpoint)
     }
+
+    /// Get the mock OAuth 2.0 server metadata.
+    pub fn server_metadata(&self) -> AuthorizationServerMetadata {
+        MockServerMetadataBuilder::new(&self.server.server().uri())
+            .build()
+            .deserialize()
+            .expect("mock OAuth 2.0 server metadata should deserialize successfully")
+    }
 }
 
 // Specific mount endpoints.
@@ -295,12 +303,17 @@ impl<'a> MockEndpoint<'a, DeviceAuthorizationEndpoint> {
 pub struct TokenEndpoint;
 
 impl<'a> MockEndpoint<'a, TokenEndpoint> {
-    /// Returns a successful token response.
+    /// Returns a successful token response with the default tokens.
     pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_with_tokens("1234", "ZYXWV")
+    }
+
+    /// Returns a successful token response with custom tokens.
+    pub fn ok_with_tokens(self, access_token: &str, refresh_token: &str) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "1234",
+            "access_token": access_token,
             "expires_in": 300,
-            "refresh_token": "ZYXWV",
+            "refresh_token":  refresh_token,
             "token_type": "Bearer"
         })))
     }

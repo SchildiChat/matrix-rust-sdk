@@ -29,7 +29,9 @@ use ruma::{
     serde::{PartialEqAsRefStr, StringEnum},
 };
 
-pub use super::cross_process::CrossProcessRefreshLockError;
+pub use super::{
+    cross_process::CrossProcessRefreshLockError, registration_store::OAuthRegistrationStoreError,
+};
 
 /// An error when interacting with the OAuth 2.0 authorization server.
 pub type OAuthRequestError<T> =
@@ -65,10 +67,6 @@ pub enum OAuthError {
     #[error("client not registered")]
     NotRegistered,
 
-    /// The device ID was not returned by the homeserver after login.
-    #[error("missing device ID in response")]
-    MissingDeviceId,
-
     /// The client is not authenticated while the request requires it.
     #[error("client not authenticated")]
     NotAuthenticated,
@@ -94,9 +92,13 @@ pub enum OAuthError {
     #[error(transparent)]
     LockError(#[from] CrossProcessRefreshLockError),
 
-    /// An unknown error occurred.
-    #[error("unknown error")]
-    UnknownError(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The user logged into a session that is different than the one the client
+    /// is already using.
+    ///
+    /// This only happens if the session was already restored, and the user logs
+    /// into a new session that is different than the old one.
+    #[error("new logged-in session is different than current client session")]
+    SessionMismatch,
 }
 
 /// All errors that can occur when discovering the OAuth 2.0 server metadata.
@@ -258,6 +260,10 @@ pub enum OAuthClientRegistrationError {
     /// Deserialization of the registration response failed.
     #[error("failed to deserialize registration response: {0}")]
     FromJson(serde_json::Error),
+
+    /// Failed to access or store the registration in the store.
+    #[error("failed to use registration store: {0}")]
+    Store(#[from] OAuthRegistrationStoreError),
 }
 
 /// Error response returned by server after requesting an authorization code.

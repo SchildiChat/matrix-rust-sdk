@@ -8,7 +8,18 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- [**breaking**]: The `RoomPagination::run_backwards` method has been removed, and replaced by two
+- [**breaking**]: The element call widget URL configuration struct (`VirtualElementCallWidgetOptions`) and URL generation
+  have changed.
+  - It supports the new fields: `hide_screensharing`, `posthog_api_host`, `posthog_api_key`,
+  `rageshake_submit_url`, `sentry_dsn`, `sentry_environment`.
+  - The widget URL will no longer automatically add `/room` to the base domain. For backward compatibility
+  the app itself would need to add `/room` to the `element_call_url`.
+  - And replaced:
+    - `analytics_id` -> `posthog_user_id` (The widget URL query parameters will include `analytics_id` & `posthog_user_id`
+    for backward compatibility)
+    - `skip_lobby` -> `intent` (`Intent.StartCall`, `Intent.JoinExisting`. The widget URL query parameters will include `skip_lobby` if `intent` is `Intent.StartCall` for backward compatibility)
+  - `VirtualElementCallWidgetOptions` now implements `Default`.
+- [**breaking**]: The `RoomPagination::run_backwards` method has been removed and replaced by two
 simpler methods:
   - `RoomPagination::run_backwards_until()`, which will retrigger back-paginations until a certain
   number of events have been received (and retry if the timeline has been reset in the background).
@@ -170,6 +181,41 @@ simpler methods:
   - `OidcError` was renamed to `OAuthError` and the `RefreshTokenError::Oidc`
     variant was renamed to `RefreshTokenError::OAuth`.
   - `Oidc::provider_metadata()` was renamed to `OAuth::server_metadata()`.
+- [**breaking**]: `OAuth::finish_login()` must always be called, instead of `OAuth::finish_authorization()`
+  ([#4817](https://github.com/matrix-org/matrix-rust-sdk/pull/4817))
+  - `OAuth::abort_authorization()` was renamed to `OAuth::abort_login()`.
+  - `OAuth::finish_login()` can be called several times for the same session,
+    but it will return an error if it is called with a new session.
+  - `OAuthError::MissingDeviceId` was removed, it cannot occur anymore.
+- [**breaking**] `OidcRegistrations` was renamed to `OAuthRegistrationStore`.
+  ([#4814](https://github.com/matrix-org/matrix-rust-sdk/pull/4814))
+  - `OidcRegistrationsError` was renamed to `OAuthRegistrationStoreError`. 
+  - The `registrations` module was renamed and is now private.
+    `OAuthRegistrationStore` and `ClientId` are exported from `oauth`, and
+    `OAuthRegistrationStoreError` is exported from `oauth::error`.
+  - All the methods of `OAuthRegistrationStore` are now `async` and return a
+    `Result`: errors when reading the file are no longer ignored, and blocking
+    I/O is performed in a separate thread.
+  - `OAuthRegistrationStore::new()` takes a `PathBuf` instead of a `Path`.
+  - `OAuthRegistrationStore::new()` no longer takes a `static_registrations`
+    parameter. It should be provided if needed with
+    `OAuthRegistrationStore::with_static_registrations()`.
+- [**breaking**] Allow to use any registration method with `OAuth::login()` and
+  `OAuth::login_with_qr_code()`.
+  ([#4827](https://github.com/matrix-org/matrix-rust-sdk/pull/4827))
+  - `OAuth::login` takes an `ClientRegistrationMethod` to be able to register
+    and login with a single function call.
+  - `OAuth::url_for_oidc()` was removed, it can be replaced by a call to
+    `OAuth::login()`.
+  - `OAuth::login_with_qr_code()` takes a `ClientRegistrationMethod` instead of
+    the client metadata.
+  - `OAuth::finish_login` takes a `UrlOrQuery` instead of an
+    `AuthorizationCode`. The deserialization of the query string will occur
+    inside the method and eventual errors will be handled.
+  - `OAuth::login_with_oidc_callback()` was removed, it can be replaced by a
+    call to `OAuth::finish_login()`.
+  - `AuthorizationResponse`, `AuthorizationCode` and `AuthorizationError` are
+    now private.
 
 ## [0.10.0] - 2025-02-04
 
