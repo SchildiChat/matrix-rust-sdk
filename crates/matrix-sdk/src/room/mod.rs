@@ -17,6 +17,7 @@
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap},
+    future::Future,
     ops::Deref,
     sync::Arc,
     time::Duration,
@@ -46,8 +47,8 @@ use matrix_sdk_base::{
     event_cache::store::media::IgnoreMediaRetentionPolicy,
     media::MediaThumbnailSettings,
     store::StateStoreExt,
-    ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges,
-    StateStoreDataKey, StateStoreDataValue,
+    ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, SendOutsideWasm,
+    StateChanges, StateStoreDataKey, StateStoreDataValue,
 };
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 use matrix_sdk_common::BoxFuture;
@@ -57,6 +58,7 @@ use matrix_sdk_common::{
     timeout::timeout,
 };
 use mime::Mime;
+use reply::Reply;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
     room::encrypted::OriginalSyncRoomEncryptedEvent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
@@ -166,6 +168,7 @@ pub mod knock_requests;
 mod member;
 mod messages;
 pub mod power_levels;
+pub mod reply;
 
 /// Contains all the functionality for modifying the privacy settings in a room.
 pub mod privacy_settings;
@@ -207,7 +210,10 @@ impl Room {
     pub async fn leave(&self) -> Result<()> {
         let state = self.state();
         if state == RoomState::Left {
-            return Err(Error::WrongRoomState(WrongRoomState::new("Joined or Invited", state)));
+            return Err(Error::WrongRoomState(Box::new(WrongRoomState::new(
+                "Joined or Invited",
+                state,
+            ))));
         }
 
         let request = leave_room::v3::Request::new(self.inner.room_id().to_owned());
@@ -223,7 +229,10 @@ impl Room {
     pub async fn join(&self) -> Result<()> {
         let state = self.state();
         if state == RoomState::Joined {
-            return Err(Error::WrongRoomState(WrongRoomState::new("Invited or Left", state)));
+            return Err(Error::WrongRoomState(Box::new(WrongRoomState::new(
+                "Invited or Left",
+                state,
+            ))));
         }
 
         let prev_room_state = self.inner.state();
@@ -489,10 +498,35 @@ impl Room {
 
         // Save the event into the event cache, if it's set up.
         if let Ok((cache, _handles)) = self.event_cache().await {
-            cache.save_event(event.clone()).await;
+            cache.save_events([event.clone()]).await;
         }
 
         Ok(event)
+    }
+
+    /// Try to load the event from the event cache, if it's enabled, or fetch it
+    /// from the homeserver.
+    ///
+    /// When running the request against the homeserver, it uses the given
+    /// [`RequestConfig`] if provided, or the client's default one
+    /// otherwise.
+    pub async fn load_or_fetch_event(
+        &self,
+        event_id: &EventId,
+        request_config: Option<RequestConfig>,
+    ) -> Result<TimelineEvent> {
+        match self.event_cache().await {
+            Ok((event_cache, _drop_handles)) => {
+                if let Some(event) = event_cache.event(event_id).await {
+                    return Ok(event);
+                }
+                // Fallthrough: try with a request.
+            }
+            Err(err) => {
+                debug!("error when getting the event cache: {err}");
+            }
+        }
+        self.event(event_id, request_config).await
     }
 
     /// Fetch the event with the given `EventId` in this room, using the
@@ -625,7 +659,7 @@ impl Room {
                 let mut changes = StateChanges::default();
                 changes.add_room(room_info.clone());
 
-                self.client.store().save_changes(&changes).await?;
+                self.client.state_store().save_changes(&changes).await?;
                 self.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
 
                 Ok(())
@@ -778,7 +812,11 @@ impl Room {
         &self,
         event_type: StateEventType,
     ) -> Result<Vec<RawAnySyncOrStrippedState>> {
-        self.client.store().get_state_events(self.room_id(), event_type).await.map_err(Into::into)
+        self.client
+            .state_store()
+            .get_state_events(self.room_id(), event_type)
+            .await
+            .map_err(Into::into)
     }
 
     /// Get all state events of a given statically-known type in this room.
@@ -802,7 +840,7 @@ impl Room {
         C: StaticEventContent + StaticStateEventContent + RedactContent,
         C::Redacted: RedactedStateEventContent,
     {
-        Ok(self.client.store().get_state_events_static(self.room_id()).await?)
+        Ok(self.client.state_store().get_state_events_static(self.room_id()).await?)
     }
 
     /// Get the state events of a given type with the given state keys in this
@@ -813,7 +851,7 @@ impl Room {
         state_keys: &[&str],
     ) -> Result<Vec<RawAnySyncOrStrippedState>> {
         self.client
-            .store()
+            .state_store()
             .get_state_events_for_keys(self.room_id(), event_type, state_keys)
             .await
             .map_err(Into::into)
@@ -850,7 +888,11 @@ impl Room {
         I: IntoIterator<Item = &'a K> + Send,
         I::IntoIter: Send,
     {
-        Ok(self.client.store().get_state_events_for_keys_static(self.room_id(), state_keys).await?)
+        Ok(self
+            .client
+            .state_store()
+            .get_state_events_for_keys_static(self.room_id(), state_keys)
+            .await?)
     }
 
     /// Get a specific state event in this room.
@@ -860,7 +902,7 @@ impl Room {
         state_key: &str,
     ) -> Result<Option<RawAnySyncOrStrippedState>> {
         self.client
-            .store()
+            .state_store()
             .get_state_event(self.room_id(), event_type, state_key)
             .await
             .map_err(Into::into)
@@ -921,7 +963,11 @@ impl Room {
         C::Redacted: RedactedStateEventContent,
         K: AsRef<str> + ?Sized + Sync,
     {
-        Ok(self.client.store().get_state_event_static_for_key(self.room_id(), state_key).await?)
+        Ok(self
+            .client
+            .state_store()
+            .get_state_event_static_for_key(self.room_id(), state_key)
+            .await?)
     }
 
     /// Returns the parents this room advertises as its parents.
@@ -1005,7 +1051,7 @@ impl Room {
         data_type: RoomAccountDataEventType,
     ) -> Result<Option<Raw<AnyRoomAccountDataEvent>>> {
         self.client
-            .store()
+            .state_store()
             .get_room_account_data_event(self.room_id(), data_type)
             .await
             .map_err(Into::into)
@@ -1042,8 +1088,11 @@ impl Room {
     /// Returns true if all devices in the room are verified, otherwise false.
     #[cfg(feature = "e2e-encryption")]
     pub async fn contains_only_verified_devices(&self) -> Result<bool> {
-        let user_ids =
-            self.client.store().get_user_ids(self.room_id(), RoomMemberships::empty()).await?;
+        let user_ids = self
+            .client
+            .state_store()
+            .get_user_ids(self.room_id(), RoomMemberships::empty())
+            .await?;
 
         for user_id in user_ids {
             let devices = self.client.encryption().get_user_devices(&user_id).await?;
@@ -1673,7 +1722,7 @@ impl Room {
                 let mut changes = StateChanges::default();
                 changes.add_room(room_info.clone());
 
-                self.client.store().save_changes(&changes).await?;
+                self.client.state_store().save_changes(&changes).await?;
                 self.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
             } else {
                 debug!("room successfully marked as encrypted");
@@ -1707,7 +1756,7 @@ impl Room {
                 {
                     let members = self
                         .client
-                        .store()
+                        .state_store()
                         .get_user_ids(self.room_id(), RoomMemberships::ACTIVE)
                         .await?;
                     self.client.claim_one_time_keys(members.iter().map(Deref::deref)).await?;
@@ -1848,7 +1897,7 @@ impl Room {
         let olm = olm.as_ref().expect("Olm machine wasn't started");
 
         let members =
-            self.client.store().get_user_ids(self.room_id(), RoomMemberships::ACTIVE).await?;
+            self.client.state_store().get_user_ids(self.room_id(), RoomMemberships::ACTIVE).await?;
 
         let tracked: HashMap<_, _> = olm
             .store()
@@ -2100,18 +2149,21 @@ impl Room {
             }
         }
 
-        let content = Self::make_attachment_event(
-            self.make_attachment_type(
-                content_type,
-                filename,
-                media_source,
-                config.caption,
-                config.formatted_caption,
-                config.info,
-                thumbnail,
-            ),
-            mentions,
-        );
+        let content = self
+            .make_attachment_event(
+                self.make_attachment_type(
+                    content_type,
+                    filename,
+                    media_source,
+                    config.caption,
+                    config.formatted_caption,
+                    config.info,
+                    thumbnail,
+                ),
+                mentions,
+                config.reply,
+            )
+            .await?;
 
         let mut fut = self.send(content);
         if let Some(txn_id) = txn_id {
@@ -2212,17 +2264,24 @@ impl Room {
         }
     }
 
-    /// Creates the [`RoomMessageEventContent`] based on the message type and
-    /// mentions.
-    pub(crate) fn make_attachment_event(
+    /// Creates the [`RoomMessageEventContent`] based on the message type,
+    /// mentions and reply information.
+    pub(crate) async fn make_attachment_event(
+        &self,
         msg_type: MessageType,
         mentions: Option<Mentions>,
-    ) -> RoomMessageEventContent {
+        reply: Option<Reply>,
+    ) -> Result<RoomMessageEventContent> {
         let mut content = RoomMessageEventContent::new(msg_type);
         if let Some(mentions) = mentions {
             content = content.add_mentions(mentions);
         }
-        content
+        if let Some(reply) = reply {
+            // Since we just created the event, there is no relation attached to it. Thus,
+            // it is safe to add the reply relation without overriding anything.
+            content = self.make_reply_event(content.into(), reply).await?;
+        }
+        Ok(content)
     }
 
     /// Update the power levels of a select set of users of this room.
@@ -2916,7 +2975,7 @@ impl Room {
     pub async fn invite_details(&self) -> Result<Invite> {
         let state = self.state();
         if state != RoomState::Invited {
-            return Err(Error::WrongRoomState(WrongRoomState::new("Invited", state)));
+            return Err(Error::WrongRoomState(Box::new(WrongRoomState::new("Invited", state))));
         }
 
         let invitee = self
@@ -2967,7 +3026,10 @@ impl Room {
         let state = self.state();
         match state {
             RoomState::Joined | RoomState::Invited | RoomState::Knocked => {
-                return Err(Error::WrongRoomState(WrongRoomState::new("Left / Banned", state)));
+                return Err(Error::WrongRoomState(Box::new(WrongRoomState::new(
+                    "Left / Banned",
+                    state,
+                ))));
             }
             RoomState::Left | RoomState::Banned => {}
         }
@@ -2994,7 +3056,7 @@ impl Room {
         if state == RoomState::Joined {
             Ok(())
         } else {
-            Err(Error::WrongRoomState(WrongRoomState::new("Joined", state)))
+            Err(Error::WrongRoomState(Box::new(WrongRoomState::new("Joined", state))))
         }
     }
 
@@ -3077,7 +3139,7 @@ impl Room {
     ) -> Result<report_content::v3::Response> {
         let state = self.state();
         if state != RoomState::Joined {
-            return Err(Error::WrongRoomState(WrongRoomState::new("Joined", state)));
+            return Err(Error::WrongRoomState(Box::new(WrongRoomState::new("Joined", state))));
         }
 
         let request = report_content::v3::Request::new(
@@ -3288,7 +3350,7 @@ impl Room {
     /// room id, as identifier.
     pub async fn save_composer_draft(&self, draft: ComposerDraft) -> Result<()> {
         self.client
-            .store()
+            .state_store()
             .set_kv_data(
                 StateStoreDataKey::ComposerDraft(self.room_id()),
                 StateStoreDataValue::ComposerDraft(draft),
@@ -3301,7 +3363,7 @@ impl Room {
     pub async fn load_composer_draft(&self) -> Result<Option<ComposerDraft>> {
         let data = self
             .client
-            .store()
+            .state_store()
             .get_kv_data(StateStoreDataKey::ComposerDraft(self.room_id()))
             .await?;
         Ok(data.and_then(|d| d.into_composer_draft()))
@@ -3310,7 +3372,7 @@ impl Room {
     /// Remove the `ComposerDraft` stored in the state store for this room.
     pub async fn clear_composer_draft(&self) -> Result<()> {
         self.client
-            .store()
+            .state_store()
             .remove_kv_data(StateStoreDataKey::ComposerDraft(self.room_id()))
             .await?;
         Ok(())
@@ -3779,6 +3841,19 @@ impl TryFrom<Int> for ReportedContentScore {
     }
 }
 
+trait EventSource {
+    fn get_event(
+        &self,
+        event_id: &EventId,
+    ) -> impl Future<Output = Result<TimelineEvent, Error>> + SendOutsideWasm;
+}
+
+impl EventSource for &Room {
+    async fn get_event(&self, event_id: &EventId) -> Result<TimelineEvent, Error> {
+        self.load_or_fetch_event(event_id, None).await
+    }
+}
+
 /// The error type returned when a checked `ReportedContentScore` conversion
 /// fails.
 #[derive(Debug, Clone, Error)]
@@ -3809,6 +3884,7 @@ mod tests {
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
     #[async_test]
     async fn test_cache_invalidation_while_encrypt() {
+        use matrix_sdk_base::store::RoomLoadSettings;
         use matrix_sdk_test::{message_like_event_content, DEFAULT_TEST_ROOM_ID};
 
         let sqlite_path = std::env::temp_dir().join("cache_invalidation_while_encrypt.db");
@@ -3821,7 +3897,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        client.matrix_auth().restore_session(session.clone()).await.unwrap();
+        client
+            .matrix_auth()
+            .restore_session(session.clone(), RoomLoadSettings::default())
+            .await
+            .unwrap();
 
         client.encryption().enable_cross_process_store_lock("client1".to_owned()).await.unwrap();
 
@@ -3863,7 +3943,11 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            client.matrix_auth().restore_session(session.clone()).await.unwrap();
+            client
+                .matrix_auth()
+                .restore_session(session.clone(), RoomLoadSettings::default())
+                .await
+                .unwrap();
             client
                 .encryption()
                 .enable_cross_process_store_lock("client2".to_owned())

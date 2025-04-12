@@ -41,7 +41,7 @@ use crate::{
         LocalEcho, LocalEchoContent, MediaHandles, RoomSendQueueStorageError, RoomSendQueueUpdate,
         SendHandle,
     },
-    Client, Media, Room,
+    Client, Media,
 };
 
 /// Replace the source by the final ones in all the media types handled by
@@ -183,18 +183,22 @@ impl RoomSendQueue {
         };
 
         // Create the content for the media event.
-        let event_content = Room::make_attachment_event(
-            room.make_attachment_type(
-                &content_type,
-                filename,
-                file_media_request.source.clone(),
-                config.caption,
-                config.formatted_caption,
-                config.info,
-                event_thumbnail_info,
-            ),
-            config.mentions,
-        );
+        let event_content = room
+            .make_attachment_event(
+                room.make_attachment_type(
+                    &content_type,
+                    filename,
+                    file_media_request.source.clone(),
+                    config.caption,
+                    config.formatted_caption,
+                    config.info,
+                    event_thumbnail_info,
+                ),
+                config.mentions,
+                config.reply,
+            )
+            .await
+            .map_err(|_| RoomSendQueueError::FailedToCreateAttachment)?;
 
         let created_at = MilliSecondsSinceUnixEpoch::now();
 
@@ -329,7 +333,7 @@ impl QueueStorage {
         trace!(%event_txn, "queueing media event after successfully uploading media(s)");
 
         client
-            .store()
+            .state_store()
             .save_send_queue_request(
                 &self.room_id,
                 event_txn,
@@ -377,7 +381,7 @@ impl QueueStorage {
         };
 
         client
-            .store()
+            .state_store()
             .save_send_queue_request(
                 &self.room_id,
                 next_upload_txn,
@@ -409,7 +413,7 @@ impl QueueStorage {
         // Keep the lock until we're done touching the storage.
         debug!("trying to abort an upload");
 
-        let store = client.store();
+        let store = client.state_store();
 
         let upload_file_as_dependent = ChildTransactionId::from(handles.upload_file_txn.clone());
         let event_as_dependent = ChildTransactionId::from(event_txn.to_owned());
@@ -530,7 +534,7 @@ impl QueueStorage {
 
         let guard = self.store.lock().await;
         let client = guard.client()?;
-        let store = client.store();
+        let store = client.state_store();
 
         // The media event can be in one of three states:
         // - still stored as a dependent request,
@@ -576,7 +580,7 @@ impl QueueStorage {
                     .await?;
 
                 trace!("caption successfully updated");
-                return Ok(Some(local_echo.into()));
+                return Ok(Some((*local_echo).into()));
             }
         }
 

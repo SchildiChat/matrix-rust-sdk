@@ -52,12 +52,11 @@ pub(super) use self::{
 pub use self::{
     content::{
         AnyOtherFullStateEventContent, EncryptedMessage, InReplyToDetails, MemberProfileChange,
-        MembershipChange, Message, OtherState, PollResult, PollState, RepliedToEvent,
-        RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineItemContent,
+        MembershipChange, Message, MsgLikeContent, MsgLikeKind, OtherState, PollResult, PollState,
+        RepliedToEvent, RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineItemContent,
     },
     local::EventSendState,
 };
-use super::{RepliedToInfo, ReplyContent, UnsupportedReplyItem};
 
 /// An item in the timeline that represents at least one event.
 ///
@@ -356,20 +355,24 @@ impl EventTimelineItem {
         }
 
         match self.content() {
-            TimelineItemContent::Message(message) => {
-                matches!(
-                    message.msgtype(),
-                    MessageType::Text(_)
-                        | MessageType::Emote(_)
-                        | MessageType::Audio(_)
-                        | MessageType::File(_)
-                        | MessageType::Image(_)
-                        | MessageType::Video(_)
-                )
-            }
-            TimelineItemContent::Poll(poll) => {
-                poll.response_data.is_empty() && poll.end_event_timestamp.is_none()
-            }
+            TimelineItemContent::MsgLike(msglike) => match &msglike.kind {
+                MsgLikeKind::Message(message) => {
+                    matches!(
+                        message.msgtype(),
+                        MessageType::Text(_)
+                            | MessageType::Emote(_)
+                            | MessageType::Audio(_)
+                            | MessageType::File(_)
+                            | MessageType::Image(_)
+                            | MessageType::Video(_)
+                    )
+                }
+                MsgLikeKind::Poll(poll) => {
+                    poll.response_data.is_empty() && poll.end_event_timestamp.is_none()
+                }
+                // Other MsgLike timeline items can't be edited at the moment.
+                _ => false,
+            },
             _ => {
                 // Other timeline items can't be edited at the moment.
                 false
@@ -401,7 +404,7 @@ impl EventTimelineItem {
         }
 
         // An unable-to-decrypt message has no authenticity shield.
-        if let TimelineItemContent::UnableToDecrypt(_) = self.content() {
+        if self.content().is_unable_to_decrypt() {
             return None;
         }
 
@@ -425,7 +428,7 @@ impl EventTimelineItem {
         // This must be in sync with the early returns of `Timeline::send_reply`
         if self.event_id().is_none() {
             false
-        } else if let TimelineItemContent::Message(_) = self.content() {
+        } else if self.content.is_message() {
             true
         } else {
             self.latest_json().is_some()
@@ -538,31 +541,6 @@ impl EventTimelineItem {
         }
     }
 
-    /// Gives the information needed to reply to the event of the item.
-    pub fn replied_to_info(&self) -> Result<RepliedToInfo, UnsupportedReplyItem> {
-        let reply_content = match self.content() {
-            TimelineItemContent::Message(msg) => ReplyContent::Message(msg.to_owned()),
-            _ => {
-                let Some(raw_event) = self.latest_json() else {
-                    return Err(UnsupportedReplyItem::MissingJson);
-                };
-
-                ReplyContent::Raw(raw_event.clone())
-            }
-        };
-
-        let Some(event_id) = self.event_id() else {
-            return Err(UnsupportedReplyItem::MissingEventId);
-        };
-
-        Ok(RepliedToInfo {
-            event_id: event_id.to_owned(),
-            sender: self.sender().to_owned(),
-            timestamp: self.timestamp(),
-            content: reply_content,
-        })
-    }
-
     pub(super) fn handle(&self) -> TimelineItemHandle<'_> {
         match &self.kind {
             EventTimelineItemKind::Local(local) => {
@@ -608,23 +586,25 @@ impl EventTimelineItem {
     /// See `test_emoji_detection` for more examples.
     pub fn contains_only_emojis(&self) -> bool {
         let body = match self.content() {
-            TimelineItemContent::Message(msg) => match msg.msgtype() {
-                MessageType::Text(text) => Some(text.body.as_str()),
-                MessageType::Audio(audio) => audio.caption(),
-                MessageType::File(file) => file.caption(),
-                MessageType::Image(image) => image.caption(),
-                MessageType::Video(video) => video.caption(),
-                _ => None,
+            TimelineItemContent::MsgLike(msglike) => match &msglike.kind {
+                MsgLikeKind::Message(message) => match &message.msgtype {
+                    MessageType::Text(text) => Some(text.body.as_str()),
+                    MessageType::Audio(audio) => audio.caption(),
+                    MessageType::File(file) => file.caption(),
+                    MessageType::Image(image) => image.caption(),
+                    MessageType::Video(video) => video.caption(),
+                    _ => None,
+                },
+                MsgLikeKind::Sticker(_)
+                | MsgLikeKind::Poll(_)
+                | MsgLikeKind::Redacted
+                | MsgLikeKind::UnableToDecrypt(_) => None,
             },
-            TimelineItemContent::RedactedMessage
-            | TimelineItemContent::Sticker(_)
-            | TimelineItemContent::UnableToDecrypt(_)
-            | TimelineItemContent::MembershipChange(_)
+            TimelineItemContent::MembershipChange(_)
             | TimelineItemContent::ProfileChange(_)
             | TimelineItemContent::OtherState(_)
             | TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. }
-            | TimelineItemContent::Poll(_)
             | TimelineItemContent::CallInvite
             | TimelineItemContent::CallNotify => None,
         };

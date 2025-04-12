@@ -29,9 +29,8 @@ use ruma::{
     serde::{PartialEqAsRefStr, StringEnum},
 };
 
-pub use super::{
-    cross_process::CrossProcessRefreshLockError, registration_store::OAuthRegistrationStoreError,
-};
+#[cfg(feature = "e2e-encryption")]
+pub use super::cross_process::CrossProcessRefreshLockError;
 
 /// An error when interacting with the OAuth 2.0 authorization server.
 pub type OAuthRequestError<T> =
@@ -84,11 +83,8 @@ pub enum OAuthError {
     #[error("failed to log out: {0}")]
     Logout(#[from] OAuthTokenRevocationError),
 
-    /// An error occurred building the account management URL.
-    #[error("failed to build account management URL: {0}")]
-    AccountManagementUrl(serde_html_form::ser::Error),
-
     /// An error occurred caused by the cross-process locks.
+    #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
     LockError(#[from] CrossProcessRefreshLockError),
 
@@ -260,10 +256,6 @@ pub enum OAuthClientRegistrationError {
     /// Deserialization of the registration response failed.
     #[error("failed to deserialize registration response: {0}")]
     FromJson(serde_json::Error),
-
-    /// Failed to access or store the registration in the store.
-    #[error("failed to use registration store: {0}")]
-    Store(#[from] OAuthRegistrationStoreError),
 }
 
 /// Error response returned by server after requesting an authorization code.

@@ -27,8 +27,10 @@ use matrix_sdk::{
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
     event_cache::RoomPaginationStatus,
-    room::edit::EditedContent as SdkEditedContent,
-    Error,
+    room::{
+        edit::EditedContent as SdkEditedContent,
+        reply::{EnforceThread, Reply},
+    },
 };
 use matrix_sdk_ui::timeline::{
     self, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
@@ -48,7 +50,7 @@ use ruma::{
         },
         receipt::ReceiptThread,
         room::message::{
-            ForwardThread, LocationMessageEventContent, MessageType,
+            LocationMessageEventContent, MessageType, ReplyWithinThread,
             RoomMessageEventContentWithoutRelation,
         },
         AnyMessageLikeEventContent,
@@ -122,7 +124,8 @@ impl Timeline {
             .info(attachment_info)
             .caption(params.caption)
             .formatted_caption(formatted_caption)
-            .mentions(params.mentions.map(Into::into));
+            .mentions(params.mentions.map(Into::into))
+            .reply(params.reply_params.map(|p| p.try_into()).transpose()?);
 
         let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
             let mut request =
@@ -202,12 +205,45 @@ pub struct UploadParameters {
     caption: Option<String>,
     /// Optional HTML-formatted caption, for clients that support it.
     formatted_caption: Option<FormattedBody>,
-    // Optional intentional mentions to be sent with the media.
+    /// Optional intentional mentions to be sent with the media.
     mentions: Option<Mentions>,
+    /// Optional parameters for sending the media as (threaded) reply.
+    reply_params: Option<ReplyParameters>,
     /// Should the media be sent with the send queue, or synchronously?
     ///
     /// Watching progress only works with the synchronous method, at the moment.
     use_send_queue: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct ReplyParameters {
+    /// The ID of the event to reply to.
+    event_id: String,
+    /// Whether to enforce a thread relation.
+    enforce_thread: bool,
+    /// If enforcing a threaded relation, whether the message is a reply on a
+    /// thread.
+    reply_within_thread: bool,
+}
+
+impl TryInto<Reply> for ReplyParameters {
+    type Error = RoomError;
+
+    fn try_into(self) -> Result<Reply, Self::Error> {
+        let event_id =
+            EventId::parse(&self.event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
+        let enforce_thread = if self.enforce_thread {
+            EnforceThread::Threaded(if self.reply_within_thread {
+                ReplyWithinThread::Yes
+            } else {
+                ReplyWithinThread::No
+            })
+        } else {
+            EnforceThread::MaybeThreaded
+        };
+
+        Ok(Reply { event_id, enforce_thread })
+    }
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -215,18 +251,18 @@ impl Timeline {
     pub async fn add_listener(&self, listener: Box<dyn TimelineListener>) -> Arc<TaskHandle> {
         let (timeline_items, timeline_stream) = self.inner.subscribe().await;
 
+        // It's important that the initial items are passed *before* we forward the
+        // stream updates, with a guaranteed ordering. Otherwise, it could
+        // be that the listener be called before the initial items have been
+        // handled by the caller. See #3535 for details.
+
+        // First, pass all the items as a reset update.
+        listener.on_update(vec![Arc::new(TimelineDiff::new(VectorDiff::Reset {
+            values: timeline_items,
+        }))]);
+
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(timeline_stream);
-
-            // It's important that the initial items are passed *before* we forward the
-            // stream updates, with a guaranteed ordering. Otherwise, it could
-            // be that the listener be called before the initial items have been
-            // handled by the caller. See #3535 for details.
-
-            // First, pass all the items as a reset update.
-            listener.on_update(vec![Arc::new(TimelineDiff::new(VectorDiff::Reset {
-                values: timeline_items,
-            }))]);
 
             // Then forward new items.
             while let Some(diffs) = timeline_stream.next().await {
@@ -465,7 +501,7 @@ impl Timeline {
         Ok(())
     }
 
-    pub fn end_poll(
+    pub async fn end_poll(
         self: Arc<Self>,
         poll_start_event_id: String,
         text: String,
@@ -475,29 +511,25 @@ impl Timeline {
         let poll_end_event_content = UnstablePollEndEventContent::new(text, poll_start_event_id);
         let event_content = AnyMessageLikeEventContent::UnstablePollEnd(poll_end_event_content);
 
-        get_runtime_handle().spawn(async move {
-            if let Err(err) = self.inner.send(event_content).await {
-                error!("unable to end poll: {err}");
-            }
-        });
+        if let Err(err) = self.inner.send(event_content).await {
+            error!("unable to end poll: {err}");
+        }
 
         Ok(())
     }
 
+    /// Send a reply.
+    ///
+    /// If the replied to event has a thread relation, it is forwarded on the
+    /// reply so that clients that support threads can render the reply
+    /// inside the thread.
     pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
-        event_id: String,
+        reply_params: ReplyParameters,
     ) -> Result<(), ClientError> {
-        let event_id = EventId::parse(event_id)?;
-        let replied_to_info = self
-            .inner
-            .replied_to_info_from_event_id(&event_id)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-
         self.inner
-            .send_reply((*msg).clone(), replied_to_info, ForwardThread::Yes)
+            .send_reply((*msg).clone(), reply_params.try_into()?)
             .await
             .map_err(|err| anyhow::anyhow!(err))?;
         Ok(())
@@ -645,19 +677,12 @@ impl Timeline {
     ) -> Result<Arc<InReplyToDetails>, ClientError> {
         let event_id = EventId::parse(&event_id_str)?;
 
-        let replied_to: Result<RepliedToEvent, Error> =
-            if let Some(event) = self.inner.item_by_event_id(&event_id).await {
-                Ok(RepliedToEvent::from_timeline_item(&event))
-            } else {
-                match self.inner.room().event(&event_id, None).await {
-                    Ok(timeline_event) => Ok(RepliedToEvent::try_from_timeline_event_for_room(
-                        timeline_event,
-                        self.inner.room(),
-                    )
-                    .await?),
-                    Err(e) => Err(e),
-                }
-            };
+        let replied_to = match self.inner.room().load_or_fetch_event(&event_id, None).await {
+            Ok(event) => RepliedToEvent::try_from_timeline_event_for_room(event, self.inner.room())
+                .await
+                .map_err(ClientError::from),
+            Err(e) => Err(ClientError::from(e)),
+        };
 
         match replied_to {
             Ok(replied_to) => Ok(Arc::new(InReplyToDetails::new(
@@ -958,6 +983,7 @@ impl TimelineItem {
         match self.0.as_virtual()? {
             VItem::DateDivider(ts) => Some(VirtualTimelineItem::DateDivider { ts: (*ts).into() }),
             VItem::ReadMarker => Some(VirtualTimelineItem::ReadMarker),
+            VItem::TimelineStart => Some(VirtualTimelineItem::TimelineStart),
         }
     }
 
@@ -1238,6 +1264,9 @@ pub enum VirtualTimelineItem {
 
     /// The user's own read marker.
     ReadMarker,
+
+    /// The timeline start, that is, the *oldest* event in time for that room.
+    TimelineStart,
 }
 
 /// A [`TimelineItem`](super::TimelineItem) that doesn't correspond to an event.

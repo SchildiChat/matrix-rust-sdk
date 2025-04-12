@@ -34,6 +34,7 @@ use matrix_sdk::{
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
     },
     sliding_sync::Version as SdkSlidingSyncVersion,
+    store::RoomLoadSettings as SdkRoomLoadSettings,
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
 use matrix_sdk_ui::notification_client::{
@@ -42,10 +43,7 @@ use matrix_sdk_ui::notification_client::{
 };
 use mime::Mime;
 use ruma::{
-    api::client::{
-        alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo,
-        error::ErrorKind, uiaa::UserIdentifier,
-    },
+    api::client::{alias::get_alias, error::ErrorKind, uiaa::UserIdentifier},
     events::{
         ignored_user_list::IgnoredUserListEventContent,
         key::verification::request::ToDeviceKeyVerificationRequestEvent,
@@ -407,10 +405,10 @@ impl Client {
         oidc_configuration: &OidcConfiguration,
         prompt: Option<OidcPrompt>,
     ) -> Result<Arc<OAuthAuthorizationData>, OidcError> {
-        let registrations = oidc_configuration.registrations().await?;
+        let registration_data = oidc_configuration.registration_data()?;
         let redirect_uri = oidc_configuration.redirect_uri()?;
 
-        let mut url_builder = self.inner.oauth().login(registrations.into(), redirect_uri, None);
+        let mut url_builder = self.inner.oauth().login(redirect_uri, None, Some(registration_data));
 
         if let Some(prompt) = prompt {
             url_builder = url_builder.prompt(vec![prompt.into()]);
@@ -463,11 +461,34 @@ impl Client {
     }
 
     /// Restores the client from a `Session`.
+    ///
+    /// It reloads the entire set of rooms from the previous session.
+    ///
+    /// If you want to control the amount of rooms to reloads, check
+    /// [`Client::restore_session_with`].
     pub async fn restore_session(&self, session: Session) -> Result<(), ClientError> {
+        self.restore_session_with(session, RoomLoadSettings::All).await
+    }
+
+    /// Restores the client from a `Session`.
+    ///
+    /// It reloads a set of rooms controlled by [`RoomLoadSettings`].
+    pub async fn restore_session_with(
+        &self,
+        session: Session,
+        room_load_settings: RoomLoadSettings,
+    ) -> Result<(), ClientError> {
         let sliding_sync_version = session.sliding_sync_version.clone();
         let auth_session: AuthSession = session.try_into()?;
 
-        self.restore_session_inner(auth_session).await?;
+        self.inner
+            .restore_session_with(
+                auth_session,
+                room_load_settings
+                    .try_into()
+                    .map_err(|error| ClientError::Generic { msg: error })?,
+            )
+            .await?;
         self.inner.set_sliding_sync_version(sliding_sync_version.try_into()?);
 
         Ok(())
@@ -531,15 +552,6 @@ impl Client {
 }
 
 impl Client {
-    /// Restores the client from an `AuthSession`.
-    pub(crate) async fn restore_session_inner(
-        &self,
-        session: impl Into<AuthSession>,
-    ) -> anyhow::Result<()> {
-        self.inner.restore_session(session).await?;
-        Ok(())
-    }
-
     /// Whether or not the client's homeserver supports the password login flow.
     pub(crate) async fn supports_password_login(&self) -> anyhow::Result<bool> {
         let login_types = self.inner.matrix_auth().get_login_types().await?;
@@ -606,13 +618,20 @@ impl Client {
             return Ok(None);
         }
 
-        match self.inner.oauth().account_management_url(action.map(Into::into)).await {
-            Ok(url) => Ok(url.map(|u| u.to_string())),
+        let mut url_builder = match self.inner.oauth().account_management_url().await {
+            Ok(Some(url_builder)) => url_builder,
+            Ok(None) => return Ok(None),
             Err(e) => {
-                tracing::error!("Failed retrieving account management URL: {e}");
-                Err(e.into())
+                error!("Failed retrieving account management URL: {e}");
+                return Err(e.into());
             }
+        };
+
+        if let Some(action) = action {
+            url_builder = url_builder.action(action.into());
         }
+
+        Ok(Some(url_builder.build().to_string()))
     }
 
     pub fn user_id(&self) -> Result<String, ClientError> {
@@ -796,24 +815,7 @@ impl Client {
 
     /// Log the current user out.
     pub async fn logout(&self) -> Result<(), ClientError> {
-        let Some(auth_api) = self.inner.auth_api() else {
-            return Err(anyhow!("Missing authentication API").into());
-        };
-
-        match auth_api {
-            AuthApi::Matrix(a) => {
-                tracing::info!("Logging out via the homeserver.");
-                a.logout().await?;
-                Ok(())
-            }
-
-            AuthApi::OAuth(api) => {
-                tracing::info!("Logging out via OAuth 2.0.");
-                api.logout().await?;
-                Ok(())
-            }
-            _ => Err(anyhow!("Unknown authentication API").into()),
-        }
+        Ok(self.inner.logout().await?)
     }
 
     /// Registers a pusher with given parameters
@@ -1199,13 +1201,14 @@ impl Client {
     ///   retention policy.
     pub async fn clear_caches(&self) -> Result<(), ClientError> {
         let closure = async || -> Result<_, EventCacheError> {
-            let store = self.inner.event_cache_store().lock().await?;
-
-            // Clear all the room chunks.
-            store.clear_all_rooms_chunks().await?;
-
             // Clean up the media cache according to the current media retention policy.
-            store.clean_up_media_cache().await?;
+            self.inner.event_cache_store().lock().await?.clean_up_media_cache().await?;
+
+            // Clear all the room chunks. It's important to *not* call
+            // `EventCacheStore::clear_all_rooms_chunks` here, because there might be live
+            // observers of the linked chunks, and that would cause some very bad state
+            // mismatch.
+            self.inner.event_cache().clear_all_rooms().await?;
 
             Ok(())
         };
@@ -1330,6 +1333,38 @@ impl Client {
         let session = Self::session_inner(client)?;
         session_delegate.save_session_in_keychain(session);
         Ok(())
+    }
+}
+
+/// Configure how many rooms will be restored when restoring the session with
+/// [`Client::restore_session_with`].
+///
+/// Please, see the documentation of [`matrix_sdk::store::RoomLoadSettings`] to
+/// learn more.
+#[derive(uniffi::Enum)]
+pub enum RoomLoadSettings {
+    /// Load all rooms from the `StateStore` into the in-memory state store
+    /// `BaseStateStore`.
+    All,
+
+    /// Load a single room from the `StateStore` into the in-memory state
+    /// store `BaseStateStore`.
+    ///
+    /// Please, be careful with this option. Read the documentation of
+    /// [`RoomLoadSettings`].
+    One { room_id: String },
+}
+
+impl TryInto<SdkRoomLoadSettings> for RoomLoadSettings {
+    type Error = String;
+
+    fn try_into(self) -> Result<SdkRoomLoadSettings, Self::Error> {
+        Ok(match self {
+            Self::All => SdkRoomLoadSettings::All,
+            Self::One { room_id } => {
+                SdkRoomLoadSettings::One(RoomId::parse(room_id).map_err(|error| error.to_string())?)
+            }
+        })
     }
 }
 
@@ -1617,10 +1652,9 @@ impl Session {
                 let matrix_sdk::authentication::oauth::UserSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
                     tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
-                    issuer,
                 } = api.user_session().context("Missing session")?;
                 let client_id = api.client_id().context("OIDC client ID is missing.")?.clone();
-                let oidc_data = OidcSessionData { client_id, issuer };
+                let oidc_data = OidcSessionData { client_id };
 
                 let oidc_data = serde_json::to_string(&oidc_data).ok();
                 Ok(Session {
@@ -1665,7 +1699,6 @@ impl TryFrom<Session> for AuthSession {
                     device_id: device_id.into(),
                 },
                 tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
-                issuer: oidc_data.issuer,
             };
 
             let session = OAuthSession { client_id: oidc_data.client_id, user: user_session };
@@ -1689,31 +1722,8 @@ impl TryFrom<Session> for AuthSession {
 /// Represents a client registration against an OpenID Connect authentication
 /// issuer.
 #[derive(Serialize, Deserialize)]
-#[serde(try_from = "OidcSessionDataDeHelper")]
 pub(crate) struct OidcSessionData {
     client_id: ClientId,
-    issuer: Url,
-}
-
-#[derive(Deserialize)]
-struct OidcSessionDataDeHelper {
-    client_id: ClientId,
-    issuer_info: Option<AuthenticationServerInfo>,
-    issuer: Option<Url>,
-}
-
-impl TryFrom<OidcSessionDataDeHelper> for OidcSessionData {
-    type Error = String;
-
-    fn try_from(value: OidcSessionDataDeHelper) -> Result<Self, Self::Error> {
-        let OidcSessionDataDeHelper { client_id, issuer_info, issuer } = value;
-
-        let issuer = issuer
-            .or(issuer_info.and_then(|info| Url::parse(&info.issuer).ok()))
-            .ok_or_else(|| "missing field `issuer`".to_owned())?;
-
-        Ok(Self { client_id, issuer })
-    }
 }
 
 #[derive(uniffi::Enum)]

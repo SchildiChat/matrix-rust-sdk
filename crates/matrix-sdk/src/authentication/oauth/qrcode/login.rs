@@ -19,6 +19,7 @@ use futures_core::Stream;
 use matrix_sdk_base::{
     boxed_into_future,
     crypto::types::qr_login::{QrCodeData, QrCodeMode},
+    store::RoomLoadSettings,
     SessionMeta,
 };
 use oauth2::{DeviceCodeErrorResponseType, StandardDeviceAuthorizationResponse};
@@ -37,7 +38,7 @@ use super::{
 #[cfg(doc)]
 use crate::authentication::oauth::OAuth;
 use crate::{
-    authentication::oauth::{ClientRegistrationMethod, OAuthError},
+    authentication::oauth::{ClientRegistrationData, OAuthError},
     Client,
 };
 
@@ -82,7 +83,7 @@ pub enum LoginProgress {
 #[derive(Debug)]
 pub struct LoginWithQrCode<'a> {
     client: &'a Client,
-    registration_method: ClientRegistrationMethod,
+    registration_data: Option<&'a ClientRegistrationData>,
     qr_code_data: &'a QrCodeData,
     state: SharedObservable<LoginProgress>,
 }
@@ -199,15 +200,17 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             let whoami_response =
                 self.client.whoami().await.map_err(QRCodeLoginError::UserIdDiscovery)?;
             self.client
-                .set_session_meta(
+                .base_client()
+                .activate(
                     SessionMeta {
                         user_id: whoami_response.user_id,
                         device_id: OwnedDeviceId::from(device_id.to_base64()),
                     },
+                    RoomLoadSettings::default(),
                     Some(account),
                 )
                 .await
-                .map_err(QRCodeLoginError::SessionTokens)?;
+                .map_err(|error| QRCodeLoginError::SessionTokens(error.into()))?;
 
             self.client.oauth().enable_cross_process_lock().await?;
 
@@ -267,10 +270,10 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
 impl<'a> LoginWithQrCode<'a> {
     pub(crate) fn new(
         client: &'a Client,
-        registration_method: ClientRegistrationMethod,
         qr_code_data: &'a QrCodeData,
+        registration_data: Option<&'a ClientRegistrationData>,
     ) -> LoginWithQrCode<'a> {
-        LoginWithQrCode { client, registration_method, qr_code_data, state: Default::default() }
+        LoginWithQrCode { client, registration_data, qr_code_data, state: Default::default() }
     }
 
     async fn establish_secure_channel(
@@ -296,7 +299,7 @@ impl<'a> LoginWithQrCode<'a> {
     ) -> Result<AuthorizationServerMetadata, DeviceAuthorizationOAuthError> {
         let oauth = self.client.oauth();
         let server_metadata = oauth.server_metadata().await.map_err(OAuthError::from)?;
-        oauth.use_registration_method(&server_metadata, &self.registration_method).await?;
+        oauth.use_registration_data(&server_metadata, self.registration_data).await?;
 
         Ok(server_metadata)
     }
@@ -462,7 +465,8 @@ mod test {
         let qr_code = alice.qr_code_data().clone();
 
         let oauth = bob.oauth();
-        let login_bob = oauth.login_with_qr_code(&qr_code, mock_client_metadata().into());
+        let registration_data = mock_client_metadata().into();
+        let login_bob = oauth.login_with_qr_code(&qr_code, Some(&registration_data));
         let mut updates = login_bob.subscribe_to_progress();
 
         let updates_task = tokio::spawn(async move {
@@ -549,7 +553,8 @@ mod test {
         let qr_code = alice.qr_code_data().clone();
 
         let oauth = bob.oauth();
-        let login_bob = oauth.login_with_qr_code(&qr_code, mock_client_metadata().into());
+        let registration_data = mock_client_metadata().into();
+        let login_bob = oauth.login_with_qr_code(&qr_code, Some(&registration_data));
         let mut updates = login_bob.subscribe_to_progress();
 
         let _updates_task = tokio::spawn(async move {
@@ -672,7 +677,8 @@ mod test {
         let qr_code = alice.qr_code_data().clone();
 
         let oauth = bob.oauth();
-        let login_bob = oauth.login_with_qr_code(&qr_code, mock_client_metadata().into());
+        let registration_data = mock_client_metadata().into();
+        let login_bob = oauth.login_with_qr_code(&qr_code, Some(&registration_data));
         let mut updates = login_bob.subscribe_to_progress();
 
         let _updates_task = tokio::spawn(async move {

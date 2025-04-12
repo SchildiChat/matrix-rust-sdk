@@ -47,7 +47,6 @@ use wiremock::{
     Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
 };
 
-#[cfg(feature = "experimental-oidc")]
 pub mod oauth;
 
 use super::client::MockClientBuilder;
@@ -149,7 +148,6 @@ impl MatrixMockServer {
     }
 
     /// Get an `OAuthMockServer` that uses the same mock server as this one.
-    #[cfg(feature = "experimental-oidc")]
     pub fn oauth(&self) -> oauth::OAuthMockServer<'_> {
         oauth::OAuthMockServer::new(self)
     }
@@ -996,6 +994,12 @@ impl MatrixMockServer {
         let mock =
             Mock::given(method("POST")).and(path_regex(r"^/_matrix/client/v3/rooms/.*/leave"));
         self.mock_endpoint(mock, RoomLeaveEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint use to log out a session.
+    pub fn mock_logout(&self) -> MockEndpoint<'_, LogoutEndpoint> {
+        let mock = Mock::given(method("POST")).and(path("/_matrix/client/v3/logout"));
+        self.mock_endpoint(mock, LogoutEndpoint).expect_default_access_token()
     }
 }
 
@@ -2483,8 +2487,40 @@ impl<'a> MockEndpoint<'a, UploadCrossSigningKeysEndpoint> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
     }
 
+    /// Returns an error response with a UIAA stage that failed to authenticate
+    /// because of an invalid password.
+    pub fn uiaa_invalid_password(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "errcode": "M_FORBIDDEN",
+            "error": "Invalid password",
+            "flows": [
+                {
+                    "stages": [
+                        "m.login.password"
+                    ]
+                }
+            ],
+            "params": {},
+            "session": "oFIJVvtEOCKmRUTYKTYIIPHL"
+        })))
+    }
+
+    /// Returns an error response with a UIAA stage.
+    pub fn uiaa(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "flows": [
+                {
+                    "stages": [
+                        "m.login.password"
+                    ]
+                }
+            ],
+            "params": {},
+            "session": "oFIJVvtEOCKmRUTYKTYIIPHL"
+        })))
+    }
+
     /// Returns an error response with an OAuth 2.0 UIAA stage.
-    #[cfg(feature = "experimental-oidc")]
     pub fn uiaa_oauth(self) -> MatrixMock<'a> {
         let server_uri = self.server.uri();
         self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
@@ -2522,5 +2558,15 @@ impl<'a> MockEndpoint<'a, RoomLeaveEndpoint> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "room_id": room_id,
         })))
+    }
+}
+
+/// A prebuilt mock for `POST /logout` request.
+pub struct LogoutEndpoint;
+
+impl<'a> MockEndpoint<'a, LogoutEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
     }
 }

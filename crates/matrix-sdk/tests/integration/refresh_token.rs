@@ -9,6 +9,7 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::RequestConfig,
     executor::spawn,
+    store::RoomLoadSettings,
     test_utils::{
         client::mock_session_meta, logged_in_client_with_server, no_retry_test_client_with_server,
         test_client_builder_with_server,
@@ -63,8 +64,7 @@ async fn test_login_username_refresh_token() {
         .await
         .unwrap();
 
-    let logged_in = client.logged_in();
-    assert!(logged_in, "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
     res.refresh_token.unwrap();
 }
 
@@ -108,8 +108,7 @@ async fn test_login_sso_refresh_token() {
         .await
         .unwrap();
 
-    let logged_in = client.logged_in();
-    assert!(logged_in, "Client should be logged in");
+    assert!(client.is_active(), "Client should be active");
     res.refresh_token.unwrap();
 }
 
@@ -183,7 +182,7 @@ async fn test_refresh_token() {
     let mut session_changes = client.subscribe_to_session_changes();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     assert_eq!(*num_save_session_callback_calls.lock().unwrap(), 0);
     assert_eq!(session_changes.try_recv(), Err(TryRecvError::Empty));
@@ -244,7 +243,7 @@ async fn test_refresh_token_not_handled() {
     let auth = client.matrix_auth();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -279,7 +278,7 @@ async fn test_refresh_token_handled_success() {
     let auth = client.matrix_auth();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     let mut session_changes = client.subscribe_to_session_changes();
 
@@ -330,7 +329,7 @@ async fn test_refresh_token_handled_failure() {
     let auth = client.matrix_auth();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     let mut session_changes = client.subscribe_to_session_changes();
 
@@ -388,7 +387,7 @@ async fn test_refresh_token_handled_multi_success() {
     let auth = client.matrix_auth();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -461,7 +460,7 @@ async fn test_refresh_token_handled_multi_failure() {
     let auth = client.matrix_auth();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -534,7 +533,7 @@ async fn test_refresh_token_handled_other_error() {
     let auth = client.matrix_auth();
 
     let session = session();
-    auth.restore_session(session).await.unwrap();
+    auth.restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/refresh"))
@@ -555,7 +554,6 @@ async fn test_refresh_token_handled_other_error() {
     client.whoami().await.unwrap_err();
 }
 
-#[cfg(feature = "experimental-oidc")]
 #[async_test]
 async fn test_oauth_refresh_token_handled_success() {
     use matrix_sdk::test_utils::{
@@ -579,12 +577,14 @@ async fn test_oauth_refresh_token_handled_success() {
     oauth_server.mock_server_metadata().ok().expect(1..).named("server_metadata").mount().await;
     oauth_server.mock_token().ok().expect(1).named("token").mount().await;
 
-    let issuer = server.server().uri();
     let client = server.client_builder().unlogged().handle_refresh_tokens().build().await;
     let oauth = client.oauth();
 
     oauth
-        .restore_session(mock_session(mock_prev_session_tokens_with_refresh(), issuer))
+        .restore_session(
+            mock_session(mock_prev_session_tokens_with_refresh()),
+            RoomLoadSettings::default(),
+        )
         .await
         .unwrap();
 
@@ -605,7 +605,6 @@ async fn test_oauth_refresh_token_handled_success() {
     );
 }
 
-#[cfg(feature = "experimental-oidc")]
 #[async_test]
 async fn test_oauth_refresh_token_handled_failure() {
     use matrix_sdk::{
@@ -632,12 +631,14 @@ async fn test_oauth_refresh_token_handled_failure() {
     // Return an error to fail the token refresh.
     oauth_server.mock_token().invalid_grant().expect(1).named("token").mount().await;
 
-    let issuer = server.server().uri();
     let client = server.client_builder().unlogged().handle_refresh_tokens().build().await;
     let oauth = client.oauth();
 
     oauth
-        .restore_session(mock_session(mock_prev_session_tokens_with_refresh(), issuer))
+        .restore_session(
+            mock_session(mock_prev_session_tokens_with_refresh()),
+            RoomLoadSettings::default(),
+        )
         .await
         .unwrap();
 
@@ -668,7 +669,6 @@ async fn test_oauth_refresh_token_handled_failure() {
     );
 }
 
-#[cfg(feature = "experimental-oidc")]
 #[async_test]
 async fn test_oauth_handle_refresh_tokens() {
     use matrix_sdk::test_utils::{
@@ -684,12 +684,14 @@ async fn test_oauth_handle_refresh_tokens() {
 
     oauth_server.mock_server_metadata().ok().expect(1..).named("server_metadata").mount().await;
 
-    let issuer = server.server().uri();
     let client = server.client_builder().unlogged().handle_refresh_tokens().build().await;
 
     let oauth = client.oauth();
     oauth
-        .restore_session(mock_session(mock_prev_session_tokens_with_refresh(), issuer))
+        .restore_session(
+            mock_session(mock_prev_session_tokens_with_refresh()),
+            RoomLoadSettings::default(),
+        )
         .await
         .unwrap();
 

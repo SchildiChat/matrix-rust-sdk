@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use matrix_sdk::test_utils::mocks::MatrixMockServer;
+use matrix_sdk::{store::RoomLoadSettings, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::{
     store::StoreConfig, BaseClient, RoomInfo, RoomState, SessionMeta, StateChanges, StateStore,
 };
@@ -55,17 +55,18 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
         .block_on(sqlite_store.save_changes(&changes))
         .expect("initial filling of sqlite failed");
 
-    let base_client = BaseClient::with_store_config(
+    let base_client = BaseClient::new(
         StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
             .state_store(sqlite_store),
     );
 
     runtime
-        .block_on(base_client.set_session_meta(
+        .block_on(base_client.activate(
             SessionMeta {
                 user_id: user_id!("@somebody:example.com").to_owned(),
                 device_id: device_id!("DEVICE_ID").to_owned(),
             },
+            RoomLoadSettings::default(),
             None,
         ))
         .expect("Could not set session meta");
@@ -172,7 +173,14 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
             assert_eq!(pinned_event_ids.len(), PINNED_EVENTS_COUNT);
 
             // Reset cache so it always loads the events from the mocked endpoint
-            client.event_cache().empty_immutable_cache().await;
+            client
+                .event_cache_store()
+                .lock()
+                .await
+                .unwrap()
+                .clear_all_rooms_chunks()
+                .await
+                .unwrap();
 
             let timeline = Timeline::builder(&room)
                 .with_focus(TimelineFocus::PinnedEvents {

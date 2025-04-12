@@ -15,10 +15,14 @@
 
 mod homeserver_config;
 
+#[cfg(feature = "sqlite")]
+use std::path::Path;
 use std::{fmt, sync::Arc};
 
 use homeserver_config::*;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
+#[cfg(feature = "sqlite")]
+use matrix_sdk_sqlite::SqliteStoreConfig;
 use ruma::{
     api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
@@ -28,8 +32,6 @@ use tokio::sync::{broadcast, Mutex, OnceCell};
 use tracing::{debug, field::debug, instrument, Span};
 
 use super::{Client, ClientInner};
-#[cfg(feature = "experimental-oidc")]
-use crate::authentication::oauth::OAuthCtx;
 #[cfg(feature = "e2e-encryption")]
 use crate::crypto::{CollectStrategy, TrustRequirement};
 #[cfg(feature = "e2e-encryption")]
@@ -37,9 +39,14 @@ use crate::encryption::EncryptionSettings;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::http_client::HttpSettings;
 use crate::{
-    authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
-    error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
-    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
+    authentication::{oauth::OAuthCtx, AuthCtx},
+    client::ClientServerCapabilities,
+    config::RequestConfig,
+    error::RumaApiError,
+    http_client::HttpClient,
+    send_queue::SendQueueData,
+    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder,
+    HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -201,16 +208,11 @@ impl ClientBuilder {
 
     /// Set up the store configuration for a SQLite store.
     #[cfg(feature = "sqlite")]
-    pub fn sqlite_store(
-        mut self,
-        path: impl AsRef<std::path::Path>,
-        passphrase: Option<&str>,
-    ) -> Self {
-        self.store_config = BuilderStoreConfig::Sqlite {
-            path: path.as_ref().to_owned(),
-            cache_path: None,
-            passphrase: passphrase.map(ToOwned::to_owned),
-        };
+    pub fn sqlite_store(mut self, path: impl AsRef<Path>, passphrase: Option<&str>) -> Self {
+        let sqlite_store_config = SqliteStoreConfig::new(path).passphrase(passphrase);
+        self.store_config =
+            BuilderStoreConfig::Sqlite { config: sqlite_store_config, cache_path: None };
+
         self
     }
 
@@ -219,15 +221,32 @@ impl ClientBuilder {
     #[cfg(feature = "sqlite")]
     pub fn sqlite_store_with_cache_path(
         mut self,
-        path: impl AsRef<std::path::Path>,
-        cache_path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
         passphrase: Option<&str>,
     ) -> Self {
+        let sqlite_store_config = SqliteStoreConfig::new(path).passphrase(passphrase);
         self.store_config = BuilderStoreConfig::Sqlite {
-            path: path.as_ref().to_owned(),
+            config: sqlite_store_config,
             cache_path: Some(cache_path.as_ref().to_owned()),
-            passphrase: passphrase.map(ToOwned::to_owned),
         };
+
+        self
+    }
+
+    /// Set up the store configuration for a SQLite store with a store config,
+    /// and with an optional cache data separated out from state/crypto data.
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite_store_with_config_and_cache_path(
+        mut self,
+        config: SqliteStoreConfig,
+        cache_path: Option<impl AsRef<Path>>,
+    ) -> Self {
+        self.store_config = BuilderStoreConfig::Sqlite {
+            config,
+            cache_path: cache_path.map(|cache_path| cache_path.as_ref().to_owned()),
+        };
+
         self
     }
 
@@ -472,7 +491,7 @@ impl ClientBuilder {
             base_client
         } else {
             #[allow(unused_mut)]
-            let mut client = BaseClient::with_store_config(
+            let mut client = BaseClient::new(
                 build_store_config(self.store_config, &self.cross_process_store_locks_holder_name)
                     .await?,
             );
@@ -508,7 +527,6 @@ impl ClientBuilder {
             version
         };
 
-        #[cfg(feature = "experimental-oidc")]
         let allow_insecure_oauth = homeserver.scheme() == "http";
 
         let auth_ctx = Arc::new(AuthCtx {
@@ -519,7 +537,6 @@ impl ClientBuilder {
             tokens: OnceCell::default(),
             reload_session_callback: OnceCell::default(),
             save_session_callback: OnceCell::default(),
-            #[cfg(feature = "experimental-oidc")]
             oauth: OAuthCtx::new(allow_insecure_oauth),
         });
 
@@ -572,22 +589,24 @@ async fn build_store_config(
     #[allow(clippy::infallible_destructuring_match)]
     let store_config = match builder_config {
         #[cfg(feature = "sqlite")]
-        BuilderStoreConfig::Sqlite { path, cache_path, passphrase } => {
+        BuilderStoreConfig::Sqlite { config, cache_path } => {
             let store_config = StoreConfig::new(cross_process_store_locks_holder_name.to_owned())
                 .state_store(
-                    matrix_sdk_sqlite::SqliteStateStore::open(&path, passphrase.as_deref()).await?,
+                    matrix_sdk_sqlite::SqliteStateStore::open_with_config(config.clone()).await?,
                 )
-                .event_cache_store(
-                    matrix_sdk_sqlite::SqliteEventCacheStore::open(
-                        cache_path.as_ref().unwrap_or(&path),
-                        passphrase.as_deref(),
-                    )
-                    .await?,
-                );
+                .event_cache_store({
+                    let mut config = config.clone();
+
+                    if let Some(cache_path) = cache_path {
+                        config = config.path(cache_path);
+                    }
+
+                    matrix_sdk_sqlite::SqliteEventCacheStore::open_with_config(config).await?
+                });
 
             #[cfg(feature = "e2e-encryption")]
             let store_config = store_config.crypto_store(
-                matrix_sdk_sqlite::SqliteCryptoStore::open(&path, passphrase.as_deref()).await?,
+                matrix_sdk_sqlite::SqliteCryptoStore::open_with_config(config).await?,
             );
 
             store_config
@@ -688,9 +707,8 @@ impl Default for HttpConfig {
 enum BuilderStoreConfig {
     #[cfg(feature = "sqlite")]
     Sqlite {
-        path: std::path::PathBuf,
+        config: SqliteStoreConfig,
         cache_path: Option<std::path::PathBuf>,
-        passphrase: Option<String>,
     },
     #[cfg(feature = "indexeddb")]
     IndexedDb {
@@ -706,13 +724,17 @@ impl fmt::Debug for BuilderStoreConfig {
         #[allow(clippy::infallible_destructuring_match)]
         match self {
             #[cfg(feature = "sqlite")]
-            Self::Sqlite { path, .. } => {
-                f.debug_struct("Sqlite").field("path", path).finish_non_exhaustive()
-            }
+            Self::Sqlite { config, cache_path, .. } => f
+                .debug_struct("Sqlite")
+                .field("config", config)
+                .field("cache_path", cache_path)
+                .finish_non_exhaustive(),
+
             #[cfg(feature = "indexeddb")]
             Self::IndexedDb { name, .. } => {
                 f.debug_struct("IndexedDb").field("name", name).finish_non_exhaustive()
             }
+
             Self::Custom(store_config) => f.debug_tuple("Custom").field(store_config).finish(),
         }
     }

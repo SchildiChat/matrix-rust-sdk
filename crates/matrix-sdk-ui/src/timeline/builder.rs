@@ -30,7 +30,7 @@ use matrix_sdk::{
 use ruma::{events::AnySyncTimelineEvent, OwnedEventId, RoomVersionId};
 use tokio::sync::broadcast::{error::RecvError, Receiver};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{info, info_span, trace, warn, Instrument, Span};
+use tracing::{info_span, trace, warn, Instrument, Span};
 
 use super::{
     controller::{TimelineController, TimelineSettings},
@@ -178,7 +178,7 @@ impl TimelineBuilder {
             .unwrap_or_default();
 
         let controller = TimelineController::new(
-            room,
+            room.clone(),
             focus.clone(),
             internal_id_prefix.clone(),
             unable_to_decrypt_hook,
@@ -187,9 +187,6 @@ impl TimelineBuilder {
         .with_settings(settings);
 
         let has_events = controller.init_focus(&room_event_cache).await?;
-
-        let room = controller.room();
-        let client = room.client();
 
         let pinned_events_join_handle = if is_pinned_events {
             Some(spawn(pinned_events_task(room.pinned_event_ids_stream(), controller.clone())))
@@ -256,7 +253,7 @@ impl TimelineBuilder {
             room.room_id().to_owned(),
         ));
 
-        let handles = vec![room_key_handle, forwarded_room_key_handle];
+        let event_handlers = vec![room_key_handle, forwarded_room_key_handle];
 
         // Not using room.add_event_handler here because RoomKey events are
         // to-device events that are not received in the context of a room.
@@ -291,7 +288,7 @@ impl TimelineBuilder {
             event_cache: room_event_cache,
             drop_handle: Arc::new(TimelineDropHandle {
                 client,
-                event_handler_handles: handles,
+                event_handler_handles: event_handlers,
                 room_update_join_handle,
                 pinned_events_join_handle,
                 room_key_from_backups_join_handle,
@@ -426,7 +423,7 @@ async fn room_send_queue_update_task(
     mut send_queue_stream: Receiver<RoomSendQueueUpdate>,
     timeline_controller: TimelineController,
 ) {
-    info!("spawned the local echo task!");
+    trace!("spawned the local echo task!");
 
     loop {
         match send_queue_stream.recv().await {
@@ -437,7 +434,7 @@ async fn room_send_queue_update_task(
             }
 
             Err(RecvError::Closed) => {
-                info!("channel closed, exiting the local echo handler");
+                trace!("channel closed, exiting the local echo handler");
                 break;
             }
         }
