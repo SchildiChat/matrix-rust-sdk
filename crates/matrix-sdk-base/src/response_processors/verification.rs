@@ -13,12 +13,59 @@
 // limitations under the License.
 
 use matrix_sdk_crypto::OlmMachine;
-use ruma::{events::AnySyncMessageLikeEvent, RoomId};
+use ruma::{
+    events::{
+        room::message::MessageType, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+        SyncMessageLikeEvent,
+    },
+    RoomId,
+};
 
-use super::Context;
+use super::{e2ee::E2EE, Context};
 use crate::Result;
 
-pub async fn verification(
+/// Process the given event as a verification event if it is a candidate. The
+/// event must be decrypted.
+pub async fn process_if_relevant(
+    context: &mut Context,
+    event: &AnySyncTimelineEvent,
+    e2ee: E2EE<'_>,
+    room_id: &RoomId,
+) -> Result<()> {
+    if let AnySyncTimelineEvent::MessageLike(event) = event {
+        // That's it, we are good, the event has been decrypted successfully.
+
+        // However, let's run an additional action. Check if this is a verification
+        // event (`m.key.verification.*`), and call `verification` accordingly.
+        if match &event {
+            // This is an original (i.e. non-redacted) `m.room.message` event and its
+            // content is a verification request…
+            AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
+                original_event,
+            )) => {
+                matches!(&original_event.content.msgtype, MessageType::VerificationRequest(_))
+            }
+
+            // … or this is verification request event
+            AnySyncMessageLikeEvent::KeyVerificationReady(_)
+            | AnySyncMessageLikeEvent::KeyVerificationStart(_)
+            | AnySyncMessageLikeEvent::KeyVerificationCancel(_)
+            | AnySyncMessageLikeEvent::KeyVerificationAccept(_)
+            | AnySyncMessageLikeEvent::KeyVerificationKey(_)
+            | AnySyncMessageLikeEvent::KeyVerificationMac(_)
+            | AnySyncMessageLikeEvent::KeyVerificationDone(_) => true,
+
+            _ => false,
+        } {
+            verification(context, e2ee.verification_is_allowed, e2ee.olm_machine, event, room_id)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn verification(
     _context: &mut Context,
     verification_is_allowed: bool,
     olm_machine: Option<&OlmMachine>,

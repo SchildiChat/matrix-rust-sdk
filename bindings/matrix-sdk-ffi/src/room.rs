@@ -43,7 +43,7 @@ use crate::{
     identity_status_change::IdentityStatusChange,
     live_location_share::{LastLocation, LiveLocationShare},
     room_info::RoomInfo,
-    room_member::RoomMember,
+    room_member::{RoomMember, RoomMemberWithSenderInfo},
     ruma::{ImageInfo, LocationContent, Mentions, NotifyType},
     timeline::{
         configuration::{TimelineConfiguration, TimelineFilter},
@@ -291,6 +291,22 @@ impl Room {
         Ok(avatar_url_string)
     }
 
+    /// Get the membership details for the current user.
+    ///
+    /// Returns:
+    ///     - If the user was present in the room, a
+    ///       [`matrix_sdk::room::RoomMemberWithSenderInfo`] containing both the
+    ///       user info and the member info of the sender of the `m.room.member`
+    ///       event.
+    ///     - If the current user is not present, an error.
+    pub async fn member_with_sender_info(
+        &self,
+        user_id: String,
+    ) -> Result<RoomMemberWithSenderInfo, ClientError> {
+        let user_id = UserId::parse(&*user_id)?;
+        self.inner.member_with_sender_info(&user_id).await?.try_into()
+    }
+
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
         RoomInfo::new(&self.inner).await
     }
@@ -338,8 +354,11 @@ impl Room {
     ///
     /// * `content` - The content of the event to send encoded as JSON string.
     pub async fn send_raw(&self, event_type: String, content: String) -> Result<(), ClientError> {
-        let content_json: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| ClientError::Generic { msg: format!("Failed to parse JSON: {e}") })?;
+        let content_json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| ClientError::Generic {
+                msg: format!("Failed to parse JSON: {e}"),
+                details: Some(format!("{e:?}")),
+            })?;
 
         self.inner.send_raw(&event_type, content_json).await?;
 
@@ -396,9 +415,7 @@ impl Room {
             .report_content(
                 EventId::parse(event_id)?,
                 score.map(TryFrom::try_from).transpose().map_err(
-                    |error: TryFromReportedContentScoreError| ClientError::Generic {
-                        msg: error.to_string(),
-                    },
+                    |error: TryFromReportedContentScoreError| ClientError::from_err(error),
                 )?,
                 reason,
             )
@@ -690,10 +707,7 @@ impl Room {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.inner
-            .update_power_levels(updates)
-            .await
-            .map_err(|e| ClientError::Generic { msg: e.to_string() })?;
+        self.inner.update_power_levels(updates).await.map_err(ClientError::from_err)?;
         Ok(())
     }
 

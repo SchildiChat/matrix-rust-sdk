@@ -134,17 +134,8 @@ impl HttpClient {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, request, config, homeserver, access_token, send_progress),
-        fields(
-            config,
-            uri,
-            method,
-            request_size,
-            request_id,
-            status,
-            response_size,
-            sentry_event_id,
-        )
+        skip(self, request, config, homeserver, access_token, server_versions, send_progress),
+        fields(uri, method, request_size, request_id, status, response_size, sentry_event_id)
     )]
     pub async fn send<R>(
         &self,
@@ -204,7 +195,10 @@ impl HttpClient {
             // in conjunction with request bodies
             if [Method::POST, Method::PUT, Method::PATCH].contains(method) {
                 let request_size = request.body().len().try_into().unwrap_or(u64::MAX);
-                span.record("request_size", ByteSize(request_size).to_string_as(true));
+                span.record(
+                    "request_size",
+                    ByteSize(request_size).display().si_short().to_string(),
+                );
             }
 
             request

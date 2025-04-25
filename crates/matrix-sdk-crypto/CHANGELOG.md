@@ -8,7 +8,20 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- [**breaking**] Add support for the shared history flag defined in [MSC3061](https://github.com/matrix-org/matrix-spec-proposals/pull/3061).
+- Add experimental APIs for sharing encrypted room key history with new members, `Store::build_room_key_bundle` and `OlmMachine::share_room_key_bundle_data`.
+  ([#4775](https://github.com/matrix-org/matrix-rust-sdk/pull/4775), [#4864](https://github.com/matrix-org/matrix-rust-sdk/pull/4864))
+
+- Check the `sender_device_keys` field on *all* incoming Olm-encrypted to-device messages
+  and ignore any to-device messages which include the field but whose data is invalid
+  (as per [MSC4147](https://github.com/matrix-org/matrix-spec-proposals/pull/4147)).
+  ([#4922](https://github.com/matrix-org/matrix-rust-sdk/pull/4922))
+
+## [0.11.0] - 2025-04-11
+
+### Features
+
+- [**breaking**] Add support for the shared history flag defined in
+  [MSC3061](https://github.com/matrix-org/matrix-spec-proposals/pull/3061).
   The shared history flag is now respected when room keys are received as an
   `m.room_key` event as well as when they are imported from a backup or a file
   export. We also ensure to set the flag when we send out room keys. Due to
@@ -16,6 +29,10 @@ All notable changes to this project will be documented in this file.
   has been added and `PickledInboundGroupSession` has received a new
   `shared_history` field that defaults to `false.`
   ([#4700](https://github.com/matrix-org/matrix-rust-sdk/pull/4700))
+
+- Have the `RoomIdentityProvider` return processing changes when identities transition
+  to `IdentityState::Verified` too.
+  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
 
 ## [0.10.0] - 2025-02-04
 
@@ -33,19 +50,20 @@ All notable changes to this project will be documented in this file.
 - Room keys are not shared with unsigned dehydrated devices.
   ([#4551](https://github.com/matrix-org/matrix-rust-sdk/pull/4551))
   
-- Have the `RoomIdentityProvider` return processing changes when identities transition
-  to `IdentityState::Verified` too.
-  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
-
 ## [0.9.0] - 2024-12-18
 
 ### Features
 
-- Expose new API `DehydratedDevices::get_dehydrated_device_pickle_key`, `DehydratedDevices::save_dehydrated_device_pickle_key`
-  and `DehydratedDevices::delete_dehydrated_device_pickle_key` to store/load the dehydrated device pickle key.
-  This allows client to automatically rotate the dehydrated device to avoid one-time-keys exhaustion and to_device accumulation.
-  [**breaking**] `DehydratedDevices::keys_for_upload` and `DehydratedDevices::rehydrate` now use the `DehydratedDeviceKey`
-  as parameter instead of a raw byte array. Use `DehydratedDeviceKey::from_bytes` to migrate.
+- [**breaking**] Expose new API
+  `DehydratedDevices::get_dehydrated_device_pickle_key`,
+  `DehydratedDevices::save_dehydrated_device_pickle_key` and
+  `DehydratedDevices::delete_dehydrated_device_pickle_key` to store/load the
+  dehydrated device pickle key. This allows client to automatically rotate
+  the dehydrated device to avoid one-time-keys exhaustion and to_device
+  accumulation.
+  `DehydratedDevices::keys_for_upload` and
+  `DehydratedDevices::rehydrate` now use the `DehydratedDeviceKey` as parameter
+  instead of a raw byte array. Use `DehydratedDeviceKey::from_bytes` to migrate.
   ([#4383](https://github.com/matrix-org/matrix-rust-sdk/pull/4383))
 
 - Add extra logging in `OtherUserIdentity::pin_current_master_key` and

@@ -13,19 +13,10 @@
 // limitations under the License.
 
 use matrix_sdk_common::deserialized_responses::TimelineEvent;
-use matrix_sdk_crypto::{
-    DecryptionSettings, OlmMachine, RoomEventDecryptionResult, TrustRequirement,
-};
-use ruma::{
-    events::{
-        room::message::MessageType, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-        SyncMessageLikeEvent,
-    },
-    serde::Raw,
-    RoomId,
-};
+use matrix_sdk_crypto::{DecryptionSettings, RoomEventDecryptionResult};
+use ruma::{events::AnySyncTimelineEvent, serde::Raw, RoomId};
 
-use super::Context;
+use super::{e2ee::E2EE, verification, Context};
 use crate::{
     latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent},
     Result, Room,
@@ -37,30 +28,22 @@ use crate::{
 /// If we can decrypt them, change [`Room::latest_event`] to reflect what we
 /// found, and remove any older encrypted events from
 /// [`Room::latest_encrypted_events`].
-pub async fn decrypt_latest_events(
+pub async fn decrypt_from_rooms(
     context: &mut Context,
     rooms: Vec<Room>,
-    olm_machine: Option<&OlmMachine>,
-    decryption_trust_requirement: TrustRequirement,
-    verification_is_allowed: bool,
+    e2ee: E2EE<'_>,
 ) -> Result<()> {
-    let Some(olm_machine) = olm_machine else {
+    // All functions used by this one expect an `OlmMachine`. Return if there is
+    // none.
+    if e2ee.olm_machine.is_none() {
         return Ok(());
-    };
+    }
 
     for room in rooms {
         // Try to find a message we can decrypt and is suitable for using as the latest
         // event. If we found one, set it as the latest and delete any older
         // encrypted events
-        if let Some((found, found_index)) = decrypt_latest_suitable_event(
-            context,
-            olm_machine,
-            &room,
-            &decryption_trust_requirement,
-            verification_is_allowed,
-        )
-        .await
-        {
+        if let Some((found, found_index)) = find_suitable_and_decrypt(context, &room, &e2ee).await {
             room.on_latest_event_decrypted(
                 found,
                 found_index,
@@ -73,12 +56,10 @@ pub async fn decrypt_latest_events(
     Ok(())
 }
 
-async fn decrypt_latest_suitable_event(
+async fn find_suitable_and_decrypt(
     context: &mut Context,
-    olm_machine: &OlmMachine,
     room: &Room,
-    decryption_trust_requirement: &TrustRequirement,
-    verification_is_allowed: bool,
+    e2ee: &E2EE<'_>,
 ) -> Option<(Box<LatestEvent>, usize)> {
     let enc_events = room.latest_encrypted_events();
     let power_levels = room.power_levels().await.ok();
@@ -89,14 +70,8 @@ async fn decrypt_latest_suitable_event(
         // Size of the `decrypt_sync_room_event` future should not impact this
         // async fn since it is likely that there aren't even any encrypted
         // events when calling it.
-        let decrypt_sync_room_event = Box::pin(decrypt_sync_room_event(
-            context,
-            olm_machine,
-            event,
-            room.room_id(),
-            decryption_trust_requirement,
-            verification_is_allowed,
-        ));
+        let decrypt_sync_room_event =
+            Box::pin(decrypt_sync_room_event(context, event, e2ee, room.room_id()));
 
         if let Ok(decrypted) = decrypt_sync_room_event.await {
             // We found an event we can decrypt
@@ -126,54 +101,35 @@ async fn decrypt_latest_suitable_event(
 /// representing the decryption error; in the case of problems with our
 /// application, returns `Err`.
 ///
-/// Returns `Ok(None)` if encryption is not configured.
+/// # Panics
+///
+/// Panics if there is no [`OlmMachine`] in [`E2EE`].
 async fn decrypt_sync_room_event(
     context: &mut Context,
-    olm_machine: &OlmMachine,
     event: &Raw<AnySyncTimelineEvent>,
+    e2ee: &E2EE<'_>,
     room_id: &RoomId,
-    decryption_trust_requirement: &TrustRequirement,
-    verification_is_allowed: bool,
 ) -> Result<TimelineEvent> {
     let decryption_settings =
-        DecryptionSettings { sender_device_trust_requirement: *decryption_trust_requirement };
+        DecryptionSettings { sender_device_trust_requirement: e2ee.decryption_trust_requirement };
 
-    let event = match olm_machine
+    let event = match e2ee
+        .olm_machine
+        .expect("An `OlmMachine` is expected")
         .try_decrypt_room_event(event.cast_ref(), room_id, &decryption_settings)
         .await?
     {
         RoomEventDecryptionResult::Decrypted(decrypted) => {
             let event: TimelineEvent = decrypted.into();
 
-            if let Ok(AnySyncTimelineEvent::MessageLike(event)) = event.raw().deserialize() {
-                match &event {
-                    AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
-                        original_event,
-                    )) => {
-                        if let MessageType::VerificationRequest(_) = &original_event.content.msgtype
-                        {
-                            super::verification(
-                                context,
-                                verification_is_allowed,
-                                Some(olm_machine),
-                                &event,
-                                room_id,
-                            )
-                            .await?;
-                        }
-                    }
-                    _ if event.event_type().to_string().starts_with("m.key.verification") => {
-                        super::verification(
-                            context,
-                            verification_is_allowed,
-                            Some(olm_machine),
-                            &event,
-                            room_id,
-                        )
-                        .await?;
-                    }
-                    _ => (),
-                }
+            if let Ok(sync_timeline_event) = event.raw().deserialize() {
+                verification::process_if_relevant(
+                    context,
+                    &sync_timeline_event,
+                    e2ee.clone(),
+                    room_id,
+                )
+                .await?;
             }
 
             event
@@ -194,11 +150,8 @@ mod tests {
     };
     use ruma::{event_id, events::room::member::MembershipState, room_id, user_id};
 
-    use super::{decrypt_latest_events, Context};
-    use crate::{
-        rooms::normal::RoomInfoNotableUpdateReasons, test_utils::logged_in_base_client,
-        StateChanges,
-    };
+    use super::{decrypt_from_rooms, Context, E2EE};
+    use crate::{rooms::normal::RoomInfoNotableUpdateReasons, test_utils::logged_in_base_client};
 
     #[async_test]
     async fn test_when_there_are_no_latest_encrypted_events_decrypting_them_does_nothing() {
@@ -230,14 +183,16 @@ mod tests {
         assert!(room.latest_event().is_none());
 
         // When I tell it to do some decryption
-        let mut context = Context::new(StateChanges::default(), Default::default());
+        let mut context = Context::default();
 
-        decrypt_latest_events(
+        decrypt_from_rooms(
             &mut context,
             vec![room.clone()],
-            client.olm_machine().await.as_ref(),
-            client.decryption_trust_requirement,
-            client.handle_verification_events,
+            E2EE::new(
+                client.olm_machine().await.as_ref(),
+                client.decryption_trust_requirement,
+                client.handle_verification_events,
+            ),
         )
         .await
         .unwrap();

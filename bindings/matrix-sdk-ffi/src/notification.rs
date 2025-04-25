@@ -5,7 +5,11 @@ use matrix_sdk_ui::notification_client::{
 };
 use ruma::{EventId, RoomId};
 
-use crate::{client::Client, error::ClientError, event::TimelineEvent};
+use crate::{
+    client::{Client, JoinRule},
+    error::ClientError,
+    event::TimelineEvent,
+};
 
 #[derive(uniffi::Enum)]
 pub enum NotificationEvent {
@@ -25,9 +29,11 @@ pub struct NotificationRoomInfo {
     pub display_name: String,
     pub avatar_url: Option<String>,
     pub canonical_alias: Option<String>,
+    pub join_rule: Option<JoinRule>,
     pub joined_members_count: u64,
     pub is_encrypted: Option<bool>,
     pub is_direct: bool,
+    pub is_public: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -42,6 +48,7 @@ pub struct NotificationItem {
     /// information to create a push context.
     pub is_noisy: Option<bool>,
     pub has_mention: Option<bool>,
+    pub thread_id: Option<String>,
 }
 
 impl NotificationItem {
@@ -54,7 +61,6 @@ impl NotificationItem {
                 NotificationEvent::Invite { sender: event.sender.to_string() }
             }
         };
-
         Self {
             event,
             sender_info: NotificationSenderInfo {
@@ -66,12 +72,15 @@ impl NotificationItem {
                 display_name: item.room_computed_display_name,
                 avatar_url: item.room_avatar_url,
                 canonical_alias: item.room_canonical_alias,
+                join_rule: item.room_join_rule.try_into().ok(),
                 joined_members_count: item.joined_members_count,
                 is_encrypted: item.is_room_encrypted,
                 is_direct: item.is_direct_message_room,
+                is_public: item.is_room_public,
             },
             is_noisy: item.is_noisy,
             has_mention: item.has_mention,
+            thread_id: item.thread_id.map(|t| t.to_string()),
         }
     }
 }

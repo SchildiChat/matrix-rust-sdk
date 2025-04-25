@@ -28,6 +28,7 @@ use ruma::{
     directory::RoomTypeFilter,
     events::{
         room::{
+            join_rules::JoinRule,
             member::{MembershipState, StrippedRoomMemberEvent},
             message::{Relation, SyncRoomMessageEvent},
         },
@@ -632,6 +633,22 @@ impl NotificationEvent {
             NotificationEvent::Invite(ev) => &ev.sender,
         }
     }
+
+    /// Returns the root event id of the thread the notification event is in, if
+    /// any.
+    fn thread_id(&self) -> Option<OwnedEventId> {
+        let NotificationEvent::Timeline(AnySyncTimelineEvent::MessageLike(event)) = &self else {
+            return None;
+        };
+        let content = event.original_content()?;
+        match content {
+            AnyMessageLikeEventContent::RoomMessage(content) => match content.relates_to? {
+                Relation::Thread(thread) => Some(thread.event_id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 /// A notification with its full content.
@@ -656,8 +673,12 @@ pub struct NotificationItem {
     pub room_avatar_url: Option<String>,
     /// Room canonical alias.
     pub room_canonical_alias: Option<String>,
+    /// Room join rule.
+    pub room_join_rule: JoinRule,
     /// Is this room encrypted?
     pub is_room_encrypted: Option<bool>,
+    /// Is this a public room?
+    pub is_room_public: bool,
     /// Is this room considered a direct message?
     pub is_direct_message_room: bool,
     /// Numbers of members who joined the room.
@@ -669,7 +690,7 @@ pub struct NotificationItem {
     /// It is set if and only if the push actions could be determined.
     pub is_noisy: Option<bool>,
     pub has_mention: Option<bool>,
-    pub thread_id: Option<String>,
+    pub thread_id: Option<OwnedEventId>,
 }
 
 impl NotificationItem {
@@ -736,18 +757,7 @@ impl NotificationItem {
 
         let is_noisy = push_actions.map(|actions| actions.iter().any(|a| a.sound().is_some()));
         let has_mention = push_actions.map(|actions| actions.iter().any(|a| a.is_highlight()));
-
-        let thread_id = 'thread_id: {
-            if let NotificationEvent::Timeline(AnySyncTimelineEvent::MessageLike(event)) = &event {
-                let content = event.original_content();
-                if let Some(AnyMessageLikeEventContent::RoomMessage(content)) = content {
-                    if let Some(Relation::Thread(thread)) = content.relates_to {
-                        break 'thread_id Some(thread.event_id.to_string());
-                    }
-                }
-            };
-            None
-        };
+        let thread_id = event.thread_id().clone();
 
         let item = NotificationItem {
             event,
@@ -758,7 +768,9 @@ impl NotificationItem {
             room_computed_display_name: room.display_name().await?.to_string(),
             room_avatar_url: room.avatar_url().map(|s| s.to_string()),
             room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
+            room_join_rule: room.join_rule(),
             is_direct_message_room: room.is_direct().await?,
+            is_room_public: room.is_public(),
             is_room_encrypted: room
                 .latest_encryption_state()
                 .await
@@ -803,4 +815,39 @@ pub enum Error {
     /// An error forwarded from the underlying state store.
     #[error(transparent)]
     StoreError(#[from] StoreError),
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches2::assert_let;
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use matrix_sdk_test::{async_test, event_factory::EventFactory};
+    use ruma::{event_id, room_id, user_id};
+
+    use crate::notification_client::{NotificationItem, RawNotificationEvent};
+
+    #[async_test]
+    async fn test_notification_item_returns_thread_id() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let thread_root_event_id = event_id!("$root:b.c");
+        let message = EventFactory::new()
+            .room(room_id)
+            .sender(user_id!("@sender:b.c"))
+            .text_msg("Threaded")
+            .in_thread(thread_root_event_id, event_id!("$prev:b.c"))
+            .into_raw_sync();
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        let raw_notification_event = RawNotificationEvent::Timeline(message);
+        let notification_item =
+            NotificationItem::new(&room, raw_notification_event, None, Vec::new())
+                .await
+                .expect("Could not create notification item");
+
+        assert_let!(Some(thread_id) = notification_item.thread_id);
+        assert_eq!(thread_id, thread_root_event_id);
+    }
 }

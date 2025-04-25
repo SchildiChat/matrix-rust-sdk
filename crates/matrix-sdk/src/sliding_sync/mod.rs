@@ -321,14 +321,14 @@ impl SlidingSync {
             let updated_rooms = {
                 let mut rooms_map = self.inner.rooms.write().await;
 
-                let mut updated_rooms = Vec::with_capacity(sync_response.rooms.join.len());
+                let mut updated_rooms = Vec::with_capacity(sync_response.rooms.joined.len());
 
                 for (room_id, mut room_data) in sliding_sync_response.rooms.into_iter() {
                     // `sync_response` contains the rooms with decrypted events if any, so look at
                     // the timeline events here first if the room exists.
                     // Otherwise, let's look at the timeline inside the `sliding_sync_response`.
                     let timeline =
-                        if let Some(joined_room) = sync_response.rooms.join.remove(&room_id) {
+                        if let Some(joined_room) = sync_response.rooms.joined.remove(&room_id) {
                             joined_room.timeline.events
                         } else {
                             room_data.timeline.drain(..).map(TimelineEvent::new).collect()
@@ -363,7 +363,7 @@ impl SlidingSync {
                 // Since we've removed rooms that were in the room subsection from
                 // `sync_response.rooms.join`, the remaining ones aren't already present in
                 // `updated_rooms` and wouldn't cause any duplicates.
-                updated_rooms.extend(sync_response.rooms.join.keys().cloned());
+                updated_rooms.extend(sync_response.rooms.joined.keys().cloned());
 
                 updated_rooms
             };
@@ -576,11 +576,14 @@ impl SlidingSync {
                 // aborted as soon as possible.
 
                 let client = self.inner.client.clone();
-                let e2ee_uploads = spawn(async move {
-                    if let Err(error) = client.send_outgoing_requests().await {
-                        error!(?error, "Error while sending outgoing E2EE requests");
+                let e2ee_uploads = spawn(
+                    async move {
+                        if let Err(error) = client.send_outgoing_requests().await {
+                            error!(?error, "Error while sending outgoing E2EE requests");
+                        }
                     }
-                })
+                    .instrument(Span::current()),
+                )
                 // Ensure that the task is not running in detached mode. It is aborted when it's
                 // dropped.
                 .abort_on_drop();

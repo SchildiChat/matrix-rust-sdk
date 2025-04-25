@@ -6,22 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.11.0] - 2025-04-11
+
 ### Features
 
 - `Room::load_or_fetch_event()` is a new method that will find an event in the event cache (if
   enabled), or using network like `Room::event()` does.
   ([#4837](https://github.com/matrix-org/matrix-rust-sdk/pull/4837))
-- [**breaking**]: The element call widget URL configuration struct (`VirtualElementCallWidgetOptions`) and URL generation
-  have changed.
+- [**breaking**]: The element call widget URL configuration struct
+  (`VirtualElementCallWidgetOptions`) and URL generation have changed.
   - It supports the new fields: `hide_screensharing`, `posthog_api_host`, `posthog_api_key`,
   `rageshake_submit_url`, `sentry_dsn`, `sentry_environment`.
   - The widget URL will no longer automatically add `/room` to the base domain. For backward compatibility
   the app itself would need to add `/room` to the `element_call_url`.
   - And replaced:
-    - `analytics_id` -> `posthog_user_id` (The widget URL query parameters will include `analytics_id` & `posthog_user_id`
-    for backward compatibility)
-    - `skip_lobby` -> `intent` (`Intent.StartCall`, `Intent.JoinExisting`. The widget URL query parameters will include `skip_lobby` if `intent` is `Intent.StartCall` for backward compatibility)
+    - `analytics_id` -> `posthog_user_id` (The widget URL query parameters will
+      include `analytics_id` & `posthog_user_id` for backward compatibility)
+    - `skip_lobby` -> `intent` (`Intent.StartCall`, `Intent.JoinExisting`.
+      The widget URL query parameters will include `skip_lobby` if `intent` is
+      `Intent.StartCall` for backward compatibility)
   - `VirtualElementCallWidgetOptions` now implements `Default`.
+  ([#4822](https://github.com/matrix-org/matrix-rust-sdk/pull/4822))
 - [**breaking**]: The `RoomPagination::run_backwards` method has been removed and replaced by two
 simpler methods:
   - `RoomPagination::run_backwards_until()`, which will retrigger back-paginations until a certain
@@ -90,9 +95,15 @@ simpler methods:
 
 ### Refactor
 
+
+- [**breaking**] Switched from the unmaintained backoff crate to the [backon](https://docs.rs/backon/1.5.0/backon/)
+  crate. As part of this change, the `RequestConfig::retry_limit` method was
+  renamed to `RequestConfig::max_retry_time` and the parameter for the method was
+  updated from a `u64` to a `usize`.
+  ([#4916](https://github.com/matrix-org/matrix-rust-sdk/pull/4916))
 - [**breaking**] We now require Rust 1.85 as the minimum supported Rust version to compile.
   Yay for async closures!
-  ([#4745](https://github.com/matrix-org/matrix-rust-sdk/pull/4745)
+  ([#4745](https://github.com/matrix-org/matrix-rust-sdk/pull/4745))
 - [**breaking**] The `server_url` and `server_response` methods of
   `SsoLoginBuilder` are replaced by `server_builder()`, which allows more
   fine-grained settings for the server.
@@ -290,6 +301,8 @@ simpler methods:
     ([#4879](https://github.com/matrix-org/matrix-rust-sdk/pull/4879))
     - `Oidc::issuer()` was removed.
     - The `issuer` field of `UserSession` was removed.
+- `SendHandle::media_handles` was generalized into a vector
+  ([#4898](https://github.com/matrix-org/matrix-rust-sdk/pull/4898))
 
 ## [0.10.0] - 2025-02-04
 

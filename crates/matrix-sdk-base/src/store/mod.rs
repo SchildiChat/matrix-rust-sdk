@@ -339,7 +339,7 @@ impl BaseStateStore {
     pub fn get_or_create_room(
         &self,
         room_id: &RoomId,
-        room_type: RoomState,
+        room_state: RoomState,
         room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
         is_space: Option<bool>,
     ) -> Room {
@@ -354,7 +354,7 @@ impl BaseStateStore {
                     user_id,
                     self.inner.clone(),
                     room_id,
-                    room_type,
+                    room_state,
                     room_info_notable_update_sender,
                 )
             })

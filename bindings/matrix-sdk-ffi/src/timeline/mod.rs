@@ -17,7 +17,6 @@ use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
 use anyhow::{Context, Result};
 use as_variant::as_variant;
 use async_compat::get_runtime_handle;
-use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt as _};
 use matrix_sdk::{
@@ -37,6 +36,7 @@ use matrix_sdk_ui::timeline::{
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
+use reply::{InReplyToDetails, RepliedToEventDetails};
 use ruma::{
     events::{
         location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
@@ -64,7 +64,8 @@ use tokio::{
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use self::content::{Reaction, ReactionSenderData, TimelineItemContent};
+use self::content::TimelineItemContent;
+pub use self::msg_like::MessageContent;
 use crate::{
     client::ProgressWatcher,
     error::{ClientError, RoomError},
@@ -80,8 +81,9 @@ use crate::{
 
 pub mod configuration;
 mod content;
+mod msg_like;
+mod reply;
 
-pub use content::MessageContent;
 use matrix_sdk::utils::formatted_body_from;
 
 use crate::error::QueueWedgeError;
@@ -1078,7 +1080,6 @@ pub struct EventTimelineItem {
     is_editable: bool,
     content: TimelineItemContent,
     timestamp: Timestamp,
-    reactions: Vec<Reaction>,
     local_send_state: Option<EventSendState>,
     local_created_at: Option<u64>,
     read_receipts: HashMap<String, Receipt>,
@@ -1089,21 +1090,6 @@ pub struct EventTimelineItem {
 
 impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
     fn from(item: matrix_sdk_ui::timeline::EventTimelineItem) -> Self {
-        let reactions = item
-            .content()
-            .reactions()
-            .iter()
-            .map(|(k, v)| Reaction {
-                key: k.to_owned(),
-                senders: v
-                    .into_iter()
-                    .map(|(sender_id, info)| ReactionSenderData {
-                        sender_id: sender_id.to_string(),
-                        timestamp: info.timestamp.into(),
-                    })
-                    .collect(),
-            })
-            .collect();
         let item = Arc::new(item);
         let lazy_provider = Arc::new(LazyTimelineItemProvider(item.clone()));
         let read_receipts =
@@ -1117,7 +1103,6 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
             is_editable: item.is_editable(),
             content: item.content().clone().into(),
             timestamp: item.timestamp().into(),
-            reactions,
             local_send_state: item.send_state().map(|s| s.into()),
             local_created_at: item.local_created_at().map(|t| t.0.into()),
             read_receipts,
