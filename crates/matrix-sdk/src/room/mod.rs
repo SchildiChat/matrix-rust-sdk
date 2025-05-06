@@ -26,10 +26,7 @@ use std::{
 use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
-use futures_util::{
-    future::{try_join, try_join_all},
-    stream::FuturesUnordered,
-};
+use futures_util::{future::join_all, stream::FuturesUnordered};
 use http::StatusCode;
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 pub use identity_status_changes::IdentityStatusChanges;
@@ -119,7 +116,7 @@ use ruma::{
         RoomAccountDataEventContent, RoomAccountDataEventType, StateEventContent, StateEventType,
         StaticEventContent, StaticStateEventContent, SyncStateEvent,
     },
-    push::{Action, PushConditionRoomCtx},
+    push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
     time::Instant,
     EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
@@ -127,14 +124,17 @@ use ruma::{
 };
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::{join, sync::broadcast};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, instrument, warn};
 
 use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent};
 pub use self::{
     member::{RoomMember, RoomMemberRole},
-    messages::{EventWithContextResponse, Messages, MessagesOptions},
+    messages::{
+        EventWithContextResponse, IncludeRelations, ListThreadsOptions, Messages, MessagesOptions,
+        Relations, RelationsOptions, ThreadRoots,
+    },
 };
 #[cfg(doc)]
 use crate::event_cache::EventCache;
@@ -158,10 +158,7 @@ use crate::{
     BaseRoom, Client, Error, HttpResult, Result, RoomState, TransmissionProgress,
 };
 #[cfg(feature = "e2e-encryption")]
-use crate::{
-    crypto::types::events::CryptoContextInfo, encryption::backups::BackupState,
-    room::shared_room_history::share_room_history,
-};
+use crate::{crypto::types::events::CryptoContextInfo, encryption::backups::BackupState};
 
 pub mod edit;
 pub mod futures;
@@ -198,6 +195,29 @@ impl Deref for Room {
 const TYPING_NOTICE_TIMEOUT: Duration = Duration::from_secs(4);
 const TYPING_NOTICE_RESEND_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Context allowing to compute the push actions for a given event.
+#[derive(Debug)]
+pub struct PushContext {
+    /// The Ruma context used to compute the push actions.
+    push_condition_room_ctx: PushConditionRoomCtx,
+
+    /// Push rules for this room, based on the push rules state event, or the
+    /// global server default as defined by [`Ruleset::server_default`].
+    push_rules: Ruleset,
+}
+
+impl PushContext {
+    /// Create a new [`PushContext`] from its inner components.
+    pub fn new(push_condition_room_ctx: PushConditionRoomCtx, push_rules: Ruleset) -> Self {
+        Self { push_condition_room_ctx, push_rules }
+    }
+
+    /// Compute the push rules for a given event.
+    pub fn for_event<T>(&self, event: &Raw<T>) -> Vec<Action> {
+        self.push_rules.get_actions(event, &self.push_condition_room_ctx).to_owned()
+    }
+}
+
 impl Room {
     /// Create a new `Room`
     ///
@@ -233,15 +253,13 @@ impl Room {
     /// Only invited and left rooms can be joined via this method.
     #[doc(alias = "accept_invitation")]
     pub async fn join(&self) -> Result<()> {
-        let state = self.state();
-        if state == RoomState::Joined {
+        let prev_room_state = self.inner.state();
+        if prev_room_state == RoomState::Joined {
             return Err(Error::WrongRoomState(Box::new(WrongRoomState::new(
                 "Invited or Left",
-                state,
+                prev_room_state,
             ))));
         }
-
-        let prev_room_state = self.inner.state();
 
         let mark_as_direct = prev_room_state == RoomState::Invited
             && self.inner.is_direct().await.unwrap_or_else(|e| {
@@ -340,48 +358,18 @@ impl Room {
         let request = options.into_request(room_id);
         let http_response = self.client.send(request).await?;
 
-        #[allow(unused_mut)]
-        let mut response = Messages {
+        let push_ctx = self.push_context().await?;
+        let chunk = join_all(
+            http_response.chunk.into_iter().map(|ev| self.try_decrypt_event(ev, push_ctx.as_ref())),
+        )
+        .await;
+
+        Ok(Messages {
             start: http_response.start,
             end: http_response.end,
-            #[cfg(not(feature = "e2e-encryption"))]
-            chunk: http_response
-                .chunk
-                .into_iter()
-                .map(|raw| TimelineEvent::new(raw.cast()))
-                .collect(),
-            #[cfg(feature = "e2e-encryption")]
-            chunk: Vec::with_capacity(http_response.chunk.len()),
+            chunk,
             state: http_response.state,
-        };
-
-        #[cfg(feature = "e2e-encryption")]
-        for event in http_response.chunk {
-            let decrypted_event = if let Ok(AnySyncTimelineEvent::MessageLike(
-                AnySyncMessageLikeEvent::RoomEncrypted(SyncMessageLikeEvent::Original(_)),
-            )) = event.deserialize_as::<AnySyncTimelineEvent>()
-            {
-                if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
-                    event
-                } else {
-                    TimelineEvent::new(event.cast())
-                }
-            } else {
-                TimelineEvent::new(event.cast())
-            };
-            response.chunk.push(decrypted_event);
-        }
-
-        if let Some(push_context) = self.push_context().await? {
-            let push_rules = self.client().account().push_rules().await?;
-
-            for event in &mut response.chunk {
-                event.push_actions =
-                    Some(push_rules.get_actions(event.raw(), &push_context).to_owned());
-            }
-        }
-
-        Ok(response)
+        })
     }
 
     /// Register a handler for events of a specific type, within this room.
@@ -468,23 +456,27 @@ impl Room {
     /// Returns a wrapping `TimelineEvent` for the input `AnyTimelineEvent`,
     /// decrypted if needs be.
     ///
-    /// Doesn't return an error `Result` when decryption failed; only logs from
-    /// the crypto crate will indicate so.
-    async fn try_decrypt_event(&self, event: Raw<AnyTimelineEvent>) -> Result<TimelineEvent> {
+    /// Only logs from the crypto crate will indicate a failure to decrypt.
+    #[allow(clippy::unused_async)] // Used only in e2e-encryption.
+    async fn try_decrypt_event(
+        &self,
+        event: Raw<AnyTimelineEvent>,
+        push_ctx: Option<&PushContext>,
+    ) -> TimelineEvent {
         #[cfg(feature = "e2e-encryption")]
         if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
             SyncMessageLikeEvent::Original(_),
         ))) = event.deserialize_as::<AnySyncTimelineEvent>()
         {
-            if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
-                return Ok(event);
+            if let Ok(event) = self.decrypt_event(event.cast_ref(), push_ctx).await {
+                return event;
             }
         }
 
         let mut event = TimelineEvent::new(event.cast());
-        event.push_actions = self.event_push_actions(event.raw()).await?;
+        event.push_actions = push_ctx.map(|ctx| ctx.for_event(event.raw()));
 
-        Ok(event)
+        event
     }
 
     /// Fetch the event with the given `EventId` in this room.
@@ -500,7 +492,8 @@ impl Room {
             get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
 
         let raw_event = self.client.send(request).with_request_config(request_config).await?.event;
-        let event = self.try_decrypt_event(raw_event).await?;
+        let push_ctx = self.push_context().await?;
+        let event = self.try_decrypt_event(raw_event, push_ctx.as_ref()).await;
 
         // Save the event into the event cache, if it's set up.
         if let Ok((cache, _handles)) = self.event_cache().await {
@@ -556,8 +549,10 @@ impl Room {
 
         let response = self.client.send(request).with_request_config(request_config).await?;
 
+        let push_ctx = self.push_context().await?;
+        let push_ctx = push_ctx.as_ref();
         let target_event = if let Some(event) = response.event {
-            Some(self.try_decrypt_event(event).await?)
+            Some(self.try_decrypt_event(event, push_ctx).await)
         } else {
             None
         };
@@ -565,11 +560,14 @@ impl Room {
         // Note: the joined future will fail if any future failed, but
         // [`Self::try_decrypt_event`] doesn't hard-fail when there's a
         // decryption error, so we should prevent against most bad cases here.
-        let (events_before, events_after) = try_join(
-            try_join_all(response.events_before.into_iter().map(|ev| self.try_decrypt_event(ev))),
-            try_join_all(response.events_after.into_iter().map(|ev| self.try_decrypt_event(ev))),
-        )
-        .await?;
+        let (events_before, events_after) = join!(
+            join_all(
+                response.events_before.into_iter().map(|ev| self.try_decrypt_event(ev, push_ctx)),
+            ),
+            join_all(
+                response.events_after.into_iter().map(|ev| self.try_decrypt_event(ev, push_ctx)),
+            ),
+        );
 
         // Save the loaded events into the event cache, if it's set up.
         if let Ok((cache, _handles)) = self.event_cache().await {
@@ -1356,6 +1354,7 @@ impl Room {
     pub async fn decrypt_event(
         &self,
         event: &Raw<OriginalSyncRoomEncryptedEvent>,
+        push_ctx: Option<&PushContext>,
     ) -> Result<TimelineEvent> {
         let machine = self.client.olm_machine().await;
         let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
@@ -1377,7 +1376,7 @@ impl Room {
             }
         };
 
-        event.push_actions = self.event_push_actions(event.raw()).await?;
+        event.push_actions = push_ctx.map(|ctx| ctx.for_event(event.raw()));
         Ok(event)
     }
 
@@ -1480,6 +1479,11 @@ impl Room {
     /// * `user_id` - The `UserId` of the user to invite to the room.
     #[instrument(skip_all)]
     pub async fn invite_user_by_id(&self, user_id: &UserId) -> Result<()> {
+        #[cfg(all(feature = "experimental-share-history-on-invite", feature = "e2e-encryption"))]
+        {
+            shared_room_history::share_room_history(self, user_id.to_owned()).await?;
+        }
+
         let recipient = InvitationRecipient::UserId { user_id: user_id.to_owned() };
         let request = invite_user::v3::Request::new(self.room_id().to_owned(), recipient);
         self.client.send(request).await?;
@@ -1806,21 +1810,6 @@ impl Room {
         Ok(())
     }
 
-    /// Share any shareable E2EE history in this room with the given recipient,
-    /// as per [MSC4268].
-    ///
-    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
-    ///
-    /// This is temporarily exposed for integration testing as part of
-    /// experimental work on history sharing. In future, it will be combined
-    /// with sending an invite.
-    #[cfg(feature = "e2e-encryption")]
-    #[doc(hidden)]
-    #[instrument(skip_all, fields(room_id = ?self.room_id(), ?user_id))]
-    pub async fn share_history<'a>(&'a self, user_id: &UserId) -> Result<()> {
-        share_room_history(self, user_id.to_owned()).await
-    }
-
     /// Wait for the room to be fully synced.
     ///
     /// This method makes sure the room that was returned when joining a room
@@ -1911,9 +1900,10 @@ impl Room {
         SendMessageLikeEvent::new(self, content)
     }
 
-    /// Run /keys/query requests for all the non-tracked users.
+    /// Run /keys/query requests for all the non-tracked users, and for users
+    /// with an out-of-date device list.
     #[cfg(feature = "e2e-encryption")]
-    async fn query_keys_for_untracked_users(&self) -> Result<()> {
+    async fn query_keys_for_untracked_or_dirty_users(&self) -> Result<()> {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().expect("Olm machine wasn't started");
 
@@ -2111,7 +2101,7 @@ impl Room {
         #[cfg(feature = "e2e-encryption")]
         let (media_source, thumbnail) = if self.latest_encryption_state().await?.is_encrypted() {
             self.client
-                .upload_encrypted_media_and_thumbnail(content_type, &data, thumbnail, send_progress)
+                .upload_encrypted_media_and_thumbnail(&data, thumbnail, send_progress)
                 .await?
         } else {
             self.client
@@ -2949,7 +2939,7 @@ impl Room {
     ///
     /// Returns `None` if some data couldn't be found. This should only happen
     /// in brand new rooms, while we process its state.
-    pub async fn push_context(&self) -> Result<Option<PushConditionRoomCtx>> {
+    pub async fn push_condition_room_ctx(&self) -> Result<Option<PushConditionRoomCtx>> {
         let room_id = self.room_id();
         let user_id = self.own_user_id();
         let room_info = self.clone_info();
@@ -2976,25 +2966,30 @@ impl Room {
         }))
     }
 
+    /// Retrieves a [`PushContext`] that can be used to compute the push
+    /// actions for events.
+    pub async fn push_context(&self) -> Result<Option<PushContext>> {
+        let Some(push_condition_room_ctx) = self.push_condition_room_ctx().await? else {
+            debug!("Could not aggregate push context");
+            return Ok(None);
+        };
+        let push_rules = self.client().account().push_rules().await?;
+        Ok(Some(PushContext::new(push_condition_room_ctx, push_rules)))
+    }
+
     /// Get the push actions for the given event with the current room state.
     ///
     /// Note that it is possible that no push action is returned because the
     /// current room state does not have all the required state events.
     pub async fn event_push_actions<T>(&self, event: &Raw<T>) -> Result<Option<Vec<Action>>> {
-        let Some(push_context) = self.push_context().await? else {
-            debug!("Could not aggregate push context");
-            return Ok(None);
-        };
-
-        let push_rules = self.client().account().push_rules().await?;
-
-        Ok(Some(push_rules.get_actions(event, &push_context).to_owned()))
+        Ok(self.push_context().await?.map(|ctx| ctx.for_event(event)))
     }
 
     /// The membership details of the (latest) invite for the logged-in user in
     /// this room.
     pub async fn invite_details(&self) -> Result<Invite> {
         let state = self.state();
+
         if state != RoomState::Invited {
             return Err(Error::WrongRoomState(Box::new(WrongRoomState::new("Invited", state))));
         }
@@ -3583,6 +3578,48 @@ impl Room {
     pub fn privacy_settings(&self) -> RoomPrivacySettings<'_> {
         RoomPrivacySettings::new(&self.inner, &self.client)
     }
+
+    /// Retrieve a list of all the threads for the current room.
+    ///
+    /// Since this client-server API is paginated, the return type may include a
+    /// token used to resuming back-pagination into the list of results, in
+    /// [`ThreadRoots::prev_batch_token`]. This token can be fed back into
+    /// [`ListThreadsOptions::from`] to continue the pagination
+    /// from the previous position.
+    pub async fn list_threads(&self, opts: ListThreadsOptions) -> Result<ThreadRoots> {
+        let request = opts.into_request(self.room_id());
+
+        let response = self.client.send(request).await?;
+
+        let push_ctx = self.push_context().await?;
+        let chunk = join_all(
+            response.chunk.into_iter().map(|ev| self.try_decrypt_event(ev, push_ctx.as_ref())),
+        )
+        .await;
+
+        Ok(ThreadRoots { chunk, prev_batch_token: response.next_batch })
+    }
+
+    /// Retrieve a list of relations for the given event, according to the given
+    /// options.
+    ///
+    /// Since this client-server API is paginated, the return type may include a
+    /// token used to resuming back-pagination into the list of results, in
+    /// [`Relations::prev_batch_token`]. This token can be fed back into
+    /// [`RelationsOptions::from`] to continue the pagination from the previous
+    /// position.
+    ///
+    /// **Note**: if [`RelationsOptions::from`] is set for a subsequent request,
+    /// then it must be used with the same
+    /// [`RelationsOptions::include_relations`] value as the request that
+    /// returns the `from` token, otherwise the server behavior is undefined.
+    pub async fn relations(
+        &self,
+        event_id: OwnedEventId,
+        opts: RelationsOptions,
+    ) -> Result<Relations> {
+        opts.send(self, event_id).await
+    }
 }
 
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
@@ -3902,7 +3939,11 @@ mod tests {
         async_test, event_factory::EventFactory, test_json, JoinedRoomBuilder, StateTestEvent,
         SyncResponseBuilder,
     };
-    use ruma::{event_id, events::room::member::MembershipState, int, room_id, user_id};
+    use ruma::{
+        event_id,
+        events::{relation::RelationType, room::member::MembershipState},
+        int, owned_event_id, room_id, user_id,
+    };
     use wiremock::{
         matchers::{header, method, path_regex},
         Mock, MockServer, ResponseTemplate,
@@ -3911,7 +3952,12 @@ mod tests {
     use super::ReportedContentScore;
     use crate::{
         config::RequestConfig,
-        test_utils::{client::mock_matrix_session, logged_in_client, mocks::MatrixMockServer},
+        room::messages::{IncludeRelations, ListThreadsOptions, RelationsOptions},
+        test_utils::{
+            client::mock_matrix_session,
+            logged_in_client,
+            mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
+        },
         Client,
     };
 
@@ -4255,5 +4301,171 @@ mod tests {
         // And also the sender info from the /members endpoint
         assert!(ret.sender_info.is_some());
         assert_eq!(ret.sender_info.unwrap().event().user_id(), sender_id);
+    }
+
+    #[async_test]
+    async fn test_list_threads() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let batch1 = vec![f.text_msg("Thread root 1").event_id(eid1).into_raw_sync().cast()];
+        let batch2 = vec![f.text_msg("Thread root 2").event_id(eid2).into_raw_sync().cast()];
+
+        server
+            .mock_room_threads()
+            .ok(batch1.clone(), Some("prev_batch".to_owned()))
+            .mock_once()
+            .mount()
+            .await;
+        server
+            .mock_room_threads()
+            .match_from("prev_batch")
+            .ok(batch2, None)
+            .mock_once()
+            .mount()
+            .await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let result =
+            room.list_threads(ListThreadsOptions::default()).await.expect("Failed to list threads");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid1);
+        assert!(result.prev_batch_token.is_some());
+
+        let opts = ListThreadsOptions { from: result.prev_batch_token, ..Default::default() };
+        let result = room.list_threads(opts).await.expect("Failed to list threads");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid2);
+        assert!(result.prev_batch_token.is_none());
+    }
+
+    #[async_test]
+    async fn test_relations() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+
+        let target_event_id = owned_event_id!("$target");
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let batch1 = vec![f.text_msg("Related event 1").event_id(eid1).into_raw_sync().cast()];
+        let batch2 = vec![f.text_msg("Related event 2").event_id(eid2).into_raw_sync().cast()];
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .ok(RoomRelationsResponseTemplate::default().events(batch1).next_batch("next_batch"))
+            .mock_once()
+            .mount()
+            .await;
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_from("next_batch")
+            .ok(RoomRelationsResponseTemplate::default().events(batch2))
+            .mock_once()
+            .mount()
+            .await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        // Main endpoint: no relation type filtered out.
+        let mut opts = RelationsOptions {
+            include_relations: IncludeRelations::AllRelations,
+            ..Default::default()
+        };
+        let result = room
+            .relations(target_event_id.clone(), opts.clone())
+            .await
+            .expect("Failed to list relations the first time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid1);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_some());
+        assert!(result.recursion_depth.is_none());
+
+        opts.from = result.next_batch_token;
+        let result = room
+            .relations(target_event_id, opts)
+            .await
+            .expect("Failed to list relations the second time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid2);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_none());
+        assert!(result.recursion_depth.is_none());
+    }
+
+    #[async_test]
+    async fn test_relations_with_reltype() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+
+        let target_event_id = owned_event_id!("$target");
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let batch1 = vec![f.text_msg("In-thread event 1").event_id(eid1).into_raw_sync().cast()];
+        let batch2 = vec![f.text_msg("In-thread event 2").event_id(eid2).into_raw_sync().cast()];
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_subrequest(IncludeRelations::RelationsOfType(RelationType::Thread))
+            .ok(RoomRelationsResponseTemplate::default().events(batch1).next_batch("next_batch"))
+            .mock_once()
+            .mount()
+            .await;
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_from("next_batch")
+            .match_subrequest(IncludeRelations::RelationsOfType(RelationType::Thread))
+            .ok(RoomRelationsResponseTemplate::default().events(batch2))
+            .mock_once()
+            .mount()
+            .await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        // Reltype-filtered endpoint, for threads \o/
+        let mut opts = RelationsOptions {
+            include_relations: IncludeRelations::RelationsOfType(RelationType::Thread),
+            ..Default::default()
+        };
+        let result = room
+            .relations(target_event_id.clone(), opts.clone())
+            .await
+            .expect("Failed to list relations the first time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid1);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_some());
+        assert!(result.recursion_depth.is_none());
+
+        opts.from = result.next_batch_token;
+        let result = room
+            .relations(target_event_id, opts)
+            .await
+            .expect("Failed to list relations the second time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid2);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_none());
+        assert!(result.recursion_depth.is_none());
     }
 }

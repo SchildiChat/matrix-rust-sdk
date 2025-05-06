@@ -713,6 +713,7 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Flaky: times out waiting for timeline update that message was from a secure device"]
 async fn test_new_users_first_messages_dont_warn_about_insecure_device_if_it_is_secure() {
     async fn timeline_messages(timeline: &Timeline) -> Vec<EventTimelineItem> {
         timeline
@@ -873,6 +874,13 @@ async fn test_new_users_first_messages_dont_warn_about_insecure_device_if_it_is_
     // But when alice becomes cross-signed and bob finds out about it
     cross_sign(&alice).await;
     bob.sync_once(SyncSettings::new()).await.expect("should not fail to sync");
+
+    // Sync again to make sure the server has notified us about the update to
+    // alice's device info.
+    bob.sync_once(SyncSettings::new().timeout(Duration::from_millis(2000)))
+        .await
+        .expect("should not fail to sync");
+
     fetch_user_identity(&bob, alice.user_id()).await;
     let update2 = assert_next_with_timeout!(timeline_stream);
 

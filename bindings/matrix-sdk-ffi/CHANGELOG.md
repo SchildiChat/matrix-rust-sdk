@@ -6,9 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+Breaking changes:
+
+- `UploadParameters` replaces field `filename: String` with `source: UploadSource`.
+  `UploadSource` is an enum which may take a filename or a filename and bytes, which
+  allows a foreign language to read file contents natively and then pass those contents to
+  the foreign function when uploading a file through the `Timeline`.
+  ([#4948](https://github.com/matrix-org/matrix-rust-sdk/pull/4948))
+
 Additions:
 
 - Add room topic string to `StateEventContent`
+- Add `UploadSource` for representing upload data - this is analogous to `matrix_sdk_ui::timeline::AttachmentSource`
+
+Breaking changes:
+
+- `contacts` has been removed from `OidcConfiguration` (it was unused since the switch to OAuth). 
 
 ## [0.11.0] - 2025-04-11
 

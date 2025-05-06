@@ -17,6 +17,7 @@
 use std::{fmt, time::Duration};
 
 use async_channel::{Receiver, Sender};
+use matrix_sdk_common::executor::spawn;
 use ruma::api::client::delayed_events::DelayParameters;
 use serde::de::{self, Deserialize, Deserializer, Visitor};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -39,7 +40,7 @@ mod settings;
 
 pub use self::{
     capabilities::{Capabilities, CapabilitiesProvider},
-    filter::{EventFilter, MessageLikeEventFilter, StateEventFilter},
+    filter::{Filter, MessageLikeEventFilter, StateEventFilter},
     settings::{
         ClientProperties, EncryptionSystem, Intent, VirtualElementCallWidgetOptions, WidgetSettings,
     },
@@ -139,7 +140,7 @@ impl WidgetDriver {
         let (incoming_msg_tx, mut incoming_msg_rx) = unbounded_channel();
 
         // Forward all of the incoming messages from the widget.
-        tokio::spawn({
+        spawn({
             let incoming_msg_tx = incoming_msg_tx.clone();
             let from_widget_rx = self.from_widget_rx.clone();
             async move {
@@ -207,12 +208,12 @@ impl WidgetDriver {
                     }
 
                     MatrixDriverRequestData::ReadMessageLikeEvent(cmd) => matrix_driver
-                        .read_message_like_events(cmd.event_type.clone(), cmd.limit)
+                        .read_message_like_events(cmd.event_type.into(), cmd.limit)
                         .await
                         .map(MatrixDriverResponse::MatrixEventRead),
 
                     MatrixDriverRequestData::ReadStateEvent(cmd) => matrix_driver
-                        .read_state_events(cmd.event_type.clone(), &cmd.state_key)
+                        .read_state_events(cmd.event_type.into(), &cmd.state_key)
                         .await
                         .map(MatrixDriverResponse::MatrixEventRead),
 
@@ -226,7 +227,7 @@ impl WidgetDriver {
                             timeout: Duration::from_millis(d),
                         });
                         matrix_driver
-                            .send(event_type, state_key, content, delay_event_parameter)
+                            .send(event_type.into(), state_key, content, delay_event_parameter)
                             .await
                             .map(MatrixDriverResponse::MatrixEventSent)
                     }
@@ -259,7 +260,7 @@ impl WidgetDriver {
                 let mut matrix = matrix_driver.events();
                 let incoming_msg_tx = incoming_msg_tx.clone();
 
-                tokio::spawn(async move {
+                spawn(async move {
                     loop {
                         tokio::select! {
                             _ = stop_forwarding.cancelled() => {

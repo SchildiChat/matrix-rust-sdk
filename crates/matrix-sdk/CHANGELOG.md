@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- `Room::list_threads()` is a new method to list all the threads in a room.
+  ([#4972](https://github.com/matrix-org/matrix-rust-sdk/pull/4972))
+- `Room::relations()` is a new method to list all the events related to another event
+  ("relations"), with additional filters for relation type or relation type + event type.
+  ([#4972](https://github.com/matrix-org/matrix-rust-sdk/pull/4972))
+
+### Bug fixes
+
+### Refactor
+
+- `Room::push_context()` has been renamed into `Room::push_condition_room_ctx()`. The newer
+  `Room::push_context` now returns a `matrix_sdk::Room::PushContext`, which can be used to compute
+  the push actions for any event.
+  ([#4962](https://github.com/matrix-org/matrix-rust-sdk/pull/4962))
+- `Room::decrypt_event()` now requires an extra `matrix_sdk::Room::PushContext` parameter to
+  compute the push notifications for the decrypted event.
+  ([#4962](https://github.com/matrix-org/matrix-rust-sdk/pull/4962))
+
 ## [0.11.0] - 2025-04-11
 
 ### Features

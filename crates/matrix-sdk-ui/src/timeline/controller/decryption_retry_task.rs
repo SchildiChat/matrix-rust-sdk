@@ -174,10 +174,7 @@ fn compute_event_indices_to_retry_decryption(
         } else {
             // Non-UTDs only have a session ID if they are remote and have it in the
             // EncryptionInfo
-            event
-                .as_remote()
-                .and_then(|remote| remote.encryption_info.as_ref()?.session_id.as_ref())
-                .map(String::as_str)
+            event.as_remote().and_then(|remote| remote.encryption_info.as_ref()?.session_id())
         };
 
         if let Some(session_id) = session_id {
@@ -232,7 +229,7 @@ async fn make_replacement_for<P: RoomDataProvider>(
     let item = item?;
     let event = item.as_event()?;
     let remote = event.as_remote()?;
-    let session_id = remote.encryption_info.as_ref()?.session_id.as_deref()?;
+    let session_id = remote.encryption_info.as_ref()?.session_id()?;
 
     let new_encryption_info =
         room_data_provider.get_encryption_info(session_id, &event.sender).await;
@@ -255,7 +252,8 @@ async fn decrypt_by_index<D: Decryptor>(
     should_retry: impl Fn(&str) -> bool,
     retry_indices: Vec<usize>,
 ) {
-    let push_rules_context = room_data_provider.push_rules_and_context().await;
+    let push_ctx = room_data_provider.push_context().await;
+    let push_ctx = push_ctx.as_ref();
     let unable_to_decrypt_hook = state.meta.unable_to_decrypt_hook.clone();
 
     let retry_one = |item: Arc<TimelineItem>| {
@@ -290,7 +288,7 @@ async fn decrypt_by_index<D: Decryptor>(
                 return None;
             };
 
-            match decryptor.decrypt_event_impl(original_json).await {
+            match decryptor.decrypt_event_impl(original_json, push_ctx).await {
                 Ok(event) => {
                     if let SdkTimelineEventKind::UnableToDecrypt { utd_info, .. } = event.kind {
                         info!(
@@ -320,15 +318,7 @@ async fn decrypt_by_index<D: Decryptor>(
         ))
     };
 
-    state
-        .retry_event_decryption(
-            retry_one,
-            retry_indices,
-            push_rules_context,
-            room_data_provider,
-            settings,
-        )
-        .await;
+    state.retry_event_decryption(retry_one, retry_indices, room_data_provider, settings).await;
 }
 
 #[cfg(test)]
@@ -522,9 +512,9 @@ mod tests {
                 algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
                     curve25519_key: "".to_owned(),
                     sender_claimed_keys: BTreeMap::new(),
+                    session_id: Some(session_id.to_owned()),
                 },
                 verification_state: VerificationState::Verified,
-                session_id: Some(session_id.to_owned()),
             }),
             original_json: None,
             latest_edit_json: None,

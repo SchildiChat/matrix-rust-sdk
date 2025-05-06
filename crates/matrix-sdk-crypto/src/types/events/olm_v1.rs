@@ -30,7 +30,11 @@ use super::{
     secret_send::SecretSendContent,
     EventType,
 };
-use crate::types::{deserialize_ed25519_key, events::from_str, serialize_ed25519_key, DeviceKeys};
+use crate::types::{
+    deserialize_ed25519_key,
+    events::{from_str, room_key_bundle::RoomKeyBundleContent},
+    serialize_ed25519_key, DeviceKeys,
+};
 
 /// An `m.dummy` event that was decrypted using the
 /// `m.olm.v1.curve25519-aes-sha2` algorithm
@@ -77,6 +81,10 @@ impl DecryptedForwardedRoomKeyEvent {
 /// `m.olm.v1.curve25519-aes-sha2` algorithm
 pub type DecryptedSecretSendEvent = DecryptedOlmV1Event<SecretSendContent>;
 
+/// An `io.element.msc4268.room_key_bundle` to-device event which has
+/// been decrypted using using the `m.olm.v1.curve25519-aes-sha2` algorithm
+pub type DecryptedRoomKeyBundleEvent = DecryptedOlmV1Event<RoomKeyBundleContent>;
+
 /// An enum over the various events that were decrypted using the
 /// `m.olm.v1.curve25519-aes-sha2` algorithm.
 #[derive(Debug)]
@@ -89,6 +97,8 @@ pub enum AnyDecryptedOlmEvent {
     SecretSend(DecryptedSecretSendEvent),
     /// The `m.dummy` decrypted to-device event.
     Dummy(DecryptedDummyEvent),
+    /// The `io.element.msc4268.room_key_bundle` decrypted to-device event.
+    RoomKeyBundle(DecryptedRoomKeyBundleEvent),
     /// A decrypted to-device event of an unknown or custom type.
     Custom(Box<ToDeviceCustomEvent>),
 }
@@ -101,6 +111,7 @@ impl AnyDecryptedOlmEvent {
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => &e.sender,
             AnyDecryptedOlmEvent::SecretSend(e) => &e.sender,
             AnyDecryptedOlmEvent::Custom(e) => &e.sender,
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => &e.sender,
             AnyDecryptedOlmEvent::Dummy(e) => &e.sender,
         }
     }
@@ -112,6 +123,7 @@ impl AnyDecryptedOlmEvent {
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => &e.recipient,
             AnyDecryptedOlmEvent::SecretSend(e) => &e.recipient,
             AnyDecryptedOlmEvent::Custom(e) => &e.recipient,
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => &e.recipient,
             AnyDecryptedOlmEvent::Dummy(e) => &e.recipient,
         }
     }
@@ -123,6 +135,7 @@ impl AnyDecryptedOlmEvent {
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => &e.keys,
             AnyDecryptedOlmEvent::SecretSend(e) => &e.keys,
             AnyDecryptedOlmEvent::Custom(e) => &e.keys,
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => &e.keys,
             AnyDecryptedOlmEvent::Dummy(e) => &e.keys,
         }
     }
@@ -134,6 +147,7 @@ impl AnyDecryptedOlmEvent {
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => &e.recipient_keys,
             AnyDecryptedOlmEvent::SecretSend(e) => &e.recipient_keys,
             AnyDecryptedOlmEvent::Custom(e) => &e.recipient_keys,
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => &e.recipient_keys,
             AnyDecryptedOlmEvent::Dummy(e) => &e.recipient_keys,
         }
     }
@@ -145,6 +159,7 @@ impl AnyDecryptedOlmEvent {
             AnyDecryptedOlmEvent::RoomKey(e) => e.content.event_type(),
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => e.content.event_type(),
             AnyDecryptedOlmEvent::SecretSend(e) => e.content.event_type(),
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => e.content.event_type(),
             AnyDecryptedOlmEvent::Dummy(e) => e.content.event_type(),
         }
     }
@@ -156,6 +171,7 @@ impl AnyDecryptedOlmEvent {
             AnyDecryptedOlmEvent::RoomKey(e) => e.sender_device_keys.as_ref(),
             AnyDecryptedOlmEvent::ForwardedRoomKey(e) => e.sender_device_keys.as_ref(),
             AnyDecryptedOlmEvent::SecretSend(e) => e.sender_device_keys.as_ref(),
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => e.sender_device_keys.as_ref(),
             AnyDecryptedOlmEvent::Dummy(e) => e.sender_device_keys.as_ref(),
         }
     }
@@ -203,10 +219,7 @@ impl<C: EventType + Debug + Sized + Serialize> Serialize for DecryptedOlmV1Event
             recipient: &'a UserId,
             keys: &'a OlmV1Keys,
             recipient_keys: &'a OlmV1Keys,
-            #[serde(
-                rename = "org.matrix.msc4147.device_keys",
-                skip_serializing_if = "Option::is_none"
-            )]
+            #[serde(skip_serializing_if = "Option::is_none")]
             sender_device_keys: Option<&'a DeviceKeys>,
             content: &'a C,
             #[serde(rename = "type")]
@@ -315,7 +328,9 @@ impl<'de> Deserialize<'de> for AnyDecryptedOlmEvent {
             "m.forwarded_room_key" => AnyDecryptedOlmEvent::ForwardedRoomKey(from_str(json)?),
             "m.secret.send" => AnyDecryptedOlmEvent::SecretSend(from_str(json)?),
             "m.dummy" => AnyDecryptedOlmEvent::Dummy(from_str(json)?),
-
+            RoomKeyBundleContent::EVENT_TYPE => {
+                AnyDecryptedOlmEvent::RoomKeyBundle(from_str(json)?)
+            }
             _ => AnyDecryptedOlmEvent::Custom(from_str(json)?),
         })
     }
@@ -326,6 +341,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use assert_matches::assert_matches;
+    use insta::{assert_json_snapshot, with_settings};
     use ruma::{device_id, owned_user_id, KeyId};
     use serde_json::{json, Value};
     use similar_asserts::assert_eq;
@@ -505,6 +521,17 @@ mod tests {
     }
 
     #[test]
+    fn decrypted_to_device_event_snapshot() {
+        let event_json = room_key_event();
+        let event: DecryptedRoomKeyEvent = serde_json::from_value(event_json)
+            .expect("JSON should deserialize to the right event type");
+
+        with_settings!({ sort_maps => true, prepend_module_to_snapshot => false }, {
+            assert_json_snapshot!(event);
+        })
+    }
+
+    #[test]
     fn deserialization() -> Result<(), serde_json::Error> {
         macro_rules! assert_deserialization_result {
             ( $( $json:path => $to_device_events:ident ),* $(,)? ) => {
@@ -571,6 +598,10 @@ mod tests {
 
         // Then it contains the sender_device_keys
         assert_eq!(event.sender_device_keys, Some(sender_device_keys));
+
+        with_settings!({ sort_maps => true, prepend_module_to_snapshot => false }, {
+            assert_json_snapshot!(event);
+        });
     }
 
     #[test]

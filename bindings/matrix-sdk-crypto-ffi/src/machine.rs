@@ -554,8 +554,10 @@ impl OlmMachine {
             }),
         )?;
 
-        let to_device_events =
-            to_device_events.into_iter().map(|event| event.json().get().to_owned()).collect();
+        let to_device_events = to_device_events
+            .into_iter()
+            .map(|event| event.to_raw().json().get().to_owned())
+            .collect();
         let room_key_infos = room_key_infos.into_iter().map(|info| info.into()).collect();
 
         Ok(SyncChangesResult { to_device_events, room_key_infos })
@@ -915,21 +917,21 @@ impl OlmMachine {
         let event_json: Event<'_> = serde_json::from_str(decrypted.event.json().get())?;
 
         Ok(match &encryption_info.algorithm_info {
-            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, sender_claimed_keys } => {
-                DecryptedEvent {
-                    clear_event: serde_json::to_string(&event_json)?,
-                    sender_curve25519_key: curve25519_key.to_owned(),
-                    claimed_ed25519_key: sender_claimed_keys
-                        .get(&DeviceKeyAlgorithm::Ed25519)
-                        .cloned(),
-                    forwarding_curve25519_chain: vec![],
-                    shield_state: if strict_shields {
-                        encryption_info.verification_state.to_shield_state_strict().into()
-                    } else {
-                        encryption_info.verification_state.to_shield_state_lax().into()
-                    },
-                }
-            }
+            AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key,
+                sender_claimed_keys,
+                session_id: _,
+            } => DecryptedEvent {
+                clear_event: serde_json::to_string(&event_json)?,
+                sender_curve25519_key: curve25519_key.to_owned(),
+                claimed_ed25519_key: sender_claimed_keys.get(&DeviceKeyAlgorithm::Ed25519).cloned(),
+                forwarding_curve25519_chain: vec![],
+                shield_state: if strict_shields {
+                    encryption_info.verification_state.to_shield_state_strict().into()
+                } else {
+                    encryption_info.verification_state.to_shield_state_lax().into()
+                },
+            },
         })
     }
 

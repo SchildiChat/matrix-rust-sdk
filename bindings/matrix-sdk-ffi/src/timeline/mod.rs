@@ -32,7 +32,7 @@ use matrix_sdk::{
     },
 };
 use matrix_sdk_ui::timeline::{
-    self, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
+    self, AttachmentSource, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
@@ -131,7 +131,7 @@ impl Timeline {
 
         let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
             let mut request =
-                self.inner.send_attachment(params.filename, mime_type, attachment_config);
+                self.inner.send_attachment(params.source, mime_type, attachment_config);
 
             if params.use_send_queue {
                 request = request.use_send_queue();
@@ -201,8 +201,8 @@ fn build_thumbnail_info(
 
 #[derive(uniffi::Record)]
 pub struct UploadParameters {
-    /// Filename (previously called "url") for the media to be sent.
-    filename: String,
+    /// Source from which to upload data
+    source: UploadSource,
     /// Optional non-formatted caption, for clients that support it.
     caption: Option<String>,
     /// Optional HTML-formatted caption, for clients that support it.
@@ -215,6 +215,32 @@ pub struct UploadParameters {
     ///
     /// Watching progress only works with the synchronous method, at the moment.
     use_send_queue: bool,
+}
+
+/// A source for uploading a file
+#[derive(uniffi::Enum)]
+pub enum UploadSource {
+    /// Upload source is a file on disk
+    File {
+        /// Path to file
+        filename: String,
+    },
+    /// Upload source is data in memory
+    Data {
+        /// Bytes being uploaded
+        bytes: Vec<u8>,
+        /// Filename to associate with bytes
+        filename: String,
+    },
+}
+
+impl From<UploadSource> for AttachmentSource {
+    fn from(value: UploadSource) -> Self {
+        match value {
+            UploadSource::File { filename } => Self::File(filename.into()),
+            UploadSource::Data { bytes, filename } => Self::Data { bytes, filename },
+        }
+    }
 }
 
 #[derive(uniffi::Record)]
