@@ -48,7 +48,6 @@ use super::{
 #[derive(Debug)]
 pub struct RoomList {
     client: Client,
-    sliding_sync: Arc<SlidingSync>,
     sliding_sync_list: SlidingSyncList,
     loading_state: SharedObservable<RoomListLoadingState>,
     loading_state_task: JoinHandle<()>,
@@ -84,7 +83,6 @@ impl RoomList {
 
         Ok(Self {
             client: client.clone(),
-            sliding_sync: sliding_sync.clone(),
             sliding_sync_list: sliding_sync_list.clone(),
             loading_state: loading_state.clone(),
             loading_state_task: spawn(async move {
@@ -132,7 +130,7 @@ impl RoomList {
     fn entries(&self) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + '_) {
         let (rooms, stream) = self.client.rooms_stream(self.is_space_list);
 
-        let map_room = |room| Room::new(room, &self.sliding_sync);
+        let map_room = |room| Room::new(room);
 
         (
             rooms.into_iter().map(map_room).collect(),

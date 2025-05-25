@@ -19,6 +19,8 @@ use std::{
 };
 
 use itertools::Itertools;
+#[cfg(feature = "experimental-send-custom-to-device")]
+use matrix_sdk_common::deserialized_responses::WithheldCode;
 use matrix_sdk_common::{
     deserialized_responses::{
         AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo, UnableToDecryptInfo,
@@ -50,6 +52,8 @@ use ruma::{
 };
 use serde_json::{value::to_raw_value, Value};
 use tokio::sync::Mutex;
+#[cfg(feature = "experimental-send-custom-to-device")]
+use tracing::trace;
 use tracing::{
     debug, error,
     field::{debug, display},
@@ -952,9 +956,17 @@ impl OlmMachine {
             return Ok(());
         };
 
+        // We already checked that `sender_device_keys` matches the actual sender of the
+        // message when we decrypted the message, which included doing
+        // `DeviceData::try_from` on it, so it can't fail.
+
+        let sender_device_data =
+            DeviceData::try_from(sender_device_keys).expect("failed to verify sender device keys");
+        let sender_device = self.store().wrap_device_data(sender_device_data).await?;
+
         changes.received_room_key_bundles.push(StoredRoomKeyBundleData {
             sender_user: event.sender.clone(),
-            sender_data: SenderData::device_info(sender_device_keys.clone()),
+            sender_data: SenderData::from_device(&sender_device),
             bundle_data: event.content.clone(),
         });
         Ok(())
@@ -1111,6 +1123,50 @@ impl OlmMachine {
         self.inner.group_session_manager.share_room_key(room_id, users, encryption_settings).await
     }
 
+    /// Encrypts the given content using Olm for each of the given devices.
+    ///
+    /// The 1-to-1 session must be established prior to this
+    /// call by using the [`OlmMachine::get_missing_sessions`] method or the
+    /// encryption will fail.
+    ///
+    /// The caller is responsible for sending the encrypted
+    /// event to the target device, and should do it ASAP to avoid out-of-order
+    /// messages.
+    ///
+    /// # Returns
+    /// A list of `ToDeviceRequest` to send out the event, and the list of
+    /// devices where encryption did not succeed (device excluded or no olm)
+    #[cfg(feature = "experimental-send-custom-to-device")]
+    pub async fn encrypt_content_for_devices(
+        &self,
+        devices: Vec<DeviceData>,
+        event_type: &str,
+        content: &Value,
+    ) -> OlmResult<(Vec<ToDeviceRequest>, Vec<(DeviceData, WithheldCode)>)> {
+        // TODO: Use a `CollectStrategy` arguments to filter our devices depending on
+        // safety settings (like not sending to insecure devices).
+        let mut changes = Changes::default();
+
+        let result = self
+            .inner
+            .group_session_manager
+            .encrypt_content_for_devices(devices, event_type, content.clone(), &mut changes)
+            .await;
+
+        // Persist any changes we might have collected.
+        if !changes.is_empty() {
+            let session_count = changes.sessions.len();
+
+            self.inner.store.save_changes(changes).await?;
+
+            trace!(
+                session_count = session_count,
+                "Stored the changed sessions after encrypting a custom to-device event"
+            );
+        }
+
+        result
+    }
     /// Collect the devices belonging to the given user, and send the details of
     /// a room key bundle to those devices.
     ///

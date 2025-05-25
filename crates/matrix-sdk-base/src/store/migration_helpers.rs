@@ -46,7 +46,7 @@ use crate::{
     latest_event::LatestEvent,
     rooms::{
         normal::{RoomSummary, SyncInfo},
-        BaseRoomInfo, RoomNotableTags,
+        BaseRoomInfo,
     },
     sync::UnreadNotificationsCount,
     MinimalStateEvent, OriginalMinimalStateEvent, RoomInfo, RoomState,
@@ -111,7 +111,6 @@ impl RoomInfoV1 {
             version: 0,
             room_id,
             room_state: room_type,
-            prev_room_state: None,
             notification_counts,
             unread_count: None,
             summary,
@@ -216,11 +215,7 @@ impl BaseRoomInfoV1 {
             name,
             tombstone,
             topic,
-            space_children: Default::default(),
-            rtc_member_events: BTreeMap::new(),
-            is_marked_unread: false,
-            notable_tags: RoomNotableTags::empty(),
-            pinned_events: None,
+            ..Default::default()
         })
     }
 }

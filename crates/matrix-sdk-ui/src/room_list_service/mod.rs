@@ -91,6 +91,7 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomPowerLevels, ""),
     (StateEventType::CallMember, "*"),
     (StateEventType::RoomJoinRules, ""),
+    (StateEventType::RoomTombstone, ""),
     // Those two events are required to properly compute room previews.
     (StateEventType::RoomCreate, ""),
     (StateEventType::RoomHistoryVisibility, ""),
@@ -412,7 +413,6 @@ impl RoomListService {
     pub fn room(&self, room_id: &RoomId) -> Result<Room, Error> {
         Ok(Room::new(
             self.client.get_room(room_id).ok_or_else(|| Error::RoomNotFound(room_id.to_owned()))?,
-            &self.sliding_sync,
         ))
     }
 
