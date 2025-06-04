@@ -506,7 +506,7 @@ mod tests {
             read_receipts: Default::default(),
             is_own: false,
             is_highlighted: false,
-            encryption_info: Some(EncryptionInfo {
+            encryption_info: Some(Arc::new(EncryptionInfo {
                 sender: owned_user_id!("@u:s.co"),
                 sender_device: None,
                 algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
@@ -515,11 +515,13 @@ mod tests {
                     session_id: Some(session_id.to_owned()),
                 },
                 verification_state: VerificationState::Verified,
-            }),
+            })),
             original_json: None,
             latest_edit_json: None,
             origin: RemoteEventOrigin::Sync,
         });
+
+        let content = RoomMessageEventContent::text_plain("hi");
 
         TimelineItem::new(
             TimelineItemKind::Event(EventTimelineItem::new(
@@ -527,8 +529,8 @@ mod tests {
                 TimelineDetails::Pending,
                 timestamp(),
                 TimelineItemContent::message(
-                    RoomMessageEventContent::text_plain("hi"),
-                    None,
+                    content.msgtype,
+                    content.mentions,
                     ReactionsByKeyBySender::default(),
                     None,
                     None,

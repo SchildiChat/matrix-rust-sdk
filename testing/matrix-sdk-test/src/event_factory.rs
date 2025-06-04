@@ -25,6 +25,7 @@ use matrix_sdk_common::deserialized_responses::{
 };
 use ruma::{
     events::{
+        beacon::BeaconEventContent,
         member_hints::MemberHintsEventContent,
         poll::{
             unstable_end::UnstablePollEndEventContent,
@@ -40,7 +41,7 @@ use ruma::{
         room::{
             avatar::{self, RoomAvatarEventContent},
             canonical_alias::RoomCanonicalAliasEventContent,
-            create::RoomCreateEventContent,
+            create::{PreviousRoom, RoomCreateEventContent},
             encrypted::{EncryptedEventScheme, RoomEncryptedEventContent},
             member::{MembershipState, RoomMemberEventContent},
             message::{
@@ -113,12 +114,21 @@ struct Unsigned<C: EventContent> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     redacted_because: Option<RedactedBecause>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age: Option<Int>,
 }
 
 // rustc can't derive Default because C isn't marked as `Default` 🤔 oh well.
 impl<C: EventContent> Default for Unsigned<C> {
     fn default() -> Self {
-        Self { prev_content: None, transaction_id: None, relations: None, redacted_because: None }
+        Self {
+            prev_content: None,
+            transaction_id: None,
+            relations: None,
+            redacted_because: None,
+            age: None,
+        }
     }
 }
 
@@ -173,6 +183,12 @@ where
     pub fn unsigned_transaction_id(mut self, transaction_id: &TransactionId) -> Self {
         self.unsigned.get_or_insert_with(Default::default).transaction_id =
             Some(transaction_id.to_owned());
+        self
+    }
+
+    /// Add age to unsigned data in this event.
+    pub fn age(mut self, age: impl Into<Int>) -> Self {
+        self.unsigned.get_or_insert_with(Default::default).age = Some(age.into());
         self
     }
 
@@ -272,7 +288,7 @@ where
     }
 
     pub fn into_raw_timeline(self) -> Raw<AnyTimelineEvent> {
-        Raw::new(&self.construct_json(true)).unwrap().cast()
+        self.into_raw()
     }
 
     pub fn into_raw_sync(self) -> Raw<AnySyncTimelineEvent> {
@@ -380,6 +396,20 @@ impl EventBuilder<UnstablePollStartEventContent> {
         if let UnstablePollStartEventContent::New(content) = &mut self.content {
             content.relates_to = Some(RelationWithoutReplacement::Thread(thread));
         };
+        self
+    }
+}
+
+impl EventBuilder<RoomCreateEventContent> {
+    /// Define the predecessor fields.
+    pub fn predecessor(mut self, room_id: &RoomId, event_id: &EventId) -> Self {
+        self.content.predecessor = Some(PreviousRoom::new(room_id.to_owned(), event_id.to_owned()));
+        self
+    }
+
+    /// Erase the predecessor if any.
+    pub fn no_predecessor(mut self) -> Self {
+        self.content.predecessor = None;
         self
     }
 }
@@ -750,12 +780,21 @@ impl EventFactory {
     /// Create a new `m.room.create` event.
     pub fn create(
         &self,
-        user_id: &UserId,
+        creator_user_id: &UserId,
         room_version: RoomVersionId,
     ) -> EventBuilder<RoomCreateEventContent> {
-        let mut event = RoomCreateEventContent::new_v1(user_id.to_owned());
-        event.room_version = room_version;
-        self.event(event)
+        let mut event = self.event(RoomCreateEventContent::new_v1(creator_user_id.to_owned()));
+        event.content.room_version = room_version;
+
+        if self.sender.is_some() {
+            event.sender = self.sender.clone();
+        } else {
+            event.sender = Some(creator_user_id.to_owned());
+        }
+
+        event.state_key = Some("".to_owned());
+
+        event
     }
 
     /// Create a new `m.room.power_levels` event.
@@ -788,6 +827,42 @@ impl EventFactory {
         event.alias = alias;
         event.alt_aliases = alt_aliases;
         self.event(event)
+    }
+
+    /// Create a new `org.matrix.msc3672.beacon` event.
+    ///
+    /// ```
+    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// use ruma::{
+    ///     events::{beacon::BeaconEventContent, MessageLikeEvent},
+    ///     owned_event_id, room_id,
+    ///     serde::Raw,
+    ///     user_id, MilliSecondsSinceUnixEpoch,
+    /// };
+    ///
+    /// let factory = EventFactory::new().room(room_id!("!test:localhost"));
+    ///
+    /// let event: Raw<MessageLikeEvent<BeaconEventContent>> = factory
+    ///     .beacon(
+    ///         owned_event_id!("$123456789abc:localhost"),
+    ///         10.1,
+    ///         15.2,
+    ///         5,
+    ///         Some(MilliSecondsSinceUnixEpoch(1000u32.into())),
+    ///     )
+    ///     .sender(user_id!("@alice:localhost"))
+    ///     .into_raw();
+    /// ```
+    pub fn beacon(
+        &self,
+        beacon_info_event_id: OwnedEventId,
+        latitude: f64,
+        longitude: f64,
+        uncertainty: u32,
+        ts: Option<MilliSecondsSinceUnixEpoch>,
+    ) -> EventBuilder<BeaconEventContent> {
+        let geo_uri = format!("geo:{latitude},{longitude};u={uncertainty}");
+        self.event(BeaconEventContent::new(beacon_info_event_id, geo_uri, ts))
     }
 
     /// Set the next server timestamp.

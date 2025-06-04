@@ -15,7 +15,7 @@ where
 {
     fn matches(&self, left: &Room, right: &Room) -> Ordering {
         // Same workaround as for recency sorter - not sure if required?
-        if left.id() == right.id() {
+        if left.room_id() == right.room_id() {
             return Ordering::Greater;
         }
 
@@ -33,14 +33,13 @@ pub fn new_sorter(client_generated_counts: bool, with_silent_unread: bool) -> im
 }
 
 fn room_to_unread_weight(room: &Room, client_generated_counts: bool, with_silent_unread: bool) -> u8 {
-    let inner_room = room.inner_room();
     if client_generated_counts {
         counts_to_unread_weight(
-            inner_room.is_marked_unread(),
-            inner_room.num_unread_mentions(),
-            inner_room.num_unread_notifications(),
+            room.is_marked_unread(),
+            room.num_unread_mentions(),
+            room.num_unread_notifications(),
             if with_silent_unread {
-                inner_room.num_unread_messages()
+                room.num_unread_messages()
             } else {
                 0
             },
@@ -48,11 +47,11 @@ fn room_to_unread_weight(room: &Room, client_generated_counts: bool, with_silent
     } else {
         // Note: always use client-generated mention counts, server cannot know for encrypted rooms
         counts_to_unread_weight(
-            inner_room.is_marked_unread(),
-            inner_room.num_unread_mentions(),
-            inner_room.unread_notification_counts().notification_count,
+            room.is_marked_unread(),
+            room.num_unread_mentions(),
+            room.unread_notification_counts().notification_count,
             if with_silent_unread {
-                inner_room.unread_count().unwrap_or_default()
+                room.unread_count().unwrap_or_default()
             } else {
                 0
             },

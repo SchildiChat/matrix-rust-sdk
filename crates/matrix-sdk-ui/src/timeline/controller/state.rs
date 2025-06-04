@@ -19,14 +19,9 @@ use matrix_sdk::{deserialized_responses::TimelineEvent, send_queue::SendHandle};
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
-    events::{
-        poll::unstable_start::NewUnstablePollStartEventContentWithoutRelation,
-        relation::Replacement, room::message::RoomMessageEventContentWithoutRelation,
-        AnyMessageLikeEventContent, AnySyncEphemeralRoomEvent, AnySyncTimelineEvent,
-    },
+    events::{AnyMessageLikeEventContent, AnySyncEphemeralRoomEvent},
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    RoomVersionId,
+    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId,
 };
 use tracing::{instrument, trace, warn};
 
@@ -93,6 +88,25 @@ impl TimelineState {
 
         let mut transaction = self.transaction();
         transaction.handle_remote_events_with_diffs(diffs, origin, room_data, settings).await;
+        transaction.commit();
+    }
+
+    /// Handle remote aggregations on events as [`VectorDiff`]s.
+    pub(super) async fn handle_remote_aggregations<RoomData>(
+        &mut self,
+        diffs: Vec<VectorDiff<TimelineEvent>>,
+        origin: RemoteEventOrigin,
+        room_data: &RoomData,
+        settings: &TimelineSettings,
+    ) where
+        RoomData: RoomDataProvider,
+    {
+        if diffs.is_empty() {
+            return;
+        }
+
+        let mut transaction = self.transaction();
+        transaction.handle_remote_aggregations(diffs, origin, room_data, settings).await;
         transaction.commit();
     }
 
@@ -169,7 +183,7 @@ impl TimelineState {
         let mut date_divider_adjuster = DateDividerAdjuster::new(date_divider_mode);
 
         if let Some(timeline_action) =
-            TimelineAction::from_content(content, None, None, None, &txn.items, &mut txn.meta)
+            TimelineAction::from_content(content, None, &txn.items, &mut txn.meta)
         {
             TimelineEventHandler::new(&mut txn, ctx)
                 .handle_event(&mut date_divider_adjuster, timeline_action)
@@ -281,38 +295,5 @@ impl TimelineState {
 
     pub(super) fn transaction(&mut self) -> TimelineStateTransaction<'_> {
         TimelineStateTransaction::new(&mut self.items, &mut self.meta, self.timeline_focus)
-    }
-}
-
-#[derive(Clone)]
-pub(in crate::timeline) enum PendingEditKind {
-    RoomMessage(Replacement<RoomMessageEventContentWithoutRelation>),
-    Poll(Replacement<NewUnstablePollStartEventContentWithoutRelation>),
-}
-
-#[derive(Clone)]
-pub(in crate::timeline) struct PendingEdit {
-    pub kind: PendingEditKind,
-    pub event_json: Raw<AnySyncTimelineEvent>,
-}
-
-impl PendingEdit {
-    pub fn edited_event(&self) -> &EventId {
-        match &self.kind {
-            PendingEditKind::RoomMessage(Replacement { event_id, .. })
-            | PendingEditKind::Poll(Replacement { event_id, .. }) => event_id,
-        }
-    }
-}
-
-#[cfg(not(tarpaulin_include))]
-impl std::fmt::Debug for PendingEdit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.kind {
-            PendingEditKind::RoomMessage(_) => {
-                f.debug_struct("RoomMessage").finish_non_exhaustive()
-            }
-            PendingEditKind::Poll(_) => f.debug_struct("Poll").finish_non_exhaustive(),
-        }
     }
 }

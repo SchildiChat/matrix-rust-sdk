@@ -10,9 +10,13 @@ use matrix_sdk::{
         TryFromReportedContentScoreError,
     },
     ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType, EncryptionState,
-    RoomHero as SdkRoomHero, RoomMemberships, RoomState,
+    PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
+    SuccessorRoom as SdkSuccessorRoom,
 };
-use matrix_sdk_ui::timeline::{default_event_filter, RoomExt};
+use matrix_sdk_ui::{
+    timeline::{default_event_filter, RoomExt, TimelineBuilder},
+    unable_to_decrypt_hook::UtdHookManager,
+};
 use mime::Mime;
 use ruma::{
     assign,
@@ -26,13 +30,14 @@ use ruma::{
         },
         AnyMessageLikeEventContent, AnySyncTimelineEvent, TimelineEventType,
     },
-    EventId, Int, OwnedDeviceId, OwnedUserId, RoomAliasId, UserId, RoomId,
+    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
+    ServerName, UserId,
 };
-use tokio::sync::RwLock;
 use tracing::{error, warn};
 
 // SC
 use crate::space_child_info::{SpaceChildInfo, space_children_info};
+use ruma::RoomId;
 // SC end
 
 use crate::{
@@ -44,12 +49,13 @@ use crate::{
     live_location_share::{LastLocation, LiveLocationShare},
     room_info::RoomInfo,
     room_member::{RoomMember, RoomMemberWithSenderInfo},
+    room_preview::RoomPreview,
     ruma::{ImageInfo, LocationContent, Mentions, NotifyType},
     timeline::{
         configuration::{TimelineConfiguration, TimelineFilter},
-        ReceiptType, SendHandle, Timeline,
+        EventTimelineItem, ReceiptType, SendHandle, Timeline,
     },
-    utils::u64_to_uint,
+    utils::{u64_to_uint, AsyncRuntimeDropped},
     TaskHandle,
 };
 
@@ -74,21 +80,15 @@ impl From<RoomState> for Membership {
     }
 }
 
-pub(crate) type TimelineLock = Arc<RwLock<Option<Arc<Timeline>>>>;
-
 #[derive(uniffi::Object)]
 pub struct Room {
     pub(super) inner: SdkRoom,
-    timeline: TimelineLock,
+    utd_hook_manager: Option<Arc<UtdHookManager>>,
 }
 
 impl Room {
-    pub(crate) fn new(inner: SdkRoom) -> Self {
-        Room { inner, timeline: Default::default() }
-    }
-
-    pub(crate) fn with_timeline(inner: SdkRoom, timeline: TimelineLock) -> Self {
-        Room { inner, timeline }
+    pub(crate) fn new(inner: SdkRoom, utd_hook_manager: Option<Arc<UtdHookManager>>) -> Self {
+        Room { inner, utd_hook_manager }
     }
 }
 
@@ -130,8 +130,31 @@ impl Room {
         return space_children_info(&self.inner);
     }
 
-    pub fn is_tombstoned(&self) -> bool {
-        self.inner.is_tombstoned()
+    /// If this room is tombstoned, return the “reference” to the successor room
+    /// —i.e. the room replacing this one.
+    ///
+    /// A room is tombstoned if it has received a [`m.room.tombstone`] state
+    /// event.
+    ///
+    /// [`m.room.tombstone`]: https://spec.matrix.org/v1.14/client-server-api/#mroomtombstone
+    pub fn successor_room(&self) -> Option<SuccessorRoom> {
+        self.inner.successor_room().map(Into::into)
+    }
+
+    /// If this room is the successor of a tombstoned room, return the
+    /// “reference” to the predecessor room.
+    ///
+    /// A room is tombstoned if it has received a [`m.room.tombstone`] state
+    /// event.
+    ///
+    /// To determine if a room is the successor of a tombstoned room, the
+    /// [`m.room.create`] must have been received, **with** a `predecessor`
+    /// field.
+    ///
+    /// [`m.room.tombstone`]: https://spec.matrix.org/v1.14/client-server-api/#mroomtombstone
+    /// [`m.room.create`]: https://spec.matrix.org/v1.14/client-server-api/#mroomcreate
+    pub fn predecessor_room(&self) -> Option<PredecessorRoom> {
+        self.inner.predecessor_room().map(Into::into)
     }
 
     pub fn canonical_alias(&self) -> Option<String> {
@@ -142,6 +165,17 @@ impl Room {
         self.inner.alt_aliases().iter().map(|a| a.to_string()).collect()
     }
 
+    /// Get the user who created the invite, if any.
+    pub async fn inviter(&self) -> Result<Option<RoomMember>, ClientError> {
+        let invite_details = self.inner.invite_details().await?;
+
+        match invite_details.inviter {
+            Some(inviter) => Ok(Some(inviter.try_into()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The room's current membership state.
     pub fn membership(&self) -> Membership {
         self.inner.state().into()
     }
@@ -181,15 +215,10 @@ impl Room {
         Ok(())
     }
 
+    /// Create a timeline with a default configuration, i.e. a live timeline
+    /// with read receipts and read marker tracking.
     pub async fn timeline(&self) -> Result<Arc<Timeline>, ClientError> {
-        let mut write_guard = self.timeline.write().await;
-        if let Some(timeline) = &*write_guard {
-            Ok(timeline.clone())
-        } else {
-            let timeline = Timeline::new(self.inner.timeline().await?);
-            *write_guard = Some(timeline.clone());
-            Ok(timeline)
-        }
+        Ok(Timeline::new(self.inner.timeline().await?))
     }
 
     /// Build a new timeline instance with the given configuration.
@@ -197,7 +226,7 @@ impl Room {
         &self,
         configuration: TimelineConfiguration,
     ) -> Result<Arc<Timeline>, ClientError> {
-        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(&self.inner);
+        let mut builder = matrix_sdk_ui::timeline::TimelineBuilder::new(&self.inner);
 
         builder = builder
             .with_focus(configuration.focus.try_into()?)
@@ -241,6 +270,14 @@ impl Room {
             builder = builder.with_internal_id_prefix(internal_id_prefix);
         }
 
+        if configuration.report_utds {
+            if let Some(utd_hook_manager) = self.utd_hook_manager.clone() {
+                builder = builder.with_unable_to_decrypt_hook(utd_hook_manager);
+            } else {
+                return Err(ClientError::Generic { msg: "Failed creating timeline because the configuration is set to report UTDs but no hook manager is set".to_owned(), details: None });
+            }
+        }
+
         let timeline = builder.build().await?;
 
         Ok(Timeline::new(timeline))
@@ -252,6 +289,22 @@ impl Room {
 
     pub fn encryption_state(&self) -> EncryptionState {
         self.inner.encryption_state()
+    }
+
+    /// Checks whether the room is encrypted or not.
+    ///
+    /// **Note**: this info may not be reliable if you don't set up
+    /// `m.room.encryption` as required state.
+    async fn is_encrypted(&self) -> bool {
+        self.inner
+            .latest_encryption_state()
+            .await
+            .map(|state| state.is_encrypted())
+            .unwrap_or(false)
+    }
+
+    async fn latest_event(&self) -> Option<EventTimelineItem> {
+        self.inner.latest_event_item().await.map(Into::into)
     }
 
     pub async fn latest_encryption_state(&self) -> Result<EncryptionState, ClientError> {
@@ -673,11 +726,11 @@ impl Room {
     /// Mark a room as read, by attaching a read receipt on the latest event.
     ///
     /// Note: this does NOT unset the unread flag; it's the caller's
-    /// responsibility to do so, if needs be.
+    /// responsibility to do so, if need be.
     pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<(), ClientError> {
-        let timeline = self.timeline().await?;
+        let timeline = TimelineBuilder::new(&self.inner).build().await?;
 
-        timeline.mark_as_read(receipt_type).await?;
+        timeline.mark_as_read(receipt_type.into()).await?;
         Ok(())
     }
 
@@ -1110,6 +1163,41 @@ impl Room {
         self.inner.forget().await?;
         Ok(())
     }
+
+    /// Builds a `RoomPreview` from a room list item. This is intended for
+    /// invited, knocked or banned rooms.
+    async fn preview_room(&self, via: Vec<String>) -> Result<Arc<RoomPreview>, ClientError> {
+        // Validate parameters first.
+        let server_names: Vec<OwnedServerName> = via
+            .into_iter()
+            .map(|server| ServerName::parse(server).map_err(ClientError::from))
+            .collect::<Result<_, ClientError>>()?;
+
+        // Do the thing.
+        let client = self.inner.client();
+        let (room_or_alias_id, mut server_names) = if let Some(alias) = self.inner.canonical_alias()
+        {
+            let room_or_alias_id: OwnedRoomOrAliasId = alias.into();
+            (room_or_alias_id, Vec::new())
+        } else {
+            let room_or_alias_id: OwnedRoomOrAliasId = self.inner.room_id().to_owned().into();
+            (room_or_alias_id, server_names)
+        };
+
+        // If no server names are provided and the room's membership is invited,
+        // add the server name from the sender's user id as a fallback value
+        if server_names.is_empty() {
+            if let Ok(invite_details) = self.inner.invite_details().await {
+                if let Some(inviter) = invite_details.inviter {
+                    server_names.push(inviter.user_id().server_name().to_owned());
+                }
+            }
+        }
+
+        let room_preview = client.get_room_preview(&room_or_alias_id, server_names).await?;
+
+        Ok(Arc::new(RoomPreview::new(AsyncRuntimeDropped::new(client), room_preview)))
+    }
 }
 
 /// A listener for receiving new live location shares in a room.
@@ -1486,5 +1574,50 @@ impl TryFrom<RoomHistoryVisibility> for RumaHistoryVisibility {
             RoomHistoryVisibility::WorldReadable => Ok(RumaHistoryVisibility::WorldReadable),
             RoomHistoryVisibility::Custom { .. } => Err(NotYetImplemented),
         }
+    }
+}
+
+/// When a room A is tombstoned, it is replaced by a room B. The room A is the
+/// predecessor of B, and B is the successor of A. This type holds information
+/// about the successor room. See [`Room::successor_room`].
+///
+/// A room is tombstoned if it has received a [`m.room.tombstone`] state event.
+///
+/// [`m.room.tombstone`]: https://spec.matrix.org/v1.14/client-server-api/#mroomtombstone
+#[derive(uniffi::Record)]
+pub struct SuccessorRoom {
+    /// The ID of the replacement room.
+    pub room_id: String,
+
+    /// The message explaining why the room has been tombstoned.
+    pub reason: Option<String>,
+}
+
+impl From<SdkSuccessorRoom> for SuccessorRoom {
+    fn from(value: SdkSuccessorRoom) -> Self {
+        Self { room_id: value.room_id.to_string(), reason: value.reason }
+    }
+}
+
+/// When a room A is tombstoned, it is replaced by a room B. The room A is the
+/// predecessor of B, and B is the successor of A. This type holds information
+/// about the predecessor room. See [`Room::predecessor_room`].
+///
+/// To know the predecessor of a room, the [`m.room.create`] state event must
+/// have been received.
+///
+/// [`m.room.create`]: https://spec.matrix.org/v1.14/client-server-api/#mroomcreate
+#[derive(uniffi::Record)]
+pub struct PredecessorRoom {
+    /// The ID of the replacement room.
+    pub room_id: String,
+
+    /// The event ID of the last known event in the predecesssor room.
+    pub last_event_id: String,
+}
+
+impl From<SdkPredecessorRoom> for PredecessorRoom {
+    fn from(value: SdkPredecessorRoom) -> Self {
+        Self { room_id: value.room_id.to_string(), last_event_id: value.last_event_id.to_string() }
     }
 }

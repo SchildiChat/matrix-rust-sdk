@@ -32,7 +32,7 @@ use matrix_sdk::{
     },
 };
 use matrix_sdk_ui::timeline::{
-    self, AttachmentSource, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
+    self, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
@@ -97,11 +97,6 @@ pub struct Timeline {
 impl Timeline {
     pub(crate) fn new(inner: matrix_sdk_ui::timeline::Timeline) -> Arc<Self> {
         Arc::new(Self { inner })
-    }
-
-    pub(crate) fn from_arc(inner: Arc<matrix_sdk_ui::timeline::Timeline>) -> Arc<Self> {
-        // SAFETY: repr(transparent) means transmuting the arc this way is allowed
-        unsafe { Arc::from_raw(Arc::into_raw(inner) as _) }
     }
 
     fn send_attachment(
@@ -706,20 +701,23 @@ impl Timeline {
         let event_id = EventId::parse(&event_id_str)?;
 
         let replied_to = match self.inner.room().load_or_fetch_event(&event_id, None).await {
-            Ok(event) => RepliedToEvent::try_from_timeline_event_for_room(event, self.inner.room())
-                .await
-                .map_err(ClientError::from),
+            Ok(event) => self.inner.make_replied_to(event).await.map_err(ClientError::from),
             Err(e) => Err(ClientError::from(e)),
         };
 
         match replied_to {
-            Ok(replied_to) => Ok(Arc::new(InReplyToDetails::new(
+            Ok(Some(replied_to)) => Ok(Arc::new(InReplyToDetails::new(
                 event_id_str,
                 RepliedToEventDetails::Ready {
                     content: replied_to.content().clone().into(),
                     sender: replied_to.sender().to_string(),
                     sender_profile: replied_to.sender_profile().into(),
                 },
+            ))),
+
+            Ok(None) => Ok(Arc::new(InReplyToDetails::new(
+                event_id_str,
+                RepliedToEventDetails::Error { message: "unsupported event".to_owned() },
             ))),
 
             Err(e) => Ok(Arc::new(InReplyToDetails::new(

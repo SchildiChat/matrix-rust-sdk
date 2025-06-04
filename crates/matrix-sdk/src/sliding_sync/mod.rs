@@ -20,7 +20,6 @@ mod cache;
 mod client;
 mod error;
 mod list;
-mod room;
 mod sticky_parameters;
 mod utils;
 
@@ -50,7 +49,7 @@ use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
 
 #[cfg(feature = "e2e-encryption")]
 use self::utils::JoinHandleExt as _;
-pub use self::{builder::*, client::VersionBuilderError, error::*, list::*, room::*};
+pub use self::{builder::*, client::VersionBuilderError, error::*, list::*};
 use self::{
     cache::restore_sliding_sync_state,
     client::SlidingSyncResponseProcessor,
@@ -111,9 +110,6 @@ pub(super) struct SlidingSyncInner {
 
     /// The lists of this Sliding Sync instance.
     lists: AsyncRwLock<BTreeMap<String, SlidingSyncList>>,
-
-    /// All the rooms synced with Sliding Sync.
-    rooms: AsyncRwLock<BTreeMap<OwnedRoomId, SlidingSyncRoom>>,
 
     /// Request parameters that are sticky.
     sticky: StdRwLock<SlidingSyncStickyManager<SlidingSyncStickyParameters>>,
@@ -180,16 +176,6 @@ impl SlidingSync {
         }
     }
 
-    /// Lookup a specific room
-    pub async fn get_room(&self, room_id: &RoomId) -> Option<SlidingSyncRoom> {
-        self.inner.rooms.read().await.get(room_id).cloned()
-    }
-
-    /// Check the number of rooms.
-    pub fn get_number_of_rooms(&self) -> usize {
-        self.inner.rooms.blocking_read().len()
-    }
-
     /// Find a list by its name, and do something on it if it exists.
     pub async fn on_list<Function, FunctionOutput, R>(
         &self,
@@ -245,21 +231,6 @@ impl SlidingSync {
         self.add_list(list_builder).await
     }
 
-    /// Lookup a set of rooms
-    pub async fn get_rooms<I: Iterator<Item = OwnedRoomId>>(
-        &self,
-        room_ids: I,
-    ) -> Vec<Option<SlidingSyncRoom>> {
-        let rooms = self.inner.rooms.read().await;
-
-        room_ids.map(|room_id| rooms.get(&room_id).cloned()).collect()
-    }
-
-    /// Get all rooms.
-    pub async fn get_all_rooms(&self) -> Vec<SlidingSyncRoom> {
-        self.inner.rooms.read().await.values().cloned().collect()
-    }
-
     /// Handle the HTTP response.
     #[instrument(skip_all)]
     async fn handle_response(
@@ -282,26 +253,31 @@ impl SlidingSync {
         // happens here.
 
         let sync_response = {
-            // Take the lock to avoid concurrent sliding syncs overwriting each other's room
-            // infos.
-            let _sync_lock = self.inner.client.base_client().sync_lock().lock().await;
+            let response_processor = {
+                // Take the lock to avoid concurrent sliding syncs overwriting each other's room
+                // infos.
+                let _sync_lock = self.inner.client.base_client().sync_lock().lock().await;
 
-            let mut response_processor =
-                SlidingSyncResponseProcessor::new(self.inner.client.clone());
+                let mut response_processor =
+                    SlidingSyncResponseProcessor::new(self.inner.client.clone());
 
-            #[cfg(feature = "e2e-encryption")]
-            if self.is_e2ee_enabled() {
-                response_processor.handle_encryption(&sliding_sync_response.extensions).await?
-            }
+                #[cfg(feature = "e2e-encryption")]
+                if self.is_e2ee_enabled() {
+                    response_processor.handle_encryption(&sliding_sync_response.extensions).await?
+                }
 
-            // Only handle the room's subsection of the response, if this sliding sync was
-            // configured to do so.
-            if must_process_rooms_response {
+                // Only handle the room's subsection of the response, if this sliding sync was
+                // configured to do so.
+                if must_process_rooms_response {
+                    response_processor
+                        .handle_room_response(&sliding_sync_response, &requested_required_states)
+                        .await?;
+                }
+
                 response_processor
-                    .handle_room_response(&sliding_sync_response, &requested_required_states)
-                    .await?;
-            }
+            };
 
+            // Release the lock before calling event handlers
             response_processor.process_and_take_response().await?
         };
 
@@ -318,30 +294,15 @@ impl SlidingSync {
         let update_summary = {
             // Update the rooms.
             let updated_rooms = {
-                let mut rooms_map = self.inner.rooms.write().await;
+                let mut updated_rooms = Vec::with_capacity(
+                    sliding_sync_response.rooms.len() + sync_response.rooms.joined.len(),
+                );
 
-                let mut updated_rooms = Vec::with_capacity(sync_response.rooms.joined.len());
-
-                for room_id in sliding_sync_response.rooms.keys() {
-                    match rooms_map.get_mut(room_id) {
-                        // The room existed before, let's update it.
-                        Some(room) => {
-                            room.update_state();
-                        }
-
-                        // First time we need this room, let's create it.
-                        None => {
-                            rooms_map
-                                .insert(room_id.clone(), SlidingSyncRoom::new(room_id.clone()));
-                        }
-                    }
-
-                    updated_rooms.push(room_id.to_owned());
-                }
+                updated_rooms.extend(sliding_sync_response.rooms.keys().cloned());
 
                 // There might be other rooms that were only mentioned in the sliding sync
                 // extensions part of the response, and thus would result in rooms present in
-                // the `sync_response.join`. Mark them as updated too.
+                // the `sync_response.joined`. Mark them as updated too.
                 //
                 // Since we've removed rooms that were in the room subsection from
                 // `sync_response.rooms.joined`, the remaining ones aren't already present in
@@ -431,8 +392,7 @@ impl SlidingSync {
             self.inner.sticky.read().unwrap().data().extensions.to_device.enabled == Some(true);
 
         let restored_fields = if self.inner.share_pos || to_device_enabled {
-            let lists = self.inner.lists.read().await;
-            restore_sliding_sync_state(&self.inner.client, &self.inner.storage_key, &lists).await?
+            restore_sliding_sync_state(&self.inner.client, &self.inner.storage_key).await?
         } else {
             None
         };
@@ -836,29 +796,6 @@ pub(super) struct SlidingSyncPositionMarkers {
     pos: Option<String>,
 }
 
-/// Frozen bits of a Sliding Sync that are stored in the *state* store.
-#[derive(Debug, Serialize, Deserialize)]
-struct FrozenSlidingSync {
-    /// Deprecated: prefer storing in the crypto store.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    to_device_since: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rooms: Vec<FrozenSlidingSyncRoom>,
-}
-
-impl FrozenSlidingSync {
-    fn new(rooms: &BTreeMap<OwnedRoomId, SlidingSyncRoom>) -> Self {
-        // The to-device token must be saved in the `FrozenCryptoSlidingSync` now.
-        Self {
-            to_device_since: None,
-            rooms: rooms
-                .iter()
-                .map(|(_room_id, sliding_sync_room)| FrozenSlidingSyncRoom::from(sliding_sync_room))
-                .collect::<Vec<_>>(),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct FrozenSlidingSyncPos {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -960,24 +897,32 @@ mod tests {
     use assert_matches::assert_matches;
     use event_listener::Listener;
     use futures_util::{future::join_all, pin_mut, StreamExt};
-    use matrix_sdk_base::RequestedRequiredStates;
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_base::{RequestedRequiredStates, RoomMemberships};
+    use matrix_sdk_test::{async_test, event_factory::EventFactory, ALICE};
     use ruma::{
-        api::client::error::ErrorKind, assign, owned_room_id, room_id, serde::Raw, uint,
-        OwnedRoomId, TransactionId,
+        api::client::error::ErrorKind,
+        assign,
+        events::{direct::DirectEvent, room::member::MembershipState},
+        owned_room_id, room_id,
+        serde::Raw,
+        uint, OwnedRoomId, TransactionId,
     };
     use serde::Deserialize;
     use serde_json::json;
-    use wiremock::{http::Method, Match, Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{
+        http::Method, matchers::method, Match, Mock, MockServer, Request, ResponseTemplate,
+    };
 
     use super::{
         http,
         sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
-        FrozenSlidingSync, SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
+        SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
         SlidingSyncStickyParameters,
     };
     use crate::{
-        sliding_sync::cache::restore_sliding_sync_state, test_utils::logged_in_client, Result,
+        sliding_sync::cache::restore_sliding_sync_state,
+        test_utils::{logged_in_client, mocks::MatrixMockServer},
+        Client, Result,
     };
 
     #[derive(Copy, Clone)]
@@ -1182,20 +1127,6 @@ mod tests {
             assert!(room_subscriptions.contains_key(room_id_1).not());
             assert!(room_subscriptions.contains_key(room_id_2));
         }
-
-        Ok(())
-    }
-
-    #[async_test]
-    async fn test_to_device_token_properly_cached() -> Result<()> {
-        let (_server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
-            .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
-        .await?;
-
-        // FrozenSlidingSync doesn't contain the to_device_token anymore, as it's saved
-        // in the crypto store since PR #2323.
-        let frozen = FrozenSlidingSync::new(&*sliding_sync.inner.rooms.read().await);
-        assert!(frozen.to_device_since.is_none());
 
         Ok(())
     }
@@ -1877,13 +1808,9 @@ mod tests {
 
         assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("0"));
 
-        let restored_fields = restore_sliding_sync_state(
-            &client,
-            &sliding_sync.inner.storage_key,
-            &*sliding_sync.inner.lists.read().await,
-        )
-        .await?
-        .expect("must have restored fields");
+        let restored_fields = restore_sliding_sync_state(&client, &sliding_sync.inner.storage_key)
+            .await?
+            .expect("must have restored fields");
 
         // While it has been saved into the database, it's not necessarily going to be
         // used later!
@@ -1972,13 +1899,9 @@ mod tests {
 
         assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("0".to_owned()));
 
-        let restored_fields = restore_sliding_sync_state(
-            &client,
-            &sliding_sync.inner.storage_key,
-            &*sliding_sync.inner.lists.read().await,
-        )
-        .await?
-        .expect("must have restored fields");
+        let restored_fields = restore_sliding_sync_state(&client, &sliding_sync.inner.storage_key)
+            .await?
+            .expect("must have restored fields");
 
         // While it has been saved into the database, it's not necessarily going to be
         // used later!
@@ -2851,6 +2774,86 @@ mod tests {
 
         // The sync beat listener won't be notified in this case
         assert!(sync_beat_listener.wait_timeout(Duration::from_secs(1)).is_none());
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_sync_lock_is_released_before_calling_handlers() -> Result<()> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!mu5hr00m:example.org");
+
+        let _sync_mock_guard = Mock::given(SlidingSyncMatcher)
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pos": "0",
+                "lists": {},
+                "extensions": {
+                    "account_data": {
+                        "global": [
+                            {
+                                "type": "m.direct",
+                                "content": {
+                                    "@de4dlockh0lmes:example.org": [
+                                        "!mu5hr00m:example.org"
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                },
+                "rooms": {
+                    room_id: {
+                        "name": "Mario Bros Fanbase Room",
+                        "initial": true,
+                    },
+                }
+            })))
+            .mount_as_scoped(server.server())
+            .await;
+
+        let f = EventFactory::new().room(room_id);
+
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(r"/_matrix/client/v3/rooms/.*/members"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk": [
+                    f.member(&ALICE).membership(MembershipState::Join).into_raw_timeline(),
+                ]
+            })))
+            .mount(server.server())
+            .await;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        client.add_event_handler(move |_: DirectEvent, client: Client| async move {
+            // Try to run a /members query while in a event handler.
+            let members =
+                client.get_room(room_id).unwrap().members(RoomMemberships::JOIN).await.unwrap();
+            assert_eq!(members.len(), 1);
+            tx.lock().unwrap().take().expect("sender consumed multiple times").send(()).unwrap();
+        });
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .add_list(SlidingSyncList::builder("thelist"))
+            .with_account_data_extension(
+                assign!(http::request::AccountData::default(), { enabled: Some(true) }),
+            )
+            .build()
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(5), sliding_sync.sync_once())
+            .await
+            .expect("Sync did not complete in time")
+            .expect("Sync failed");
+
+        // Wait for the event handler to complete.
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("Event handler did not complete in time")
+            .expect("Event handler failed");
 
         Ok(())
     }

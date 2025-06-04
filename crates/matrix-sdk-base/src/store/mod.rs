@@ -60,7 +60,7 @@ use tracing::warn;
 use crate::{
     deserialized_responses::DisplayName,
     event_cache::store as event_cache_store,
-    rooms::{normal::RoomInfoNotableUpdate, RoomInfo, RoomState},
+    room::{RoomInfo, RoomInfoNotableUpdate, RoomState},
     MinimalRoomMemberEvent, Room, RoomStateFilter, SessionMeta,
 };
 
@@ -72,7 +72,7 @@ mod send_queue;
 #[cfg(any(test, feature = "testing"))]
 pub use self::integration_tests::StateStoreIntegrationTests;
 #[cfg(feature = "unstable-msc4274")]
-pub use self::send_queue::AccumulatedSentMediaInfo;
+pub use self::send_queue::{AccumulatedSentMediaInfo, FinishGalleryItemInfo};
 pub use self::{
     memory_store::MemoryStore,
     send_queue::{

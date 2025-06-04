@@ -25,17 +25,28 @@ All notable changes to this project will be documented in this file.
 - `Room::set_unread_flag()` now sets the stable `m.marked_unread` room account data, which was
   stabilized in Matrix 1.12. `Room::is_marked_unread()` also ignores the unstable
   `com.famedly.marked_unread` room account data if the stable variant is present.
+  ([#5034](https://github.com/matrix-org/matrix-rust-sdk/pull/5034))
 - `Encryption::encrypt_and_send_raw_to_device`: Introduced as an experimental method for
   sending custom encrypted to-device events. This feature is gated behind the
   `experimental-send-custom-to-device` flag, as it remains under active development and may undergo changes.
   ([4998](https://github.com/matrix-org/matrix-rust-sdk/pull/4998))
-
+- `Room::send_single_receipt()` and `Room::send_multiple_receipts()` now also unset the unread
+  flag of the room if an unthreaded read receipt is sent.
+  ([#5055](https://github.com/matrix-org/matrix-rust-sdk/pull/5055))
+- `Client::is_user_ignored(&UserId)` can be used to check if a user is currently ignored. 
+- ([#5081](https://github.com/matrix-org/matrix-rust-sdk/pull/5081))
+- `RoomSendQueue::send_gallery` has been added to allow sending MSC4274-style media galleries
+  via the send queue under the `unstable-msc4274` feature.
+  ([#4977](https://github.com/matrix-org/matrix-rust-sdk/pull/4977))
 
 ### Bug fixes
 
 - A invited DM room joined with `Client::join_room_by_id()` or `Client::join_room_by_id_or_alias()`
   will now be correctly marked as a DM.
   ([#5043](https://github.com/matrix-org/matrix-rust-sdk/pull/5043))
+- API responses with an HTTP status code `520` won't be retried anymore, as this is used by some proxies 
+  (including Cloudflare) to warn that an unknown error has happened in the actual server.
+  ([#5105](https://github.com/matrix-org/matrix-rust-sdk/pull/5105))
 
 ### Refactor
 
@@ -46,6 +57,12 @@ All notable changes to this project will be documented in this file.
 - `Room::decrypt_event()` now requires an extra `matrix_sdk::Room::PushContext` parameter to
   compute the push notifications for the decrypted event.
   ([#4962](https://github.com/matrix-org/matrix-rust-sdk/pull/4962))
+- `SlidingSyncRoom` has been removed. With it, the `SlidingSync::get_room`,
+  `get_all_rooms`, `get_rooms`, `get_number_of_rooms`, and
+  `FrozenSlidingSync` methods and type have been removed.
+  ([#5047](https://github.com/matrix-org/matrix-rust-sdk/pull/5047))
+- `Room::set_unread_flag()` is now a no-op if the unread flag already has the wanted value.
+  ([#5055](https://github.com/matrix-org/matrix-rust-sdk/pull/5055))
 
 ## [0.11.0] - 2025-04-11
 

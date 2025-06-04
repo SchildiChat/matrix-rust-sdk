@@ -52,7 +52,6 @@
 //! machine's state, which can be pretty helpful for the client app.
 
 pub mod filters;
-mod room;
 mod room_list;
 pub mod sc_room_list;
 pub mod sorters;
@@ -64,10 +63,9 @@ use async_stream::stream;
 use eyeball::Subscriber;
 use futures_util::{pin_mut, Stream, StreamExt};
 use matrix_sdk::{
-    event_cache::EventCacheError, timeout::timeout, Client, Error as SlidingSyncError, SlidingSync,
-    SlidingSyncList, SlidingSyncMode,
+    event_cache::EventCacheError, timeout::timeout, Client, Error as SlidingSyncError, Room,
+    SlidingSync, SlidingSyncList, SlidingSyncMode,
 };
-pub use room::*;
 pub use room_list::*;
 use ruma::{
     api::client::sync::sync_events::v5 as http, assign, directory::RoomTypeFilter,
@@ -76,8 +74,6 @@ use ruma::{
 pub use state::*;
 use thiserror::Error;
 use tracing::debug;
-
-use crate::timeline;
 
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
@@ -93,6 +89,8 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomJoinRules, ""),
     (StateEventType::RoomTombstone, ""),
     // Those two events are required to properly compute room previews.
+    // `StateEventType::RoomCreate` is also necessary to compute the room
+    // version, and thus handling the tombstoned room correctly.
     (StateEventType::RoomCreate, ""),
     (StateEventType::RoomHistoryVisibility, ""),
     // Required to correctly calculate the room display name.
@@ -411,9 +409,7 @@ impl RoomListService {
 
     /// Get a [`Room`] if it exists.
     pub fn room(&self, room_id: &RoomId) -> Result<Room, Error> {
-        Ok(Room::new(
-            self.client.get_room(room_id).ok_or_else(|| Error::RoomNotFound(room_id.to_owned()))?,
-        ))
+        self.client.get_room(room_id).ok_or_else(|| Error::RoomNotFound(room_id.to_owned()))
     }
 
     /// Subscribe to rooms.
@@ -464,12 +460,6 @@ pub enum Error {
     /// The requested room doesn't exist.
     #[error("Room `{0}` not found")]
     RoomNotFound(OwnedRoomId),
-
-    #[error("A timeline instance already exists for room {0}")]
-    TimelineAlreadyExists(OwnedRoomId),
-
-    #[error(transparent)]
-    InitializingTimeline(#[from] timeline::Error),
 
     #[error(transparent)]
     EventCache(#[from] EventCacheError),

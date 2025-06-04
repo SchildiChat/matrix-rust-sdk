@@ -16,7 +16,7 @@ where
 {
     fn matches(&self, left: &Room, right: &Room) -> Ordering {
         // Same workaround as for recency sorter - not sure if required?
-        if left.id() == right.id() {
+        if left.room_id() == right.room_id() {
             return Ordering::Greater;
         }
 
@@ -34,12 +34,11 @@ pub fn new_sorter(pin_favorites: bool, bury_low_priority: bool) -> impl Sorter {
 }
 
 fn room_to_tag_weight(room: &Room, pin_favorites: bool, bury_low_priority: bool) -> u8 {
-    let inner_room = room.inner_room();
-    if inner_room.state() == RoomState::Invited {
+    if room.state() == RoomState::Invited {
         0
-    } else if pin_favorites && inner_room.is_favourite() {
+    } else if pin_favorites && room.is_favourite() {
         1
-    } else if bury_low_priority && inner_room.is_low_priority() {
+    } else if bury_low_priority && room.is_low_priority() {
         3
     } else {
         2
