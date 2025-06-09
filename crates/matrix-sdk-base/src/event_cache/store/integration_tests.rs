@@ -74,14 +74,10 @@ pub fn make_test_event_with_event_id(
     }
     let event = builder.into_raw_timeline().cast();
 
-    TimelineEvent {
-        kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
-            event,
-            encryption_info,
-            unsigned_encryption_info: None,
-        }),
-        push_actions: Some(vec![Action::Notify]),
-    }
+    TimelineEvent::from_decrypted(
+        DecryptedRoomEvent { event, encryption_info, unsigned_encryption_info: None },
+        Some(vec![Action::Notify]),
+    )
 }
 
 /// Check that an event created with [`make_test_event`] contains the expected
@@ -91,7 +87,7 @@ pub fn make_test_event_with_event_id(
 #[track_caller]
 pub fn check_test_event(event: &TimelineEvent, text: &str) {
     // Check push actions.
-    let actions = event.push_actions.as_ref().unwrap();
+    let actions = event.push_actions().unwrap();
     assert_eq!(actions.len(), 1);
     assert_matches!(&actions[0], Action::Notify);
 
@@ -1139,7 +1135,7 @@ macro_rules! event_cache_store_integration_tests {
 #[macro_export]
 macro_rules! event_cache_store_integration_tests_time {
     () => {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         mod event_cache_store_integration_tests_time {
             use std::time::Duration;
 

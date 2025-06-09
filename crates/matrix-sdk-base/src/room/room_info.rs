@@ -200,6 +200,7 @@ impl BaseRoomInfo {
             AnySyncStateEvent::RoomName(n) => {
                 self.name = Some(n.into());
             }
+            // `m.room.create` can NOT be overwritten.
             AnySyncStateEvent::RoomCreate(c) if self.create.is_none() => {
                 self.create = Some(c.into());
             }
@@ -1238,7 +1239,7 @@ mod tests {
             last_prev_batch: Some("pb".to_owned()),
             sync_info: SyncInfo::FullySynced,
             encryption_state_synced: true,
-            latest_event: Some(Box::new(LatestEvent::new(TimelineEvent::new(
+            latest_event: Some(Box::new(LatestEvent::new(TimelineEvent::from_plaintext(
                 Raw::from_json_string(json!({"sender": "@u:i.uk"}).to_string()).unwrap(),
             )))),
             base_info: Box::new(
@@ -1276,6 +1277,7 @@ mod tests {
             "latest_event": {
                 "event": {
                     "kind": {"PlainText": {"event": {"sender": "@u:i.uk"}}},
+                    "thread_summary": "None"
                 },
             },
             "base_info": {

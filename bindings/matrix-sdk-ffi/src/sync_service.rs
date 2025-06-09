@@ -14,9 +14,9 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use async_compat::get_runtime_handle;
 use futures_util::pin_mut;
 use matrix_sdk::Client;
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     sync_service::{
         State as MatrixSyncServiceState, SyncService as MatrixSyncService,
@@ -26,7 +26,8 @@ use matrix_sdk_ui::{
 };
 
 use crate::{
-    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService, TaskHandle,
+    error::ClientError, helpers::unwrap_or_clone_arc, room_list::RoomListService,
+    runtime::get_runtime_handle, TaskHandle,
 };
 
 #[derive(uniffi::Enum)]
@@ -51,7 +52,7 @@ impl From<MatrixSyncServiceState> for SyncServiceState {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait SyncServiceStateObserver: Send + Sync + Debug {
+pub trait SyncServiceStateObserver: SendOutsideWasm + SyncOutsideWasm + Debug {
     fn on_update(&self, state: SyncServiceState);
 }
 

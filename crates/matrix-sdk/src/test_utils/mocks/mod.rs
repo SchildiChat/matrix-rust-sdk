@@ -19,9 +19,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicU32, Arc, Mutex},
 };
 
+use js_int::UInt;
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use matrix_sdk_test::{
     test_json, InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
@@ -32,13 +33,15 @@ use ruma::{
     api::client::{receipt::create_receipt::v3::ReceiptType, room::Visibility},
     device_id,
     directory::PublicRoomsChunk,
+    encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
     events::{
         room::member::RoomMemberEvent, AnyStateEvent, AnyTimelineEvent, GlobalAccountDataEventType,
         MessageLikeEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
     time::Duration,
-    DeviceId, MxcUri, OwnedEventId, OwnedRoomId, RoomId, ServerName, UserId,
+    DeviceId, MxcUri, OwnedDeviceId, OwnedEventId, OwnedOneTimeKeyId, OwnedRoomId, OwnedUserId,
+    RoomId, ServerName, UserId,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -47,10 +50,26 @@ use wiremock::{
     Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
 };
 
+#[cfg(feature = "e2e-encryption")]
+pub mod encryption;
 pub mod oauth;
 
 use super::client::MockClientBuilder;
 use crate::{room::IncludeRelations, Client, OwnedServerName, Room};
+
+/// Structure used to store the crypto keys uploaded to the server.
+/// They will be served back to clients when requested.
+#[derive(Debug, Default)]
+struct Keys {
+    device: BTreeMap<OwnedUserId, BTreeMap<String, Raw<DeviceKeys>>>,
+    master: BTreeMap<OwnedUserId, Raw<CrossSigningKey>>,
+    self_signing: BTreeMap<OwnedUserId, Raw<CrossSigningKey>>,
+    user_signing: BTreeMap<OwnedUserId, Raw<CrossSigningKey>>,
+    one_time_keys: BTreeMap<
+        OwnedUserId,
+        BTreeMap<OwnedDeviceId, BTreeMap<OwnedOneTimeKeyId, Raw<OneTimeKey>>>,
+    >,
+}
 
 /// A [`wiremock`] [`MockServer`] along with useful methods to help mocking
 /// Matrix client-server API endpoints easily.
@@ -122,18 +141,40 @@ pub struct MatrixMockServer {
     /// token and avoid the client ignoring subsequent responses after the first
     /// one.
     sync_response_builder: Arc<Mutex<SyncResponseBuilder>>,
+
+    /// Make this mock server capable of mocking real end to end communications
+    keys: Arc<Mutex<Keys>>,
+
+    /// For crypto API end-points to work we need to be able to recognise
+    /// what client is doing the request by mapping the token to the user_id
+    token_to_user_id_map: Arc<Mutex<BTreeMap<String, OwnedUserId>>>,
+    token_counter: AtomicU32,
 }
 
 impl MatrixMockServer {
     /// Create a new [`wiremock`] server specialized for Matrix usage.
     pub async fn new() -> Self {
         let server = MockServer::start().await;
-        Self { server, sync_response_builder: Default::default() }
+        let keys: Arc<Mutex<Keys>> = Default::default();
+        Self {
+            server,
+            sync_response_builder: Default::default(),
+            keys,
+            token_to_user_id_map: Default::default(),
+            token_counter: AtomicU32::new(0),
+        }
     }
 
     /// Creates a new [`MatrixMockServer`] from a [`wiremock`] server.
     pub fn from_server(server: MockServer) -> Self {
-        Self { server, sync_response_builder: Default::default() }
+        let keys: Arc<Mutex<Keys>> = Default::default();
+        Self {
+            server,
+            sync_response_builder: Default::default(),
+            keys,
+            token_to_user_id_map: Default::default(),
+            token_counter: AtomicU32::new(0),
+        }
     }
 
     /// Creates a new [`MockClientBuilder`] configured to use this server,
@@ -1142,6 +1183,15 @@ impl MatrixMockServer {
             "^/_matrix/client/v3/user/.*/rooms/.*/account_data/{data_type}"
         )));
         self.mock_endpoint(mock, RoomAccountDataEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get the media config of
+    /// the homeserver.
+    pub fn mock_authenticated_media_config(
+        &self,
+    ) -> MockEndpoint<'_, AuthenticatedMediaConfigEndpoint> {
+        let mock = Mock::given(method("GET")).and(path("/_matrix/client/v1/media/config"));
+        self.mock_endpoint(mock, AuthenticatedMediaConfigEndpoint).expect_default_access_token()
     }
 }
 
@@ -3001,5 +3051,24 @@ impl<'a> MockEndpoint<'a, RoomAccountDataEndpoint> {
     /// Returns a successful empty response.
     pub fn ok(self) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+    }
+}
+
+/// A prebuilt mock for `GET /_matrix/client/v1/media/config` request.
+pub struct AuthenticatedMediaConfigEndpoint;
+
+impl<'a> MockEndpoint<'a, AuthenticatedMediaConfigEndpoint> {
+    /// Returns a successful response with the provided max upload size.
+    pub fn ok(self, max_upload_size: UInt) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "m.upload.size": max_upload_size,
+        })))
+    }
+
+    /// Returns a successful response with a maxed out max upload size.
+    pub fn ok_default(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "m.upload.size": UInt::MAX,
+        })))
     }
 }

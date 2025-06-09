@@ -188,6 +188,13 @@ impl BaseClient {
             }
         }
 
+        // Check if tombstoned rooms are not creating an invalid state, like a loop.
+        processors::state_events::check_room_upgrades(
+            &mut context,
+            &room_updates,
+            &self.state_store,
+        )?;
+
         // Handle read receipts and typing notifications independently of the rooms:
         // these both live in a different subsection of the server's response,
         // so they may exist without any update for the associated room.
@@ -2511,12 +2518,12 @@ mod tests {
 
     #[cfg(feature = "e2e-encryption")]
     fn make_event(event_type: &str, id: &str) -> TimelineEvent {
-        TimelineEvent::new(make_raw_event(event_type, id))
+        TimelineEvent::from_plaintext(make_raw_event(event_type, id))
     }
 
     #[cfg(feature = "e2e-encryption")]
     fn make_encrypted_event(id: &str) -> TimelineEvent {
-        TimelineEvent::new_utd_event(
+        TimelineEvent::from_utd(
             Raw::from_json_string(
                 json!({
                     "type": "m.room.encrypted",

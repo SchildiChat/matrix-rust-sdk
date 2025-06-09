@@ -28,9 +28,9 @@ use eyeball::SharedObservable;
 use futures_core::Stream;
 use futures_util::{future::join_all, stream::FuturesUnordered};
 use http::StatusCode;
-#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+#[cfg(feature = "e2e-encryption")]
 pub use identity_status_changes::IdentityStatusChanges;
-#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+#[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::{
@@ -47,7 +47,7 @@ use matrix_sdk_base::{
     ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, SendOutsideWasm,
     StateChanges, StateStoreDataKey, StateStoreDataValue,
 };
-#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+#[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::BoxFuture;
 use matrix_sdk_common::{
     deserialized_responses::TimelineEvent,
@@ -385,7 +385,6 @@ impl Room {
             ))));
         }
 
-        #[cfg(all(feature = "experimental-share-history-on-invite", feature = "e2e-encryption"))]
         let inviter = if prev_room_state == RoomState::Invited {
             match self.invite_details().await {
                 Ok(details) => details.inviter,
@@ -400,10 +399,16 @@ impl Room {
 
         self.client.join_room_by_id(self.room_id()).await?;
 
-        #[cfg(all(feature = "experimental-share-history-on-invite", feature = "e2e-encryption"))]
-        if let Some(inviter) = inviter {
-            shared_room_history::maybe_accept_key_bundle(self, inviter.user_id()).await?;
+        #[cfg(feature = "e2e-encryption")]
+        if self.client.inner.enable_share_history_on_invite {
+            if let Some(inviter) = inviter {
+                shared_room_history::maybe_accept_key_bundle(self, inviter.user_id()).await?;
+            }
         }
+
+        #[cfg(not(feature = "e2e-encryption"))]
+        // Suppress "unused variable" lint
+        let _inviter = inviter;
 
         Ok(())
     }
@@ -578,7 +583,7 @@ impl Room {
     /// Note that if a user who is in pin violation leaves the room, a `Pinned`
     /// update is sent, to indicate that the warning should be removed, even
     /// though the user's identity is not necessarily pinned.
-    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    #[cfg(feature = "e2e-encryption")]
     pub async fn subscribe_to_identity_status_changes(
         &self,
     ) -> Result<impl Stream<Item = Vec<IdentityStatusChange>>> {
@@ -605,8 +610,10 @@ impl Room {
             }
         }
 
-        let mut event = TimelineEvent::new(event.cast());
-        event.push_actions = push_ctx.map(|ctx| ctx.for_event(event.raw()));
+        let mut event = TimelineEvent::from_plaintext(event.cast());
+        if let Some(push_ctx) = push_ctx {
+            event.set_push_actions(push_ctx.for_event(event.raw()));
+        }
 
         event
     }
@@ -1494,22 +1501,23 @@ impl Room {
         let decryption_settings = DecryptionSettings {
             sender_device_trust_requirement: self.client.base_client().decryption_trust_requirement,
         };
-        let mut event: TimelineEvent = match machine
+
+        match machine
             .try_decrypt_room_event(event.cast_ref(), self.inner.room_id(), &decryption_settings)
             .await?
         {
-            RoomEventDecryptionResult::Decrypted(decrypted) => decrypted.into(),
+            RoomEventDecryptionResult::Decrypted(decrypted) => {
+                let push_actions = push_ctx.map(|push_ctx| push_ctx.for_event(&decrypted.event));
+                Ok(TimelineEvent::from_decrypted(decrypted, push_actions))
+            }
             RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
                 self.client
                     .encryption()
                     .backups()
                     .maybe_download_room_key(self.room_id().to_owned(), event.clone());
-                TimelineEvent::new_utd_event(event.clone().cast(), utd_info)
+                Ok(TimelineEvent::from_utd(event.clone().cast(), utd_info))
             }
-        };
-
-        event.push_actions = push_ctx.map(|ctx| ctx.for_event(event.raw()));
-        Ok(event)
+        }
     }
 
     /// Fetches the [`EncryptionInfo`] for the supplied session_id.
@@ -1611,8 +1619,8 @@ impl Room {
     /// * `user_id` - The `UserId` of the user to invite to the room.
     #[instrument(skip_all)]
     pub async fn invite_user_by_id(&self, user_id: &UserId) -> Result<()> {
-        #[cfg(all(feature = "experimental-share-history-on-invite", feature = "e2e-encryption"))]
-        {
+        #[cfg(feature = "e2e-encryption")]
+        if self.client.inner.enable_share_history_on_invite {
             shared_room_history::share_room_history(self, user_id.to_owned()).await?;
         }
 
@@ -3735,7 +3743,7 @@ impl Room {
     }
 }
 
-#[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+#[cfg(feature = "e2e-encryption")]
 impl RoomIdentityProvider for Room {
     fn is_member<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, bool> {
         Box::pin(async { self.get_member(user_id).await.unwrap_or(None).is_some() })
@@ -4045,7 +4053,7 @@ pub struct RoomMemberWithSenderInfo {
     pub sender_info: Option<RoomMember>,
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use matrix_sdk_base::{store::ComposerDraftType, ComposerDraft};
     use matrix_sdk_test::{

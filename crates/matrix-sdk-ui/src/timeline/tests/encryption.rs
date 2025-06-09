@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![cfg(not(target_arch = "wasm32"))]
+#![cfg(not(target_family = "wasm"))]
 
 use std::{
     io::Cursor,
@@ -626,22 +626,28 @@ async fn test_retry_fetching_encryption_info() {
 
     // But right now the timeline contains 2 events whose info says "unverified"
     // One is linked to SESSION_ID, the other is linked to some other session.
-    let timeline_event_this_session = TimelineEvent::from(DecryptedRoomEvent {
-        event: f.text_msg("foo").sender(sender).room(room_id).into_raw(),
-        encryption_info: make_encryption_info(
-            SESSION_ID,
-            VerificationState::Unverified(VerificationLevel::UnsignedDevice),
-        ),
-        unsigned_encryption_info: None,
-    });
-    let timeline_event_other_session = TimelineEvent::from(DecryptedRoomEvent {
-        event: f.text_msg("foo").sender(sender).room(room_id).into_raw(),
-        encryption_info: make_encryption_info(
-            "other_session_id",
-            VerificationState::Unverified(VerificationLevel::UnsignedDevice),
-        ),
-        unsigned_encryption_info: None,
-    });
+    let timeline_event_this_session = TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: f.text_msg("foo").sender(sender).room(room_id).into_raw(),
+            encryption_info: make_encryption_info(
+                SESSION_ID,
+                VerificationState::Unverified(VerificationLevel::UnsignedDevice),
+            ),
+            unsigned_encryption_info: None,
+        },
+        None,
+    );
+    let timeline_event_other_session = TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: f.text_msg("foo").sender(sender).room(room_id).into_raw(),
+            encryption_info: make_encryption_info(
+                "other_session_id",
+                VerificationState::Unverified(VerificationLevel::UnsignedDevice),
+            ),
+            unsigned_encryption_info: None,
+        },
+        None,
+    );
     timeline.handle_live_event(timeline_event_this_session).await;
     timeline.handle_live_event(timeline_event_other_session).await;
 
@@ -873,7 +879,7 @@ async fn test_retry_decryption_updates_response() {
         assert_eq!(reply_details.event_id, original_event_id);
 
         let replied_to = as_variant!(&reply_details.event, TimelineDetails::Ready).unwrap();
-        assert!(replied_to.content().is_unable_to_decrypt());
+        assert!(replied_to.content.is_unable_to_decrypt());
     }
 
     // Import a room key backup.
@@ -908,7 +914,7 @@ async fn test_retry_decryption_updates_response() {
         assert_eq!(reply_details.event_id, original_event_id);
 
         let replied_to = as_variant!(&reply_details.event, TimelineDetails::Ready).unwrap();
-        assert_eq!(replied_to.content().as_message().unwrap().body(), "It's a secret to everybody");
+        assert_eq!(replied_to.content.as_message().unwrap().body(), "It's a secret to everybody");
     }
 
     // The event itself is decrypted.
@@ -941,7 +947,7 @@ fn utd_event_with_unsigned(unsigned: serde_json::Value) -> TimelineEvent {
         .unwrap(),
     );
 
-    TimelineEvent::new_utd_event(
+    TimelineEvent::from_utd(
         raw,
         matrix_sdk::deserialized_responses::UnableToDecryptInfo {
             session_id: Some("SESSION_ID".into()),

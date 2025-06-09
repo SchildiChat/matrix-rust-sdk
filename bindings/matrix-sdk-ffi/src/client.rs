@@ -7,8 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context as _};
-use async_compat::get_runtime_handle;
-use futures_util::{pin_mut, StreamExt};
+use futures_util::pin_mut;
 use matrix_sdk::{
     authentication::oauth::{
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
@@ -41,6 +40,7 @@ use matrix_sdk::{
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
     STATE_STORE_DATABASE_NAME,
 };
+use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     notification_client::{
         NotificationClient as MatrixNotificationClient,
@@ -91,13 +91,15 @@ use crate::{
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
-    room::RoomHistoryVisibility,
+    room::{RoomHistoryVisibility, RoomInfoListener},
     room_directory_search::RoomDirectorySearch,
+    room_info::RoomInfo,
     room_preview::RoomPreview,
     ruma::{
         AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
         MediaPreviews, MediaSource, RoomAccountDataEvent, RoomAccountDataEventType,
     },
+    runtime::get_runtime_handle,
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
     utd::{UnableToDecryptDelegate, UtdHook},
@@ -166,24 +168,24 @@ impl From<PushFormat> for RumaPushFormat {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait ClientDelegate: Sync + Send {
+pub trait ClientDelegate: SyncOutsideWasm + SendOutsideWasm {
     fn did_receive_auth_error(&self, is_soft_logout: bool);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait ClientSessionDelegate: Sync + Send {
+pub trait ClientSessionDelegate: SyncOutsideWasm + SendOutsideWasm {
     fn retrieve_session_from_keychain(&self, user_id: String) -> Result<Session, ClientError>;
     fn save_session_in_keychain(&self, session: Session);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait ProgressWatcher: Send + Sync {
+pub trait ProgressWatcher: SyncOutsideWasm + SendOutsideWasm {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
 /// A listener to the global (client-wide) error reporter of the send queue.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait SendQueueRoomErrorListener: Sync + Send {
+pub trait SendQueueRoomErrorListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called every time the send queue has ran into an error for a given room,
     /// which will disable the send queue for that particular room.
     fn on_error(&self, room_id: String, error: ClientError);
@@ -191,14 +193,14 @@ pub trait SendQueueRoomErrorListener: Sync + Send {
 
 /// A listener for changes of global account data events.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait AccountDataListener: Sync + Send {
+pub trait AccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a global account data event has changed.
     fn on_change(&self, event: AccountDataEvent);
 }
 
 /// A listener for changes of room account data events.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait RoomAccountDataListener: Sync + Send {
+pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a room account data event was changed.
     fn on_change(&self, event: RoomAccountDataEvent, room_id: String);
 }
@@ -1565,15 +1567,65 @@ impl Client {
     ) -> Result<Option<MediaPreviewConfig>, ClientError> {
         Ok(self.inner.account().fetch_media_preview_config_event_content().await?.map(Into::into))
     }
+
+    /// Gets the `max_upload_size` value from the homeserver, which controls the
+    /// max size a media upload request can have.
+    pub async fn get_max_media_upload_size(&self) -> Result<u64, ClientError> {
+        let max_upload_size = self.inner.load_or_fetch_max_upload_size().await?;
+        Ok(max_upload_size.into())
+    }
+
+    /// Subscribe to [`RoomInfo`] updates given a provided [`RoomId`].
+    ///
+    /// This works even for rooms we haven't received yet, so we can subscribe
+    /// to this and wait until we receive updates from them when sync responses
+    /// are processed.
+    ///
+    /// Note this method should be used sparingly since using callback
+    /// interfaces is expensive, as well as keeping them alive for a long
+    /// time. Usages of this method should be short-lived and dropped as
+    /// soon as possible.
+    pub async fn subscribe_to_room_info(
+        &self,
+        room_id: String,
+        listener: Box<dyn RoomInfoListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        // Emit the initial event, if present
+        if let Some(room) = self.inner.get_room(&room_id) {
+            if let Ok(room_info) = RoomInfo::new(&room).await {
+                listener.call(room_info);
+            }
+        }
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn({
+            let client = self.inner.clone();
+            let mut receiver = client.room_info_notable_update_receiver();
+            async move {
+                while let Ok(room_update) = receiver.recv().await {
+                    if room_update.room_id != room_id {
+                        continue;
+                    }
+
+                    if let Some(room) = client.get_room(&room_id) {
+                        if let Ok(room_info) = RoomInfo::new(&room).await {
+                            listener.call(room_info);
+                        }
+                    }
+                }
+            }
+        }))))
+    }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait MediaPreviewConfigListener: Sync + Send {
+pub trait MediaPreviewConfigListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_change(&self, media_preview_config: Option<MediaPreviewConfig>);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait IgnoredUsersListener: Sync + Send {
+pub trait IgnoredUsersListener: SyncOutsideWasm + SendOutsideWasm {
     fn call(&self, ignored_user_ids: Vec<String>);
 }
 

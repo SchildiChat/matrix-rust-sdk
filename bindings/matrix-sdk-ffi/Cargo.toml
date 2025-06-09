@@ -17,8 +17,9 @@ release = true
 crate-type = ["cdylib", "staticlib"]
 
 [features]
-default = ["bundled-sqlite"]
+default = ["bundled-sqlite", "unstable-msc4274"]
 bundled-sqlite = ["matrix-sdk/bundled-sqlite"]
+unstable-msc4274 = ["matrix-sdk-ui/unstable-msc4274"]
 
 [dependencies]
 anyhow.workspace = true
@@ -29,6 +30,7 @@ eyeball-im.workspace = true
 futures-util.workspace = true
 language-tags = "0.3.2"
 log-panics = { version = "2", features = ["with-backtrace"] }
+matrix-sdk-common.workspace = true
 matrix-sdk-ffi-macros.workspace = true
 matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
 mime = "0.3.16"

@@ -186,7 +186,7 @@ impl TestTimeline {
     }
 
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
-        let timeline_event = TimelineEvent::new(event.cast());
+        let timeline_event = TimelineEvent::from_plaintext(event.cast());
         self.controller
             .handle_remote_events_with_diffs(
                 vec![VectorDiff::PushFront { value: timeline_event }],
@@ -435,6 +435,10 @@ impl RoomDataProvider for TestRoomDataProvider {
         _event_id: OwnedEventId,
         _opts: matrix_sdk::room::RelationsOptions,
     ) -> Result<Relations, matrix_sdk::Error> {
+        unimplemented!();
+    }
+
+    async fn load_event<'a>(&'a self, _event_id: &'a EventId) -> matrix_sdk::Result<TimelineEvent> {
         unimplemented!();
     }
 }

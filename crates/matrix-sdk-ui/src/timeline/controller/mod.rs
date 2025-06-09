@@ -26,7 +26,7 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         paginator::{PaginationResult, Paginator},
-        RoomEventCache,
+        RoomEventCache, RoomPaginationStatus,
     },
     send_queue::{
         LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendHandle, SendReactionHandle,
@@ -69,8 +69,8 @@ use super::{
     subscriber::TimelineSubscriber,
     threaded_events_loader::ThreadedEventsLoader,
     traits::{Decryptor, RoomDataProvider},
-    DateDividerMode, Error, EventSendState, EventTimelineItem, InReplyToDetails, PaginationError,
-    Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
+    DateDividerMode, EmbeddedEvent, Error, EventSendState, EventTimelineItem, InReplyToDetails,
+    PaginationError, Profile, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
     TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
 };
 use crate::{
@@ -232,19 +232,21 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, room_version: &RoomVer
                                 return false;
                             }
 
-                            matches!(
-                                content.msgtype,
+                            match content.msgtype {
                                 MessageType::Audio(_)
-                                    | MessageType::Emote(_)
-                                    | MessageType::File(_)
-                                    | MessageType::Image(_)
-                                    | MessageType::Location(_)
-                                    | MessageType::Notice(_)
-                                    | MessageType::ServerNotice(_)
-                                    | MessageType::Text(_)
-                                    | MessageType::Video(_)
-                                    | MessageType::VerificationRequest(_)
-                            )
+                                | MessageType::Emote(_)
+                                | MessageType::File(_)
+                                | MessageType::Image(_)
+                                | MessageType::Location(_)
+                                | MessageType::Notice(_)
+                                | MessageType::ServerNotice(_)
+                                | MessageType::Text(_)
+                                | MessageType::Video(_)
+                                | MessageType::VerificationRequest(_) => true,
+                                #[cfg(feature = "unstable-msc4274")]
+                                MessageType::Gallery(_) => true,
+                                _ => false,
+                            }
                         }
 
                         AnyMessageLikeEventContent::Sticker(_)
@@ -354,6 +356,17 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                     RemoteEventOrigin::Cache,
                 )
                 .await;
+
+                match room_event_cache.pagination().status().get() {
+                    RoomPaginationStatus::Idle { hit_timeline_start } => {
+                        if hit_timeline_start {
+                            // Eagerly insert the timeline start item, since pagination claims
+                            // we've already hit the timeline start.
+                            self.insert_timeline_start_if_missing().await;
+                        }
+                    }
+                    RoomPaginationStatus::Paginating => {}
+                }
 
                 Ok(has_events)
             }
@@ -1340,7 +1353,7 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         txn.commit();
     }
 
-    /// Create a [`RepliedToEvent`] from an arbitrary event, be it in the
+    /// Create a [`EmbeddedEvent`] from an arbitrary event, be it in the
     /// timeline or not.
     ///
     /// Can be `None` if the event cannot be represented as a standalone item,
@@ -1348,12 +1361,12 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
     pub(super) async fn make_replied_to(
         &self,
         event: TimelineEvent,
-    ) -> Result<Option<RepliedToEvent>, Error> {
+    ) -> Result<Option<EmbeddedEvent>, Error> {
         // Reborrow, to avoid that the automatic deref borrows the entire guard (and we
         // can't borrow both items and meta).
         let state = &mut *self.state.write().await;
 
-        RepliedToEvent::try_from_timeline_event(
+        EmbeddedEvent::try_from_timeline_event(
             event,
             &self.room_data_provider,
             &state.items,
@@ -1564,9 +1577,9 @@ async fn fetch_replied_to_event(
     msglike: &MsgLikeContent,
     in_reply_to: &EventId,
     room: &Room,
-) -> Result<TimelineDetails<Box<RepliedToEvent>>, Error> {
+) -> Result<TimelineDetails<Box<EmbeddedEvent>>, Error> {
     if let Some((_, item)) = rfind_event_by_id(&state_guard.items, in_reply_to) {
-        let details = TimelineDetails::Ready(Box::new(RepliedToEvent::from_timeline_item(&item)));
+        let details = TimelineDetails::Ready(Box::new(EmbeddedEvent::from_timeline_item(&item)));
         trace!("Found replied-to event locally");
         return Ok(details);
     };
@@ -1591,7 +1604,7 @@ async fn fetch_replied_to_event(
         Ok(timeline_event) => {
             let state = &mut *state_lock.write().await;
 
-            let replied_to_item = RepliedToEvent::try_from_timeline_event(
+            let replied_to_item = EmbeddedEvent::try_from_timeline_event(
                 timeline_event,
                 room,
                 &state.items,

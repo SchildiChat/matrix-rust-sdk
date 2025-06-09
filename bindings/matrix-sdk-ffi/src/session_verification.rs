@@ -1,6 +1,5 @@
 use std::sync::{Arc, RwLock};
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
     encryption::{
@@ -11,10 +10,13 @@ use matrix_sdk::{
     ruma::events::key::verification::VerificationMethod,
     Account,
 };
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::UserId;
 use tracing::{error, warn};
 
-use crate::{client::UserProfile, error::ClientError, utils::Timestamp};
+use crate::{
+    client::UserProfile, error::ClientError, runtime::get_runtime_handle, utils::Timestamp,
+};
 
 #[derive(uniffi::Object)]
 pub struct SessionVerificationEmoji {
@@ -51,7 +53,7 @@ pub struct SessionVerificationRequestDetails {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait SessionVerificationControllerDelegate: Sync + Send {
+pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWasm {
     fn did_receive_verification_request(&self, details: SessionVerificationRequestDetails);
     fn did_accept_verification_request(&self);
     fn did_start_sas_verification(&self);

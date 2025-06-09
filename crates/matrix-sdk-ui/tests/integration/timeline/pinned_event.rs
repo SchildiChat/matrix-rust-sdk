@@ -12,6 +12,7 @@ use matrix_sdk::{
     Client, Room,
 };
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
+use matrix_sdk_common::executor::spawn;
 use matrix_sdk_test::{
     async_test, event_factory::EventFactory, JoinedRoomBuilder, StateTestEvent,
     SyncResponseBuilder, BOB,
@@ -629,7 +630,7 @@ async fn test_ensure_max_concurrency_is_observed() {
     let room = client.get_room(&room_id).unwrap();
 
     // Start loading the pinned event timeline asynchronously.
-    let handle = tokio::spawn({
+    let handle = spawn({
         let timeline_builder = room.timeline_builder().with_focus(pinned_events_focus(100));
         async {
             let _ = timeline_builder.build().await;
@@ -658,7 +659,7 @@ async fn mock_events_endpoint(
             .mock_room_event()
             .room(room_id.to_owned())
             .match_event_id()
-            .ok(TimelineEvent::new(event.cast()))
+            .ok(TimelineEvent::from_plaintext(event.cast()))
             .mount()
             .await;
     }

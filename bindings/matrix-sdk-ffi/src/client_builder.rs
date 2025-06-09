@@ -1,6 +1,5 @@
 use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
     authentication::oauth::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
@@ -19,6 +18,7 @@ use matrix_sdk::{
     Client as MatrixClient, ClientBuildError as MatrixClientBuildError, HttpError, IdParseError,
     RumaApiError, SqliteStoreConfig,
 };
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
 use zeroize::Zeroizing;
@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 use super::client::Client;
 use crate::{
     authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
-    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
+    helpers::unwrap_or_clone_arc, runtime::get_runtime_handle, task_handle::TaskHandle,
 };
 
 /// A list of bytes containing a certificate in DER or PEM form.
@@ -173,7 +173,7 @@ pub enum QrLoginProgress {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait QrLoginProgressListener: Sync + Send {
+pub trait QrLoginProgressListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, state: QrLoginProgress);
 }
 
@@ -287,6 +287,7 @@ pub struct ClientBuilder {
     encryption_settings: EncryptionSettings,
     room_key_recipient_strategy: CollectStrategy,
     decryption_trust_requirement: TrustRequirement,
+    enable_share_history_on_invite: bool,
     request_config: Option<RequestConfig>,
 }
 
@@ -321,6 +322,7 @@ impl ClientBuilder {
             },
             room_key_recipient_strategy: Default::default(),
             decryption_trust_requirement: TrustRequirement::Untrusted,
+            enable_share_history_on_invite: false,
             request_config: Default::default(),
         })
     }
@@ -552,6 +554,19 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    /// Set whether to enable the experimental support for sending and receiving
+    /// encrypted room history on invite, per [MSC4268].
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub fn enable_share_history_on_invite(
+        self: Arc<Self>,
+        enable_share_history_on_invite: bool,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.enable_share_history_on_invite = enable_share_history_on_invite;
+        Arc::new(builder)
+    }
+
     /// Add a default request config to this client.
     pub fn request_config(self: Arc<Self>, config: RequestConfig) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
@@ -680,7 +695,8 @@ impl ClientBuilder {
         inner_builder = inner_builder
             .with_encryption_settings(builder.encryption_settings)
             .with_room_key_recipient_strategy(builder.room_key_recipient_strategy)
-            .with_decryption_trust_requirement(builder.decryption_trust_requirement);
+            .with_decryption_trust_requirement(builder.decryption_trust_requirement)
+            .with_enable_share_history_on_invite(builder.enable_share_history_on_invite);
 
         match builder.sliding_sync_version_builder {
             SlidingSyncVersionBuilder::None => {

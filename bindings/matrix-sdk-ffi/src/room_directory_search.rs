@@ -15,14 +15,14 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use async_compat::get_runtime_handle;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::room_directory_search::RoomDirectorySearch as SdkRoomDirectorySearch;
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::ServerName;
 use tokio::sync::RwLock;
 
-use crate::{error::ClientError, task_handle::TaskHandle};
+use crate::{error::ClientError, runtime::get_runtime_handle, task_handle::TaskHandle};
 
 #[derive(uniffi::Enum)]
 pub enum PublicRoomJoinRule {
@@ -198,6 +198,6 @@ impl From<VectorDiff<matrix_sdk::room_directory_search::RoomDescription>>
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait RoomDirectorySearchEntriesListener: Send + Sync + Debug {
+pub trait RoomDirectorySearchEntriesListener: SendOutsideWasm + SyncOutsideWasm + Debug {
     fn on_update(&self, room_entries_update: Vec<RoomDirectorySearchEntryUpdate>);
 }

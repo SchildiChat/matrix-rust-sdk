@@ -8,9 +8,9 @@ use matrix_sdk::{
     locks::Mutex,
     ruma::{
         api::client::receipt::create_receipt::v3::ReceiptType,
-        events::room::message::RoomMessageEventContent, OwnedRoomId, OwnedUserId,
+        events::room::message::RoomMessageEventContent, OwnedRoomId, UserId,
     },
-    RoomState,
+    Room, RoomState,
 };
 use ratatui::{prelude::*, widgets::*};
 use tokio::{spawn, task::JoinHandle};
@@ -48,6 +48,8 @@ pub struct RoomView {
 
     mode: Mode,
 
+    timeline_list: ListState,
+
     input: Input,
 }
 
@@ -61,6 +63,7 @@ impl RoomView {
             current_pagination: Default::default(),
             mode: Mode::Normal { invited_room_view: None },
             input: Input::new(),
+            timeline_list: ListState::default(),
         }
     }
 
@@ -124,6 +127,14 @@ impl RoomView {
                                 }
                             }
                         }
+
+                        (_, Down) | (KeyModifiers::CONTROL, Char('n')) => {
+                            self.timeline_list.select_next()
+                        }
+                        (_, Up) | (KeyModifiers::CONTROL, Char('p')) => {
+                            self.timeline_list.select_previous()
+                        }
+                        (_, Esc) => self.timeline_list.select(None),
 
                         _ => self.input.handle_key_press(key),
                     }
@@ -197,6 +208,7 @@ impl RoomView {
             }
         }
 
+        self.timeline_list = ListState::default();
         self.selected_room = room;
     }
 
@@ -264,33 +276,67 @@ impl RoomView {
         };
     }
 
-    async fn invite_member(&mut self, user_id: OwnedUserId) {
+    /// Attempt to find the currently selected room and pass it to the async
+    /// callback.
+    async fn call_with_room(&self, function: impl AsyncFnOnce(Room, &StatusHandle)) {
         let Some(room) = self
             .selected_room
             .as_deref()
             .and_then(|room_id| self.ui_rooms.lock().get(room_id).cloned())
         else {
             self.status_handle
-                .set_message(format!("Coulnd't find the room object to invite {user_id}"));
+                .set_message("Couldn't find a room selected room to perform an action".to_owned());
             return;
         };
 
-        match room.invite_user_by_id(&user_id).await {
-            Ok(_) => {
-                self.status_handle
-                    .set_message(format!("Successfully invited {user_id} to the room"));
-                self.input.clear();
+        function(room, &self.status_handle).await
+    }
+
+    async fn invite_member(&mut self, user_id: &str) {
+        self.call_with_room(async move |room, status_handle| {
+            let user_id = match UserId::parse_with_server_name(
+                user_id,
+                room.client().user_id().unwrap().server_name(),
+            ) {
+                Ok(user_id) => user_id,
+                Err(e) => {
+                    status_handle
+                        .set_message(format!("Failed to parse {user_id} as a user ID: {e:?}"));
+                    return;
+                }
+            };
+
+            match room.invite_user_by_id(&user_id).await {
+                Ok(_) => {
+                    status_handle
+                        .set_message(format!("Successfully invited {user_id} to the room"));
+                }
+                Err(e) => {
+                    status_handle
+                        .set_message(format!("Failed to invite {user_id} to the room: {e:?}"));
+                }
             }
-            Err(e) => {
-                self.status_handle
-                    .set_message(format!("Failed to invite {user_id} to the room: {e:?}"));
-            }
-        }
+        })
+        .await;
+
+        self.input.clear();
+    }
+
+    async fn leave_room(&mut self) {
+        self.call_with_room(async |room, status_handle| {
+            let _ = room.leave().await.inspect_err(|e| {
+                status_handle.set_message(format!("Couldn't leave the room {e:?}"))
+            });
+        })
+        .await;
+
+        self.input.clear();
     }
 
     async fn handle_command(&mut self, command: input::Command) {
         match command {
-            input::Command::Invite { user_id } => self.invite_member(user_id).await,
+            input::Command::Invite { user_id } => self.invite_member(&user_id).await,
+            input::Command::Leave => self.leave_room().await,
         }
     }
 
@@ -424,7 +470,7 @@ impl Widget for &mut RoomView {
                     let items = items.lock();
                     let mut timeline = TimelineView::new(items.deref());
 
-                    timeline.render(timeline_area, buf);
+                    timeline.render(timeline_area, buf, &mut self.timeline_list);
                 }
             }
         } else {
