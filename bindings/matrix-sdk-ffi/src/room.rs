@@ -38,6 +38,7 @@ use tracing::{error, warn};
 // SC
 use crate::space_child_info::{SpaceChildInfo, space_children_info};
 use ruma::RoomId;
+use ruma::events::receipt::ReceiptThread;
 // SC end
 
 use crate::{
@@ -794,6 +795,17 @@ impl Room {
     pub async fn remove_space_child(&self, child_room_id: String)-> Result<(), ClientError> {
         let child_room_id = RoomId::parse(child_room_id)?;
         Ok(self.inner.remove_space_child(child_room_id).await?)
+    }
+    pub async fn force_send_single_receipt(&self, receipt_type: ReceiptType, event_id: String) -> Result<(), ClientError> {
+        let timeline = TimelineBuilder::new(&self.inner).build().await?;
+        let event_id = EventId::parse(event_id)?;
+
+        timeline.force_send_single_receipt(
+            receipt_type.into(),
+            ReceiptThread::Unthreaded,
+            event_id,
+        ).await?;
+        Ok(())
     }
     /// SC end
 
