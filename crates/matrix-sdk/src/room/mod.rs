@@ -1520,12 +1520,18 @@ impl Room {
         }
     }
 
-    /// Fetches the [`EncryptionInfo`] for the supplied session_id.
+    /// Fetches the [`EncryptionInfo`] for an event decrypted with the supplied
+    /// session_id.
     ///
     /// This may be used when we receive an update for a session, and we want to
     /// reflect the changes in messages we have received that were encrypted
     /// with that session, e.g. to remove a warning shield because a device is
     /// now verified.
+    ///
+    /// # Arguments
+    /// * `session_id` - The ID of the Megolm session to get information for.
+    /// * `sender` - The (claimed) sender of the event where the session was
+    ///   used.
     #[cfg(feature = "e2e-encryption")]
     pub async fn get_encryption_info(
         &self,
@@ -3342,28 +3348,45 @@ impl Room {
     /// It will configure the notify type: ring or notify based on:
     ///  - is this a DM room -> ring
     ///  - is this a group with more than one other member -> notify
-    pub async fn send_call_notification_if_needed(&self) -> Result<()> {
+    ///
+    /// Returns:
+    ///  - `Ok(true)` if the event was successfully sent.
+    ///  - `Ok(false)` if we didn't send it because it was unnecessary.
+    ///  - `Err(_)` if sending the event failed.
+    pub async fn send_call_notification_if_needed(&self) -> Result<bool> {
+        debug!("Sending call notification for room {} if needed", self.inner.room_id());
+
         if self.has_active_room_call() {
-            return Ok(());
+            warn!("Room {} has active room call, not sending a new notify event.", self.room_id());
+            return Ok(false);
         }
 
         if !self.can_user_trigger_room_notification(self.own_user_id()).await? {
-            return Ok(());
+            warn!(
+                "User can't send notifications to everyone in the room {}. \
+                Not sending a new notify event.",
+                self.room_id()
+            );
+            return Ok(false);
         }
+
+        let notify_type = if self.is_direct().await.unwrap_or(false) {
+            NotifyType::Ring
+        } else {
+            NotifyType::Notify
+        };
+
+        debug!("Sending `m.call.notify` event with notify type: {notify_type:?}");
 
         self.send_call_notification(
             self.room_id().to_string().to_owned(),
             ApplicationType::Call,
-            if self.is_direct().await.unwrap_or(false) {
-                NotifyType::Ring
-            } else {
-                NotifyType::Notify
-            },
+            notify_type,
             Mentions::with_room_mention(),
         )
         .await?;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Get the beacon information event in the room for the `user_id`.

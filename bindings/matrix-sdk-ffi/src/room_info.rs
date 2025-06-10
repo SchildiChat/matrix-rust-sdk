@@ -89,7 +89,7 @@ impl RoomInfo {
 
         let join_rule = room.join_rule().try_into();
         if let Err(e) = &join_rule {
-            warn!("Failed to parse join rule: {:?}", e);
+            warn!("Failed to parse join rule: {e:?}");
         }
 
         // Some SC spaces things

@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.12.0] - 2025-06-10
+
 ### Features
 
 - [**breaking**] The `ProcessedToDeviceEvent::Decrypted` variant now also have an `EncryptionInfo` field.
@@ -41,6 +43,19 @@ All notable changes to this project will be documented in this file.
   This allows for example to make the difference between an event sent in clear and an event successfully decrypted.
   For quick compatibility a helper `ProcessedToDeviceEvent::to_raw` allows to map back to the previous behaviour.
   ([#4935](https://github.com/matrix-org/matrix-rust-sdk/pull/4935))
+
+## [0.11.1] - 2025-06-10
+
+### Security Fixes
+- Check the sender of an event matches owner of session, preventing sender
+  spoofing by homeserver owners.
+  [13c1d20](https://github.com/matrix-org/matrix-rust-sdk/commit/13c1d2048286bbabf5e7bc6b015aafee98f04d55) (High, [GHSA-x958-rvg6-956w](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-x958-rvg6-956w)).
+
+### Bug Fixes
+- Remove a wildcard enum variant import which breaks compilation if used with
+  `tracing-attributes` version `0.1.29`. This is a workaround for a bug in
+  `tracing-attributes`.
+  ([#5190](https://github.com/matrix-org/matrix-rust-sdk/issues/5190)) ([#5191](https://github.com/matrix-org/matrix-rust-sdk/issues/5191)) ([#5193](https://github.com/matrix-org/matrix-rust-sdk/issues/5193))
 
 ## [0.11.0] - 2025-04-11
 
