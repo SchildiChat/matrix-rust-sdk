@@ -75,9 +75,13 @@ use crate::{
     },
     session_manager::{GroupSessionManager, SessionManager},
     store::{
-        Changes, CryptoStoreWrapper, DeviceChanges, IdentityChanges, IntoCryptoStore, MemoryStore,
-        PendingChanges, Result as StoreResult, RoomKeyInfo, RoomSettings, SecretImportError, Store,
-        StoreCache, StoreTransaction, StoredRoomKeyBundleData,
+        caches::StoreCache,
+        types::{
+            Changes, CrossSigningKeyExport, DeviceChanges, IdentityChanges, PendingChanges,
+            RoomKeyInfo, RoomSettings, StoredRoomKeyBundleData,
+        },
+        CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
+        Store, StoreTransaction,
     },
     types::{
         events::{
@@ -101,8 +105,8 @@ use crate::{
     },
     utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
-    CollectStrategy, CrossSigningKeyExport, CryptoStoreError, DecryptionSettings, DeviceData,
-    LocalTrust, RoomEventDecryptionResult, SignatureError, TrustRequirement,
+    CollectStrategy, CryptoStoreError, DecryptionSettings, DeviceData, LocalTrust,
+    RoomEventDecryptionResult, SignatureError, TrustRequirement,
 };
 
 /// State machine implementation of the Olm/Megolm encryption protocol used for
@@ -1659,14 +1663,7 @@ impl OlmMachine {
         // `DeviceLinkProblem` for `VerificationLevel::None`.
         let (verification_state, device_id) = match sender_data.user_id() {
             Some(i) if i != sender => {
-                // For backwards compatibility, we treat this the same as "Unknown device".
-                // TODO: use a dedicated VerificationLevel here.
-                (
-                    VerificationState::Unverified(VerificationLevel::None(
-                        DeviceLinkProblem::MissingDevice,
-                    )),
-                    None,
-                )
+                (VerificationState::Unverified(VerificationLevel::MismatchedSender), None)
             }
 
             Some(_) | None => {
@@ -1963,6 +1960,7 @@ impl OlmMachine {
 
                     // Case 4
                     (VerificationLevel::VerificationViolation, _)
+                    | (VerificationLevel::MismatchedSender, _)
                     | (VerificationLevel::UnsignedDevice, false)
                     | (VerificationLevel::None(_), false) => false,
                 }
@@ -1974,6 +1972,7 @@ impl OlmMachine {
                 VerificationLevel::UnverifiedIdentity => true,
 
                 VerificationLevel::VerificationViolation
+                | VerificationLevel::MismatchedSender
                 | VerificationLevel::UnsignedDevice
                 | VerificationLevel::None(_) => false,
             },
@@ -2266,6 +2265,7 @@ impl OlmMachine {
     ///
     /// * `event` - The event to get information for.
     /// * `room_id` - The ID of the room where the event was sent to.
+    #[instrument(skip(self, event), fields(event_id, sender, session_id))]
     pub async fn get_room_event_encryption_info(
         &self,
         event: &Raw<EncryptedEvent>,
@@ -2281,6 +2281,11 @@ impl OlmMachine {
                 return Err(EventError::UnsupportedAlgorithm.into());
             }
         };
+
+        Span::current()
+            .record("sender", debug(&event.sender))
+            .record("event_id", debug(&event.event_id))
+            .record("session_id", content.session_id());
 
         self.get_session_encryption_info(room_id, content.session_id(), &event.sender).await
     }

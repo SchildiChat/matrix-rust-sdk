@@ -6,17 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+- [**breaking**] Add a new `VerificationLevel::MismatchedSender` to indicate that the sender of an event appears to have been tampered with.
+  ([#5219](https://github.com/matrix-org/matrix-rust-sdk/pull/5219))
+
 ## [0.12.0] - 2025-06-10
 
 ### Features
 
 - [**breaking**] The `ProcessedToDeviceEvent::Decrypted` variant now also have an `EncryptionInfo` field.
   Format changed from `Decrypted(Raw<AnyToDeviceEvent>)` to `Decrypted { raw: Raw<AnyToDeviceEvent>, encryption_info: EncryptionInfo) }`
-  ([5074](https://github.com/matrix-org/matrix-rust-sdk/pull/5074))
+  ([#5074](https://github.com/matrix-org/matrix-rust-sdk/pull/5074))
 
 - [**breaking**] Move `session_id` from `EncryptionInfo` to `AlgorithmInfo` as it is megolm specific. 
   Use `EncryptionInfo::session_id()` helper for quick access.
-  ([4981](https://github.com/matrix-org/matrix-rust-sdk/pull/4981))
+  ([#4981](https://github.com/matrix-org/matrix-rust-sdk/pull/4981))
 
 - Send stable identifier `sender_device_keys` for MSC4147 (Including device
   keys with Olm-encrypted events).
@@ -49,7 +52,7 @@ All notable changes to this project will be documented in this file.
 ### Security Fixes
 - Check the sender of an event matches owner of session, preventing sender
   spoofing by homeserver owners.
-  [13c1d20](https://github.com/matrix-org/matrix-rust-sdk/commit/13c1d2048286bbabf5e7bc6b015aafee98f04d55) (High, [GHSA-x958-rvg6-956w](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-x958-rvg6-956w)).
+  [13c1d20](https://github.com/matrix-org/matrix-rust-sdk/commit/13c1d2048286bbabf5e7bc6b015aafee98f04d55) (High, [CVE-2025-48937](https://www.cve.org/CVERecord?id=CVE-2025-48937), [GHSA-x958-rvg6-956w](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-x958-rvg6-956w)).
 
 ### Bug Fixes
 - Remove a wildcard enum variant import which breaks compilation if used with
