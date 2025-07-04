@@ -34,15 +34,15 @@ use super::{
         traits::RoomDataProvider,
     },
     metadata::EventMeta,
-    ObservableItems, ObservableItemsTransaction, TimelineFocusKind, TimelineMetadata,
-    TimelineSettings,
+    ObservableItems, ObservableItemsTransaction, TimelineMetadata, TimelineSettings,
 };
 use crate::timeline::{
+    controller::TimelineFocusKind,
     event_handler::{FailedToParseEvent, RemovedItem, TimelineAction},
     EmbeddedEvent, ThreadSummary, TimelineDetails, VirtualTimelineItem,
 };
 
-pub(in crate::timeline) struct TimelineStateTransaction<'a> {
+pub(in crate::timeline) struct TimelineStateTransaction<'a, P: RoomDataProvider> {
     /// A vector transaction over the items themselves. Holds temporary state
     /// until committed.
     pub items: ObservableItemsTransaction<'a>,
@@ -59,15 +59,15 @@ pub(in crate::timeline) struct TimelineStateTransaction<'a> {
     previous_meta: &'a mut TimelineMetadata,
 
     /// The kind of focus of this timeline.
-    pub(super) timeline_focus: TimelineFocusKind,
+    pub focus: &'a TimelineFocusKind<P>,
 }
 
-impl<'a> TimelineStateTransaction<'a> {
+impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
     /// Create a new [`TimelineStateTransaction`].
     pub(super) fn new(
         items: &'a mut ObservableItems,
         meta: &'a mut TimelineMetadata,
-        timeline_focus: TimelineFocusKind,
+        focus: &'a TimelineFocusKind<P>,
     ) -> Self {
         let previous_meta = meta;
         let meta = previous_meta.clone();
@@ -78,20 +78,18 @@ impl<'a> TimelineStateTransaction<'a> {
             items,
             previous_meta,
             meta,
-            timeline_focus,
+            focus,
         }
     }
 
     /// Handle updates on events as [`VectorDiff`]s.
-    pub(super) async fn handle_remote_events_with_diffs<RoomData>(
+    pub(super) async fn handle_remote_events_with_diffs(
         &mut self,
         diffs: Vec<VectorDiff<TimelineEvent>>,
         origin: RemoteEventOrigin,
-        room_data_provider: &RoomData,
+        room_data_provider: &P,
         settings: &TimelineSettings,
-    ) where
-        RoomData: RoomDataProvider,
-    {
+    ) {
         let mut date_divider_adjuster =
             DateDividerAdjuster::new(settings.date_divider_mode.clone());
 
@@ -159,7 +157,10 @@ impl<'a> TimelineStateTransaction<'a> {
                         )
                         .await;
                     } else {
-                        warn!(event_index, "Set update dropped because there wasn't any attached timeline item index.");
+                        warn!(
+                            event_index,
+                            "Set update dropped because there wasn't any attached timeline item index."
+                        );
                     }
                 }
 
@@ -179,16 +180,16 @@ impl<'a> TimelineStateTransaction<'a> {
         self.check_invariants();
     }
 
-    async fn handle_remote_aggregation<RoomData>(
+    async fn handle_remote_aggregation(
         &mut self,
         event: TimelineEvent,
         position: TimelineItemPosition,
-        room_data_provider: &RoomData,
+        room_data_provider: &P,
         date_divider_adjuster: &mut DateDividerAdjuster,
-    ) where
-        RoomData: RoomDataProvider,
-    {
-        let deserialized = match event.raw().deserialize() {
+    ) {
+        let raw_event = event.raw();
+
+        let deserialized = match raw_event.deserialize() {
             Ok(deserialized) => deserialized,
             Err(err) => {
                 warn!("Failed to deserialize timeline event: {err}");
@@ -203,7 +204,7 @@ impl<'a> TimelineStateTransaction<'a> {
 
         if let Some(action @ TimelineAction::HandleAggregation { .. }) = TimelineAction::from_event(
             deserialized,
-            event.raw(),
+            raw_event,
             room_data_provider,
             None,
             &self.meta,
@@ -245,15 +246,13 @@ impl<'a> TimelineStateTransaction<'a> {
     /// - it only applies to aggregated events, not all the sync events.
     /// - it will also not add the events to the `all_remote_events` array
     ///   itself.
-    pub(super) async fn handle_remote_aggregations<RoomData>(
+    pub(super) async fn handle_remote_aggregations(
         &mut self,
         diffs: Vec<VectorDiff<TimelineEvent>>,
         origin: RemoteEventOrigin,
-        room_data_provider: &RoomData,
+        room_data_provider: &P,
         settings: &TimelineSettings,
-    ) where
-        RoomData: RoomDataProvider,
-    {
+    ) {
         let mut date_divider_adjuster =
             DateDividerAdjuster::new(settings.date_divider_mode.clone());
 
@@ -316,7 +315,10 @@ impl<'a> TimelineStateTransaction<'a> {
                         )
                         .await;
                     } else {
-                        warn!(event_index, "Set update dropped because there wasn't any attached timeline item index.");
+                        warn!(
+                            event_index,
+                            "Set update dropped because there wasn't any attached timeline item index."
+                        );
                     }
                 }
 
@@ -388,7 +390,7 @@ impl<'a> TimelineStateTransaction<'a> {
     }
 
     /// Whether the event should be added to the timeline as a new item.
-    fn should_add_event_item<P: RoomDataProvider>(
+    fn should_add_event_item(
         &self,
         room_data_provider: &P,
         settings: &TimelineSettings,
@@ -402,13 +404,13 @@ impl<'a> TimelineStateTransaction<'a> {
             return false;
         }
 
-        match &self.timeline_focus {
-            TimelineFocusKind::PinnedEvents => {
+        match &self.focus {
+            TimelineFocusKind::PinnedEvents { .. } => {
                 // Only add pinned events for the pinned events timeline.
                 room_data_provider.is_pinned_event(event.event_id())
             }
 
-            TimelineFocusKind::Event { hide_threaded_events } => {
+            TimelineFocusKind::Event { hide_threaded_events, .. } => {
                 // If the timeline's filtering out in-thread events, don't add items for
                 // threaded events.
                 if thread_root.is_some() && *hide_threaded_events {
@@ -441,7 +443,7 @@ impl<'a> TimelineStateTransaction<'a> {
                 thread_root.is_none() || !hide_threaded_events
             }
 
-            TimelineFocusKind::Thread { root_event_id } => {
+            TimelineFocusKind::Thread { root_event_id, .. } => {
                 // Add new items only for the thread root and the thread replies.
                 event.event_id() == root_event_id
                     || thread_root.as_ref().is_some_and(|r| r == root_event_id)
@@ -455,7 +457,7 @@ impl<'a> TimelineStateTransaction<'a> {
     async fn maybe_add_error_item(
         &mut self,
         position: TimelineItemPosition,
-        room_data_provider: &impl RoomDataProvider,
+        room_data_provider: &P,
         raw: &Raw<AnySyncTimelineEvent>,
         deserialization_error: serde_json::Error,
         settings: &TimelineSettings,
@@ -557,10 +559,9 @@ impl<'a> TimelineStateTransaction<'a> {
     async fn fetch_latest_thread_reply(
         &mut self,
         event_id: &EventId,
-        room_data_provider: &impl RoomDataProvider,
+        room_data_provider: &P,
     ) -> Option<Box<EmbeddedEvent>> {
-        let event = room_data_provider
-            .load_event(event_id)
+        let event = RoomDataProvider::load_event(room_data_provider, event_id)
             .await
             .inspect_err(|err| {
                 warn!("Failed to load thread latest event: {err}");
@@ -580,7 +581,7 @@ impl<'a> TimelineStateTransaction<'a> {
     /// Handle a remote event.
     ///
     /// Returns whether an item has been removed from the timeline.
-    pub(super) async fn handle_remote_event<P: RoomDataProvider>(
+    pub(super) async fn handle_remote_event(
         &mut self,
         event: TimelineEvent,
         position: TimelineItemPosition,
@@ -626,7 +627,7 @@ impl<'a> TimelineStateTransaction<'a> {
                     &raw,
                     bundled_edit_encryption_info,
                     &self.items,
-                    &self.timeline_focus,
+                    matches!(self.focus, TimelineFocusKind::Thread { .. }),
                 );
 
                 let should_add = self.should_add_event_item(
@@ -809,7 +810,9 @@ impl<'a> TimelineStateTransaction<'a> {
                 .meta
                 .subscriber_skip_count
                 .compute_next(previous_number_of_items, next_number_of_items);
-            self.meta.subscriber_skip_count.update(count, &self.timeline_focus);
+            self.meta
+                .subscriber_skip_count
+                .update(count, matches!(self.focus, TimelineFocusKind::Live { .. }));
         }
 
         // Replace the pointer to the previous meta with the new one.
@@ -822,7 +825,7 @@ impl<'a> TimelineStateTransaction<'a> {
     /// [`ObservableItems::all_remote_events`] collection.
     ///
     /// This method also adjusts read receipt if needed.
-    async fn add_or_update_remote_event<P: RoomDataProvider>(
+    async fn add_or_update_remote_event(
         &mut self,
         event_meta: EventMeta,
         sender: Option<&UserId>,

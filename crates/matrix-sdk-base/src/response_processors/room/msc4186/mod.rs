@@ -128,6 +128,7 @@ pub async fn update_any_room(
         &mut room_info,
         ambiguity_cache,
         &mut new_user_ids,
+        state_store,
     )
     .await?;
 

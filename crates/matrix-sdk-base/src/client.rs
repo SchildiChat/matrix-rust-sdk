@@ -26,8 +26,8 @@ use eyeball_im::{Vector, VectorDiff};
 use futures_util::Stream;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    store::DynCryptoStore, types::requests::ToDeviceRequest, CollectStrategy, EncryptionSettings,
-    OlmError, OlmMachine, TrustRequirement,
+    store::DynCryptoStore, types::requests::ToDeviceRequest, CollectStrategy, DecryptionSettings,
+    EncryptionSettings, OlmError, OlmMachine, TrustRequirement,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::room::{history_visibility::HistoryVisibility, member::MembershipState};
@@ -115,9 +115,9 @@ pub struct BaseClient {
     #[cfg(feature = "e2e-encryption")]
     pub room_key_recipient_strategy: CollectStrategy,
 
-    /// The trust requirement to use for decrypting events.
+    /// The settings to use for decrypting events.
     #[cfg(feature = "e2e-encryption")]
-    pub decryption_trust_requirement: TrustRequirement,
+    pub decryption_settings: DecryptionSettings,
 
     /// If the client should handle verification events received when syncing.
     #[cfg(feature = "e2e-encryption")]
@@ -168,7 +168,9 @@ impl BaseClient {
             #[cfg(feature = "e2e-encryption")]
             room_key_recipient_strategy: Default::default(),
             #[cfg(feature = "e2e-encryption")]
-            decryption_trust_requirement: TrustRequirement::Untrusted,
+            decryption_settings: DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
             #[cfg(feature = "e2e-encryption")]
             handle_verification_events: true,
         }
@@ -200,7 +202,7 @@ impl BaseClient {
             ignore_user_list_changes: Default::default(),
             room_info_notable_update_sender: self.room_info_notable_update_sender.clone(),
             room_key_recipient_strategy: self.room_key_recipient_strategy.clone(),
-            decryption_trust_requirement: self.decryption_trust_requirement,
+            decryption_settings: self.decryption_settings.clone(),
             handle_verification_events,
         };
 
@@ -500,7 +502,7 @@ impl BaseClient {
         #[cfg(feature = "e2e-encryption")]
         let to_device = {
             let processors::e2ee::to_device::Output {
-                decrypted_to_device_events: to_device,
+                processed_to_device_events: to_device,
                 room_key_updates,
             } = processors::e2ee::to_device::from_sync_v2(&response, olm_machine.as_ref()).await?;
 
@@ -513,7 +515,7 @@ impl BaseClient {
                     .collect(),
                 processors::e2ee::E2EE::new(
                     olm_machine.as_ref(),
-                    self.decryption_trust_requirement,
+                    &self.decryption_settings,
                     self.handle_verification_events,
                 ),
             )
@@ -523,7 +525,22 @@ impl BaseClient {
         };
 
         #[cfg(not(feature = "e2e-encryption"))]
-        let to_device = response.to_device.events;
+        let to_device = response
+            .to_device
+            .events
+            .into_iter()
+            .map(|raw| {
+                if let Ok(Some(event_type)) = raw.get_field::<String>("type") {
+                    if event_type == "m.room.encrypted" {
+                        matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::UnableToDecrypt(raw)
+                    } else {
+                        matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::PlainText(raw)
+                    }
+                } else {
+                    matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent::Invalid(raw) // Exclude events with no type
+                }
+            })
+            .collect();
 
         let mut ambiguity_cache = AmbiguityCache::new(self.state_store.inner.clone());
 
@@ -557,7 +574,7 @@ impl BaseClient {
                 #[cfg(feature = "e2e-encryption")]
                 processors::e2ee::E2EE::new(
                     olm_machine.as_ref(),
-                    self.decryption_trust_requirement,
+                    &self.decryption_settings,
                     self.handle_verification_events,
                 ),
             )
@@ -584,7 +601,7 @@ impl BaseClient {
                 #[cfg(feature = "e2e-encryption")]
                 processors::e2ee::E2EE::new(
                     olm_machine.as_ref(),
-                    self.decryption_trust_requirement,
+                    &self.decryption_settings,
                     self.handle_verification_events,
                 ),
             )

@@ -246,7 +246,7 @@ jobs:
           components: clippy
 
       - name: Install wasm-pack
-        uses: qmaru/wasm-pack-action@v0.5.0
+        uses: qmaru/wasm-pack-action@v0.5.1
         if: '!matrix.check_only'
         with:
           version: v0.10.3
@@ -290,7 +290,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check the spelling of the files in our repo
-        uses: crate-ci/typos@v1.33.1
+        uses: crate-ci/typos@v1.34.0
 
   lint:
     name: Lint
@@ -309,7 +309,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-02-20
+          toolchain: nightly-2025-06-27
           components: clippy, rustfmt
 
       - name: Load cache
@@ -397,4 +397,3 @@ jobs:
       - name: Compile benchmarks (no run)
         run: |
           cargo bench --profile dev --no-run
-

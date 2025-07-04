@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use matrix_sdk::{EncryptionState, RoomState};
 use tracing::warn;
@@ -7,7 +7,9 @@ use crate::{
     client::JoinRule,
     error::ClientError,
     notification_settings::RoomNotificationMode,
-    room::{Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom},
+    room::{
+        power_levels::RoomPowerLevels, Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom,
+    },
     room_member::RoomMember,
     space_child_info::{SpaceChildInfo, space_children_info},
     event::StateEventType,
@@ -26,7 +28,11 @@ pub struct RoomInfo {
     topic: Option<String>,
     avatar_url: Option<String>,
     is_direct: bool,
-    is_public: bool,
+    /// Whether the room is public or not, based on the join rules.
+    ///
+    /// Can be `None` if the join rules state event is not available for this
+    /// room.
+    is_public: Option<bool>,
     is_space: bool,
     /// If present, it means the room has been archived/upgraded.
     successor_room: Option<SuccessorRoom>,
@@ -45,7 +51,6 @@ pub struct RoomInfo {
     active_members_count: u64,
     invited_members_count: u64,
     joined_members_count: u64,
-    user_power_levels: HashMap<String, i64>,
     highlight_count: u64,
     notification_count: u64,
     unread_count: u64,
@@ -72,6 +77,10 @@ pub struct RoomInfo {
     join_rule: Option<JoinRule>,
     /// The history visibility for this room, if known.
     history_visibility: RoomHistoryVisibility,
+    /// This room's current power levels.
+    ///
+    /// Can be missing if the room power levels event is missing from the store.
+    power_levels: Option<Arc<RoomPowerLevels>>,
 }
 
 impl RoomInfo {
@@ -79,29 +88,42 @@ impl RoomInfo {
         let unread_notification_counts = room.unread_notification_counts();
         let unread_count = room.unread_count();
 
-        let power_levels_map = room.users_with_power_levels().await;
-        let mut user_power_levels = HashMap::<String, i64>::new();
-        for (id, level) in power_levels_map.iter() {
-            user_power_levels.insert(id.to_string(), *level);
-        }
         let pinned_event_ids =
             room.pinned_event_ids().unwrap_or_default().iter().map(|id| id.to_string()).collect();
 
-        let join_rule = room.join_rule().try_into();
-        if let Err(e) = &join_rule {
-            warn!("Failed to parse join rule: {e:?}");
-        }
+        let join_rule = room
+            .join_rule()
+            .map(TryInto::try_into)
+            .transpose()
+            .inspect_err(|err| {
+                warn!("Failed to parse join rule: {err}");
+            })
+            .ok()
+            .flatten();
+
+        let power_levels = room
+            .power_levels()
+            .await
+            .ok()
+            .map(|p| RoomPowerLevels::new(p, room.own_user_id().to_owned()));
 
         // Some SC spaces things
         let is_space = room.is_space();
+        let power_levels = power_levels.map(Arc::new);
         let can_user_manage_spaces = if is_space {
-            match room.can_user_send_state(room.own_user_id(), StateEventType::SpaceChild.into()).await {
-                Ok(can_send) => can_send,
-                Err(e) => {
-                    warn!("Failed to check if user can manage space: {:?}", e);
-                    false
+            match power_levels
+                .clone()
+                .map(|s| s.can_user_send_state(room.own_user_id().into(), StateEventType::SpaceChild.into())) {
+                    Some(Ok(can_send)) => can_send,
+                    Some(Err(e)) => {
+                        warn!("Failed to check if user can manage space: {:?}", e);
+                        false
+                    },
+                    None => {
+                        warn!("Failed to check if user can manage space, failed to retrieve power levels");
+                        false
+                    }
                 }
-            }
         } else {
             false
         };
@@ -139,7 +161,6 @@ impl RoomInfo {
             active_members_count: room.active_members_count(),
             invited_members_count: room.invited_members_count(),
             joined_members_count: room.joined_members_count(),
-            user_power_levels,
             highlight_count: unread_notification_counts.highlight_count,
             notification_count: unread_notification_counts.notification_count,
             unread_count: unread_count.unwrap_or_default(),
@@ -159,8 +180,9 @@ impl RoomInfo {
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),
             pinned_event_ids,
-            join_rule: join_rule.ok(),
+            join_rule,
             history_visibility: room.history_visibility_or_default().try_into()?,
+            power_levels //: power_levels.map(Arc::new),
         })
     }
 }

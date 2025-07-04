@@ -31,11 +31,10 @@ use matrix_sdk::{
     attachment::AttachmentConfig,
     deserialized_responses::TimelineEvent,
     event_cache::{EventCacheDropHandles, RoomEventCache},
-    event_handler::EventHandlerHandle,
     executor::JoinHandle,
     room::{edit::EditedContent, reply::Reply, Receipts, Room},
     send_queue::{RoomSendQueueError, SendHandle},
-    Client, Result,
+    Result,
 };
 use mime::Mime;
 use pinned_events_loader::PinnedEventsRoom;
@@ -64,6 +63,7 @@ use tracing::{instrument, trace, warn};
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
 };
+use crate::timeline::controller::CryptoDropHandles;
 
 mod algorithms;
 mod builder;
@@ -78,9 +78,9 @@ mod item;
 mod pagination;
 mod pinned_events_loader;
 mod subscriber;
+mod tasks;
 #[cfg(test)]
 mod tests;
-mod threaded_events_loader;
 mod to_device;
 mod traits;
 mod virtual_item;
@@ -240,7 +240,7 @@ impl Timeline {
 
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
-        if self.controller.is_live().await {
+        if self.controller.is_live() {
             self.controller.items().await.last()?.as_event().cloned()
         } else {
             None
@@ -788,34 +788,21 @@ impl Timeline {
 
 #[derive(Debug)]
 struct TimelineDropHandle {
-    client: Client,
-    event_handler_handles: Vec<EventHandlerHandle>,
     room_update_join_handle: JoinHandle<()>,
     pinned_events_join_handle: Option<JoinHandle<()>>,
-    room_key_from_backups_join_handle: JoinHandle<()>,
-    room_keys_received_join_handle: JoinHandle<()>,
-    room_key_backup_enabled_join_handle: JoinHandle<()>,
     local_echo_listener_handle: JoinHandle<()>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
-    encryption_changes_handle: JoinHandle<()>,
+    _crypto_drop_handles: CryptoDropHandles,
 }
 
 impl Drop for TimelineDropHandle {
     fn drop(&mut self) {
-        for handle in self.event_handler_handles.drain(..) {
-            self.client.remove_event_handler(handle);
-        }
-
         if let Some(handle) = self.pinned_events_join_handle.take() {
             handle.abort()
         };
 
         self.local_echo_listener_handle.abort();
         self.room_update_join_handle.abort();
-        self.room_key_from_backups_join_handle.abort();
-        self.room_key_backup_enabled_join_handle.abort();
-        self.room_keys_received_join_handle.abort();
-        self.encryption_changes_handle.abort();
     }
 }
 

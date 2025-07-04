@@ -19,6 +19,7 @@ use std::{
 
 use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
+use matrix_sdk_common::ROOM_VERSION_FALLBACK;
 use ruma::{
     canonical_json::{redact, RedactedBecause},
     events::{
@@ -31,13 +32,13 @@ use ruma::{
     serde::Raw,
     time::Instant,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use tracing::{debug, instrument, warn};
 
 use super::{
     send_queue::{ChildTransactionId, QueuedRequest, SentRequestKey},
-    traits::{ComposerDraft, ServerCapabilities},
+    traits::{ComposerDraft, ServerInfo},
     DependentQueuedRequest, DependentQueuedRequestKind, QueuedRequestKind, Result, RoomInfo,
     RoomLoadSettings, StateChanges, StateStore, StoreError,
 };
@@ -54,7 +55,7 @@ struct MemoryStoreInner {
     composer_drafts: HashMap<(OwnedRoomId, Option<OwnedEventId>), ComposerDraft>,
     user_avatar_url: HashMap<OwnedUserId, OwnedMxcUri>,
     sync_token: Option<String>,
-    server_capabilities: Option<ServerCapabilities>,
+    server_info: Option<ServerInfo>,
     filters: HashMap<String, String>,
     utd_hook_manager_data: Option<GrowableBloom>,
     account_data: HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>,
@@ -149,8 +150,8 @@ impl StateStore for MemoryStore {
             StateStoreDataKey::SyncToken => {
                 inner.sync_token.clone().map(StateStoreDataValue::SyncToken)
             }
-            StateStoreDataKey::ServerCapabilities => {
-                inner.server_capabilities.clone().map(StateStoreDataValue::ServerCapabilities)
+            StateStoreDataKey::ServerInfo => {
+                inner.server_info.clone().map(StateStoreDataValue::ServerInfo)
             }
             StateStoreDataKey::Filter(filter_name) => {
                 inner.filters.get(filter_name).cloned().map(StateStoreDataValue::Filter)
@@ -222,11 +223,9 @@ impl StateStore for MemoryStore {
                     value.into_composer_draft().expect("Session data not a composer draft"),
                 );
             }
-            StateStoreDataKey::ServerCapabilities => {
-                inner.server_capabilities = Some(
-                    value
-                        .into_server_capabilities()
-                        .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => {
+                inner.server_info = Some(
+                    value.into_server_info().expect("Session data not containing server info"),
                 );
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => {
@@ -246,7 +245,7 @@ impl StateStore for MemoryStore {
         let mut inner = self.inner.write().unwrap();
         match key {
             StateStoreDataKey::SyncToken => inner.sync_token = None,
-            StateStoreDataKey::ServerCapabilities => inner.server_capabilities = None,
+            StateStoreDataKey::ServerInfo => inner.server_info = None,
             StateStoreDataKey::Filter(filter_name) => {
                 inner.filters.remove(filter_name);
             }
@@ -441,12 +440,13 @@ impl StateStore for MemoryStore {
         }
 
         let make_room_version = |room_info: &HashMap<OwnedRoomId, RoomInfo>, room_id| {
-            room_info.get(room_id).and_then(|info| info.room_version().cloned()).unwrap_or_else(
-                || {
-                    warn!(?room_id, "Unable to find the room version, assuming version 9");
-                    RoomVersionId::V9
-                },
-            )
+            room_info.get(room_id).map(|info| info.room_version_or_default()).unwrap_or_else(|| {
+                warn!(
+                    ?room_id,
+                    "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}"
+                );
+                ROOM_VERSION_FALLBACK
+            })
         };
 
         let inner = &mut *inner;

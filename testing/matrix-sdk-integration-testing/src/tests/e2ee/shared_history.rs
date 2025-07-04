@@ -1,5 +1,9 @@
+use std::ops::Deref;
+
 use anyhow::Result;
+use assert_matches2::assert_let;
 use assign::assign;
+use futures::{pin_mut, FutureExt, StreamExt};
 use matrix_sdk::{
     assert_decrypted_message_eq,
     encryption::EncryptionSettings,
@@ -8,6 +12,7 @@ use matrix_sdk::{
         events::room::message::RoomMessageEventContent,
     },
 };
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use matrix_sdk_ui::sync_service::SyncService;
 use similar_asserts::assert_eq;
 use tracing::{info, Instrument};
@@ -66,6 +71,12 @@ async fn test_history_share_on_invite() -> Result<()> {
         .expect("We should be able to send a message to the room")
         .event_id;
 
+    let bundle_stream = bob
+        .encryption()
+        .historic_room_key_stream()
+        .await
+        .expect("We should be able to get the bundle stream");
+
     // Alice invites Bob to the room
     alice_room.invite_user_by_id(bob.user_id().unwrap()).await?;
 
@@ -78,15 +89,27 @@ async fn test_history_share_on_invite() -> Result<()> {
     // Bob should have received a to-device event with the payload
     assert_eq!(bob_response.to_device.len(), 1);
     let to_device_event = &bob_response.to_device[0];
+    assert_let!(ProcessedToDeviceEvent::Decrypted { raw, .. } = to_device_event);
     assert_eq!(
-        to_device_event.get_field::<String>("type").unwrap().unwrap(),
+        raw.get_field::<String>("type").unwrap().unwrap(),
         "io.element.msc4268.room_key_bundle"
     );
 
-    let bob_room = bob.get_room(alice_room.room_id()).expect("Bob should have received the invite");
+    bob.get_room(alice_room.room_id()).expect("Bob should have received the invite");
 
-    bob_room
-        .join()
+    pin_mut!(bundle_stream);
+
+    let info = bundle_stream
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("We should be notified about the received bundle");
+
+    assert_eq!(Some(info.sender.deref()), alice.user_id());
+    assert_eq!(info.room_id, alice_room.room_id());
+
+    let bob_room = bob
+        .join_room_by_id(alice_room.room_id())
         .instrument(bob_span.clone())
         .await
         .expect("Bob should be able to accept the invitation from Alice");

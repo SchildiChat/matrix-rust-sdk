@@ -4,14 +4,14 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use matrix_sdk_common::store_locks::CrossProcessStoreLock;
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
-use tokio::sync::{
-    broadcast::{self},
-    Mutex,
-};
+use tokio::sync::{broadcast, Mutex};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, trace, warn};
 
-use super::{caches::SessionStore, DeviceChanges, IdentityChanges, LockableCryptoStore};
+use super::{
+    caches::SessionStore, types::RoomKeyBundleInfo, DeviceChanges, IdentityChanges,
+    LockableCryptoStore,
+};
 use crate::{
     olm::InboundGroupSession,
     store,
@@ -49,6 +49,10 @@ pub(crate) struct CryptoStoreWrapper {
     /// identities which got updated or newly created.
     identities_broadcaster:
         broadcast::Sender<(Option<OwnUserIdentityData>, IdentityChanges, DeviceChanges)>,
+
+    /// The sender side of a broadcast channel which sends out information about
+    /// historic room key bundles we have received.
+    historic_room_key_bundles_broadcaster: broadcast::Sender<RoomKeyBundleInfo>,
 }
 
 impl CryptoStoreWrapper {
@@ -59,6 +63,7 @@ impl CryptoStoreWrapper {
         // The identities broadcaster is responsible for user identities as well as
         // devices, that's why we increase the capacity here.
         let identities_broadcaster = broadcast::Sender::new(20);
+        let historic_room_key_bundles_broadcaster = broadcast::Sender::new(10);
 
         Self {
             user_id: user_id.to_owned(),
@@ -69,6 +74,7 @@ impl CryptoStoreWrapper {
             room_keys_withheld_received_sender,
             secrets_broadcaster,
             identities_broadcaster,
+            historic_room_key_bundles_broadcaster,
         }
     }
 
@@ -110,6 +116,8 @@ impl CryptoStoreWrapper {
         let secrets = changes.secrets.to_owned();
         let devices = changes.devices.to_owned();
         let identities = changes.identities.to_owned();
+        let room_key_bundle_updates: Vec<_> =
+            changes.received_room_key_bundles.iter().map(RoomKeyBundleInfo::from).collect();
 
         if devices
             .changed
@@ -162,6 +170,10 @@ impl CryptoStoreWrapper {
             let _ = self.secrets_broadcaster.send(secret);
         }
 
+        for bundle_info in room_key_bundle_updates {
+            let _ = self.historic_room_key_bundles_broadcaster.send(bundle_info);
+        }
+
         if !devices.is_empty() || !identities.is_empty() {
             // Mapping the devices and user identities from the read-only variant to one's
             // that contain side-effects requires our own identity. This is
@@ -178,7 +190,9 @@ impl CryptoStoreWrapper {
                 let own_identity_is_verified = own_identity_after.is_verified();
 
                 if !own_identity_was_verified_before_change && own_identity_is_verified {
-                    debug!("Own identity is now verified, check all known identities for verification status changes");
+                    debug!(
+                        "Own identity is now verified, check all known identities for verification status changes"
+                    );
                     // We need to review all the other identities to see if they are verified now
                     // and mark them as such
                     self.check_all_identities_and_update_was_previously_verified_flag_if_needed(
@@ -331,6 +345,13 @@ impl CryptoStoreWrapper {
     pub fn secrets_stream(&self) -> impl Stream<Item = GossippedSecret> {
         let stream = BroadcastStream::new(self.secrets_broadcaster.subscribe());
         Self::filter_errors_out_of_stream(stream, "secrets_stream")
+    }
+
+    /// Receive notifications of historic room key bundles being received and
+    /// stored in the store as a [`Stream`].
+    pub fn historic_room_key_stream(&self) -> impl Stream<Item = RoomKeyBundleInfo> {
+        let stream = BroadcastStream::new(self.historic_room_key_bundles_broadcaster.subscribe());
+        Self::filter_errors_out_of_stream(stream, "bundle_stream")
     }
 
     /// Returns a stream of newly created or updated cryptographic identities.

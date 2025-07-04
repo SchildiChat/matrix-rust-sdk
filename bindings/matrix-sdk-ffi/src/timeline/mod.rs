@@ -17,7 +17,7 @@ use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
 use anyhow::{Context, Result};
 use as_variant::as_variant;
 use eyeball_im::VectorDiff;
-use futures_util::{pin_mut, StreamExt as _};
+use futures_util::pin_mut;
 use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
@@ -29,6 +29,10 @@ use matrix_sdk::{
         edit::EditedContent as SdkEditedContent,
         reply::{EnforceThread, Reply},
     },
+};
+use matrix_sdk_common::{
+    executor::{AbortHandle, JoinHandle},
+    stream::StreamExt,
 };
 use matrix_sdk_ui::timeline::{
     self, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
@@ -56,10 +60,7 @@ use ruma::{
     },
     EventId, UInt,
 };
-use tokio::{
-    sync::Mutex,
-    task::{AbortHandle, JoinHandle},
-};
+use tokio::sync::Mutex;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -399,7 +400,7 @@ impl Timeline {
             Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
             Err(err) => {
                 error!("error when sending a message: {err}");
-                Err(anyhow::anyhow!(err).into())
+                Err(err.into())
             }
         }
     }
@@ -552,10 +553,7 @@ impl Timeline {
         msg: Arc<RoomMessageEventContentWithoutRelation>,
         reply_params: ReplyParameters,
     ) -> Result<(), ClientError> {
-        self.inner
-            .send_reply((*msg).clone(), reply_params.try_into()?)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
+        self.inner.send_reply((*msg).clone(), reply_params.try_into()?).await?;
         Ok(())
     }
 
@@ -585,7 +583,10 @@ impl Timeline {
                 let event_id = match event_or_transaction_id {
                     EventOrTransactionId::EventId { event_id } => EventId::parse(event_id)?,
                     EventOrTransactionId::TransactionId { .. } => {
-                        warn!("trying to apply an edit to a local echo that doesn't exist in this timeline, aborting");
+                        warn!(
+                            "trying to apply an edit to a local echo that doesn't exist \
+                             in this timeline, aborting"
+                        );
                         return Ok(());
                     }
                 };
@@ -655,7 +656,10 @@ impl Timeline {
 
     pub async fn fetch_details_for_event(&self, event_id: String) -> Result<(), ClientError> {
         let event_id = <&EventId>::try_from(event_id.as_str())?;
-        self.inner.fetch_details_for_event(event_id).await.context("Fetching event details")?;
+        self.inner
+            .fetch_details_for_event(event_id)
+            .await
+            .map_err(|e| ClientError::from_str(e, Some("Fetching event details".to_owned())))?;
         Ok(())
     }
 
@@ -719,6 +723,8 @@ impl Timeline {
                     content: replied_to.content.clone().into(),
                     sender: replied_to.sender.to_string(),
                     sender_profile: replied_to.sender_profile.into(),
+                    timestamp: replied_to.timestamp.into(),
+                    event_or_transaction_id: replied_to.identifier.into(),
                 },
             ))),
 
@@ -1254,7 +1260,10 @@ impl SendAttachmentJoinHandle {
                     return Ok(());
                 }
                 error!("task panicked! resuming panic from here.");
+                #[cfg(not(target_family = "wasm"))]
                 panic::resume_unwind(err.into_panic());
+                #[cfg(target_family = "wasm")]
+                panic!("task panicked! {err}");
             }
         }
     }
@@ -1398,24 +1407,22 @@ impl LazyTimelineItemProvider {
 mod galleries {
     use std::{panic, sync::Arc};
 
-    use async_compat::get_runtime_handle;
     use matrix_sdk::{
         attachment::{
             AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo, Thumbnail,
         },
         utils::formatted_body_from,
     };
+    use matrix_sdk_common::executor::{AbortHandle, JoinHandle};
     use matrix_sdk_ui::timeline::GalleryConfig;
     use mime::Mime;
-    use tokio::{
-        sync::Mutex,
-        task::{AbortHandle, JoinHandle},
-    };
+    use tokio::sync::Mutex;
     use tracing::error;
 
     use crate::{
         error::RoomError,
         ruma::{AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, VideoInfo},
+        runtime::get_runtime_handle,
         timeline::{build_thumbnail_info, ReplyParameters, Timeline},
     };
 
@@ -1585,7 +1592,10 @@ mod galleries {
                         return Ok(());
                     }
                     error!("task panicked! resuming panic from here.");
+                    #[cfg(not(target_family = "wasm"))]
                     panic::resume_unwind(err.into_panic());
+                    #[cfg(target_family = "wasm")]
+                    panic!("task panicked! {err}");
                 }
             }
         }

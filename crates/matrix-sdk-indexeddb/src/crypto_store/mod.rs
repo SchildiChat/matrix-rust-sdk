@@ -87,6 +87,8 @@ mod keys {
 
     pub const DIRECT_WITHHELD_INFO: &str = "direct_withheld_info";
 
+    pub const RECEIVED_ROOM_KEY_BUNDLES: &str = "received_room_key_bundles";
+
     // keys
     pub const STORE_CIPHER: &str = "store_cipher";
     pub const ACCOUNT: &str = "account";
@@ -146,7 +148,10 @@ pub enum IndexeddbCryptoStoreError {
     },
     #[error(transparent)]
     CryptoStoreError(#[from] CryptoStoreError),
-    #[error("The schema version of the crypto store is too new. Existing version: {current_version}; max supported version: {max_supported_version}")]
+    #[error(
+        "The schema version of the crypto store is too new. \
+         Existing version: {current_version}; max supported version: {max_supported_version}"
+    )]
     SchemaTooNewError { max_supported_version: u32, current_version: u32 },
 }
 
@@ -658,6 +663,18 @@ impl IndexeddbCryptoStore {
                 let value = self.serializer.serialize_value(&secret)?;
 
                 secret_store.put(key, value);
+            }
+        }
+
+        if !changes.received_room_key_bundles.is_empty() {
+            let mut bundle_store = indexeddb_changes.get(keys::RECEIVED_ROOM_KEY_BUNDLES);
+            for bundle in &changes.received_room_key_bundles {
+                let key = self.serializer.encode_key(
+                    keys::RECEIVED_ROOM_KEY_BUNDLES,
+                    (&bundle.bundle_data.room_id, &bundle.sender_user),
+                );
+                let value = self.serializer.serialize_value(&bundle)?;
+                bundle_store.put(key, value);
             }
         }
 
@@ -1375,10 +1392,18 @@ impl_crypto_store! {
             .transpose()
     }
 
-    #[allow(clippy::unused_async)]
-    async fn get_received_room_key_bundle_data(&self, _room_id: &RoomId, _user_id: &UserId) -> Result<Option<StoredRoomKeyBundleData>> {
-        // TODO: not yet implemented for indexeddb
-        Ok(None)
+    async fn get_received_room_key_bundle_data(&self, room_id: &RoomId, user_id: &UserId) -> Result<Option<StoredRoomKeyBundleData>> {
+        let key = self.serializer.encode_key(keys::RECEIVED_ROOM_KEY_BUNDLES, (room_id, user_id));
+        let result = self
+            .inner
+            .transaction_on_one_with_mode(keys::RECEIVED_ROOM_KEY_BUNDLES, IdbTransactionMode::Readonly)?
+            .object_store(keys::RECEIVED_ROOM_KEY_BUNDLES)?
+            .get(&key)?
+            .await?
+            .map(|v| self.serializer.deserialize_value(v))
+            .transpose()?;
+
+        Ok(result)
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -1559,7 +1584,9 @@ async fn import_store_cipher_with_key(
             // Loading the cipher with the passphrase was successful. Let's update the
             // stored version of the cipher so that it is encrypted with a key,
             // to save doing this again.
-            debug!("IndexedDbCryptoStore: Migrating passphrase-encrypted store cipher to key-encryption");
+            debug!(
+                "IndexedDbCryptoStore: Migrating passphrase-encrypted store cipher to key-encryption"
+            );
 
             let export = cipher.export_with_key(chacha_key).map_err(CryptoStoreError::backend)?;
             save_store_cipher(db, &export).await?;

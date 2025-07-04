@@ -18,15 +18,17 @@ use std::{sync::Arc, time::Duration};
 
 use eyeball::{SharedObservable, Subscriber};
 use matrix_sdk_base::timeout::timeout;
-use matrix_sdk_common::linked_chunk::ChunkContent;
 use ruma::api::Direction;
 use tracing::{debug, instrument, trace};
 
 use super::{
-    room::{events::Gap, LoadMoreEventsBackwardsOutcome, RoomEventCacheInner},
+    room::{LoadMoreEventsBackwardsOutcome, RoomEventCacheInner},
     BackPaginationOutcome, EventsOrigin, Result, RoomEventCacheUpdate,
 };
-use crate::{event_cache::EventCacheError, room::MessagesOptions};
+use crate::{
+    event_cache::{EventCacheError, RoomEventCacheGenericUpdate},
+    room::MessagesOptions,
+};
 
 /// Status for the back-pagination on a room event cache.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -152,6 +154,15 @@ impl RoomPagination {
                 status_observable
                     .set(RoomPaginationStatus::Idle { hit_timeline_start: outcome.reached_start });
 
+                // Send a room event cache generic update.
+                if !outcome.events.is_empty() {
+                    let _ = self.inner.generic_update_sender.send(
+                        RoomEventCacheGenericUpdate::TimelineUpdated {
+                            room_id: self.inner.room_id.clone(),
+                        },
+                    );
+                }
+
                 Ok(Some(outcome))
             }
 
@@ -252,7 +263,7 @@ impl RoomPagination {
         batch_size: u16,
         prev_token: Option<String>,
     ) -> Result<Option<BackPaginationOutcome>> {
-        let (events, new_gap) = {
+        let (events, new_token) = {
             let Some(room) = self.inner.weak_room.get() else {
                 // The client is shutting down, return an empty default response.
                 return Ok(Some(BackPaginationOutcome {
@@ -264,82 +275,40 @@ impl RoomPagination {
             let mut options = MessagesOptions::new(Direction::Backward).from(prev_token.as_deref());
             options.limit = batch_size.into();
 
-            let response = room.messages(options).await.map_err(|err| {
-                EventCacheError::BackpaginationError(
-                    crate::event_cache::paginator::PaginatorError::SdkError(Box::new(err)),
-                )
-            })?;
+            let response = room
+                .messages(options)
+                .await
+                .map_err(|err| EventCacheError::BackpaginationError(Box::new(err)))?;
 
-            let new_gap = response.end.map(|prev_token| Gap { prev_token });
-
-            (response.chunk, new_gap)
+            (response.chunk, response.end)
         };
 
-        // Make sure the `RoomEvents` isn't updated while we are saving events from
-        // backpagination.
-        let mut state = self.inner.state.write().await;
-
-        // Check that the previous token still exists; otherwise it's a sign that the
-        // room's timeline has been cleared.
-        let prev_gap_chunk_id = if let Some(token) = prev_token {
-            let gap_chunk_id = state.events().chunk_identifier(|chunk| {
-                matches!(chunk.content(), ChunkContent::Gap(Gap { ref prev_token }) if *prev_token == token)
-            });
-
-            if gap_chunk_id.is_none() {
-                // We got a previous-batch token from the linked chunk *before* running the
-                // request, but it is missing *after* completing the
-                // request.
-                //
-                // It may be a sign the linked chunk has been reset, but it's fine, per this
-                // function's contract.
-                return Ok(None);
+        if let Some((outcome, timeline_event_diffs)) = self
+            .inner
+            .state
+            .write()
+            .await
+            .handle_backpagination(events, new_token, prev_token)
+            .await?
+        {
+            if !timeline_event_diffs.is_empty() {
+                let _ = self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
+                    diffs: timeline_event_diffs,
+                    origin: EventsOrigin::Pagination,
+                });
             }
 
-            gap_chunk_id
+            Ok(Some(outcome))
         } else {
-            None
-        };
-
-        let (outcome, timeline_event_diffs) =
-            state.handle_backpagination(events, new_gap, prev_gap_chunk_id).await?;
-
-        if !timeline_event_diffs.is_empty() {
-            let _ = self.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
-                diffs: timeline_event_diffs,
-                origin: EventsOrigin::Pagination,
-            });
+            // The previous token has gone missing, so the timeline has been reset in the
+            // meanwhile, but it's fine per this function's contract.
+            Ok(None)
         }
-
-        Ok(Some(outcome))
     }
 
     /// Returns a subscriber to the pagination status used for the
     /// back-pagination integrated to the event cache.
     pub fn status(&self) -> Subscriber<RoomPaginationStatus> {
         self.inner.pagination_status.subscribe()
-    }
-}
-
-/// Pagination token data, indicating in which state is the current pagination.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PaginationToken {
-    /// We never had a pagination token, so we'll start back-paginating from the
-    /// end, or forward-paginating from the start.
-    None,
-    /// We paginated once before, and we received a prev/next batch token that
-    /// we may reuse for the next query.
-    HasMore(String),
-    /// We've hit one end of the timeline (either the start or the actual end),
-    /// so there's no need to continue paginating.
-    HitEnd,
-}
-
-impl From<Option<String>> for PaginationToken {
-    fn from(token: Option<String>) -> Self {
-        match token {
-            Some(val) => Self::HasMore(val),
-            None => Self::None,
-        }
     }
 }

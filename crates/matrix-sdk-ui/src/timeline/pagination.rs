@@ -27,7 +27,7 @@ impl super::Timeline {
     /// Returns whether we hit the start of the timeline.
     #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
     pub async fn paginate_backwards(&self, mut num_events: u16) -> Result<bool, Error> {
-        if self.controller.is_live().await {
+        if self.controller.is_live() {
             match self.controller.live_lazy_paginate_backwards(num_events).await {
                 Some(needed_num_events) => {
                     num_events = needed_num_events.try_into().expect(
@@ -55,7 +55,7 @@ impl super::Timeline {
     /// Returns whether we hit the end of the timeline.
     #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
     pub async fn paginate_forwards(&self, num_events: u16) -> Result<bool, Error> {
-        if self.controller.is_live().await {
+        if self.controller.is_live() {
             Ok(true)
         } else {
             Ok(self.controller.focused_paginate_forwards(num_events).await?)
@@ -104,7 +104,7 @@ impl super::Timeline {
     pub async fn live_back_pagination_status(
         &self,
     ) -> Option<(RoomPaginationStatus, impl Stream<Item = RoomPaginationStatus>)> {
-        if !self.controller.is_live().await {
+        if !self.controller.is_live() {
             return None;
         }
 
@@ -112,7 +112,7 @@ impl super::Timeline {
 
         let mut status = pagination.status();
 
-        let current_value = status.next_now();
+        let current_value = self.controller.map_pagination_status(status.next_now()).await;
 
         let controller = self.controller.clone();
         let stream = Box::pin(stream! {
@@ -121,6 +121,8 @@ impl super::Timeline {
             pin_mut!(status_stream);
 
             while let Some(state) = status_stream.next().await {
+                let state = controller.map_pagination_status(state).await;
+
                 match state {
                     RoomPaginationStatus::Idle { hit_timeline_start } => {
                         if hit_timeline_start {
@@ -129,6 +131,7 @@ impl super::Timeline {
                     }
                     RoomPaginationStatus::Paginating => {}
                 }
+
                 yield state;
             }
         });

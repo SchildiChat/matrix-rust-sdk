@@ -116,11 +116,8 @@ impl SessionVerificationController {
     /// Request verification for the current device
     pub async fn request_device_verification(&self) -> Result<(), ClientError> {
         let methods = vec![VerificationMethod::SasV1];
-        let verification_request = self
-            .user_identity
-            .request_verification_with_methods(methods)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let verification_request =
+            self.user_identity.request_verification_with_methods(methods).await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -141,10 +138,7 @@ impl SessionVerificationController {
 
         let methods = vec![VerificationMethod::SasV1];
 
-        let verification_request = user_identity
-            .request_verification_with_methods(methods)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let verification_request = user_identity.request_verification_with_methods(methods).await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -241,7 +235,10 @@ impl SessionVerificationController {
         if sender != self.user_identity.user_id() {
             if let Some(status) = self.encryption.cross_signing_status().await {
                 if !status.is_complete() {
-                    warn!("Cannot verify other users until our own device's cross-signing status is complete: {status:?}");
+                    warn!(
+                        "Cannot verify other users until our own device's cross-signing status \
+                         is complete: {status:?}"
+                    );
                     return;
                 }
             }

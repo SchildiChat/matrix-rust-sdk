@@ -1,25 +1,25 @@
 use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use futures_util::StreamExt as _;
+use futures_util::StreamExt;
 use imbl::Vector;
 use input::MessageOrCommand;
 use invited_room::InvitedRoomView;
 use matrix_sdk::{
+    Client, Room, RoomState,
     locks::Mutex,
     room::reply::{EnforceThread::Threaded, Reply},
     ruma::{
+        OwnedEventId, OwnedRoomId, RoomId, UserId,
         api::client::receipt::create_receipt::v3::ReceiptType,
         events::room::message::{
             ReplyWithinThread, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
         },
-        OwnedEventId, OwnedRoomId, RoomId, UserId,
     },
-    Client, Room, RoomState,
 };
 use matrix_sdk_ui::{
-    timeline::{TimelineBuilder, TimelineFocus, TimelineItem},
     Timeline,
+    timeline::{TimelineBuilder, TimelineFocus, TimelineItem},
 };
 use ratatui::{prelude::*, widgets::*};
 use tokio::{spawn, sync::OnceCell, task::JoinHandle};
@@ -28,8 +28,8 @@ use tracing::info;
 use self::{details::RoomDetails, input::Input, timeline::TimelineView};
 use super::status::StatusHandle;
 use crate::{
+    HEADER_BG, NORMAL_ROW_COLOR, TEXT_COLOR, Timelines,
     widgets::{recovery::ShouldExit, room_view::timeline::TimelineListState},
-    Timelines, HEADER_BG, NORMAL_ROW_COLOR, TEXT_COLOR,
 };
 
 mod details;
@@ -38,6 +38,11 @@ mod invited_room;
 mod timeline;
 
 const DEFAULT_TILING_DIRECTION: Direction = Direction::Horizontal;
+
+pub struct DetailsState<'a> {
+    selected_room: Option<&'a Room>,
+    selected_item: Option<Arc<TimelineItem>>,
+}
 
 enum Mode {
     Normal { invited_room_view: Option<InvitedRoomView> },
@@ -313,6 +318,14 @@ impl RoomView {
                             }
                         }
 
+                        (_, Down) | (KeyModifiers::CONTROL, Char('n')) => {
+                            self.timeline_list.select_next()
+                        }
+
+                        (_, Up) | (KeyModifiers::CONTROL, Char('p')) => {
+                            self.timeline_list.select_previous()
+                        }
+
                         _ => match view.handle_key_press(key) {
                             ShouldExit::No => {}
                             ShouldExit::OnlySubScreen => {}
@@ -565,10 +578,18 @@ impl RoomView {
         }
     }
 
+    fn get_selected_event(&self) -> Option<Arc<TimelineItem>> {
+        let selected = self.timeline_list.selected()?;
+        let items = self.get_selected_timeline_items()?;
+        items.get(selected).cloned()
+    }
+
     fn update(&mut self) {
         match &mut self.mode {
             Mode::Normal { invited_room_view } => {
-                if invited_room_view.as_ref().is_some_and(|view| view.should_switch()) {
+                if let Some(view) = invited_room_view
+                    && view.should_switch()
+                {
                     self.mode = Mode::Normal { invited_room_view: None };
                 }
             }
@@ -620,6 +641,8 @@ impl Widget for &mut RoomView {
             let maybe_room = self.client.get_room(room_id);
             let mut maybe_room = maybe_room.as_ref();
 
+            let selected_event = self.get_selected_event();
+
             let timeline_area = match &mut self.mode {
                 Mode::Normal { invited_room_view } => {
                     if let Some(view) = invited_room_view {
@@ -640,18 +663,21 @@ impl Widget for &mut RoomView {
                     let [timeline_area, details_area] = vertical.areas(middle_area);
                     Clear.render(details_area, buf);
 
-                    view.render(details_area, buf, &mut maybe_room);
+                    let mut state =
+                        DetailsState { selected_room: maybe_room, selected_item: selected_event };
+
+                    view.render(details_area, buf, &mut state);
 
                     Some(timeline_area)
                 }
             };
 
-            if let Some(timeline_area) = timeline_area {
-                if let Some(items) = self.get_selected_timeline_items() {
-                    let is_thread = matches!(self.kind, TimelineKind::Thread { .. });
-                    let mut timeline = TimelineView::new(&items, is_thread);
-                    timeline.render(timeline_area, buf, &mut self.timeline_list);
-                }
+            if let Some(timeline_area) = timeline_area
+                && let Some(items) = self.get_selected_timeline_items()
+            {
+                let is_thread = matches!(self.kind, TimelineKind::Thread { .. });
+                let mut timeline = TimelineView::new(&items, is_thread);
+                timeline.render(timeline_area, buf, &mut self.timeline_list);
             }
         } else {
             render_paragraph(buf, "Nothing to see here...".to_owned())

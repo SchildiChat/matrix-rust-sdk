@@ -19,17 +19,18 @@ use matrix_sdk_base::{
     event_cache::store::DEFAULT_CHUNK_CAPACITY,
     linked_chunk::{
         lazy_loader::{self, LazyLoaderError},
-        ChunkContent, ChunkIdentifierGenerator, RawChunk,
+        ChunkContent, ChunkIdentifierGenerator, ChunkMetadata, OrderTracker, RawChunk,
     },
 };
 use matrix_sdk_common::linked_chunk::{
     AsVector, Chunk, ChunkIdentifier, Error, Iter, IterBackward, LinkedChunk, ObservableUpdates,
     Position,
 };
+use tracing::trace;
 
-/// This type represents all events of a single room.
+/// This type represents a linked chunk of events for a single room or thread.
 #[derive(Debug)]
-pub struct RoomEvents {
+pub(in crate::event_cache) struct EventLinkedChunk {
     /// The real in-memory storage for all the events.
     chunks: LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>,
 
@@ -37,35 +38,41 @@ pub struct RoomEvents {
     ///
     /// [`Update`]: matrix_sdk_base::linked_chunk::Update
     chunks_updates_as_vectordiffs: AsVector<Event, Gap>,
+
+    /// Tracker of the events ordering in this room.
+    pub order_tracker: OrderTracker<Event, Gap>,
 }
 
-impl Default for RoomEvents {
+impl Default for EventLinkedChunk {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RoomEvents {
-    /// Build a new [`RoomEvents`] struct with zero events.
+impl EventLinkedChunk {
+    /// Build a new [`EventLinkedChunk`] struct with zero events.
     pub fn new() -> Self {
-        Self::with_initial_linked_chunk(None)
+        Self::with_initial_linked_chunk(None, None)
     }
 
-    /// Build a new [`RoomEvents`] struct with prior chunks knowledge.
+    /// Build a new [`EventLinkedChunk`] struct with prior chunks knowledge.
     ///
     /// The provided [`LinkedChunk`] must have been built with update history.
     pub fn with_initial_linked_chunk(
         linked_chunk: Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>,
+        full_linked_chunk_metadata: Option<Vec<ChunkMetadata>>,
     ) -> Self {
         let mut linked_chunk = linked_chunk.unwrap_or_else(LinkedChunk::new_with_update_history);
 
         let chunks_updates_as_vectordiffs = linked_chunk
             .as_vector()
-            // SAFETY: The `LinkedChunk` has been built with `new_with_update_history`, so
-            // `as_vector` must return `Some(…)`.
             .expect("`LinkedChunk` must have been built with `new_with_update_history`");
 
-        Self { chunks: linked_chunk, chunks_updates_as_vectordiffs }
+        let order_tracker = linked_chunk
+            .order_tracker(full_linked_chunk_metadata)
+            .expect("`LinkedChunk` must have been built with `new_with_update_history`");
+
+        Self { chunks: linked_chunk, chunks_updates_as_vectordiffs, order_tracker }
     }
 
     /// Clear all events.
@@ -76,61 +83,16 @@ impl RoomEvents {
         self.chunks.clear();
     }
 
-    /// Replace the events with the given last chunk of events and generator.
-    ///
-    /// This clears all the chunks in memory before resetting to the new chunk,
-    /// if provided.
-    pub(super) fn replace_with(
-        &mut self,
-        last_chunk: Option<RawChunk<Event, Gap>>,
-        chunk_identifier_generator: ChunkIdentifierGenerator,
-    ) -> Result<(), LazyLoaderError> {
-        lazy_loader::replace_with(&mut self.chunks, last_chunk, chunk_identifier_generator)
-    }
-
     /// Push events after all events or gaps.
     ///
     /// The last event in `events` is the most recent one.
-    pub fn push_events<I>(&mut self, events: I)
+    #[cfg(test)]
+    pub(in crate::event_cache) fn push_events<I>(&mut self, events: I)
     where
         I: IntoIterator<Item = Event>,
         I::IntoIter: ExactSizeIterator,
     {
         self.chunks.push_items_back(events);
-    }
-
-    /// Push a gap after all events or gaps.
-    pub fn push_gap(&mut self, gap: Gap) {
-        self.chunks.push_gap_back(gap);
-    }
-
-    /// Insert events at a specified position.
-    pub fn insert_events_at(
-        &mut self,
-        events: Vec<Event>,
-        position: Position,
-    ) -> Result<(), Error> {
-        self.chunks.insert_items_at(events, position)?;
-        Ok(())
-    }
-
-    /// Insert a gap at a specified position.
-    pub fn insert_gap_at(&mut self, gap: Gap, position: Position) -> Result<(), Error> {
-        self.chunks.insert_gap_at(gap, position)
-    }
-
-    /// Remove an empty chunk at the given position.
-    ///
-    /// Note: the chunk must either be a gap, or an empty items chunk, and it
-    /// must NOT be the last one.
-    ///
-    /// Returns the next insert position, if any, left after the chunk that has
-    /// just been removed.
-    pub fn remove_empty_chunk_at(
-        &mut self,
-        gap: ChunkIdentifier,
-    ) -> Result<Option<Position>, Error> {
-        self.chunks.remove_empty_chunk_at(gap)
     }
 
     /// Replace the gap identified by `gap_identifier`, by events.
@@ -140,12 +102,13 @@ impl RoomEvents {
     ///
     /// This method returns the position of the (first if many) newly created
     /// `Chunk` that contains the `items`.
-    pub fn replace_gap_at(
+    fn replace_gap_at(
         &mut self,
-        events: Vec<Event>,
         gap_identifier: ChunkIdentifier,
+        events: Vec<Event>,
     ) -> Result<Option<Position>, Error> {
-        // As an optimization, we'll remove the empty chunk if it's a gap.
+        // As an optimization, we'll remove the chunk if it's a gap that would be
+        // replaced with no events.
         //
         // However, our linked chunk requires that it includes at least one chunk in the
         // in-memory representation. We could tweak this invariant, but in the
@@ -231,6 +194,36 @@ impl RoomEvents {
         self.chunks.items()
     }
 
+    /// Return the order of an event in the room linked chunk.
+    ///
+    /// Can return `None` if the event can't be found in the linked chunk.
+    pub fn event_order(&self, event_pos: Position) -> Option<usize> {
+        self.order_tracker.ordering(event_pos)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[allow(dead_code)] // Temporarily, until we figure out why it's crashing production builds.
+    fn assert_event_ordering(&self) {
+        let mut iter = self.chunks.items().enumerate();
+        let Some((i, (first_event_pos, _))) = iter.next() else {
+            return;
+        };
+
+        // Sanity check.
+        assert_eq!(i, 0);
+
+        // That's the offset in the full linked chunk. Will be 0 if the linked chunk is
+        // entirely loaded, may be non-zero otherwise.
+        let offset =
+            self.event_order(first_event_pos).expect("first event's ordering must be known");
+
+        for (i, (next_pos, _)) in iter {
+            let next_index =
+                self.event_order(next_pos).expect("next event's ordering must be known");
+            assert_eq!(offset + i, next_index, "event ordering must be continuous");
+        }
+    }
+
     /// Get all updates from the room events as [`VectorDiff`].
     ///
     /// Be careful that each `VectorDiff` is returned only once!
@@ -239,7 +232,11 @@ impl RoomEvents {
     ///
     /// [`Update`]: matrix_sdk_base::linked_chunk::Update
     pub fn updates_as_vector_diffs(&mut self) -> Vec<VectorDiff<Event>> {
-        self.chunks_updates_as_vectordiffs.take()
+        let updates = self.chunks_updates_as_vectordiffs.take();
+
+        self.order_tracker.flush_updates(false);
+
+        updates
     }
 
     /// Get a mutable reference to the [`LinkedChunk`] updates, aka
@@ -258,8 +255,9 @@ impl RoomEvents {
     pub fn debug_string(&self) -> Vec<String> {
         let mut result = Vec::new();
 
-        for chunk in self.chunks() {
-            let content = chunk_debug_string(chunk.content());
+        for chunk in self.chunks.chunks() {
+            let content =
+                chunk_debug_string(chunk.identifier(), chunk.content(), &self.order_tracker);
             let lazy_previous = if let Some(cid) = chunk.lazy_previous() {
                 format!(" (lazy previous = {})", cid.index())
             } else {
@@ -281,20 +279,186 @@ impl RoomEvents {
         self.rchunks()
             .find_map(|chunk| as_variant!(chunk.content(), ChunkContent::Gap(gap) => gap.clone()))
     }
+
+    /// Add the previous back-pagination token (if present), followed by the
+    /// timeline events themselves.
+    pub fn push_live_events(&mut self, new_gap: Option<Gap>, events: &[Event]) {
+        if let Some(new_gap) = new_gap {
+            // As a tiny optimization: remove the last chunk if it's an empty event
+            // one, as it's not useful to keep it before a gap.
+            let prev_chunk_to_remove = self.rchunks().next().and_then(|chunk| {
+                (chunk.is_items() && chunk.num_items() == 0).then_some(chunk.identifier())
+            });
+
+            self.chunks.push_gap_back(new_gap);
+
+            if let Some(prev_chunk_to_remove) = prev_chunk_to_remove {
+                self.chunks
+                    .remove_empty_chunk_at(prev_chunk_to_remove)
+                    .expect("we just checked the chunk is there, and it's an empty item chunk");
+            }
+        }
+
+        self.chunks.push_items_back(events.to_vec());
+    }
+
+    /// Finish a network back-pagination for this linked chunk by updating the
+    /// in-memory linked chunk with the results.
+    ///
+    /// ## Arguments
+    ///
+    /// - `prev_gap_id`: the identifier of the previous gap, if any.
+    /// - `new_gap`: the new gap to insert, if any. If missing, we've likely
+    ///   reached the start of the timeline.
+    /// - `events`: new events to insert, in the topological ordering (i.e. from
+    ///   oldest to most recent).
+    ///
+    /// ## Returns
+    ///
+    /// Returns a boolean indicating whether we've hit the start of the
+    /// timeline/linked chunk.
+    pub fn finish_back_pagination(
+        &mut self,
+        prev_gap_id: Option<ChunkIdentifier>,
+        new_gap: Option<Gap>,
+        events: &[Event],
+    ) -> bool {
+        let first_event_pos = self.events().next().map(|(item_pos, _)| item_pos);
+
+        // First, insert events.
+        let insert_new_gap_pos = if let Some(gap_id) = prev_gap_id {
+            // There is a prior gap, let's replace it with the new events!
+            trace!("replacing previous gap with the back-paginated events");
+
+            // Replace the gap with the events we just deduplicated. This might get rid of
+            // the underlying gap, if the conditions are favorable to
+            // us.
+            self.replace_gap_at(gap_id, events.to_vec())
+                .expect("gap_identifier is a valid chunk id we read previously")
+        } else if let Some(pos) = first_event_pos {
+            // No prior gap, but we had some events: assume we need to prepend events
+            // before those.
+            trace!("inserted events before the first known event");
+
+            self.chunks
+                .insert_items_at(pos, events.to_vec())
+                .expect("pos is a valid position we just read above");
+
+            Some(pos)
+        } else {
+            // No prior gap, and no prior events: push the events.
+            trace!("pushing events received from back-pagination");
+
+            self.chunks.push_items_back(events.to_vec());
+
+            // A new gap may be inserted before the new events, if there are any.
+            self.events().next().map(|(item_pos, _)| item_pos)
+        };
+
+        // And insert the new gap if needs be.
+        //
+        // We only do this when at least one new, non-duplicated event, has been added
+        // to the chunk. Otherwise it means we've back-paginated all the
+        // known events.
+        let has_new_gap = new_gap.is_some();
+        if let Some(new_gap) = new_gap {
+            if let Some(new_pos) = insert_new_gap_pos {
+                self.chunks
+                    .insert_gap_at(new_gap, new_pos)
+                    .expect("events_chunk_pos represents a valid chunk position");
+            } else {
+                self.chunks.push_gap_back(new_gap);
+            }
+        }
+
+        // There could be an inconsistency between the network (which thinks we hit the
+        // start of the timeline) and the disk (which has the initial empty
+        // chunks), so tweak the `reached_start` value so that it reflects the
+        // disk state in priority instead.
+
+        let has_gaps = self.chunks().any(|chunk| chunk.is_gap());
+
+        // Whether the first chunk has no predecessors or not.
+        let first_chunk_is_definitive_head =
+            self.chunks().next().map(|chunk| chunk.is_definitive_head());
+
+        let network_reached_start = !has_new_gap;
+        let reached_start =
+            !has_gaps && first_chunk_is_definitive_head.unwrap_or(network_reached_start);
+
+        trace!(
+            ?network_reached_start,
+            ?has_gaps,
+            ?first_chunk_is_definitive_head,
+            ?reached_start,
+            "finished handling network back-pagination"
+        );
+
+        reached_start
+    }
 }
 
-// Private implementations, implementation specific.
-impl RoomEvents {
+// Methods related to lazy-loading.
+impl EventLinkedChunk {
+    /// Inhibits all the linked chunk updates caused by the function `f` on the
+    /// ordering tracker.
+    ///
+    /// Updates to the linked chunk that happen because of lazy loading must not
+    /// be taken into account by the order tracker, otherwise the
+    /// fully-loaded state (tracked by the order tracker) wouldn't match
+    /// reality anymore. This provides a facility to help applying such
+    /// updates.
+    fn inhibit_updates_to_ordering_tracker<F: FnOnce(&mut Self) -> R, R>(&mut self, f: F) -> R {
+        // Start by flushing previous pending updates to the chunk ordering, if any.
+        self.order_tracker.flush_updates(false);
+
+        // Call the function.
+        let r = f(self);
+
+        // Now, flush other pending updates which have been caused by the function, and
+        // ignore them.
+        self.order_tracker.flush_updates(true);
+
+        r
+    }
+
+    /// Replace the events with the given last chunk of events and generator.
+    ///
+    /// Happens only during lazy loading.
+    ///
+    /// This clears all the chunks in memory before resetting to the new chunk,
+    /// if provided.
+    pub(super) fn replace_with(
+        &mut self,
+        last_chunk: Option<RawChunk<Event, Gap>>,
+        chunk_identifier_generator: ChunkIdentifierGenerator,
+    ) -> Result<(), LazyLoaderError> {
+        // Since `replace_with` is used only to unload some chunks, we don't want it to
+        // affect the chunk ordering.
+        self.inhibit_updates_to_ordering_tracker(move |this| {
+            lazy_loader::replace_with(&mut this.chunks, last_chunk, chunk_identifier_generator)
+        })
+    }
+
+    /// Prepends a lazily-loaded chunk at the beginning of the linked chunk.
     pub(super) fn insert_new_chunk_as_first(
         &mut self,
         raw_new_first_chunk: RawChunk<Event, Gap>,
     ) -> Result<(), LazyLoaderError> {
-        lazy_loader::insert_new_first_chunk(&mut self.chunks, raw_new_first_chunk)
+        // This is only used when reinserting a chunk that was in persisted storage, so
+        // we don't need to touch the chunk ordering for this.
+        self.inhibit_updates_to_ordering_tracker(move |this| {
+            lazy_loader::insert_new_first_chunk(&mut this.chunks, raw_new_first_chunk)
+        })
     }
 }
 
 /// Create a debug string for a [`ChunkContent`] for an event/gap pair.
-fn chunk_debug_string(content: &ChunkContent<Event, Gap>) -> String {
+fn chunk_debug_string(
+    chunk_id: ChunkIdentifier,
+    content: &ChunkContent<Event, Gap>,
+    order_tracker: &OrderTracker<Event, Gap>,
+) -> String {
     match content {
         ChunkContent::Gap(Gap { prev_token }) => {
             format!("gap['{prev_token}']")
@@ -302,11 +466,19 @@ fn chunk_debug_string(content: &ChunkContent<Event, Gap>) -> String {
         ChunkContent::Items(vec) => {
             let items = vec
                 .iter()
-                .map(|event| {
-                    // Limit event ids to 8 chars *after* the $.
+                .enumerate()
+                .map(|(i, event)| {
                     event.event_id().map_or_else(
                         || "<no event id>".to_owned(),
-                        |id| id.as_str().chars().take(1 + 8).collect(),
+                        |id| {
+                            let pos = Position::new(chunk_id, i);
+                            let order = format!("#{}: ", order_tracker.ordering(pos).unwrap());
+
+                            // Limit event ids to 8 chars *after* the $.
+                            let event_id = id.as_str().chars().take(1 + 8).collect::<String>();
+
+                            format!("{order}{event_id}")
+                        },
                     )
                 })
                 .collect::<Vec<_>>()
@@ -370,139 +542,10 @@ mod tests {
     }
 
     #[test]
-    fn test_new_room_events_has_zero_events() {
-        let room_events = RoomEvents::new();
+    fn test_new_event_linked_chunk_has_zero_events() {
+        let linked_chunk = EventLinkedChunk::new();
 
-        assert_eq!(room_events.events().count(), 0);
-    }
-
-    #[test]
-    fn test_push_events() {
-        let (event_id_0, event_0) = new_event("$ev0");
-        let (event_id_1, event_1) = new_event("$ev1");
-        let (event_id_2, event_2) = new_event("$ev2");
-
-        let mut room_events = RoomEvents::new();
-
-        room_events.push_events([event_0, event_1]);
-        room_events.push_events([event_2]);
-
-        assert_events_eq!(
-            room_events.events(),
-            [
-                (event_id_0 at (0, 0)),
-                (event_id_1 at (0, 1)),
-                (event_id_2 at (0, 2)),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_push_gap() {
-        let (event_id_0, event_0) = new_event("$ev0");
-        let (event_id_1, event_1) = new_event("$ev1");
-
-        let mut room_events = RoomEvents::new();
-
-        room_events.push_events([event_0]);
-        room_events.push_gap(Gap { prev_token: "hello".to_owned() });
-        room_events.push_events([event_1]);
-
-        assert_events_eq!(
-            room_events.events(),
-            [
-                (event_id_0 at (0, 0)),
-                (event_id_1 at (2, 0)),
-            ]
-        );
-
-        {
-            let mut chunks = room_events.chunks();
-
-            assert_let!(Some(chunk) = chunks.next());
-            assert!(chunk.is_items());
-
-            assert_let!(Some(chunk) = chunks.next());
-            assert!(chunk.is_gap());
-
-            assert_let!(Some(chunk) = chunks.next());
-            assert!(chunk.is_items());
-
-            assert!(chunks.next().is_none());
-        }
-    }
-
-    #[test]
-    fn test_insert_events_at() {
-        let (event_id_0, event_0) = new_event("$ev0");
-        let (event_id_1, event_1) = new_event("$ev1");
-        let (event_id_2, event_2) = new_event("$ev2");
-
-        let mut room_events = RoomEvents::new();
-
-        room_events.push_events([event_0, event_1]);
-
-        let position_of_event_1 = room_events
-            .events()
-            .find_map(|(position, event)| {
-                (event.event_id().unwrap() == event_id_1).then_some(position)
-            })
-            .unwrap();
-
-        room_events.insert_events_at(vec![event_2], position_of_event_1).unwrap();
-
-        assert_events_eq!(
-            room_events.events(),
-            [
-                (event_id_0 at (0, 0)),
-                (event_id_2 at (0, 1)),
-                (event_id_1 at (0, 2)),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_insert_gap_at() {
-        let (event_id_0, event_0) = new_event("$ev0");
-        let (event_id_1, event_1) = new_event("$ev1");
-
-        let mut room_events = RoomEvents::new();
-
-        room_events.push_events([event_0, event_1]);
-
-        let position_of_event_1 = room_events
-            .events()
-            .find_map(|(position, event)| {
-                (event.event_id().unwrap() == event_id_1).then_some(position)
-            })
-            .unwrap();
-
-        room_events
-            .insert_gap_at(Gap { prev_token: "hello".to_owned() }, position_of_event_1)
-            .unwrap();
-
-        assert_events_eq!(
-            room_events.events(),
-            [
-                (event_id_0 at (0, 0)),
-                (event_id_1 at (2, 0)),
-            ]
-        );
-
-        {
-            let mut chunks = room_events.chunks();
-
-            assert_let!(Some(chunk) = chunks.next());
-            assert!(chunk.is_items());
-
-            assert_let!(Some(chunk) = chunks.next());
-            assert!(chunk.is_gap());
-
-            assert_let!(Some(chunk) = chunks.next());
-            assert!(chunk.is_items());
-
-            assert!(chunks.next().is_none());
-        }
+        assert_eq!(linked_chunk.events().count(), 0);
     }
 
     #[test]
@@ -511,20 +554,20 @@ mod tests {
         let (event_id_1, event_1) = new_event("$ev1");
         let (event_id_2, event_2) = new_event("$ev2");
 
-        let mut room_events = RoomEvents::new();
+        let mut linked_chunk = EventLinkedChunk::new();
 
-        room_events.push_events([event_0]);
-        room_events.push_gap(Gap { prev_token: "hello".to_owned() });
+        linked_chunk.chunks.push_items_back([event_0]);
+        linked_chunk.chunks.push_gap_back(Gap { prev_token: "hello".to_owned() });
 
-        let chunk_identifier_of_gap = room_events
+        let gap_chunk_id = linked_chunk
             .chunks()
             .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
             .unwrap();
 
-        room_events.replace_gap_at(vec![event_1, event_2], chunk_identifier_of_gap).unwrap();
+        linked_chunk.replace_gap_at(gap_chunk_id, vec![event_1, event_2]).unwrap();
 
         assert_events_eq!(
-            room_events.events(),
+            linked_chunk.events(),
             [
                 (event_id_0 at (0, 0)),
                 (event_id_1 at (2, 0)),
@@ -533,7 +576,7 @@ mod tests {
         );
 
         {
-            let mut chunks = room_events.chunks();
+            let mut chunks = linked_chunk.chunks();
 
             assert_let!(Some(chunk) = chunks.next());
             assert!(chunk.is_items());
@@ -551,31 +594,31 @@ mod tests {
         let (_, event_1) = new_event("$ev1");
         let (_, event_2) = new_event("$ev2");
 
-        let mut room_events = RoomEvents::new();
+        let mut linked_chunk = EventLinkedChunk::new();
 
-        room_events.push_events([event_0, event_1]);
-        room_events.push_gap(Gap { prev_token: "middle".to_owned() });
-        room_events.push_events([event_2]);
-        room_events.push_gap(Gap { prev_token: "end".to_owned() });
+        linked_chunk.chunks.push_items_back([event_0, event_1]);
+        linked_chunk.chunks.push_gap_back(Gap { prev_token: "middle".to_owned() });
+        linked_chunk.chunks.push_items_back([event_2]);
+        linked_chunk.chunks.push_gap_back(Gap { prev_token: "end".to_owned() });
 
         // Remove the first gap.
-        let first_gap_id = room_events
+        let first_gap_id = linked_chunk
             .chunks()
             .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
             .unwrap();
 
         // The next insert position is the next chunk's start.
-        let pos = room_events.replace_gap_at(vec![], first_gap_id).unwrap();
+        let pos = linked_chunk.replace_gap_at(first_gap_id, vec![]).unwrap();
         assert_eq!(pos, Some(Position::new(ChunkIdentifier::new(2), 0)));
 
         // Remove the second gap.
-        let second_gap_id = room_events
+        let second_gap_id = linked_chunk
             .chunks()
             .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
             .unwrap();
 
         // No next insert position.
-        let pos = room_events.replace_gap_at(vec![], second_gap_id).unwrap();
+        let pos = linked_chunk.replace_gap_at(second_gap_id, vec![]).unwrap();
         assert!(pos.is_none());
     }
 
@@ -587,13 +630,13 @@ mod tests {
         let (event_id_3, event_3) = new_event("$ev3");
 
         // Push some events.
-        let mut room_events = RoomEvents::new();
-        room_events.push_events([event_0, event_1]);
-        room_events.push_gap(Gap { prev_token: "hello".to_owned() });
-        room_events.push_events([event_2, event_3]);
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.chunks.push_items_back([event_0, event_1]);
+        linked_chunk.chunks.push_gap_back(Gap { prev_token: "hello".to_owned() });
+        linked_chunk.chunks.push_items_back([event_2, event_3]);
 
         assert_events_eq!(
-            room_events.events(),
+            linked_chunk.events(),
             [
                 (event_id_0 at (0, 0)),
                 (event_id_1 at (0, 1)),
@@ -601,10 +644,10 @@ mod tests {
                 (event_id_3 at (2, 1)),
             ]
         );
-        assert_eq!(room_events.chunks().count(), 3);
+        assert_eq!(linked_chunk.chunks().count(), 3);
 
         // Remove some events.
-        room_events
+        linked_chunk
             .remove_events_by_position(vec![
                 Position::new(ChunkIdentifier::new(2), 1),
                 Position::new(ChunkIdentifier::new(0), 1),
@@ -612,7 +655,7 @@ mod tests {
             .unwrap();
 
         assert_events_eq!(
-            room_events.events(),
+            linked_chunk.events(),
             [
                 (event_id_0 at (0, 0)),
                 (event_id_2 at (2, 0)),
@@ -620,35 +663,35 @@ mod tests {
         );
 
         // Ensure chunks are removed once empty.
-        room_events
+        linked_chunk
             .remove_events_by_position(vec![Position::new(ChunkIdentifier::new(2), 0)])
             .unwrap();
 
         assert_events_eq!(
-            room_events.events(),
+            linked_chunk.events(),
             [
                 (event_id_0 at (0, 0)),
             ]
         );
-        assert_eq!(room_events.chunks().count(), 2);
+        assert_eq!(linked_chunk.chunks().count(), 2);
     }
 
     #[test]
     fn test_remove_events_unknown_event() {
         // Push ZERO event.
-        let mut room_events = RoomEvents::new();
+        let mut linked_chunk = EventLinkedChunk::new();
 
-        assert_events_eq!(room_events.events(), []);
+        assert_events_eq!(linked_chunk.events(), []);
 
         // Remove one undefined event.
         // An error is expected.
-        room_events
+        linked_chunk
             .remove_events_by_position(vec![Position::new(ChunkIdentifier::new(42), 153)])
             .unwrap_err();
 
-        assert_events_eq!(room_events.events(), []);
+        assert_events_eq!(linked_chunk.events(), []);
 
-        let mut events = room_events.events();
+        let mut events = linked_chunk.events();
         assert!(events.next().is_none());
     }
 
@@ -660,13 +703,13 @@ mod tests {
         let (event_id_3, event_3) = new_event("$ev3");
 
         // Push some events.
-        let mut room_events = RoomEvents::new();
-        room_events.push_events([event_0, event_1]);
-        room_events.push_gap(Gap { prev_token: "raclette".to_owned() });
-        room_events.push_events([event_2]);
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.chunks.push_items_back([event_0, event_1]);
+        linked_chunk.chunks.push_gap_back(Gap { prev_token: "raclette".to_owned() });
+        linked_chunk.chunks.push_items_back([event_2]);
 
         // Read the updates as `VectorDiff`.
-        let diffs = room_events.updates_as_vector_diffs();
+        let diffs = linked_chunk.updates_as_vector_diffs();
 
         assert_eq!(diffs.len(), 2);
 
@@ -687,11 +730,11 @@ mod tests {
         );
 
         // Now we can reset and see what happens.
-        room_events.reset();
-        room_events.push_events([event_3]);
+        linked_chunk.reset();
+        linked_chunk.chunks.push_items_back([event_3]);
 
         // Read the updates as `VectorDiff`.
-        let diffs = room_events.updates_as_vector_diffs();
+        let diffs = linked_chunk.updates_as_vector_diffs();
 
         assert_eq!(diffs.len(), 2);
 
@@ -709,20 +752,23 @@ mod tests {
     fn test_debug_string() {
         let event_factory = EventFactory::new().room(&DEFAULT_TEST_ROOM_ID).sender(*ALICE);
 
-        let mut room_events = RoomEvents::new();
-        room_events.push_events(vec![
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.chunks.push_items_back(vec![
             event_factory
                 .text_msg("hey")
                 .event_id(event_id!("$123456789101112131415617181920"))
                 .into_event(),
             event_factory.text_msg("you").event_id(event_id!("$2")).into_event(),
         ]);
-        room_events.push_gap(Gap { prev_token: "raclette".to_owned() });
+        linked_chunk.chunks.push_gap_back(Gap { prev_token: "raclette".to_owned() });
 
-        let output = room_events.debug_string();
+        // Flush updates to the order tracker.
+        let _ = linked_chunk.updates_as_vector_diffs();
+
+        let output = linked_chunk.debug_string();
 
         assert_eq!(output.len(), 2);
-        assert_eq!(&output[0], "chunk #0: events[$12345678, $2]");
+        assert_eq!(&output[0], "chunk #0: events[#0: $12345678, #1: $2]");
         assert_eq!(&output[1], "chunk #1: gap['raclette']");
     }
 

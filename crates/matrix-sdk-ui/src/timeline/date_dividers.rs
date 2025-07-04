@@ -207,8 +207,7 @@ impl DateDividerAdjuster {
 
         // Then check invariants.
         if let Some(report) = self.check_invariants(items, initial_state) {
-            warn!("Errors encountered when checking invariants.");
-            warn!("{report}");
+            error!(sentry = true, %report, "day divider invariants violated");
             #[cfg(any(debug_assertions, test))]
             panic!("There was an error checking date separator invariants");
         }
@@ -301,7 +300,10 @@ impl DateDividerAdjuster {
                     if let Some(last_event_ts) = latest_event_ts {
                         if timestamp_to_date(last_event_ts) == event_date {
                             // There's a previous event with the same date: remove the divider.
-                            trace!("removed date divider @ {item_index} between two events that have the same date");
+                            trace!(
+                                "removed date divider @ {item_index} between two events \
+                                 that have the same date"
+                            );
                             self.ops.insert(insert_op_at, DateDividerOperation::Remove(item_index));
                             return;
                         }

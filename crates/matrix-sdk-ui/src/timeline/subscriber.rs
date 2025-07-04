@@ -109,8 +109,6 @@ impl Stream for TimelineSubscriber {
 pub mod skip {
     use eyeball::{SharedObservable, Subscriber};
 
-    use super::super::controller::TimelineFocusKind;
-
     const MAXIMUM_NUMBER_OF_INITIAL_ITEMS: usize = 20;
 
     /// `SkipCount` helps to manage the `count` value used by the [`Skip`]
@@ -248,8 +246,8 @@ pub mod skip {
 
         /// Update the skip count if and only if the timeline has a live focus
         /// ([`TimelineFocusKind::Live`]).
-        pub fn update(&self, count: usize, focus_kind: &TimelineFocusKind) {
-            if matches!(focus_kind, TimelineFocusKind::Live { .. }) {
+        pub fn update(&self, count: usize, is_live_focus: bool) {
+            if is_live_focus {
                 self.count.set_if_not_eq(count);
             }
         }

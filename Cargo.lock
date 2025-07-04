@@ -878,6 +878,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1173,9 +1183,9 @@ dependencies = [
 
 [[package]]
 name = "deadpool-sqlite"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d84a12c51972a50e54895427e43743da9737af66395a609283be01ec72efd9fb"
+checksum = "9e531d0beb6d12daa84df0482bf89e06c7ed059551ae1d7313dc7531d37778fb"
 dependencies = [
  "deadpool 0.12.1",
  "deadpool-sync",
@@ -2689,9 +2699,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.31.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad8935b44e7c13394a179a438e0cebba0fe08fe01b54f152e29a93b5cf993fd4"
+checksum = "947e6816f7825b2b45027c2c32e7085da9934defa535de4a6a46b10a4d5257fa"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3094,6 +3104,7 @@ dependencies = [
  "anyhow",
  "as_variant",
  "async-compat",
+ "console_error_panic_hook",
  "extension-trait",
  "eyeball-im",
  "futures-util",
@@ -3236,6 +3247,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "similar-asserts",
  "tempfile",
  "thiserror 2.0.11",
@@ -4449,7 +4461,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.12.3"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "assign",
  "js_int",
@@ -4465,7 +4477,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.20.3"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "as_variant",
  "assign",
@@ -4488,7 +4500,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.15.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "as_variant",
  "base64",
@@ -4520,7 +4532,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.30.3"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -4545,7 +4557,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.11.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "http",
  "js_int",
@@ -4559,7 +4571,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.4.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -4571,7 +4583,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.10.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "js_int",
  "thiserror 2.0.11",
@@ -4580,7 +4592,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.15.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=c14f85442#c14f8544289520483509b3ddc6f0621b6a8f02b4"
+source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
 dependencies = [
  "cfg-if",
  "proc-macro-crate",
@@ -4594,9 +4606,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.33.0"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c6d5e5acb6f6129fe3f7ba0a7fc77bca1942cb568535e18e7bc40262baf3110"
+checksum = "a22715a5d6deef63c637207afbe68d0c72c3f8d0022d7cf9714c442d6157606b"
 dependencies = [
  "bitflags 2.8.0",
  "fallible-iterator",
@@ -4792,6 +4804,7 @@ dependencies = [
  "sentry-backtrace",
  "sentry-contexts",
  "sentry-core",
+ "sentry-debug-images",
  "sentry-panic",
  "sentry-tracing",
  "tokio",
@@ -4836,6 +4849,17 @@ dependencies = [
  "sentry-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "sentry-debug-images"
+version = "0.36.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a60bc2154e6df59beed0ac13d58f8dfaf5ad20a88548a53e29e4d92e8e835c2"
+dependencies = [
+ "findshlibs",
+ "once_cell",
+ "sentry-core",
 ]
 
 [[package]]
@@ -4944,9 +4968,9 @@ dependencies = [
 
 [[package]]
 name = "serde_path_to_error"
-version = "0.1.16"
+version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af99884400da37c88f5e9146b7f1fd0fbcae8f6eec4e9da38b67d05486f814a6"
+checksum = "59fab13f937fa393d08645bf3a84bdfe86e296747b506ada67bb15f10f218b2a"
 dependencies = [
  "itoa",
  "serde",

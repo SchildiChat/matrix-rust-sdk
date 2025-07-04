@@ -6,11 +6,48 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Add `NotificationRoomInfo::topic` to the `NotificationRoomInfo` struct, which
+  contains the topic of the room. This is useful for displaying the room topic
+  in notifications. ([#5300](https://github.com/matrix-org/matrix-rust-sdk/pull/5300))
+- Add `EmbeddedEventDetails::timestamp` and `EmbeddedEventDetails::event_or_transaction_id`
+  which are already available in regular timeline items.
+  ([#5331](https://github.com/matrix-org/matrix-rust-sdk/pull/5331))
+
+### Refactor
+
+- Adjust features in the `matrix-sdk-ffi` crate to expose more platform-specific knobs.
+  Previously the `matrix-sdk-ffi` was configured primarily by target configs, choosing
+  between the tls flavor (`rustls-tls` or `native-tls`) and features like `sentry` based
+  purely on the target. As we work to add an additional Wasm target to this crate,
+  the cross product of target specific features has become somewhat chaotic, and we
+  have shifted to externalize these choices as feature flags.
+
+  To maintain existing compatibility on the major platforms, these features should be used:
+  Android: `"bundled-sqlite,unstable-msc4274,rustls-tls,sentry"`
+  iOS: `"bundled-sqlite,unstable-msc4274,native-tls,sentry"`
+  Javascript/Wasm: `"unstable-msc4274,native-tls"`
+
+  In the future additional choices (such as session storage, `sqlite` and `indexeddb`)
+  will likely be added as well.
+
+Breaking changes:
+
+- `Client::reset_server_capabilities` has been renamed to `Client::reset_server_info`.
+  ([#5167](https://github.com/matrix-org/matrix-rust-sdk/pull/5167))
+- `RoomPreview::join_rule`, `NotificationItem::join_rule`, `RoomInfo::is_public`, and
+  `Room::is_public()` return values are now optional. They will be set to `None` if the join rule
+  state event is missing for a given room. `NotificationRoomInfo::is_public` has been removed;
+  callers can inspect the value of `NotificationItem::join_rule` to determine if the room is public
+  (i.e. if the join rule is `Public`).
+  ([#5278](https://github.com/matrix-org/matrix-rust-sdk/pull/5278))
+
 ## [0.12.0] - 2025-06-10
 
 Breaking changes:
 
-- `Client::send_call_notification_if_needed` now returns `Result<bool>` instead of `Result<()>` so we can check if 
+- `Client::send_call_notification_if_needed` now returns `Result<bool>` instead of `Result<()>` so we can check if
   the event was sent.
 - `Client::upload_avatar` and `Timeline::send_attachment` now may fail if a file too large for the homeserver media
   config is uploaded.
@@ -25,8 +62,8 @@ Breaking changes:
 
 Additions:
 
-- `Client::subscribe_to_room_info` allows clients to subscribe to room info updates in rooms which may not be known yet. 
-  This is useful when displaying a room preview for an unknown room, so when we receive any membership change for it, 
+- `Client::subscribe_to_room_info` allows clients to subscribe to room info updates in rooms which may not be known yet.
+  This is useful when displaying a room preview for an unknown room, so when we receive any membership change for it,
   we can automatically update the UI.
 - `Client::get_max_media_upload_size` to get the max size of a request sent to the homeserver so we can tweak our media
   uploads by compressing/transcoding the media.
@@ -46,7 +83,7 @@ Additions:
 
 Breaking changes:
 
-- `contacts` has been removed from `OidcConfiguration` (it was unused since the switch to OAuth). 
+- `contacts` has been removed from `OidcConfiguration` (it was unused since the switch to OAuth).
 
 ## [0.11.0] - 2025-04-11
 

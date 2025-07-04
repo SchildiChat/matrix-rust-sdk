@@ -71,6 +71,7 @@ pub async fn update_joined_room(
         &mut room_info,
         ambiguity_cache,
         &mut new_user_ids,
+        state_store,
     )
     .await?;
 
@@ -89,6 +90,7 @@ pub async fn update_joined_room(
         &mut room_info,
         ambiguity_cache,
         &mut new_user_ids,
+        state_store,
     )
     .await?;
 
@@ -188,6 +190,7 @@ pub async fn update_left_room(
         &mut room_info,
         ambiguity_cache,
         &mut (),
+        state_store,
     )
     .await?;
 
@@ -200,6 +203,7 @@ pub async fn update_left_room(
         &mut room_info,
         ambiguity_cache,
         &mut (),
+        state_store,
     )
     .await?;
 

@@ -27,9 +27,10 @@ use matrix_sdk_base::{
     store::{
         ChildTransactionId, ComposerDraft, DependentQueuedRequest, DependentQueuedRequestKind,
         QueuedRequest, QueuedRequestKind, RoomLoadSettings, SentRequestKey,
-        SerializableEventContent, ServerCapabilities, StateChanges, StateStore, StoreError,
+        SerializableEventContent, ServerInfo, StateChanges, StateStore, StoreError,
     },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, StateStoreDataKey, StateStoreDataValue,
+    ROOM_VERSION_FALLBACK,
 };
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
 use ruma::{
@@ -45,7 +46,7 @@ use ruma::{
     },
     serde::Raw,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -68,7 +69,10 @@ pub enum IndexeddbStateStoreError {
     DomException { name: String, message: String, code: u16 },
     #[error(transparent)]
     StoreError(#[from] StoreError),
-    #[error("Can't migrate {name} from {old_version} to {new_version} without deleting data. See MigrationConflictStrategy for ways to configure.")]
+    #[error(
+        "Can't migrate {name} from {old_version} to {new_version} without deleting data. \
+         See MigrationConflictStrategy for ways to configure."
+    )]
     MigrationConflict { name: String, old_version: u32, new_version: u32 },
 }
 
@@ -400,10 +404,9 @@ impl IndexeddbStateStore {
             StateStoreDataKey::SyncToken => {
                 self.encode_key(StateStoreDataKey::SYNC_TOKEN, StateStoreDataKey::SYNC_TOKEN)
             }
-            StateStoreDataKey::ServerCapabilities => self.encode_key(
-                StateStoreDataKey::SERVER_CAPABILITIES,
-                StateStoreDataKey::SERVER_CAPABILITIES,
-            ),
+            StateStoreDataKey::ServerInfo => {
+                self.encode_key(StateStoreDataKey::SERVER_INFO, StateStoreDataKey::SERVER_INFO)
+            }
             StateStoreDataKey::Filter(filter_name) => {
                 self.encode_key(StateStoreDataKey::FILTER, (StateStoreDataKey::FILTER, filter_name))
             }
@@ -537,10 +540,10 @@ impl_state_store!({
                 .map(|f| self.deserialize_value::<String>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::SyncToken),
-            StateStoreDataKey::ServerCapabilities => value
-                .map(|f| self.deserialize_value::<ServerCapabilities>(&f))
+            StateStoreDataKey::ServerInfo => value
+                .map(|f| self.deserialize_value::<ServerInfo>(&f))
                 .transpose()?
-                .map(StateStoreDataValue::ServerCapabilities),
+                .map(StateStoreDataValue::ServerInfo),
             StateStoreDataKey::Filter(_) => value
                 .map(|f| self.deserialize_value::<String>(&f))
                 .transpose()?
@@ -580,10 +583,8 @@ impl_state_store!({
         let serialized_value = match key {
             StateStoreDataKey::SyncToken => self
                 .serialize_value(&value.into_sync_token().expect("Session data not a sync token")),
-            StateStoreDataKey::ServerCapabilities => self.serialize_value(
-                &value
-                    .into_server_capabilities()
-                    .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => self.serialize_value(
+                &value.into_server_info().expect("Session data not containing server info"),
             ),
             StateStoreDataKey::Filter(_) => {
                 self.serialize_value(&value.into_filter().expect("Session data not a filter"))
@@ -929,10 +930,10 @@ impl_state_store!({
                                         .get(&self.encode_key(keys::ROOM_INFOS, room_id))?
                                         .await?
                                         .and_then(|f| self.deserialize_value::<RoomInfo>(&f).ok())
-                                        .and_then(|info| info.room_version().cloned())
+                                        .map(|info| info.room_version_or_default())
                                         .unwrap_or_else(|| {
-                                            warn!(?room_id, "Unable to find the room version, assume version 9");
-                                            RoomVersionId::V9
+                                            warn!(?room_id, "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}");
+                                            ROOM_VERSION_FALLBACK
                                         })
                                     );
                                 }

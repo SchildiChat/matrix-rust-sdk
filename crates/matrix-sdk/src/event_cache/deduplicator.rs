@@ -21,43 +21,32 @@ use matrix_sdk_base::{
     event_cache::store::EventCacheStoreLock,
     linked_chunk::{LinkedChunkId, Position},
 };
-use ruma::{OwnedEventId, RoomId};
+use ruma::OwnedEventId;
 
 use super::{
-    room::events::{Event, RoomEvents},
+    room::events::{Event, EventLinkedChunk},
     EventCacheError,
 };
 
-/// Find duplicates in the given collection of events, and return both
-/// valid events (those with an event id) as well as the event ids of
-/// duplicate events along with their position.
+/// Find duplicates in the given collection of new events, and return relevant
+/// information about the duplicates found in the new events, including the
+/// events that are not loaded in memory.
 pub async fn filter_duplicate_events(
-    room_id: &RoomId,
     store: &EventCacheStoreLock,
-    mut events: Vec<Event>,
-    room_events: &RoomEvents,
+    linked_chunk_id: LinkedChunkId<'_>,
+    linked_chunk: &EventLinkedChunk,
+    mut new_events: Vec<Event>,
 ) -> Result<DeduplicationOutcome, EventCacheError> {
-    // Remove all events with no ID, or that is duplicated inside `events`, i.e.
-    // `events` contains duplicated events in itself, e.g. `[$e0, $e1, $e0]`, here
-    // `$e0` is duplicated in within `events`.
+    // Remove all events with no ID, or that are duplicated among the new events,
+    // i.e. `new_events` contains duplicated events in itself (e.g. `[$e0, $e1,
+    // $e0]`, here `$e0` is duplicated).
     {
         let mut event_ids = BTreeSet::new();
 
-        events.retain(|event| {
-            let Some(event_id) = event.event_id() else {
-                // No event ID? Bye bye.
-                return false;
-            };
-
-            // Already seen this event in `events`? Bye bye.
-            if event_ids.contains(&event_id) {
-                return false;
-            }
-
-            event_ids.insert(event_id);
-
-            // Let's keep this event!
-            true
+        new_events.retain(|event| {
+            // Only keep events with IDs, and those for which `insert` returns `true`
+            // (meaning they were not in the set).
+            event.event_id().is_some_and(|event_id| event_ids.insert(event_id))
         });
     }
 
@@ -66,8 +55,8 @@ pub async fn filter_duplicate_events(
     // Let the store do its magic ✨
     let duplicated_event_ids = store
         .filter_duplicated_events(
-            LinkedChunkId::Room(room_id),
-            events.iter().filter_map(|event| event.event_id()).collect(),
+            linked_chunk_id,
+            new_events.iter().filter_map(|event| event.event_id()).collect(),
         )
         .await?;
 
@@ -76,7 +65,7 @@ pub async fn filter_duplicate_events(
     let (in_memory_duplicated_event_ids, in_store_duplicated_event_ids) = {
         // Collect all in-memory chunk identifiers.
         let in_memory_chunk_identifiers =
-            room_events.chunks().map(|chunk| chunk.identifier()).collect::<Vec<_>>();
+            linked_chunk.chunks().map(|chunk| chunk.identifier()).collect::<Vec<_>>();
 
         let mut in_memory = vec![];
         let mut in_store = vec![];
@@ -92,10 +81,17 @@ pub async fn filter_duplicate_events(
         (in_memory, in_store)
     };
 
+    let at_least_one_event = !new_events.is_empty();
+    let all_duplicates = (in_memory_duplicated_event_ids.len()
+        + in_store_duplicated_event_ids.len())
+        == new_events.len();
+    let non_empty_all_duplicates = at_least_one_event && all_duplicates;
+
     Ok(DeduplicationOutcome {
-        all_events: events,
+        all_events: new_events,
         in_memory_duplicated_event_ids,
         in_store_duplicated_event_ids,
+        non_empty_all_duplicates,
     })
 }
 
@@ -121,11 +117,37 @@ pub(super) struct DeduplicationOutcome {
     /// Events are sorted by their position, from the newest to the oldest
     /// (position is descending).
     pub in_store_duplicated_event_ids: Vec<(OwnedEventId, Position)>,
+
+    /// Whether there's at least one new event, and all new events are
+    /// duplicate.
+    ///
+    /// This boolean is useful to know whether we need to store a
+    /// previous-batch token (gap) we received from a server-side
+    /// request (sync or back-pagination), or if we should
+    /// *not* store it.
+    ///
+    /// Since there can be empty back-paginations with a previous-batch
+    /// token (that is, they don't contain any events), we need to
+    /// make sure that there is *at least* one new event that has
+    /// been added. Otherwise, we might conclude something wrong
+    /// because a subsequent back-pagination might
+    /// return non-duplicated events.
+    ///
+    /// If we had already seen all the duplicated events that we're trying
+    /// to add, then it would be wasteful to store a previous-batch
+    /// token, or even touch the linked chunk: we would repeat
+    /// back-paginations for events that we have already seen, and
+    /// possibly misplace them. And we should not be missing
+    /// events either: the already-known events would have their own
+    /// previous-batch token (it might already be consumed).
+    pub non_empty_all_duplicates: bool,
 }
 
 #[cfg(test)]
 #[cfg(not(target_family = "wasm"))] // These tests uses the cross-process lock, so need time support.
 mod tests {
+    use std::ops::Not as _;
+
     use matrix_sdk_base::{deserialized_responses::TimelineEvent, linked_chunk::ChunkIdentifier};
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{owned_event_id, serde::Raw, user_id, EventId};
@@ -185,7 +207,9 @@ mod tests {
                     },
                     Update::NewItemsChunk {
                         previous: Some(ChunkIdentifier::new(42)),
-                        new: ChunkIdentifier::new(0), // must match the chunk in `RoomEvents`, so 0. It simulates a lazy-load for example.
+                        new: ChunkIdentifier::new(0), /* must match the chunk in
+                                                       * `EventLinkedChunk`, so 0. It simulates a
+                                                       * lazy-load for example. */
                         next: None,
                     },
                     Update::PushItems {
@@ -199,17 +223,39 @@ mod tests {
 
         let event_cache_store = EventCacheStoreLock::new(event_cache_store, "hodor".to_owned());
 
-        let mut room_events = RoomEvents::new();
-        room_events.push_events([event_2.clone(), event_3.clone()]);
+        {
+            // When presenting with only duplicate events, some of them in the in-memory
+            // chunk, all of them in the store, we should return all of them as
+            // duplicates.
+
+            let mut linked_chunk = EventLinkedChunk::new();
+            linked_chunk.push_events([event_1.clone(), event_2.clone(), event_3.clone()]);
+
+            let outcome = filter_duplicate_events(
+                &event_cache_store,
+                LinkedChunkId::Room(room_id),
+                &linked_chunk,
+                vec![event_0.clone(), event_1.clone(), event_2.clone(), event_3.clone()],
+            )
+            .await
+            .unwrap();
+
+            assert!(outcome.non_empty_all_duplicates);
+        }
+
+        let mut linked_chunk = EventLinkedChunk::new();
+        linked_chunk.push_events([event_2.clone(), event_3.clone()]);
 
         let outcome = filter_duplicate_events(
-            room_id,
             &event_cache_store,
+            LinkedChunkId::Room(room_id),
+            &linked_chunk,
             vec![event_0, event_1, event_2, event_3, event_4],
-            &room_events,
         )
         .await
         .unwrap();
+
+        assert!(outcome.non_empty_all_duplicates.not());
 
         // The deduplication says 5 events are valid.
         assert_eq!(outcome.all_events.len(), 5);
@@ -306,19 +352,23 @@ mod tests {
         // Wrap the store into its lock.
         let event_cache_store = EventCacheStoreLock::new(event_cache_store, "hodor".to_owned());
 
-        let room_events = RoomEvents::new();
+        let linked_chunk = EventLinkedChunk::new();
+
         let DeduplicationOutcome {
             all_events: events,
             in_memory_duplicated_event_ids,
             in_store_duplicated_event_ids,
+            non_empty_all_duplicates,
         } = filter_duplicate_events(
-            room_id,
             &event_cache_store,
+            LinkedChunkId::Room(room_id),
+            &linked_chunk,
             vec![ev1, ev2, ev3, ev4],
-            &room_events,
         )
         .await
         .unwrap();
+
+        assert!(non_empty_all_duplicates.not());
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_id().as_deref(), Some(eid1));

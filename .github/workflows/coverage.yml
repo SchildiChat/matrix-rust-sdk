@@ -17,8 +17,12 @@ env:
   RUST_LOG: info,matrix_sdk=trace
 
 jobs:
+  xtask:
+    uses: ./.github/workflows/xtask.yml
+
   code_coverage:
     name: Code Coverage
+    needs: xtask
     runs-on: "ubuntu-latest"
 
     # run several docker containers with the same networking stack so the hostname 'synapse'
@@ -35,6 +39,11 @@ jobs:
             - 8008:8008
 
     steps:
+      # This CI workflow can run into space issue, so we're cleaning up some
+      # space here.
+      - name: Create some more space
+        run: rm -rf /opt/hostedtoolcache
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -56,23 +65,25 @@ jobs:
       - name: Load cache
         uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: "coverage"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install tarpaulin
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-tarpaulin
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
-      # set up backend for integration tests
-      - uses: actions/setup-python@v5
-        with:
-          python-version: 3.8
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
 
-      - name: Run tarpaulin
+      - name: Get xtask
+        uses: actions/cache/restore@v4
+        with:
+          path: target/debug/xtask
+          key: "${{ needs.xtask.outputs.cachekey-linux }}"
+          fail-on-cache-miss: true
+
+      - name: Create the coverage report
         run: |
-          rustup run stable cargo tarpaulin \
-            --skip-clean --profile cov --out xml \
-            --features experimental-widgets,testing
+          target/debug/xtask ci coverage -o codecov 
         env:
           CARGO_PROFILE_COV_INHERITS: 'dev'
           CARGO_PROFILE_COV_DEBUG: 1
@@ -89,6 +100,11 @@ jobs:
           echo "Storing commit SHA ${{ github.event.pull_request.head.sha }}"
           echo "${{ github.event.pull_request.head.sha }}" > commit_sha.txt
 
+      - name: Move the JUnit file into the root directory
+        shell: bash
+        run: |
+          mv target/nextest/ci/junit.xml ./junit.xml
+
       # This stores the coverage report and metadata in artifacts.
       # The actual upload to Codecov is executed by a different workflow `upload_coverage.yml`.
       # The reason for this split is because `on.pull_request` workflows don't have access to secrets.
@@ -97,7 +113,8 @@ jobs:
         with:
           name: codecov_report
           path: |
-            cobertura.xml
+            coverage.xml
+            junit.xml
             pr_number.txt
             commit_sha.txt
           if-no-files-found: error

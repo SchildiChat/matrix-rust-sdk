@@ -93,6 +93,7 @@ macro_rules! assert_items_eq {
 
 mod as_vector;
 pub mod lazy_loader;
+mod order_tracker;
 pub mod relational;
 mod updates;
 
@@ -104,6 +105,7 @@ use std::{
 };
 
 pub use as_vector::*;
+pub use order_tracker::OrderTracker;
 use ruma::{OwnedRoomId, RoomId};
 pub use updates::*;
 
@@ -125,12 +127,6 @@ impl LinkedChunkId<'_> {
     pub fn to_owned(&self) -> OwnedLinkedChunkId {
         match self {
             LinkedChunkId::Room(room_id) => OwnedLinkedChunkId::Room((*room_id).to_owned()),
-        }
-    }
-
-    pub fn room_id(&self) -> &RoomId {
-        match self {
-            LinkedChunkId::Room(room_id) => room_id,
         }
     }
 }
@@ -166,6 +162,7 @@ impl Display for OwnedLinkedChunkId {
 }
 
 impl OwnedLinkedChunkId {
+    #[cfg(test)]
     fn as_ref(&self) -> LinkedChunkId<'_> {
         match self {
             OwnedLinkedChunkId::Room(room_id) => LinkedChunkId::Room(room_id.as_ref()),
@@ -297,7 +294,7 @@ impl<const CAP: usize, Item, Gap> Ends<CAP, Item, Gap> {
             // Fetch the previous chunk pointer.
             let previous_ptr = unsafe { chunk_ptr.as_ref() }.previous;
 
-            // Re-box the chunk, and let Rust does its job.
+            // Re-box the chunk, and let Rust do its job.
             let _chunk_boxed = unsafe { Box::from_raw(chunk_ptr.as_ptr()) };
 
             // Update the `current_chunk_ptr`.
@@ -469,7 +466,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
     ///
     /// Because the `position` can be invalid, this method returns a
     /// `Result`.
-    pub fn insert_items_at<I>(&mut self, items: I, position: Position) -> Result<(), Error>
+    pub fn insert_items_at<I>(&mut self, position: Position, items: I) -> Result<(), Error>
     where
         Item: Clone,
         Gap: Clone,
@@ -486,7 +483,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
         let chunk = match &mut chunk.content {
             ChunkContent::Gap(..) => {
-                return Err(Error::ChunkIsAGap { identifier: chunk_identifier })
+                return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
             }
 
             ChunkContent::Items(current_items) => {
@@ -572,32 +569,24 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
                 .chunk_mut(chunk_identifier)
                 .ok_or(Error::InvalidChunkIdentifier { identifier: chunk_identifier })?;
 
-            let can_unlink_chunk = match &mut chunk.content {
+            let current_items = match &mut chunk.content {
                 ChunkContent::Gap(..) => {
-                    return Err(Error::ChunkIsAGap { identifier: chunk_identifier })
+                    return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
                 }
-
-                ChunkContent::Items(current_items) => {
-                    let current_items_length = current_items.len();
-
-                    if item_index > current_items_length {
-                        return Err(Error::InvalidItemIndex { index: item_index });
-                    }
-
-                    removed_item = current_items.remove(item_index);
-
-                    if let Some(updates) = self.updates.as_mut() {
-                        updates
-                            .push(Update::RemoveItem { at: Position(chunk_identifier, item_index) })
-                    }
-
-                    current_items.is_empty()
-                }
+                ChunkContent::Items(current_items) => current_items,
             };
 
-            // If removing empty chunk is desired, and if the `chunk` can be unlinked, and
-            // if the `chunk` is not the first one, we can remove it.
-            if can_unlink_chunk && !chunk.is_first_chunk() {
+            if item_index > current_items.len() {
+                return Err(Error::InvalidItemIndex { index: item_index });
+            }
+
+            removed_item = current_items.remove(item_index);
+            if let Some(updates) = self.updates.as_mut() {
+                updates.push(Update::RemoveItem { at: Position(chunk_identifier, item_index) })
+            }
+
+            // If the chunk is empty and not the first one, we can remove it.
+            if current_items.is_empty() && !chunk.is_first_chunk() {
                 // Unlink `chunk`.
                 chunk.unlink(self.updates.as_mut());
 
@@ -616,7 +605,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         if let Some(chunk_ptr) = chunk_ptr {
             // `chunk` has been unlinked.
 
-            // Re-box the chunk, and let Rust does its job.
+            // Re-box the chunk, and let Rust do its job.
             //
             // SAFETY: `chunk` is unlinked and not borrowed anymore. `LinkedChunk` doesn't
             // use it anymore, it's a leak. It is time to re-`Box` it and drop it.
@@ -644,7 +633,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
         match &mut chunk.content {
             ChunkContent::Gap(..) => {
-                return Err(Error::ChunkIsAGap { identifier: chunk_identifier })
+                return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
             }
 
             ChunkContent::Items(current_items) => {
@@ -908,7 +897,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
             // Stop borrowing `chunk`.
         }
 
-        // Re-box the chunk, and let Rust does its job.
+        // Re-box the chunk, and let Rust do its job.
         //
         // SAFETY: `chunk` is unlinked and not borrowed anymore. `LinkedChunk` doesn't
         // use it anymore, it's a leak. It is time to re-`Box` it and drop it.
@@ -1085,6 +1074,42 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         Some(AsVector::new(updates, token, chunk_iterator))
     }
 
+    /// Get an [`OrderTracker`] for the linked chunk, which can be used to
+    /// compare the relative position of two events in this linked chunk.
+    ///
+    /// A pre-requisite is that the linked chunk has been constructed with
+    /// [`Self::new_with_update_history`], and that if the linked chunk is
+    /// lazily-loaded, an iterator over the fully-loaded linked chunk is
+    /// passed at construction time here.
+    pub fn order_tracker(
+        &mut self,
+        all_chunks: Option<Vec<ChunkMetadata>>,
+    ) -> Option<OrderTracker<Item, Gap>>
+    where
+        Item: Clone,
+    {
+        let (updates, token) = self
+            .updates
+            .as_mut()
+            .map(|updates| (updates.inner.clone(), updates.new_reader_token()))?;
+
+        Some(OrderTracker::new(
+            updates,
+            token,
+            all_chunks.unwrap_or_else(|| {
+                // Consider the linked chunk as fully loaded.
+                self.chunks()
+                    .map(|chunk| ChunkMetadata {
+                        identifier: chunk.identifier(),
+                        num_items: chunk.num_items(),
+                        previous: chunk.previous().map(|prev| prev.identifier()),
+                        next: chunk.next().map(|next| next.identifier()),
+                    })
+                    .collect()
+            }),
+        ))
+    }
+
     /// Returns the number of items of the linked chunk.
     pub fn num_items(&self) -> usize {
         self.items().count()
@@ -1158,7 +1183,10 @@ impl ChunkIdentifierGenerator {
         // Check for overflows.
         // unlikely — TODO: call `std::intrinsics::unlikely` once it's stable.
         if previous == u64::MAX {
-            panic!("No more chunk identifiers available. Congrats, you did it. 2^64 identifiers have been consumed.")
+            panic!(
+                "No more chunk identifiers available. Congrats, you did it. \
+                 2^64 identifiers have been consumed."
+            )
         }
 
         ChunkIdentifier(previous + 1)
@@ -1721,6 +1749,25 @@ pub struct RawChunk<Item, Gap> {
     pub next: Option<ChunkIdentifier>,
 }
 
+/// A simplified [`RawChunk`] that only contains the number of items in a chunk,
+/// instead of its type.
+#[derive(Clone, Debug)]
+pub struct ChunkMetadata {
+    /// The number of items in this chunk.
+    ///
+    /// By convention, a gap chunk contains 0 items.
+    pub num_items: usize,
+
+    /// Link to the previous chunk, via its identifier.
+    pub previous: Option<ChunkIdentifier>,
+
+    /// Current chunk's identifier.
+    pub identifier: ChunkIdentifier,
+
+    /// Link to the next chunk, via its identifier.
+    pub next: Option<ChunkIdentifier>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2210,11 +2257,11 @@ mod tests {
 
         // Insert inside the last chunk.
         {
-            let position_of_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
+            let pos_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
 
             // Insert 4 elements, so that it overflows the chunk capacity. It's important to
             // see whether chunks are correctly updated and linked.
-            linked_chunk.insert_items_at(['w', 'x', 'y', 'z'], position_of_e)?;
+            linked_chunk.insert_items_at(pos_e, ['w', 'x', 'y', 'z'])?;
 
             assert_items_eq!(
                 linked_chunk,
@@ -2247,8 +2294,8 @@ mod tests {
 
         // Insert inside the first chunk.
         {
-            let position_of_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
-            linked_chunk.insert_items_at(['l', 'm', 'n', 'o'], position_of_a)?;
+            let pos_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
+            linked_chunk.insert_items_at(pos_a, ['l', 'm', 'n', 'o'])?;
 
             assert_items_eq!(
                 linked_chunk,
@@ -2281,8 +2328,8 @@ mod tests {
 
         // Insert inside a middle chunk.
         {
-            let position_of_c = linked_chunk.item_position(|item| *item == 'c').unwrap();
-            linked_chunk.insert_items_at(['r', 's'], position_of_c)?;
+            let pos_c = linked_chunk.item_position(|item| *item == 'c').unwrap();
+            linked_chunk.insert_items_at(pos_c, ['r', 's'])?;
 
             assert_items_eq!(
                 linked_chunk,
@@ -2303,11 +2350,10 @@ mod tests {
 
         // Insert at the end of a chunk.
         {
-            let position_of_f = linked_chunk.item_position(|item| *item == 'f').unwrap();
-            let position_after_f =
-                Position(position_of_f.chunk_identifier(), position_of_f.index() + 1);
+            let pos_f = linked_chunk.item_position(|item| *item == 'f').unwrap();
+            let pos_f = Position(pos_f.chunk_identifier(), pos_f.index() + 1);
 
-            linked_chunk.insert_items_at(['p', 'q'], position_after_f)?;
+            linked_chunk.insert_items_at(pos_f, ['p', 'q'])?;
             assert_items_eq!(
                 linked_chunk,
                 ['l', 'm', 'n'] ['o', 'a', 'b'] ['r', 's', 'c'] ['d', 'w', 'x'] ['y', 'z', 'e'] ['f', 'p', 'q']
@@ -2322,7 +2368,7 @@ mod tests {
         // Insert in a chunk that does not exist.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(128), 0)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(128), 0), ['u', 'v'],),
                 Err(Error::InvalidChunkIdentifier { identifier: ChunkIdentifier(128) })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());
@@ -2331,7 +2377,7 @@ mod tests {
         // Insert in a chunk that exists, but at an item that does not exist.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(0), 128)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(0), 128), ['u', 'v'],),
                 Err(Error::InvalidItemIndex { index: 128 })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());
@@ -2356,7 +2402,7 @@ mod tests {
             );
 
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(6), 0)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(6), 0), ['u', 'v'],),
                 Err(Error::ChunkIsAGap { identifier: ChunkIdentifier(6) })
             );
         }
@@ -2391,11 +2437,11 @@ mod tests {
         );
 
         // Insert inside the last chunk.
-        let position_of_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
+        let pos_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
 
         // Insert 4 elements, so that it overflows the chunk capacity. It's important to
         // see whether chunks are correctly updated and linked.
-        linked_chunk.insert_items_at(['w', 'x', 'y', 'z'], position_of_e)?;
+        linked_chunk.insert_items_at(pos_e, ['w', 'x', 'y', 'z'])?;
 
         assert_items_eq!(
             linked_chunk,
@@ -2453,8 +2499,8 @@ mod tests {
         );
 
         // Insert inside the first chunk.
-        let position_of_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
-        linked_chunk.insert_items_at(['l', 'm', 'n', 'o'], position_of_a)?;
+        let pos_a = linked_chunk.item_position(|item| *item == 'a').unwrap();
+        linked_chunk.insert_items_at(pos_a, ['l', 'm', 'n', 'o'])?;
 
         assert_items_eq!(
             linked_chunk,
@@ -2517,8 +2563,8 @@ mod tests {
             ]
         );
 
-        let position_of_d = linked_chunk.item_position(|item| *item == 'd').unwrap();
-        linked_chunk.insert_items_at(['r', 's'], position_of_d)?;
+        let pos_d = linked_chunk.item_position(|item| *item == 'd').unwrap();
+        linked_chunk.insert_items_at(pos_d, ['r', 's'])?;
 
         assert_items_eq!(
             linked_chunk,
@@ -2570,11 +2616,10 @@ mod tests {
         );
 
         // Insert at the end of a chunk.
-        let position_of_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
-        let position_after_e =
-            Position(position_of_e.chunk_identifier(), position_of_e.index() + 1);
+        let pos_e = linked_chunk.item_position(|item| *item == 'e').unwrap();
+        let pos_after_e = Position(pos_e.chunk_identifier(), pos_e.index() + 1);
 
-        linked_chunk.insert_items_at(['p', 'q'], position_after_e)?;
+        linked_chunk.insert_items_at(pos_after_e, ['p', 'q'])?;
         assert_items_eq!(
             linked_chunk,
             ['a', 'b', 'c'] ['d', 'e', 'p'] ['q']
@@ -2624,7 +2669,7 @@ mod tests {
         // Insert in a chunk that does not exist.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(128), 0)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(128), 0), ['u', 'v'],),
                 Err(Error::InvalidChunkIdentifier { identifier: ChunkIdentifier(128) })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());
@@ -2633,7 +2678,7 @@ mod tests {
         // Insert in a chunk that exists, but at an item that does not exist.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(0), 128)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(0), 128), ['u', 'v'],),
                 Err(Error::InvalidItemIndex { index: 128 })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());
@@ -2642,7 +2687,7 @@ mod tests {
         // Insert in a gap.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(1), 0)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(1), 0), ['u', 'v'],),
                 Err(Error::ChunkIsAGap { identifier: ChunkIdentifier(1) })
             );
         }
@@ -2984,7 +3029,7 @@ mod tests {
         // Insert in a chunk that does not exist.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(128), 0)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(128), 0), ['u', 'v'],),
                 Err(Error::InvalidChunkIdentifier { identifier: ChunkIdentifier(128) })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());
@@ -2993,7 +3038,7 @@ mod tests {
         // Insert in a chunk that exists, but at an item that does not exist.
         {
             assert_matches!(
-                linked_chunk.insert_items_at(['u', 'v'], Position(ChunkIdentifier(0), 128)),
+                linked_chunk.insert_items_at(Position(ChunkIdentifier(0), 128), ['u', 'v'],),
                 Err(Error::InvalidItemIndex { index: 128 })
             );
             assert!(linked_chunk.updates().unwrap().take().is_empty());

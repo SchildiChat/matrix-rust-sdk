@@ -1,11 +1,8 @@
 use std::collections::BTreeSet;
 
 use matrix_sdk_base::{sync::SyncResponse, RequestedRequiredStates};
-use ruma::{
-    api::client::{discovery::get_supported_versions, sync::sync_events::v5 as http},
-    events::AnyToDeviceEvent,
-    serde::Raw,
-};
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
+use ruma::api::client::{discovery::get_supported_versions, sync::sync_events::v5 as http};
 use tracing::error;
 
 use super::{SlidingSync, SlidingSyncBuilder};
@@ -43,7 +40,10 @@ pub enum VersionBuilderError {
 
     /// `/versions` does not contain `org.matrix.simplified_msc3575` in its
     /// `unstable_features`, or it's not set to true.
-    #[error("`/versions` does not contain `org.matrix.simplified_msc3575` in its `unstable_features`, or it's not set to true.")]
+    #[error(
+        "`/versions` does not contain `org.matrix.simplified_msc3575` in its `unstable_features`, \
+         or it's not set to true."
+    )]
     NativeVersionIsUnset,
 }
 
@@ -154,7 +154,7 @@ impl Client {
 #[must_use]
 pub(crate) struct SlidingSyncResponseProcessor {
     client: Client,
-    to_device_events: Vec<Raw<AnyToDeviceEvent>>,
+    to_device_events: Vec<ProcessedToDeviceEvent>,
     response: Option<SyncResponse>,
 }
 
@@ -201,16 +201,9 @@ impl SlidingSyncResponseProcessor {
             .await?;
         handle_receipts_extension(&self.client, response, &mut sync_response).await?;
 
+        update_in_memory_caches(&self.client, &sync_response).await?;
+
         self.response = Some(sync_response);
-        self.post_process().await
-    }
-
-    async fn post_process(&mut self) -> Result<()> {
-        // This is an internal API misuse if this is triggered (calling
-        // `handle_room_response` after this function), so panic is fine.
-        let response = self.response.as_ref().unwrap();
-
-        update_in_memory_caches(&self.client, response).await?;
 
         Ok(())
     }

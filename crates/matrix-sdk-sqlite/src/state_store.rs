@@ -16,7 +16,7 @@ use matrix_sdk_base::{
         RoomLoadSettings, SentRequestKey,
     },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
-    StateStoreDataKey, StateStoreDataValue,
+    StateStoreDataKey, StateStoreDataValue, ROOM_VERSION_FALLBACK,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
@@ -33,12 +33,12 @@ use ruma::{
     },
     serde::Raw,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::fs;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     error::{Error, Result},
@@ -390,7 +390,32 @@ impl SqliteStateStore {
 
     fn deserialize_json<T: DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
         let decoded = self.decode_value(data)?;
-        Ok(serde_json::from_slice(&decoded)?)
+
+        let json_deserializer = &mut serde_json::Deserializer::from_slice(&decoded);
+
+        serde_path_to_error::deserialize(json_deserializer).map_err(|err| {
+            let raw_json: Option<Raw<serde_json::Value>> = serde_json::from_slice(&decoded).ok();
+
+            let target_type = std::any::type_name::<T>();
+            let serde_path = err.path().to_string();
+
+            error!(
+                sentry = true,
+                %err,
+                "Failed to deserialize {target_type} in the state state: {serde_path}",
+            );
+
+            if let Some(raw) = raw_json {
+                if let Some(room_id) = raw.get_field::<OwnedRoomId>("room_id").ok().flatten() {
+                    warn!("Found a room id in the source data to deserialize: {room_id}");
+                }
+                if let Some(event_id) = raw.get_field::<OwnedEventId>("event_id").ok().flatten() {
+                    warn!("Found an event id in the source data to deserialize: {event_id}");
+                }
+            }
+
+            err.into_inner().into()
+        })
     }
 
     fn deserialize_value<T: DeserializeOwned>(&self, value: &[u8]) -> Result<T> {
@@ -410,9 +435,7 @@ impl SqliteStateStore {
     fn encode_state_store_data_key(&self, key: StateStoreDataKey<'_>) -> Key {
         let key_s = match key {
             StateStoreDataKey::SyncToken => Cow::Borrowed(StateStoreDataKey::SYNC_TOKEN),
-            StateStoreDataKey::ServerCapabilities => {
-                Cow::Borrowed(StateStoreDataKey::SERVER_CAPABILITIES)
-            }
+            StateStoreDataKey::ServerInfo => Cow::Borrowed(StateStoreDataKey::SERVER_INFO),
             StateStoreDataKey::Filter(f) => {
                 Cow::Owned(format!("{}:{f}", StateStoreDataKey::FILTER))
             }
@@ -1029,8 +1052,8 @@ impl StateStore for SqliteStateStore {
                     StateStoreDataKey::SyncToken => {
                         StateStoreDataValue::SyncToken(self.deserialize_value(&data)?)
                     }
-                    StateStoreDataKey::ServerCapabilities => {
-                        StateStoreDataValue::ServerCapabilities(self.deserialize_value(&data)?)
+                    StateStoreDataKey::ServerInfo => {
+                        StateStoreDataValue::ServerInfo(self.deserialize_value(&data)?)
                     }
                     StateStoreDataKey::Filter(_) => {
                         StateStoreDataValue::Filter(self.deserialize_value(&data)?)
@@ -1064,10 +1087,8 @@ impl StateStore for SqliteStateStore {
             StateStoreDataKey::SyncToken => self.serialize_value(
                 &value.into_sync_token().expect("Session data not a sync token"),
             )?,
-            StateStoreDataKey::ServerCapabilities => self.serialize_value(
-                &value
-                    .into_server_capabilities()
-                    .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => self.serialize_value(
+                &value.into_server_info().expect("Session data not containing server info"),
             )?,
             StateStoreDataKey::Filter(_) => {
                 self.serialize_value(&value.into_filter().expect("Session data not a filter"))?
@@ -1323,13 +1344,13 @@ impl StateStore for SqliteStateStore {
                             .ok()
                             .flatten()
                             .and_then(|v| this.deserialize_json::<RoomInfo>(&v).ok())
-                            .and_then(|info| info.room_version().cloned())
+                            .map(|info| info.room_version_or_default())
                             .unwrap_or_else(|| {
                                 warn!(
                                     ?room_id,
-                                    "Unable to find the room version, assume version 9"
+                                    "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}"
                                 );
-                                RoomVersionId::V9
+                                ROOM_VERSION_FALLBACK
                             })
                     };
 

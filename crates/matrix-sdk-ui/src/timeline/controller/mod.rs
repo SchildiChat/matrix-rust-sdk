@@ -24,10 +24,8 @@ use imbl::Vector;
 use matrix_sdk::{crypto::OlmMachine, SendOutsideWasm};
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
-    event_cache::{
-        paginator::{PaginationResult, Paginator},
-        RoomEventCache, RoomPaginationStatus,
-    },
+    event_cache::{RoomEventCache, RoomPaginationStatus},
+    paginators::{thread::ThreadedEventsLoader, PaginationResult, Paginator},
     send_queue::{
         LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendHandle, SendReactionHandle,
     },
@@ -67,7 +65,6 @@ use super::{
     event_item::{ReactionStatus, RemoteEventOrigin},
     item::TimelineUniqueId,
     subscriber::TimelineSubscriber,
-    threaded_events_loader::ThreadedEventsLoader,
     traits::{Decryptor, RoomDataProvider},
     DateDividerMode, EmbeddedEvent, Error, EventSendState, EventTimelineItem, InReplyToDetails,
     PaginationError, Profile, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
@@ -93,29 +90,36 @@ mod state;
 mod state_transaction;
 
 pub(super) use aggregations::*;
+pub(super) use decryption_retry_task::{spawn_crypto_tasks, CryptoDropHandles};
 
 /// Data associated to the current timeline focus.
+///
+/// This is the private counterpart of [`TimelineFocus`], and it is an augmented
+/// version of it, including extra state that makes it useful over the lifetime
+/// of a timeline.
 #[derive(Debug)]
-enum TimelineFocusData<P: RoomDataProvider> {
+pub(in crate::timeline) enum TimelineFocusKind<P: RoomDataProvider> {
     /// The timeline receives live events from the sync.
-    Live,
+    Live {
+        /// Whether to hide in-thread events from the timeline.
+        hide_threaded_events: bool,
+    },
 
     /// The timeline is focused on a single event, and it can expand in one
     /// direction or another.
     Event {
-        /// The event id we've started to focus on.
-        event_id: OwnedEventId,
         /// The paginator instance.
         paginator: Paginator<P>,
-        /// Number of context events to request for the first request.
-        num_context_events: u16,
+
+        /// Whether to hide in-thread events from the timeline.
+        hide_threaded_events: bool,
     },
 
     Thread {
         loader: ThreadedEventsLoader<P>,
 
-        /// Number of relations events to requests for the first request
-        num_events: u16,
+        /// The root event for the current thread.
+        root_event_id: OwnedEventId,
     },
 
     PinnedEvents {
@@ -126,10 +130,10 @@ enum TimelineFocusData<P: RoomDataProvider> {
 #[derive(Clone, Debug)]
 pub(super) struct TimelineController<P: RoomDataProvider = Room, D: Decryptor = Room> {
     /// Inner mutable state.
-    state: Arc<RwLock<TimelineState>>,
+    state: Arc<RwLock<TimelineState<P>>>,
 
-    /// Inner mutable focus state.
-    focus: Arc<RwLock<TimelineFocusData<P>>>,
+    /// Focus data.
+    focus: Arc<TimelineFocusKind<P>>,
 
     /// A [`RoomDataProvider`] implementation, providing data.
     ///
@@ -141,7 +145,7 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room, D: Decryptor = 
 
     /// Long-running task used to retry decryption of timeline items without
     /// blocking main processing.
-    decryption_retry_task: DecryptionRetryTask<D>,
+    decryption_retry_task: DecryptionRetryTask<P, D>,
 }
 
 #[derive(Clone)]
@@ -179,14 +183,6 @@ impl Default for TimelineSettings {
             date_divider_mode: DateDividerMode::Daily,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum TimelineFocusKind {
-    Live { hide_threaded_events: bool },
-    Event { hide_threaded_events: bool },
-    Thread { root_event_id: OwnedEventId },
-    PinnedEvents,
 }
 
 /// The default event filter for
@@ -277,45 +273,40 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
+        settings: TimelineSettings,
     ) -> Self {
-        let (focus_data, focus_kind) = match focus {
+        let focus = match focus {
             TimelineFocus::Live { hide_threaded_events } => {
-                (TimelineFocusData::Live, TimelineFocusKind::Live { hide_threaded_events })
+                TimelineFocusKind::Live { hide_threaded_events }
             }
 
-            TimelineFocus::Event { target, num_context_events, hide_threaded_events } => {
+            TimelineFocus::Event { hide_threaded_events, .. } => {
                 let paginator = Paginator::new(room_data_provider.clone());
-                (
-                    TimelineFocusData::Event { paginator, event_id: target, num_context_events },
-                    TimelineFocusKind::Event { hide_threaded_events },
-                )
+                TimelineFocusKind::Event { paginator, hide_threaded_events }
             }
 
-            TimelineFocus::Thread { root_event_id, num_events } => (
-                TimelineFocusData::Thread {
-                    loader: ThreadedEventsLoader::new(
-                        room_data_provider.clone(),
-                        root_event_id.clone(),
-                    ),
-                    num_events,
-                },
-                TimelineFocusKind::Thread { root_event_id },
-            ),
+            TimelineFocus::Thread { root_event_id, .. } => TimelineFocusKind::Thread {
+                loader: ThreadedEventsLoader::new(
+                    room_data_provider.clone(),
+                    root_event_id.clone(),
+                ),
+                root_event_id,
+            },
 
-            TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests } => (
-                TimelineFocusData::PinnedEvents {
+            TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests } => {
+                TimelineFocusKind::PinnedEvents {
                     loader: PinnedEventsLoader::new(
                         Arc::new(room_data_provider.clone()),
                         max_events_to_load as usize,
                         max_concurrent_requests as usize,
                     ),
-                },
-                TimelineFocusKind::PinnedEvents,
-            ),
+                }
+            }
         };
 
+        let focus = Arc::new(focus);
         let state = Arc::new(RwLock::new(TimelineState::new(
-            focus_kind,
+            focus.clone(),
             room_data_provider.own_user_id().to_owned(),
             room_data_provider.room_version(),
             internal_id_prefix,
@@ -323,18 +314,10 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
             is_room_encrypted,
         )));
 
-        let settings = TimelineSettings::default();
-
         let decryption_retry_task =
             DecryptionRetryTask::new(state.clone(), room_data_provider.clone());
 
-        Self {
-            state,
-            focus: Arc::new(RwLock::new(focus_data)),
-            room_data_provider,
-            settings,
-            decryption_retry_task,
-        }
+        Self { state, focus, room_data_provider, settings, decryption_retry_task }
     }
 
     /// Initializes the configured focus with appropriate data.
@@ -345,12 +328,11 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
     /// Returns whether there were any events added to the timeline.
     pub(super) async fn init_focus(
         &self,
+        focus: &TimelineFocus,
         room_event_cache: &RoomEventCache,
     ) -> Result<bool, Error> {
-        let focus_guard = self.focus.read().await;
-
-        match &*focus_guard {
-            TimelineFocusData::Live => {
+        match focus {
+            TimelineFocus::Live { .. } => {
                 // Retrieve the cached events, and add them to the timeline.
                 let events = room_event_cache.events().await;
 
@@ -376,14 +358,17 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                 Ok(has_events)
             }
 
-            TimelineFocusData::Event { event_id, paginator, num_context_events } => {
+            TimelineFocus::Event { target: event_id, num_context_events, .. } => {
+                let TimelineFocusKind::Event { paginator, .. } = &*self.focus else {
+                    // Note: this is sync'd with code in the ctor.
+                    unreachable!();
+                };
+
                 // Start a /context request, and append the results (in order) to the timeline.
                 let start_from_result = paginator
                     .start_from(event_id, (*num_context_events).into())
                     .await
                     .map_err(PaginationError::Paginator)?;
-
-                drop(focus_guard);
 
                 let has_events = !start_from_result.events.is_empty();
 
@@ -396,13 +381,16 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                 Ok(has_events)
             }
 
-            TimelineFocusData::Thread { loader, num_events } => {
+            TimelineFocus::Thread { num_events, .. } => {
+                let TimelineFocusKind::Thread { loader, .. } = &*self.focus else {
+                    // Note: this is sync'd with code in the ctor.
+                    unreachable!();
+                };
+
                 let result = loader
                     .paginate_backwards((*num_events).into())
                     .await
                     .map_err(PaginationError::Paginator)?;
-
-                drop(focus_guard);
 
                 // Events are in reverse topological order.
                 self.replace_with_initial_remote_events(
@@ -414,15 +402,18 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                 Ok(true)
             }
 
-            TimelineFocusData::PinnedEvents { loader } => {
+            TimelineFocus::PinnedEvents { .. } => {
+                let TimelineFocusKind::PinnedEvents { loader } = &*self.focus else {
+                    // Note: this is sync'd with code in the ctor.
+                    unreachable!();
+                };
+
                 let Some(loaded_events) =
                     loader.load_events().await.map_err(Error::PinnedEventsError)?
                 else {
                     // There wasn't any events.
                     return Ok(false);
                 };
-
-                drop(focus_guard);
 
                 let has_events = !loaded_events.is_empty();
 
@@ -471,9 +462,7 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
     pub(crate) async fn reload_pinned_events(
         &self,
     ) -> Result<Option<Vec<TimelineEvent>>, PinnedEventsLoaderError> {
-        let focus_guard = self.focus.read().await;
-
-        if let TimelineFocusData::PinnedEvents { loader } = &*focus_guard {
+        if let TimelineFocusKind::PinnedEvents { loader } = &*self.focus {
             loader.load_events().await
         } else {
             Err(PinnedEventsLoaderError::TimelineFocusNotPinnedEvents)
@@ -496,7 +485,9 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
             .subscriber_skip_count
             .compute_next_when_paginating_backwards(num_events.into());
 
-        state.meta.subscriber_skip_count.update(count, &state.timeline_focus);
+        // This always happens on a live timeline.
+        let is_live_timeline = true;
+        state.meta.subscriber_skip_count.update(count, is_live_timeline);
 
         needs
     }
@@ -509,16 +500,16 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         &self,
         num_events: u16,
     ) -> Result<bool, PaginationError> {
-        let PaginationResult { events, hit_end_of_timeline } = match &*self.focus.read().await {
-            TimelineFocusData::Live | TimelineFocusData::PinnedEvents { .. } => {
-                return Err(PaginationError::NotSupported)
+        let PaginationResult { events, hit_end_of_timeline } = match &*self.focus {
+            TimelineFocusKind::Live { .. } | TimelineFocusKind::PinnedEvents { .. } => {
+                return Err(PaginationError::NotSupported);
             }
-            TimelineFocusData::Event { paginator, .. } => paginator
+            TimelineFocusKind::Event { paginator, .. } => paginator
                 .paginate_backward(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
-            TimelineFocusData::Thread { loader, num_events } => loader
-                .paginate_backwards((*num_events).into())
+            TimelineFocusKind::Thread { loader, .. } => loader
+                .paginate_backwards(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
         };
@@ -542,12 +533,12 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         &self,
         num_events: u16,
     ) -> Result<bool, PaginationError> {
-        let PaginationResult { events, hit_end_of_timeline } = match &*self.focus.read().await {
-            TimelineFocusData::Live
-            | TimelineFocusData::PinnedEvents { .. }
-            | TimelineFocusData::Thread { .. } => return Err(PaginationError::NotSupported),
+        let PaginationResult { events, hit_end_of_timeline } = match &*self.focus {
+            TimelineFocusKind::Live { .. }
+            | TimelineFocusKind::PinnedEvents { .. }
+            | TimelineFocusKind::Thread { .. } => return Err(PaginationError::NotSupported),
 
-            TimelineFocusData::Event { paginator, .. } => paginator
+            TimelineFocusKind::Event { paginator, .. } => paginator
                 .paginate_forward(num_events.into())
                 .await
                 .map_err(PaginationError::Paginator)?,
@@ -565,13 +556,8 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
     }
 
     /// Is this timeline receiving events from sync (aka has a live focus)?
-    pub(super) async fn is_live(&self) -> bool {
-        matches!(&*self.focus.read().await, TimelineFocusData::Live)
-    }
-
-    pub(super) fn with_settings(mut self, settings: TimelineSettings) -> Self {
-        self.settings = settings;
-        self
+    pub(super) fn is_live(&self) -> bool {
+        matches!(&*self.focus, TimelineFocusKind::Live { .. })
     }
 
     /// Get a copy of the current items in the list.
@@ -717,7 +703,10 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                     let new_item = item.with_reactions(reactions);
                     state.items.replace(item_pos, new_item);
                 } else {
-                    warn!("reaction is missing on the item, not removing it locally, but sending redaction.");
+                    warn!(
+                        "reaction is missing on the item, not removing it locally, \
+                         but sending redaction."
+                    );
                 }
 
                 // Release the lock before running the request.
@@ -742,7 +731,10 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                             let new_item = item.with_reactions(reactions);
                             state.items.replace(item_pos, new_item);
                         } else {
-                            warn!("couldn't find item to re-add reaction anymore; maybe it's been redacted?");
+                            warn!(
+                                "couldn't find item to re-add reaction anymore; \
+                                 maybe it's been redacted?"
+                            );
                         }
                     }
 
@@ -1497,7 +1489,9 @@ impl TimelineController {
                         event_id,
                         state.items.all_remote_events(),
                     ) {
-                        trace!("event referred to new receipt is {relative_pos:?} the previous receipt");
+                        trace!(
+                            "event referred to new receipt is {relative_pos:?} the previous receipt"
+                        );
                         return relative_pos == RelativePosition::After;
                     }
                 }
@@ -1514,7 +1508,9 @@ impl TimelineController {
                         event_id,
                         state.items.all_remote_events(),
                     ) {
-                        trace!("event referred to new receipt is {relative_pos:?} the previous receipt");
+                        trace!(
+                            "event referred to new receipt is {relative_pos:?} the previous receipt"
+                        );
                         return relative_pos == RelativePosition::After;
                     }
                 }
@@ -1549,6 +1545,36 @@ impl TimelineController {
     pub(super) async fn retry_event_decryption(&self, session_ids: Option<BTreeSet<String>>) {
         self.retry_event_decryption_inner(self.room().clone(), session_ids).await
     }
+
+    /// Combine the global (event cache) pagination status with the local state
+    /// of the timeline.
+    ///
+    /// This only changes the global pagination status of this room, in one
+    /// case: if the timeline has a skip count greater than 0, it will
+    /// ensure that the pagination status says that we haven't reached the
+    /// timeline start yet.
+    pub(super) async fn map_pagination_status(
+        &self,
+        status: RoomPaginationStatus,
+    ) -> RoomPaginationStatus {
+        match status {
+            RoomPaginationStatus::Idle { hit_timeline_start } => {
+                if hit_timeline_start {
+                    let state = self.state.read().await;
+                    // If the skip count is greater than 0, it means that a subsequent pagination
+                    // could return more items, so pretend we didn't get the information that the
+                    // timeline start was hit.
+                    if state.meta.subscriber_skip_count.get() > 0 {
+                        return RoomPaginationStatus::Idle { hit_timeline_start: false };
+                    }
+                }
+            }
+            RoomPaginationStatus::Paginating => {}
+        }
+
+        // You're perfect, just the way you are.
+        status
+    }
 }
 
 #[cfg(test)]
@@ -1564,9 +1590,9 @@ impl<P: RoomDataProvider> TimelineController<P, (OlmMachine, OwnedRoomId)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn fetch_replied_to_event(
-    mut state_guard: RwLockWriteGuard<'_, TimelineState>,
-    state_lock: &RwLock<TimelineState>,
+async fn fetch_replied_to_event<P: RoomDataProvider>(
+    mut state_guard: RwLockWriteGuard<'_, TimelineState<P>>,
+    state_lock: &RwLock<TimelineState<P>>,
     index: usize,
     item: &EventTimelineItem,
     internal_id: TimelineUniqueId,
