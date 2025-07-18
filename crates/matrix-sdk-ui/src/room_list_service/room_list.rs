@@ -23,10 +23,10 @@ use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
-use futures_util::{pin_mut, stream, Stream, StreamExt as _};
+use futures_util::{Stream, StreamExt as _, pin_mut, stream};
 use matrix_sdk::{
-    executor::{spawn, JoinHandle},
     Client, SlidingSync, SlidingSyncList,
+    executor::{JoinHandle, spawn},
 };
 use matrix_sdk_base::RoomInfoNotableUpdate;
 use tokio::{
@@ -38,9 +38,9 @@ use tracing::{error, trace};
 use super::sorters::BoxedSorterFn;
 
 use super::{
+    Error, Room, State,
     filters::BoxedFilterFn,
     //sorters::{new_sorter_lexicographic, new_sorter_name, new_sorter_recency},
-    Error, Room, State,
 };
 
 /// A `RoomList` represents a list of rooms, from a

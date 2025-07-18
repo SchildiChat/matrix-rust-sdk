@@ -1,11 +1,11 @@
 use ruma::{
     events::{
-        presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent,
-        AnyStrippedStateEvent, AnySyncStateEvent,
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
+        AnySyncStateEvent, presence::PresenceEvent,
     },
     serde::Raw,
 };
-use serde_json::{from_value as from_json_value, Value as JsonValue};
+use serde_json::{Value as JsonValue, from_value as from_json_value};
 
 use crate::test_json;
 
@@ -147,6 +147,7 @@ impl From<PresenceTestEvent> for Raw<PresenceEvent> {
 pub enum GlobalAccountDataTestEvent {
     Direct,
     PushRules,
+    IgnoredUserList,
     Custom(JsonValue),
 }
 
@@ -155,6 +156,9 @@ impl From<GlobalAccountDataTestEvent> for JsonValue {
         match val {
             GlobalAccountDataTestEvent::Direct => test_json::sync_events::DIRECT.to_owned(),
             GlobalAccountDataTestEvent::PushRules => test_json::sync_events::PUSH_RULES.to_owned(),
+            GlobalAccountDataTestEvent::IgnoredUserList => {
+                test_json::sync_events::IGNORED_USER_LIST.to_owned()
+            }
             GlobalAccountDataTestEvent::Custom(json) => json,
         }
     }

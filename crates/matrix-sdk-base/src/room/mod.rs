@@ -44,11 +44,11 @@ use matrix_sdk_common::ring_buffer::RingBuffer;
 pub use members::{RoomMember, RoomMembersUpdate, RoomMemberships};
 pub(crate) use room_info::SyncInfo;
 pub use room_info::{
-    apply_redaction, BaseRoomInfo, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
+    apply_redaction, BaseRoomInfo, InviteAcceptanceDetails, RoomInfo, RoomInfoNotableUpdate,
+    RoomInfoNotableUpdateReasons,
 };
-#[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use ruma::{
+    assign,
     events::{
         direct::OwnedDirectUserIdentifier,
         receipt::{Receipt, ReceiptThread, ReceiptType},
@@ -60,9 +60,12 @@ use ruma::{
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
         },
     },
+    int,
     room::RoomType,
     EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
+#[cfg(feature = "e2e-encryption")]
+use ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use serde::{Deserialize, Serialize};
 pub use state::{RoomState, RoomStateFilter};
 pub(crate) use tags::RoomNotableTags;
@@ -384,6 +387,23 @@ impl Room {
             .power_levels())
     }
 
+    /// Get the current power levels of this room, or a sensible default if they
+    /// are not known.
+    pub async fn power_levels_or_default(&self) -> RoomPowerLevels {
+        if let Ok(power_levels) = self.power_levels().await {
+            return power_levels;
+        }
+
+        // As a fallback, create the default power levels of a room, with the creator at
+        // level 100.
+        let creator = self.creator();
+        assign!(
+            RoomPowerLevelsEventContent::new(),
+            { users: creator.into_iter().map(|user_id| (user_id, int!(100))).collect() }
+        )
+        .into()
+    }
+
     /// Get the `m.room.name` of this room.
     ///
     /// The returned string may be empty if the event has been redacted, or it's
@@ -469,6 +489,17 @@ impl Room {
     /// Please read `RoomInfo::recency_stamp` to learn more.
     pub fn recency_stamp(&self) -> Option<u64> {
         self.inner.read().recency_stamp
+    }
+
+    /// Returns the details about an invite to this room if the invite has been
+    /// accepted by this specific client.
+    ///
+    /// # Returns
+    /// - `Some` if an invite has been accepted by this specific client.
+    /// - `None` if we didn't join this room using an invite or the invite
+    ///   wasn't accepted by this client.
+    pub fn invite_acceptance_details(&self) -> Option<InviteAcceptanceDetails> {
+        self.inner.read().invite_acceptance_details.clone()
     }
 
     /// Get a `Stream` of loaded pinned events for this room.

@@ -9,7 +9,7 @@ name = "matrix-sdk"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version.workspace = true
-version = "0.12.0"
+version = "0.13.0"
 
 [package.metadata.docs.rs]
 features = ["docsrs"]
@@ -102,7 +102,7 @@ rand = { workspace = true, optional = true }
 ruma = { workspace = true, features = [
     "rand",
     "unstable-msc2448",
-    "unstable-msc2965",
+    "unstable-msc4191",
     "unstable-msc3930",
     "unstable-msc3245-v1-compat",
     "unstable-msc4230",

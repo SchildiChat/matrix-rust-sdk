@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "anymap2",
@@ -2950,8 +2950,9 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-base"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
+ "anyhow",
  "as_variant",
  "assert_matches",
  "assert_matches2",
@@ -2986,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-common"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "assert_matches",
  "assert_matches2",
@@ -3017,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-crypto"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -3099,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-ffi"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "as_variant",
@@ -3146,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-indexeddb"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "assert_matches",
@@ -3215,7 +3216,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-qrcode"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "byteorder",
  "image",
@@ -3227,7 +3228,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-sqlite"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "as_variant",
  "assert_matches",
@@ -3258,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-store-encryption"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3278,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-test"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "as_variant",
  "ctor",
@@ -3300,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-test-macros"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "quote",
  "syn",
@@ -3308,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-ui"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "as_variant",
@@ -3438,6 +3439,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "imbl",
+ "indexmap",
  "itertools 0.14.0",
  "matrix-sdk",
  "matrix-sdk-base",
@@ -4460,8 +4462,8 @@ dependencies = [
 
 [[package]]
 name = "ruma"
-version = "0.12.3"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+version = "0.12.5"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "assign",
  "js_int",
@@ -4476,8 +4478,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-client-api"
-version = "0.20.3"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+version = "0.20.4"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "as_variant",
  "assign",
@@ -4499,8 +4501,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-common"
-version = "0.15.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+version = "0.15.4"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "as_variant",
  "base64",
@@ -4531,8 +4533,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-events"
-version = "0.30.3"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+version = "0.30.4"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -4556,8 +4558,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-federation-api"
-version = "0.11.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+version = "0.11.2"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "http",
  "js_int",
@@ -4571,7 +4573,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.4.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -4583,7 +4585,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.10.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "js_int",
  "thiserror 2.0.11",
@@ -4591,8 +4593,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-macros"
-version = "0.15.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=d3ffb478e#d3ffb478eb744cb9beeecbebc225e6a04a00daa0"
+version = "0.15.2"
+source = "git+https://github.com/SchildiChat/ruma?rev=e178b5e84#e178b5e8440a6fcbabfb119c93c2f10de8fc8c14"
 dependencies = [
  "cfg-if",
  "proc-macro-crate",

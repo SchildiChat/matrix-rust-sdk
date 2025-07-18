@@ -48,16 +48,17 @@ mod utils;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use client::BaseClient;
+pub use client::{BaseClient, ThreadingSupport};
 #[cfg(any(test, feature = "testing"))]
 pub use http;
 #[cfg(feature = "e2e-encryption")]
 pub use matrix_sdk_crypto as crypto;
 pub use once_cell;
 pub use room::{
-    apply_redaction, EncryptionState, PredecessorRoom, Room, RoomCreateWithCreatorEventContent,
-    RoomDisplayName, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
-    RoomMember, RoomMembersUpdate, RoomMemberships, RoomState, RoomStateFilter, SuccessorRoom,
+    apply_redaction, EncryptionState, InviteAcceptanceDetails, PredecessorRoom, Room,
+    RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo, RoomInfoNotableUpdate,
+    RoomInfoNotableUpdateReasons, RoomMember, RoomMembersUpdate, RoomMemberships, RoomState,
+    RoomStateFilter, SuccessorRoom,
 };
 pub use store::{
     ComposerDraft, ComposerDraftType, QueueWedgeError, StateChanges, StateStore, StateStoreDataKey,

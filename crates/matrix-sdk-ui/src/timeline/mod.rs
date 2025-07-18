@@ -28,33 +28,33 @@ use imbl::Vector;
 #[cfg(feature = "unstable-msc4274")]
 use matrix_sdk::attachment::{AttachmentInfo, Thumbnail};
 use matrix_sdk::{
+    Result,
     attachment::AttachmentConfig,
     deserialized_responses::TimelineEvent,
     event_cache::{EventCacheDropHandles, RoomEventCache},
     executor::JoinHandle,
-    room::{edit::EditedContent, reply::Reply, Receipts, Room},
+    room::{Receipts, Room, edit::EditedContent, reply::Reply},
     send_queue::{RoomSendQueueError, SendHandle},
-    Result,
 };
 use mime::Mime;
 use pinned_events_loader::PinnedEventsRoom;
 use ruma::{
+    EventId, OwnedEventId, RoomVersionId, UserId,
     api::client::receipt::create_receipt::v3::ReceiptType,
     events::{
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
         poll::unstable_start::{NewUnstablePollStartEventContent, UnstablePollStartEventContent},
         receipt::{Receipt, ReceiptThread},
         room::{
             message::RoomMessageEventContentWithoutRelation,
             pinned_events::RoomPinnedEventsEventContent,
         },
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
-    EventId, OwnedEventId, RoomVersionId, UserId,
 };
 #[cfg(feature = "unstable-msc4274")]
 use ruma::{
-    events::{room::message::FormattedBody, Mentions},
     OwnedTransactionId,
+    events::{Mentions, room::message::FormattedBody},
 };
 use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
@@ -146,11 +146,7 @@ pub enum TimelineFocus {
     },
 
     /// Focus on a specific thread
-    Thread {
-        root_event_id: OwnedEventId,
-        /// Number of initial events to load on the first /relations request.
-        num_events: u16,
-    },
+    Thread { root_event_id: OwnedEventId },
 
     /// Only show pinned events.
     PinnedEvents { max_events_to_load: u16, max_concurrent_requests: u16 },
@@ -255,7 +251,8 @@ impl Timeline {
     /// and batches them.
     pub async fn subscribe(
         &self,
-    ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>>) {
+    ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>> + use<>)
+    {
         let (items, stream) = self.controller.subscribe().await;
         let stream = TimelineWithDropHandle::new(stream, self.drop_handle.clone());
         (items, stream)
@@ -564,7 +561,7 @@ impl Timeline {
     }
 
     /// Subscribe to changes in the read receipts of our own user.
-    pub async fn subscribe_own_user_read_receipts_changed(&self) -> impl Stream<Item = ()> {
+    pub async fn subscribe_own_user_read_receipts_changed(&self) -> impl Stream<Item = ()> + use<> {
         self.controller.subscribe_own_user_read_receipts_changed().await
     }
 
@@ -577,14 +574,18 @@ impl Timeline {
     /// If an unthreaded receipt is sent, this will also unset the unread flag
     /// of the room if necessary.
     ///
+    /// The thread of the receipt is determined by the timeline instance's
+    /// focus mode and `hide_threaded_events` flag.
+    ///
     /// Returns a boolean indicating if it sent the receipt or not.
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn send_single_receipt(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
         event_id: OwnedEventId,
     ) -> Result<bool> {
+        let thread = self.controller.infer_thread_for_read_receipt(&receipt_type);
+
         if !self.controller.should_send_receipt(&receipt_type, &thread, &event_id).await {
             trace!(
                 "not sending receipt, because we already cover the event with a previous receipt"
@@ -692,12 +693,14 @@ impl Timeline {
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<bool> {
         if let Some(event_id) = self.controller.latest_event_id().await {
-            self.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
+            self.send_single_receipt(receipt_type, event_id).await
         } else {
             trace!("can't mark room as read because there's no latest event id");
 
-            // Unset the read marker.
-            self.room().set_unread_flag(false).await?;
+            // For live timelines, unset the read marker in this case.
+            if self.controller.is_live() {
+                self.room().set_unread_flag(false).await?;
+            }
 
             Ok(false)
         }
@@ -790,6 +793,7 @@ impl Timeline {
 struct TimelineDropHandle {
     room_update_join_handle: JoinHandle<()>,
     pinned_events_join_handle: Option<JoinHandle<()>>,
+    thread_update_join_handle: Option<JoinHandle<()>>,
     local_echo_listener_handle: JoinHandle<()>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
     _crypto_drop_handles: CryptoDropHandles,
@@ -798,8 +802,12 @@ struct TimelineDropHandle {
 impl Drop for TimelineDropHandle {
     fn drop(&mut self) {
         if let Some(handle) = self.pinned_events_join_handle.take() {
-            handle.abort()
-        };
+            handle.abort();
+        }
+
+        if let Some(handle) = self.thread_update_join_handle.take() {
+            handle.abort();
+        }
 
         self.local_echo_listener_handle.abort();
         self.room_update_join_handle.abort();

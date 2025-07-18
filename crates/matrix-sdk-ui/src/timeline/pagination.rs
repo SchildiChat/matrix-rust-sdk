@@ -15,7 +15,7 @@
 use async_rx::StreamExt as _;
 use async_stream::stream;
 use futures_core::Stream;
-use futures_util::{pin_mut, StreamExt as _};
+use futures_util::{StreamExt as _, pin_mut};
 use matrix_sdk::event_cache::{self, EventCacheError, RoomPaginationStatus};
 use tracing::{instrument, warn};
 
@@ -45,6 +45,10 @@ impl super::Timeline {
             }
 
             Ok(self.live_paginate_backwards(num_events).await?)
+        } else if let Some(thread_root) = self.controller.thread_root() {
+            // Note: in the future (when the event cache implements persistent storage for
+            // threads), we might need to load the related events too here.
+            Ok(self.event_cache.paginate_thread_backwards(thread_root, num_events).await?)
         } else {
             Ok(self.controller.focused_paginate_backwards(num_events).await?)
         }
@@ -103,7 +107,7 @@ impl super::Timeline {
     /// call to [`Self::paginate_backwards()`].
     pub async fn live_back_pagination_status(
         &self,
-    ) -> Option<(RoomPaginationStatus, impl Stream<Item = RoomPaginationStatus>)> {
+    ) -> Option<(RoomPaginationStatus, impl Stream<Item = RoomPaginationStatus> + use<>)> {
         if !self.controller.is_live() {
             return None;
         }

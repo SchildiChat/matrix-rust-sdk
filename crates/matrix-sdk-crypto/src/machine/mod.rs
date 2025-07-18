@@ -266,9 +266,6 @@ impl OlmMachine {
 
     /// Create a new OlmMachine with the given [`CryptoStore`].
     ///
-    /// The created machine will keep the encryption keys only in memory and
-    /// once the object is dropped the keys will be lost.
-    ///
     /// If the store already contains encryption keys for the given user/device
     /// pair those will be re-used. Otherwise new ones will be created and
     /// stored.
@@ -618,7 +615,7 @@ impl OlmMachine {
             AnyIncomingResponse::KeysBackup(_) => {
                 Box::pin(self.inner.backup_machine.mark_request_as_sent(request_id)).await?;
             }
-        };
+        }
 
         Ok(())
     }

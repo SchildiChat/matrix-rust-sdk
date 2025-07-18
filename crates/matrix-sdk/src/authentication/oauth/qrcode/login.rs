@@ -24,7 +24,7 @@ use matrix_sdk_base::{
 };
 use oauth2::{DeviceCodeErrorResponseType, StandardDeviceAuthorizationResponse};
 use ruma::{
-    api::client::discovery::get_authorization_server_metadata::msc2965::AuthorizationServerMetadata,
+    api::client::discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadata,
     OwnedDeviceId,
 };
 use tracing::trace;
@@ -189,7 +189,7 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
                 }
 
                 return Err(e.into());
-            };
+            }
 
             // We only received an access token from the OAuth 2.0 authorization server, we
             // have no clue who we are, so we need to figure out our user ID

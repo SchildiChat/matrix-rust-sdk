@@ -43,7 +43,7 @@ use ruma::{
     },
     push::Ruleset,
     time::Instant,
-    OwnedRoomId, OwnedUserId, RoomId, UserId,
+    MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
 use tokio::sync::{broadcast, Mutex};
 #[cfg(feature = "e2e-encryption")]
@@ -66,7 +66,7 @@ use crate::{
         StateStoreDataValue, StateStoreExt, StoreConfig,
     },
     sync::{RoomUpdates, SyncResponse},
-    RoomStateFilter, SessionMeta,
+    InviteAcceptanceDetails, RoomStateFilter, SessionMeta,
 };
 
 /// A no (network) IO client implementation.
@@ -76,11 +76,12 @@ use crate::{
 /// rather through `matrix_sdk::Client`.
 ///
 /// ```rust
-/// use matrix_sdk_base::{store::StoreConfig, BaseClient};
+/// use matrix_sdk_base::{store::StoreConfig, BaseClient, ThreadingSupport};
 ///
-/// let client = BaseClient::new(StoreConfig::new(
-///     "cross-process-holder-name".to_owned(),
-/// ));
+/// let client = BaseClient::new(
+///     StoreConfig::new("cross-process-holder-name".to_owned()),
+///     ThreadingSupport::Disabled,
+/// );
 /// ```
 #[derive(Clone)]
 pub struct BaseClient {
@@ -122,6 +123,9 @@ pub struct BaseClient {
     /// If the client should handle verification events received when syncing.
     #[cfg(feature = "e2e-encryption")]
     pub handle_verification_events: bool,
+
+    /// Whether the client supports threads or not.
+    pub threading_support: ThreadingSupport,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -134,6 +138,25 @@ impl fmt::Debug for BaseClient {
     }
 }
 
+/// Whether this client instance supports threading or not. Currently used to
+/// determine how the client handles read receipts and unread count computations
+/// on the base SDK level.
+///
+/// Timelines on the other hand have a separate `TimelineFocus`
+/// `hide_threaded_events` associated value that can be used to hide threaded
+/// events but also to enable threaded read receipt sending. This is because
+/// certain timeline instances should ignore threading no matter what's defined
+/// at the client level. One such example are media filtered timelines which
+/// should contain all the room's media no matter what thread its in (unless
+/// explicitly opted into).
+#[derive(Clone, Copy, Debug)]
+pub enum ThreadingSupport {
+    /// Threading enabled
+    Enabled,
+    /// Threading disabled
+    Disabled,
+}
+
 impl BaseClient {
     /// Create a new client.
     ///
@@ -141,7 +164,7 @@ impl BaseClient {
     ///
     /// * `config` - the configuration for the stores (state store, event cache
     ///   store and crypto store).
-    pub fn new(config: StoreConfig) -> Self {
+    pub fn new(config: StoreConfig, threading_support: ThreadingSupport) -> Self {
         let store = BaseStateStore::new(config.state_store);
 
         // Create the channel to receive `RoomInfoNotableUpdate`.
@@ -173,6 +196,7 @@ impl BaseClient {
             },
             #[cfg(feature = "e2e-encryption")]
             handle_verification_events: true,
+            threading_support,
         }
     }
 
@@ -204,6 +228,7 @@ impl BaseClient {
             room_key_recipient_strategy: self.room_key_recipient_strategy.clone(),
             decryption_settings: self.decryption_settings.clone(),
             handle_verification_events,
+            threading_support: self.threading_support,
         };
 
         copy.state_store
@@ -224,7 +249,7 @@ impl BaseClient {
     ) -> Result<Self> {
         let config = StoreConfig::new(cross_process_store_locks_holder.to_owned())
             .state_store(MemoryStore::new());
-        Ok(Self::new(config))
+        Ok(Self::new(config, ThreadingSupport::Disabled))
     }
 
     /// Get the session meta information.
@@ -396,10 +421,49 @@ impl BaseClient {
         Ok(room)
     }
 
-    /// User has joined a room.
+    /// The user has joined a room using this specific client.
+    ///
+    /// This method should be called if the user accepts an invite or if they
+    /// join a public room.
+    ///
+    /// The method will create a [`Room`] object if one does not exist yet and
+    /// set the state of the [`Room`] to [`RoomState::Joined`]. The [`Room`]
+    /// object will be persisted in the cache. Please note that the [`Room`]
+    /// will be a stub until a sync has been received with the full room
+    /// state using [`BaseClient::receive_sync_response`].
     ///
     /// Update the internal and cached state accordingly. Return the final Room.
-    pub async fn room_joined(&self, room_id: &RoomId) -> Result<Room> {
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The unique ID identifying the joined room.
+    /// * `inviter` - When joining this room in response to an invitation, the
+    ///   inviter should be recorded before sending the join request to the
+    ///   server. Providing the inviter here ensures that the
+    ///   [`InviteAcceptanceDetails`] are stored for this room.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use matrix_sdk_base::{BaseClient, store::StoreConfig, RoomState, ThreadingSupport};
+    /// # use ruma::{OwnedRoomId, OwnedUserId, RoomId};
+    /// # async {
+    /// # let client = BaseClient::new(StoreConfig::new("example".to_owned()), ThreadingSupport::Disabled);
+    /// # async fn send_join_request() -> anyhow::Result<OwnedRoomId> { todo!() }
+    /// # async fn maybe_get_inviter(room_id: &RoomId) -> anyhow::Result<Option<OwnedUserId>> { todo!() }
+    /// # let room_id: &RoomId = todo!();
+    /// let maybe_inviter = maybe_get_inviter(room_id).await?;
+    /// let room_id = send_join_request().await?;
+    /// let room = client.room_joined(&room_id, maybe_inviter).await?;
+    ///
+    /// assert_eq!(room.state(), RoomState::Joined);
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn room_joined(
+        &self,
+        room_id: &RoomId,
+        inviter: Option<OwnedUserId>,
+    ) -> Result<Room> {
         let room = self.state_store.get_or_create_room(
             room_id,
             RoomState::Joined,
@@ -407,16 +471,43 @@ impl BaseClient {
             None,
         );
 
+        // If the state isn't `RoomState::Joined` then this means that we knew about
+        // this room before. Let's modify the existing state now.
         if room.state() != RoomState::Joined {
             let _sync_lock = self.sync_lock().lock().await;
 
             let mut room_info = room.clone_info();
+            let previous_state = room.state();
+
             room_info.mark_as_joined();
             room_info.mark_state_partially_synced();
             room_info.mark_members_missing(); // the own member event changed
+
+            // If our previous state was an invite and we're now in the joined state, this
+            // means that the user has explicitly accepted an invite. Let's
+            // remember some details about the invite.
+            //
+            // This is somewhat of a workaround for our lack of cryptographic membership.
+            // Later on we will decide if historic room keys should be accepted
+            // based on this info. If a user has accepted an invite and we receive a room
+            // key bundle shortly after, we might accept it. If we don't do
+            // this, the homeserver could trick us into accepting any historic room key
+            // bundle.
+            if previous_state == RoomState::Invited {
+                if let Some(inviter) = inviter {
+                    let details = InviteAcceptanceDetails {
+                        invite_accepted_at: MilliSecondsSinceUnixEpoch::now(),
+                        inviter,
+                    };
+                    room_info.set_invite_acceptance_details(details);
+                }
+            }
+
             let mut changes = StateChanges::default();
             changes.add_room(room_info.clone());
+
             self.state_store.save_changes(&changes).await?; // Update the store
+
             room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
         }
 
@@ -1066,7 +1157,7 @@ impl From<&v5::Request> for RequestedRequiredStates {
 mod tests {
     use std::collections::HashMap;
 
-    use assert_matches2::assert_let;
+    use assert_matches2::{assert_let, assert_matches};
     use futures_util::FutureExt as _;
     use matrix_sdk_test::{
         async_test, event_factory::EventFactory, ruma_response_from_json, InvitedRoomBuilder,
@@ -1084,6 +1175,7 @@ mod tests {
 
     use super::{BaseClient, RequestedRequiredStates};
     use crate::{
+        client::ThreadingSupport,
         store::{RoomLoadSettings, StateStoreExt, StoreConfig},
         test_utils::logged_in_base_client,
         RoomDisplayName, RoomState, SessionMeta,
@@ -1378,8 +1470,10 @@ mod tests {
         let user_id = user_id!("@alice:example.org");
         let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
 
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
         client
             .activate(
                 SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
@@ -1438,8 +1532,10 @@ mod tests {
         let inviter_user_id = user_id!("@bob:example.org");
         let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
 
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
         client
             .activate(
                 SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
@@ -1500,8 +1596,10 @@ mod tests {
         let inviter_user_id = user_id!("@bob:example.org");
         let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
 
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
         client
             .activate(
                 SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
@@ -1572,8 +1670,10 @@ mod tests {
     #[async_test]
     async fn test_ignored_user_list_changes() {
         let user_id = user_id!("@alice:example.org");
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(
@@ -1662,5 +1762,63 @@ mod tests {
         client.receive_sync_response(response).await.unwrap();
 
         assert!(client.is_user_ignored(ignored_user_id).await);
+    }
+
+    #[async_test]
+    async fn test_invite_details_are_set() {
+        let user_id = user_id!("@alice:localhost");
+        let client = logged_in_base_client(Some(user_id)).await;
+        let invited_room_id = room_id!("!invited:localhost");
+        let unknown_room_id = room_id!("!unknown:localhost");
+
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_invited_room(InvitedRoomBuilder::new(invited_room_id))
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // Let us first check the initial state, we should have a room in the invite
+        // state.
+        let invited_room = client
+            .get_room(invited_room_id)
+            .expect("The sync should have created a room in the invited state");
+
+        assert_eq!(invited_room.state(), RoomState::Invited);
+        assert!(invited_room.invite_acceptance_details().is_none());
+
+        // Now we join the room.
+        let joined_room = client
+            .room_joined(invited_room_id, Some(user_id.to_owned()))
+            .await
+            .expect("We should be able to mark a room as joined");
+
+        // Yup, we now have some invite details.
+        assert_eq!(joined_room.state(), RoomState::Joined);
+        assert_matches!(joined_room.invite_acceptance_details(), Some(details));
+        assert_eq!(details.inviter, user_id);
+
+        // If we didn't know about the room before the join, we assume that there wasn't
+        // an invite and we don't record the timestamp.
+        assert!(client.get_room(unknown_room_id).is_none());
+        let unknown_room = client
+            .room_joined(unknown_room_id, Some(user_id.to_owned()))
+            .await
+            .expect("We should be able to mark a room as joined");
+
+        assert_eq!(unknown_room.state(), RoomState::Joined);
+        assert!(unknown_room.invite_acceptance_details().is_none());
+
+        sync_builder.clear();
+        let response =
+            sync_builder.add_left_room(LeftRoomBuilder::new(invited_room_id)).build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        // Now that we left the room, we shouldn't have any details anymore.
+        let left_room = client
+            .get_room(invited_room_id)
+            .expect("The sync should have created a room in the invited state");
+
+        assert_eq!(left_room.state(), RoomState::Left);
+        assert!(left_room.invite_acceptance_details().is_none());
     }
 }

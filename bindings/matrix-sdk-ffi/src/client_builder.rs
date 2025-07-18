@@ -1,12 +1,9 @@
 use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::reqwest::Certificate;
 use matrix_sdk::{
-    crypto::{
-        types::qr_login::QrCodeModeData, CollectStrategy, DecryptionSettings, TrustRequirement,
-    },
+    crypto::{CollectStrategy, DecryptionSettings, TrustRequirement},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     event_cache::EventCacheError,
     ruma::{ServerName, UserId},
@@ -15,22 +12,14 @@ use matrix_sdk::{
         VersionBuilderError,
     },
     Client as MatrixClient, ClientBuildError as MatrixClientBuildError, HttpError, IdParseError,
-    RumaApiError, SqliteStoreConfig,
+    RumaApiError, SqliteStoreConfig, ThreadingSupport,
 };
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
 use zeroize::Zeroizing;
 
 use super::client::Client;
-use crate::{
-    authentication::OidcConfiguration,
-    client::ClientSessionDelegate,
-    error::ClientError,
-    helpers::unwrap_or_clone_arc,
-    qr_code::{HumanQrLoginError, QrCodeData, QrLoginProgressListener},
-    runtime::get_runtime_handle,
-    task_handle::TaskHandle,
-};
+use crate::{client::ClientSessionDelegate, error::ClientError, helpers::unwrap_or_clone_arc};
 
 /// A list of bytes containing a certificate in DER or PEM form.
 pub type CertificateBytes = Vec<u8>;
@@ -140,6 +129,8 @@ pub struct ClientBuilder {
     disable_built_in_root_certificates: bool,
     #[cfg(not(target_family = "wasm"))]
     additional_root_certificates: Vec<Vec<u8>>,
+
+    threads_enabled: bool,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -177,6 +168,7 @@ impl ClientBuilder {
             },
             enable_share_history_on_invite: false,
             request_config: Default::default(),
+            threads_enabled: false,
         })
     }
 
@@ -390,6 +382,12 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    pub fn threads_enabled(self: Arc<Self>, enabled: bool) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.threads_enabled = enabled;
+        Arc::new(builder)
+    }
+
     pub async fn build(self: Arc<Self>) -> Result<Arc<Client>, ClientBuildError> {
         let builder = unwrap_or_clone_arc(self);
         let mut inner_builder = MatrixClient::builder();
@@ -555,6 +553,12 @@ impl ClientBuilder {
             inner_builder = inner_builder.request_config(updated_config);
         }
 
+        inner_builder = inner_builder.with_threading_support(if builder.threads_enabled {
+            ThreadingSupport::Enabled
+        } else {
+            ThreadingSupport::Disabled
+        });
+
         let sdk_client = inner_builder.build().await?;
 
         Ok(Arc::new(
@@ -566,60 +570,6 @@ impl ClientBuilder {
             )
             .await?,
         ))
-    }
-
-    /// Finish the building of the client and attempt to log in using the
-    /// provided [`QrCodeData`].
-    ///
-    /// This method will build the client and immediately attempt to log the
-    /// client in using the provided [`QrCodeData`] using the login
-    /// mechanism described in [MSC4108]. As such this methods requires OAuth
-    /// 2.0 support as well as sliding sync support.
-    ///
-    /// The usage of the progress_listener is required to transfer the
-    /// [`CheckCode`] to the existing client.
-    ///
-    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
-    pub async fn build_with_qr_code(
-        self: Arc<Self>,
-        qr_code_data: &QrCodeData,
-        oidc_configuration: &OidcConfiguration,
-        progress_listener: Box<dyn QrLoginProgressListener>,
-    ) -> Result<Arc<Client>, HumanQrLoginError> {
-        let QrCodeModeData::Reciprocate { server_name } = &qr_code_data.inner.mode_data else {
-            return Err(HumanQrLoginError::OtherDeviceNotSignedIn);
-        };
-
-        let builder = self.server_name_or_homeserver_url(server_name.to_owned());
-
-        let client = builder.build().await.map_err(|e| match e {
-            ClientBuildError::SlidingSync(_) => HumanQrLoginError::SlidingSyncNotAvailable,
-            _ => {
-                error!("Couldn't build the client {e:?}");
-                HumanQrLoginError::Unknown
-            }
-        })?;
-
-        let registration_data = oidc_configuration
-            .registration_data()
-            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
-
-        let oauth = client.inner.oauth();
-        let login = oauth.login_with_qr_code(&qr_code_data.inner, Some(&registration_data));
-
-        let mut progress = login.subscribe_to_progress();
-
-        // We create this task, which will get cancelled once it's dropped, just in case
-        // the progress stream doesn't end.
-        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
-            while let Some(state) = progress.next().await {
-                progress_listener.on_update(state.into());
-            }
-        }));
-
-        login.await?;
-
-        Ok(client)
     }
 }
 

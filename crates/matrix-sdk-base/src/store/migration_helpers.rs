@@ -123,6 +123,7 @@ impl RoomInfoV1 {
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,
+            invite_acceptance_details: None,
         }
     }
 }

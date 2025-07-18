@@ -5,13 +5,14 @@ use std::{
 };
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use matrix_sdk::{
     config::SyncSettings,
     test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
 };
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
-    SyncResponseBuilder,
+    JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
+    mocks::mock_encryption_state,
 };
 use matrix_sdk_ui::{
     notification_client::{
@@ -22,18 +23,18 @@ use matrix_sdk_ui::{
 };
 use ruma::{
     event_id,
-    events::{room::member::MembershipState, AnyStateEvent, TimelineEventType},
+    events::{AnyStateEvent, TimelineEventType, room::member::MembershipState},
     mxc_uri, room_id, user_id,
 };
 use serde_json::json;
 use wiremock::{
-    matchers::{header, method, path},
     Mock, Request, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 use crate::{
     mock_sync,
-    sliding_sync::{check_requests, PartialSlidingSyncRequest, SlidingSyncMatcher},
+    sliding_sync::{PartialSlidingSyncRequest, SlidingSyncMatcher, check_requests},
 };
 
 #[async_test]
@@ -104,7 +105,7 @@ async fn test_notification_client_with_context() {
 
     server.reset().await;
 
-    let item = item.expect("the notification should be found");
+    assert_let!(NotificationStatus::Event(item) = item);
 
     assert_matches!(item.event, NotificationEvent::Timeline(event) => {
         assert_eq!(event.event_type(), TimelineEventType::RoomMessage);
@@ -759,6 +760,7 @@ async fn test_notification_client_mixed() {
 
     let _ = result.remove(event_id2).expect("fetching notification from /context failed");
 
+    assert_let!(NotificationStatus::Event(item) = item);
     assert_matches!(item.event, NotificationEvent::Timeline(event) => {
         assert_eq!(event.event_type(), TimelineEventType::RoomMessage);
     });
@@ -939,9 +941,9 @@ async fn test_notification_client_context_filters_out_events_from_ignored_users(
         .await;
 
     // If the event is not found even though there was a mocked response for it, it
-    // was discarded as expected
+    // was discarded as expected.
     let result =
         notification_client.get_notification_with_context(room_id, event_id).await.unwrap();
 
-    assert!(result.is_none());
+    assert_matches!(result, NotificationStatus::EventFilteredOut);
 }

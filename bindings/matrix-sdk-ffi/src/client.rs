@@ -20,7 +20,7 @@ use matrix_sdk::{
         api::client::{
             discovery::{
                 discover_homeserver::RtcFocusInfo,
-                get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
+                get_authorization_server_metadata::v1::Prompt as RumaOidcPrompt,
             },
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
@@ -78,7 +78,7 @@ use ruma::{
         RoomAccountDataEvent as RumaRoomAccountDataEvent,
     },
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
-    OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
+    OwnedDeviceId, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -96,6 +96,7 @@ use crate::{
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
+    qr_code::{HumanQrLoginError, QrCodeData, QrLoginProgressListener},
     room::{RoomHistoryVisibility, RoomInfoListener},
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
@@ -456,16 +457,25 @@ impl Client {
     ///   However, it should be noted that when providing a user ID as a hint
     ///   for MAS (with no upstream provider), then the format to use is defined
     ///   by [MSC4198]: https://github.com/matrix-org/matrix-spec-proposals/pull/4198
+    ///
+    /// * `device_id` - The unique ID that will be associated with the session.
+    ///   If not set, a random one will be generated. It can be an existing
+    ///   device ID from a previous login call. Note that this should be done
+    ///   only if the client also holds the corresponding encryption keys.
     pub async fn url_for_oidc(
         &self,
         oidc_configuration: &OidcConfiguration,
         prompt: Option<OidcPrompt>,
         login_hint: Option<String>,
+        device_id: Option<String>,
     ) -> Result<Arc<OAuthAuthorizationData>, OidcError> {
         let registration_data = oidc_configuration.registration_data()?;
         let redirect_uri = oidc_configuration.redirect_uri()?;
 
-        let mut url_builder = self.inner.oauth().login(redirect_uri, None, Some(registration_data));
+        let device_id = device_id.map(OwnedDeviceId::from);
+
+        let mut url_builder =
+            self.inner.oauth().login(redirect_uri, device_id, Some(registration_data));
 
         if let Some(prompt) = prompt {
             url_builder = url_builder.prompt(vec![prompt.into()]);
@@ -490,6 +500,45 @@ impl Client {
         let url = Url::parse(&callback_url).or(Err(OidcError::CallbackUrlInvalid))?;
 
         self.inner.oauth().finish_login(url.into()).await?;
+
+        Ok(())
+    }
+
+    /// Log in using the provided [`QrCodeData`]. The `Client` must be built
+    /// by providing [`QrCodeData::server_name`] as the server name for this
+    /// login to succeed.
+    ///
+    /// This method uses the login mechanism described in [MSC4108]. As such
+    /// this method requires OAuth 2.0 support as well as sliding sync support.
+    ///
+    /// The usage of the progress_listener is required to transfer the
+    /// [`CheckCode`] to the existing client.
+    ///
+    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
+    pub async fn login_with_qr_code(
+        self: Arc<Self>,
+        qr_code_data: &QrCodeData,
+        oidc_configuration: &OidcConfiguration,
+        progress_listener: Box<dyn QrLoginProgressListener>,
+    ) -> Result<(), HumanQrLoginError> {
+        let registration_data = oidc_configuration
+            .registration_data()
+            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
+
+        let oauth = self.inner.oauth();
+        let login = oauth.login_with_qr_code(&qr_code_data.inner, Some(&registration_data));
+
+        let mut progress = login.subscribe_to_progress();
+
+        // We create this task, which will get cancelled once it's dropped, just in case
+        // the progress stream doesn't end.
+        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
+            while let Some(state) = progress.next().await {
+                progress_listener.on_update(state.into());
+            }
+        }));
+
+        login.await?;
 
         Ok(())
     }

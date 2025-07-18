@@ -3,21 +3,21 @@
 
 use std::sync::Arc;
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use matrix_sdk::{
+    RoomState,
     config::SyncSettings,
     ruma::{
+        OwnedEventId,
         api::client::room::create_room::v3::Request as CreateRoomRequest,
         assign,
         events::{
-            room::{member::MembershipState, message::RoomMessageEventContent},
             AnyStrippedStateEvent, SyncMessageLikeEvent, TimelineEventType,
+            room::{member::MembershipState, message::RoomMessageEventContent},
         },
-        OwnedEventId,
     },
-    RoomState,
 };
 use matrix_sdk_ui::{
     notification_client::{
@@ -217,11 +217,11 @@ async fn test_notification() -> Result<()> {
 
     // Check with `/context`.
     let notification_client = NotificationClient::new(bob.clone(), process_setup).await.unwrap();
-    let notification = notification_client
-        .get_notification_with_context(&room_id, &event_id)
-        .await?
-        .expect("missing notification for the message");
-    check_notification(false, notification);
+    assert_let!(
+        NotificationStatus::Event(notification) =
+            notification_client.get_notification_with_context(&room_id, &event_id).await?
+    );
+    check_notification(false, *notification);
 
     Ok(())
 }

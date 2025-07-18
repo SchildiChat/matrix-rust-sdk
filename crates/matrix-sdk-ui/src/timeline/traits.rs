@@ -19,26 +19,26 @@ use indexmap::IndexMap;
 #[cfg(test)]
 use matrix_sdk::crypto::{DecryptionSettings, RoomEventDecryptionResult, TrustRequirement};
 use matrix_sdk::{
+    AsyncTraitDeps, Result, Room, SendOutsideWasm,
     crypto::types::events::CryptoContextInfo,
     deserialized_responses::{EncryptionInfo, TimelineEvent},
-    paginators::{thread::PaginableThread, PaginableRoom},
+    paginators::{PaginableRoom, thread::PaginableThread},
     room::PushContext,
-    AsyncTraitDeps, Result, Room, SendOutsideWasm,
 };
-use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo};
+use matrix_sdk_base::{RoomInfo, latest_event::LatestEvent};
 use ruma::{
+    EventId, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId, UserId,
     events::{
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
         fully_read::FullyReadEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
     serde::Raw,
-    EventId, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId, UserId,
 };
 use tracing::error;
 
 use super::{EventTimelineItem, Profile, RedactError, TimelineBuilder};
-use crate::timeline::{self, pinned_events_loader::PinnedEventsRoom, Timeline};
+use crate::timeline::{self, Timeline, pinned_events_loader::PinnedEventsRoom};
 
 pub trait RoomExt {
     /// Get a [`Timeline`] for this room.
@@ -49,7 +49,7 @@ pub trait RoomExt {
     ///
     /// This is the same as using `room.timeline_builder().build()`.
     fn timeline(&self)
-        -> impl Future<Output = Result<Timeline, timeline::Error>> + SendOutsideWasm;
+    -> impl Future<Output = Result<Timeline, timeline::Error>> + SendOutsideWasm;
 
     /// Get a [`TimelineBuilder`] for this room.
     ///
@@ -93,7 +93,7 @@ pub(super) trait RoomDataProvider:
     fn room_version(&self) -> RoomVersionId;
 
     fn crypto_context_info(&self)
-        -> impl Future<Output = CryptoContextInfo> + SendOutsideWasm + '_;
+    -> impl Future<Output = CryptoContextInfo> + SendOutsideWasm + '_;
 
     fn profile_from_user_id<'a>(
         &'a self,
@@ -113,6 +113,7 @@ pub(super) trait RoomDataProvider:
     fn load_event_receipts<'a>(
         &'a self,
         event_id: &'a EventId,
+        receipt_thread: ReceiptThread,
     ) -> impl Future<Output = IndexMap<OwnedUserId, Receipt>> + SendOutsideWasm + 'a;
 
     /// Load the current fully-read event id, from storage.
@@ -215,31 +216,36 @@ impl RoomDataProvider for Room {
     async fn load_event_receipts<'a>(
         &'a self,
         event_id: &'a EventId,
+        receipt_thread: ReceiptThread,
     ) -> IndexMap<OwnedUserId, Receipt> {
-        let mut unthreaded_receipts = match self
-            .load_event_receipts(ReceiptType::Read, ReceiptThread::Unthreaded, event_id)
+        let mut result = match self
+            .load_event_receipts(ReceiptType::Read, receipt_thread.clone(), event_id)
             .await
         {
             Ok(receipts) => receipts.into_iter().collect(),
             Err(e) => {
-                error!(?event_id, "Failed to get unthreaded read receipts for event: {e}");
+                error!(?event_id, ?receipt_thread, "Failed to get read receipts for event: {e}");
                 IndexMap::new()
             }
         };
 
-        let main_thread_receipts = match self
-            .load_event_receipts(ReceiptType::Read, ReceiptThread::Main, event_id)
-            .await
-        {
-            Ok(receipts) => receipts,
-            Err(e) => {
-                error!(?event_id, "Failed to get main thread read receipts for event: {e}");
-                Vec::new()
-            }
-        };
+        if receipt_thread == ReceiptThread::Unthreaded {
+            // Include the main thread receipts as well, to be maximally compatible with
+            // clients using either the unthreaded or main thread receipt type.
+            let main_thread_receipts = match self
+                .load_event_receipts(ReceiptType::Read, ReceiptThread::Main, event_id)
+                .await
+            {
+                Ok(receipts) => receipts,
+                Err(e) => {
+                    error!(?event_id, "Failed to get main thread read receipts for event: {e}");
+                    Vec::new()
+                }
+            };
+            result.extend(main_thread_receipts);
+        }
 
-        unthreaded_receipts.extend(main_thread_receipts);
-        unthreaded_receipts
+        result
     }
 
     async fn push_context(&self) -> Option<PushContext> {

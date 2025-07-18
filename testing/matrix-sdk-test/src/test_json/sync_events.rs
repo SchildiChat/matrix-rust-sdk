@@ -1,7 +1,7 @@
 //! Discrete events found in a sync response.
 
 use once_cell::sync::Lazy;
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 
 use crate::DEFAULT_TEST_ROOM_ID;
 
@@ -713,5 +713,16 @@ pub static MARKED_UNREAD: Lazy<JsonValue> = Lazy::new(|| {
             "unread": true,
         },
         "type": "m.marked_unread",
+    })
+});
+
+pub static IGNORED_USER_LIST: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "content": {
+            "ignored_users": {
+                "@someone:example.org": {},
+            },
+        },
+        "type": "m.ignored_user_list",
     })
 });

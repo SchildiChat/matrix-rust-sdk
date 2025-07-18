@@ -46,11 +46,11 @@ use ruma::{
     },
     room::RoomType,
     serde::Raw,
-    EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId,
-    RoomAliasId, RoomId, RoomVersionId, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId,
+    OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, field::debug, info, instrument, warn};
+use tracing::{debug, error, field::debug, info, instrument, warn};
 
 use super::{
     AccountDataSource, EncryptionState, Room, RoomCreateWithCreatorEventContent, RoomDisplayName,
@@ -70,6 +70,18 @@ use crate::{
 use std::collections::HashMap;
 use ruma::events::space::child::SpaceChildEventContent;
 // SC end
+
+/// A struct remembering details of an invite and if the invite has been
+/// accepted on this particular client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteAcceptanceDetails {
+    /// A timestamp remembering when we observed the user accepting an invite
+    /// using this client.
+    pub invite_accepted_at: MilliSecondsSinceUnixEpoch,
+
+    /// The user ID of the person that invited us.
+    pub inviter: OwnedUserId,
+}
 
 impl Room {
     /// Subscribe to the inner `RoomInfo`.
@@ -491,6 +503,14 @@ pub struct RoomInfo {
     /// more accurate than relying on the latest event.
     #[serde(default)]
     pub(crate) recency_stamp: Option<u64>,
+
+    /// A timestamp remembering when we observed the user accepting an invite on
+    /// this current device.
+    ///
+    /// This is useful to remember if the user accepted this a join on this
+    /// specific client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) invite_acceptance_details: Option<InviteAcceptanceDetails>,
 }
 
 impl RoomInfo {
@@ -515,6 +535,7 @@ impl RoomInfo {
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,
+            invite_acceptance_details: None,
         }
     }
 
@@ -545,6 +566,12 @@ impl RoomInfo {
 
     /// Set the membership RoomState of this Room
     pub fn set_state(&mut self, room_state: RoomState) {
+        if self.state() != RoomState::Joined && self.invite_acceptance_details.is_some() {
+            error!(room_id = %self.room_id, "The RoomInfo contains invite acceptance details but the room is not in the joined state");
+        }
+        // Changing our state removes the invite details since we can't know that they
+        // are relevant anymore.
+        self.invite_acceptance_details = None;
         self.room_state = room_state;
     }
 
@@ -781,6 +808,20 @@ impl RoomInfo {
     /// Updates the invited member count.
     pub(crate) fn update_invited_member_count(&mut self, count: u64) {
         self.summary.invited_member_count = count;
+    }
+
+    pub(crate) fn set_invite_acceptance_details(&mut self, details: InviteAcceptanceDetails) {
+        self.invite_acceptance_details = Some(details);
+    }
+
+    /// Returns the timestamp when an invite to this room has been accepted by
+    /// this specific client.
+    ///
+    /// # Returns
+    /// - `Some` if the invite has been accepted by this specific client.
+    /// - `None` if the invite has not been accepted
+    pub fn invite_acceptance_details(&self) -> Option<InviteAcceptanceDetails> {
+        self.invite_acceptance_details.clone()
     }
 
     /// Updates the room heroes.
@@ -1207,6 +1248,7 @@ mod tests {
         owned_mxc_uri, owned_user_id, room_id, serde::Raw,
     };
     use serde_json::json;
+    use similar_asserts::assert_eq;
 
     use super::{BaseRoomInfo, RoomInfo, SyncInfo};
     use crate::{
@@ -1256,6 +1298,7 @@ mod tests {
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: Some(42),
+            invite_acceptance_details: None,
         };
 
         let info_json = json!({
@@ -1309,7 +1352,7 @@ mod tests {
                 "num_mentions": 0,
                 "num_notifications": 0,
                 "latest_active": null,
-                "pending": []
+                "pending": [],
             },
             "recency_stamp": 42,
         });

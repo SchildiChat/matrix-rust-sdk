@@ -2961,11 +2961,7 @@ impl Room {
             return Ok(None);
         };
 
-        let power_levels = self
-            .get_state_event_static::<RoomPowerLevelsEventContent>()
-            .await?
-            .and_then(|e| e.deserialize().ok())
-            .map(|e| e.power_levels().into());
+        let power_levels = self.power_levels().await.ok().map(Into::into);
 
         Ok(Some(PushConditionRoomCtx {
             user_id: user_id.to_owned(),
@@ -3706,7 +3702,7 @@ impl RoomIdentityProvider for Room {
 
 /// A wrapper for a weak client and a room id that allows to lazily retrieve a
 /// room, only when needed.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct WeakRoom {
     client: WeakClient,
     room_id: OwnedRoomId,
@@ -4224,8 +4220,7 @@ mod tests {
             .member(user_id)
             .membership(MembershipState::Knock)
             .event_id(event_id)
-            .into_raw_timeline()
-            .cast()]);
+            .into_raw()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When loading the initial seen ids, there are none
@@ -4270,8 +4265,8 @@ mod tests {
         let user_id = user_id!("@example:localhost");
 
         let f = EventFactory::new().room(room_id).sender(user_id!("@alice:b.c"));
-        let joined_room_builder = JoinedRoomBuilder::new(room_id)
-            .add_state_bulk(vec![f.member(user_id).into_raw_sync().cast()]);
+        let joined_room_builder =
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into_raw()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
@@ -4295,8 +4290,8 @@ mod tests {
         let user_id = user_id!("@example:localhost");
 
         let f = EventFactory::new().room(room_id).sender(user_id);
-        let joined_room_builder = JoinedRoomBuilder::new(room_id)
-            .add_state_bulk(vec![f.member(user_id).into_raw_sync().cast()]);
+        let joined_room_builder =
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into_raw()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
@@ -4323,9 +4318,9 @@ mod tests {
 
         let f = EventFactory::new().room(room_id).sender(sender_id);
         let joined_room_builder = JoinedRoomBuilder::new(room_id).add_state_bulk(vec![
-            f.member(user_id).into_raw_sync().cast(),
+            f.member(user_id).into_raw(),
             // The sender info comes from the sync
-            f.member(sender_id).into_raw_sync().cast(),
+            f.member(sender_id).into_raw(),
         ]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
@@ -4352,14 +4347,14 @@ mod tests {
         let sender_id = user_id!("@alice:b.c");
 
         let f = EventFactory::new().room(room_id).sender(sender_id);
-        let joined_room_builder = JoinedRoomBuilder::new(room_id)
-            .add_state_bulk(vec![f.member(user_id).into_raw_sync().cast()]);
+        let joined_room_builder =
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into_raw()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // We'll receive the member info through the /members endpoint
         server
             .mock_get_members()
-            .ok(vec![f.member(sender_id).into_raw_timeline().cast()])
+            .ok(vec![f.member(sender_id).into_raw()])
             .mock_once()
             .mount()
             .await;
@@ -4389,8 +4384,8 @@ mod tests {
 
         let eid1 = event_id!("$1");
         let eid2 = event_id!("$2");
-        let batch1 = vec![f.text_msg("Thread root 1").event_id(eid1).into_raw_sync().cast()];
-        let batch2 = vec![f.text_msg("Thread root 2").event_id(eid2).into_raw_sync().cast()];
+        let batch1 = vec![f.text_msg("Thread root 1").event_id(eid1).into_raw()];
+        let batch2 = vec![f.text_msg("Thread root 2").event_id(eid2).into_raw()];
 
         server
             .mock_room_threads()
@@ -4432,8 +4427,8 @@ mod tests {
         let target_event_id = owned_event_id!("$target");
         let eid1 = event_id!("$1");
         let eid2 = event_id!("$2");
-        let batch1 = vec![f.text_msg("Related event 1").event_id(eid1).into_raw_sync().cast()];
-        let batch2 = vec![f.text_msg("Related event 2").event_id(eid2).into_raw_sync().cast()];
+        let batch1 = vec![f.text_msg("Related event 1").event_id(eid1).into_raw()];
+        let batch2 = vec![f.text_msg("Related event 2").event_id(eid2).into_raw()];
 
         server
             .mock_room_relations()
@@ -4493,8 +4488,8 @@ mod tests {
         let target_event_id = owned_event_id!("$target");
         let eid1 = event_id!("$1");
         let eid2 = event_id!("$2");
-        let batch1 = vec![f.text_msg("In-thread event 1").event_id(eid1).into_raw_sync().cast()];
-        let batch2 = vec![f.text_msg("In-thread event 2").event_id(eid2).into_raw_sync().cast()];
+        let batch1 = vec![f.text_msg("In-thread event 1").event_id(eid1).into_raw()];
+        let batch2 = vec![f.text_msg("In-thread event 2").event_id(eid2).into_raw()];
 
         server
             .mock_room_relations()

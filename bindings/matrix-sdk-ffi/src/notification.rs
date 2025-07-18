@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use matrix_sdk_ui::notification_client::{
-    NotificationClient as MatrixNotificationClient, NotificationItem as MatrixNotificationItem,
+    NotificationClient as SdkNotificationClient, NotificationEvent as SdkNotificationEvent,
+    NotificationItem as SdkNotificationItem, NotificationStatus as SdkNotificationStatus,
 };
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
-use tracing::error;
 
 use crate::{
     client::{Client, JoinRule},
@@ -54,12 +54,12 @@ pub struct NotificationItem {
 }
 
 impl NotificationItem {
-    fn from_inner(item: MatrixNotificationItem) -> Self {
+    fn from_inner(item: SdkNotificationItem) -> Self {
         let event = match item.event {
-            matrix_sdk_ui::notification_client::NotificationEvent::Timeline(event) => {
+            SdkNotificationEvent::Timeline(event) => {
                 NotificationEvent::Timeline { event: Arc::new(TimelineEvent(event)) }
             }
-            matrix_sdk_ui::notification_client::NotificationEvent::Invite(event) => {
+            SdkNotificationEvent::Invite(event) => {
                 NotificationEvent::Invite { sender: event.sender.to_string() }
             }
         };
@@ -87,9 +87,46 @@ impl NotificationItem {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(uniffi::Enum)]
+pub enum NotificationStatus {
+    /// The event has been found and was not filtered out.
+    Event { item: NotificationItem },
+    /// The event couldn't be found in the network queries used to find it.
+    EventNotFound,
+    /// The event has been filtered out, either because of the user's push
+    /// rules, or because the user which triggered it is ignored by the
+    /// current user.
+    EventFilteredOut,
+}
+
+impl From<SdkNotificationStatus> for NotificationStatus {
+    fn from(item: SdkNotificationStatus) -> Self {
+        match item {
+            SdkNotificationStatus::Event(item) => {
+                NotificationStatus::Event { item: NotificationItem::from_inner(*item) }
+            }
+            SdkNotificationStatus::EventNotFound => NotificationStatus::EventNotFound,
+            SdkNotificationStatus::EventFilteredOut => NotificationStatus::EventFilteredOut,
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(uniffi::Enum)]
+pub enum BatchNotificationResult {
+    /// We have more detailed information about the notification.
+    Ok { status: NotificationStatus },
+    /// An error occurred while trying to fetch the notification.
+    Error {
+        /// The error message observed while handling a specific notification.
+        message: String,
+    },
+}
+
 #[derive(uniffi::Object)]
 pub struct NotificationClient {
-    pub(crate) inner: MatrixNotificationClient,
+    pub(crate) inner: SdkNotificationClient,
 
     /// A reference to the FFI client.
     ///
@@ -113,55 +150,54 @@ impl NotificationClient {
         Ok(room)
     }
 
-    /// See also documentation of
-    /// `MatrixNotificationClient::get_notification`.
+    /// Fetches the content of a notification.
+    ///
+    /// This will first try to get the notification using a short-lived sliding
+    /// sync, and if the sliding-sync can't find the event, then it'll use a
+    /// `/context` query to find the event with associated member information.
+    ///
+    /// An error result means that we couldn't resolve the notification; in that
+    /// case, a dummy notification may be displayed instead.
     pub async fn get_notification(
         &self,
         room_id: String,
         event_id: String,
-    ) -> Result<Option<NotificationItem>, ClientError> {
+    ) -> Result<NotificationStatus, ClientError> {
         let room_id = RoomId::parse(room_id)?;
         let event_id = EventId::parse(event_id)?;
 
         let item =
             self.inner.get_notification(&room_id, &event_id).await.map_err(ClientError::from)?;
 
-        if let Some(item) = item {
-            Ok(Some(NotificationItem::from_inner(item)))
-        } else {
-            Ok(None)
-        }
+        Ok(item.into())
     }
 
     /// Get several notification items in a single batch.
     ///
     /// Returns an error if the flow failed when preparing to fetch the
     /// notifications, and a [`HashMap`] containing either a
-    /// [`NotificationItem`] or no entry for it if it failed to fetch a
-    /// notification for the provided [`EventId`].
+    /// [`BatchNotificationResult`], that indicates if the notification was
+    /// successfully fetched (in which case, it's a [`NotificationStatus`]), or
+    /// an error message if it couldn't be fetched.
     pub async fn get_notifications(
         &self,
         requests: Vec<NotificationItemsRequest>,
-    ) -> Result<HashMap<String, NotificationItem>, ClientError> {
+    ) -> Result<HashMap<String, BatchNotificationResult>, ClientError> {
         let requests =
             requests.into_iter().map(TryInto::try_into).collect::<Result<Vec<_>, _>>()?;
+
         let items = self.inner.get_notifications(&requests).await?;
-        let mut result = HashMap::new();
+
+        let mut batch_result = HashMap::new();
         for (key, value) in items.into_iter() {
-            match value {
-                Ok(item) => {
-                    result.insert(key.to_string(), NotificationItem::from_inner(item));
-                }
-                Err(error) => {
-                    // TODO This error should actually be returned so the clients can handle the
-                    // error as they see fit, but it's failing when creating
-                    // bindings for Go, i.e.
-                    // (https://github.com/NordSecurity/uniffi-bindgen-go/issues/62)
-                    error!("Could not fetch notification {key}, an error happened: {error}");
-                }
-            }
+            let result = match value {
+                Ok(status) => BatchNotificationResult::Ok { status: status.into() },
+                Err(error) => BatchNotificationResult::Error { message: error.to_string() },
+            };
+            batch_result.insert(key.to_string(), result);
         }
-        Ok(result)
+
+        Ok(batch_result)
     }
 }
 

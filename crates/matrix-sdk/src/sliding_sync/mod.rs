@@ -79,7 +79,7 @@ pub(super) struct SlidingSyncInner {
     poll_timeout: Duration,
 
     /// Extra duration for the sliding sync request to timeout. This is added to
-    /// the [`Self::proxy_timeout`].
+    /// the [`Self::poll_timeout`].
     network_timeout: Duration,
 
     /// The storage key to keep this cache at and load it from.
@@ -258,10 +258,16 @@ impl SlidingSync {
         // happens here.
 
         let sync_response = {
+            let _timer = timer!("response processor");
+
             let response_processor = {
                 // Take the lock to avoid concurrent sliding syncs overwriting each other's room
                 // infos.
-                let _sync_lock = self.inner.client.base_client().sync_lock().lock().await;
+                let _sync_lock = {
+                    let _timer = timer!("acquiring the `sync_lock`");
+
+                    self.inner.client.base_client().sync_lock().lock().await
+                };
 
                 let mut response_processor =
                     SlidingSyncResponseProcessor::new(self.inner.client.clone());
@@ -358,11 +364,14 @@ impl SlidingSync {
         // Everything went well, we can update the position markers.
         //
         // Save the new position markers.
+        debug!(previous_pos = position.pos, new_pos = pos, "Updating `pos`");
+
         position.pos = pos;
 
         Ok(update_summary)
     }
 
+    #[instrument(skip_all)]
     async fn generate_sync_request(
         &self,
         txn_id: &mut LazyTransactionId,
@@ -391,7 +400,15 @@ impl SlidingSync {
         // has been fully handled successfully, in this case the `pos` is updated, or
         // the response handling has failed, in this case the `pos` hasn't been updated
         // and the same `pos` will be used for this new request.
-        let mut position_guard = self.inner.position.clone().lock_owned().await;
+        let mut position_guard = {
+            debug!("Waiting to acquire the `position` lock");
+
+            let _timer = timer!("acquiring the `position` lock");
+
+            self.inner.position.clone().lock_owned().await
+        };
+
+        debug!(pos = ?position_guard.pos, "Got a position");
 
         let to_device_enabled =
             self.inner.sticky.read().unwrap().data().extensions.to_device.enabled == Some(true);
@@ -809,8 +826,6 @@ impl SlidingSync {
 pub(super) struct SlidingSyncPositionMarkers {
     /// An ephemeral position in the current stream, as received from the
     /// previous `/sync` response, or `None` for the first request.
-    ///
-    /// Should not be persisted.
     pos: Option<String>,
 }
 

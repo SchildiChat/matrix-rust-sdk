@@ -60,17 +60,18 @@ reqwest = { version = "0.12.12", default-features = false }
 rmp-serde = "1.3.0"
 # Be careful to use commits from the https://github.com/ruma/ruma/tree/ruma-0.12
 # branch until a proper release with breaking changes happens.
-ruma = { git = "https://github.com/SchildiChat/ruma", rev = "d3ffb478e", features = [
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "e178b5e84", features = [
     "client-api-c",
     "compat-upload-signatures",
     "compat-user-id",
     "compat-arbitrary-length-ids",
     "compat-tag-info",
     "compat-encrypted-stickers",
-    "unstable-msc3401",
-    "unstable-msc3266",
+    "compat-lax-room-create-deser",
+    "compat-lax-room-topic-deser",
     "unstable-msc2654",
     "unstable-msc2867",
+    "unstable-msc3401",
     "unstable-msc3488",
     "unstable-msc3489",
     "unstable-msc4075",
@@ -80,7 +81,7 @@ ruma = { git = "https://github.com/SchildiChat/ruma", rev = "d3ffb478e", feature
     "unstable-msc4278",
     "unstable-msc4286",
 ] }
-ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "d3ffb478e" }
+ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "e178b5e84" }
 sentry = "0.36.0"
 sentry-tracing = "0.36.0"
 serde = { version = "1.0.217", features = ["rc"] }
@@ -108,17 +109,17 @@ web-sys = "0.3.69"
 wiremock = "0.6.2"
 zeroize = "1.8.1"
 
-matrix-sdk = { path = "crates/matrix-sdk", version = "0.12.0", default-features = false }
-matrix-sdk-base = { path = "crates/matrix-sdk-base", version = "0.12.0" }
-matrix-sdk-common = { path = "crates/matrix-sdk-common", version = "0.12.0" }
-matrix-sdk-crypto = { path = "crates/matrix-sdk-crypto", version = "0.12.0" }
+matrix-sdk = { path = "crates/matrix-sdk", version = "0.13.0", default-features = false }
+matrix-sdk-base = { path = "crates/matrix-sdk-base", version = "0.13.0" }
+matrix-sdk-common = { path = "crates/matrix-sdk-common", version = "0.13.0" }
+matrix-sdk-crypto = { path = "crates/matrix-sdk-crypto", version = "0.13.0" }
 matrix-sdk-ffi-macros = { path = "bindings/matrix-sdk-ffi-macros", version = "0.7.0" }
-matrix-sdk-indexeddb = { path = "crates/matrix-sdk-indexeddb", version = "0.12.0", default-features = false }
-matrix-sdk-qrcode = { path = "crates/matrix-sdk-qrcode", version = "0.12.0" }
-matrix-sdk-sqlite = { path = "crates/matrix-sdk-sqlite", version = "0.12.0", default-features = false }
-matrix-sdk-store-encryption = { path = "crates/matrix-sdk-store-encryption", version = "0.12.0" }
-matrix-sdk-test = { path = "testing/matrix-sdk-test", version = "0.12.0" }
-matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.12.0", default-features = false }
+matrix-sdk-indexeddb = { path = "crates/matrix-sdk-indexeddb", version = "0.13.0", default-features = false }
+matrix-sdk-qrcode = { path = "crates/matrix-sdk-qrcode", version = "0.13.0" }
+matrix-sdk-sqlite = { path = "crates/matrix-sdk-sqlite", version = "0.13.0", default-features = false }
+matrix-sdk-store-encryption = { path = "crates/matrix-sdk-store-encryption", version = "0.13.0" }
+matrix-sdk-test = { path = "testing/matrix-sdk-test", version = "0.13.0" }
+matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.13.0", default-features = false }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
@@ -140,13 +141,15 @@ cloned_instead_of_copied = "warn"
 dbg_macro = "warn"
 inefficient_to_string = "warn"
 macro_use_imports = "warn"
+manual_let_else = "warn"
 mut_mut = "warn"
 needless_borrow = "warn"
 nonstandard_macro_braces = "warn"
+redundant_clone = "warn"
 str_to_string = "warn"
 todo = "warn"
+unnecessary_semicolon = "warn"
 unused_async = "warn"
-redundant_clone = "warn"
 
 # Default development profile; default for most Cargo commands, otherwise
 # selected with `--debug`

@@ -21,7 +21,7 @@
 //!
 //! ```rust
 //! use matrix_sdk_ui::room_list_service::{
-//!     filters, RoomListDynamicEntriesController,
+//!     RoomListDynamicEntriesController, filters,
 //! };
 //!
 //! fn configure_room_list(
@@ -68,7 +68,7 @@ mod sc_rooms;
 
 pub use all::new_filter as new_filter_all;
 pub use any::new_filter as new_filter_any;
-pub use category::{new_filter as new_filter_category, RoomCategory};
+pub use category::{RoomCategory, new_filter as new_filter_category};
 pub use deduplicate_versions::new_filter as new_filter_deduplicate_versions;
 pub use favourite::new_filter as new_filter_favourite;
 pub use fuzzy_match_room_name::new_filter as new_filter_fuzzy_match_room_name;
@@ -85,12 +85,12 @@ pub use normalized_match_room_name::new_filter as new_filter_normalized_match_ro
 pub use not::new_filter as new_filter_not;
 #[cfg(test)]
 use ruma::RoomId;
-use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 pub use unread::new_filter as new_filter_unread;
 #[cfg(test)]
 use wiremock::{
-    matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 pub use sc_rooms::new_filter as new_filter_sc_rooms;

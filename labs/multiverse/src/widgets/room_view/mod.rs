@@ -154,7 +154,8 @@ impl RoomView {
         let r = room.clone();
         let task = spawn(async move {
             let timeline = TimelineBuilder::new(&r)
-                .with_focus(TimelineFocus::Thread { root_event_id: root.clone(), num_events: 2 })
+                .with_focus(TimelineFocus::Thread { root_event_id: root.clone() })
+                .track_read_marker_and_receipts()
                 .build()
                 .await
                 .unwrap();
@@ -396,9 +397,9 @@ impl RoomView {
 
         let status_handle = self.status_handle.clone();
 
-        // Request to back-paginate 20 events.
+        // Request to back-paginate 5 events.
         *pagination = Some(spawn(async move {
-            if let Err(err) = sdk_timeline.paginate_backwards(20).await {
+            if let Err(err) = sdk_timeline.paginate_backwards(5).await {
                 status_handle.set_message(format!("Error during backpagination: {err}"));
             }
         }));
@@ -681,6 +682,6 @@ impl Widget for &mut RoomView {
             }
         } else {
             render_paragraph(buf, "Nothing to see here...".to_owned())
-        };
+        }
     }
 }
