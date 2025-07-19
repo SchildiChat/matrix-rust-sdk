@@ -135,7 +135,7 @@ impl RoomInfo {
             display_name: room.cached_display_name().map(|name| name.to_string()),
             raw_name: room.name(),
             topic: room.topic(),
-            avatar_url: room.avatar_url().map(Into::into),
+            avatar_url: room.cached_avatar_url().map(Into::into),
             is_direct: room.is_direct().await?,
             is_public: room.is_public(),
             is_space,

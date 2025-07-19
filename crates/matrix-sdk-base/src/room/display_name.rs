@@ -60,6 +60,16 @@ impl Room {
         self.inner.read().cached_display_name.clone()
     }
 
+    /// SC: Return avatar, or fallback to cached one from heroes, if exists.
+    pub fn cached_avatar_url(&self) -> Option<OwnedMxcUri> {
+        let inner = self.inner.read();
+        if let Some(avatar_url) = inner.avatar_url() {
+            Some(avatar_url.into())
+        } else {
+            inner.cached_avatar_url.clone()
+        }
+    }
+
     /// Force recalculating a room's display name, taking into account its name,
     /// aliases and members.
     ///

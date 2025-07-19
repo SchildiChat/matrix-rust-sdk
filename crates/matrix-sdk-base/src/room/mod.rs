@@ -253,7 +253,8 @@ impl Room {
 
     /// Get the avatar url of this room.
     pub fn avatar_url(&self) -> Option<OwnedMxcUri> {
-        self.inner.read().avatar_url().map(ToOwned::to_owned)
+        //self.inner.read().avatar_url().map(ToOwned::to_owned)
+        self.cached_avatar_url()
     }
 
     /// Get information about the avatar of this room.
