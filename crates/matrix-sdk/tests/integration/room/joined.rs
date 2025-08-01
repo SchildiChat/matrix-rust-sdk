@@ -24,7 +24,10 @@ use matrix_sdk_test::{
     StateTestEvent, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
-    api::client::{membership::Invite3pidInit, receipt::create_receipt::v3::ReceiptType},
+    api::client::{
+        membership::Invite3pidInit, receipt::create_receipt::v3::ReceiptType,
+        room::upgrade_room::v3::Request as UpgradeRoomRequest,
+    },
     assign, event_id,
     events::{
         call::{
@@ -43,7 +46,7 @@ use ruma::{
         Mentions, RoomAccountDataEventType, TimelineEventType,
     },
     int, mxc_uri, owned_device_id, owned_event_id, room_id, thirdparty, user_id, OwnedUserId,
-    TransactionId,
+    RoomVersionId, TransactionId,
 };
 use serde_json::{from_value, json, Value};
 use stream_assert::assert_pending;
@@ -177,6 +180,249 @@ async fn test_leave_invited_room_also_forgets_it() -> Result<(), anyhow::Error> 
 
     let forgotten_room = client.get_room(room_id);
     assert!(forgotten_room.is_none());
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_leave_room_also_leaves_predecessor() -> Result<(), anyhow::Error> {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let user = user_id!("@example:localhost");
+    let room_a_id = room_id!("!room_a_id:localhost");
+    let room_b_id = room_id!("!room_b_id:localhost");
+    let create_room_a_event_id = event_id!("$create_room_a_event_id:localhost");
+    let tombstone_room_a_event_id = event_id!("$tombstone_room_a_event_id:localhost");
+    let create_room_b_event_id = event_id!("$create_room_b_event_id:localhost");
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(
+                JoinedRoomBuilder::new(room_a_id).add_state_event(
+                    EventFactory::new()
+                        .create(user, RoomVersionId::V1)
+                        .room(room_a_id)
+                        .sender(user)
+                        .event_id(create_room_a_event_id),
+                ),
+            );
+        })
+        .await;
+
+    let room_a = client.get_room(room_a_id).expect("Room A not created");
+
+    server.mock_upgrade_room().ok_with(room_b_id).mount().await;
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder
+                .add_joined_room(
+                    JoinedRoomBuilder::new(room_a_id).add_state_event(
+                        EventFactory::new()
+                            .room_tombstone("This room (A) repelaced by Room B!", room_b_id)
+                            .room(room_a_id)
+                            .sender(user)
+                            .event_id(tombstone_room_a_event_id),
+                    ),
+                )
+                .add_joined_room(
+                    JoinedRoomBuilder::new(room_b_id).add_state_event(
+                        EventFactory::new()
+                            .create(user, RoomVersionId::V2)
+                            .predecessor(room_a_id)
+                            .room(room_b_id)
+                            .sender(user)
+                            .event_id(create_room_b_event_id),
+                    ),
+                );
+        })
+        .await;
+
+    let upgrade_req = UpgradeRoomRequest::new(room_a_id.to_owned(), RoomVersionId::V11);
+    let _response = client.send(upgrade_req).await?;
+
+    assert!(room_a.is_tombstoned(), "Room A not tombstoned.");
+
+    let room_b = client.get_room(room_b_id).expect("Room B not created");
+
+    server.mock_room_leave().ok(room_b_id).mount().await;
+
+    assert_eq!(room_a.state(), RoomState::Joined, "Room A not Joined");
+    assert_eq!(room_b.state(), RoomState::Joined, "Room B not Joined");
+
+    room_b.leave().await?;
+
+    assert_eq!(room_b.state(), RoomState::Left, "Room B not Left");
+    assert_eq!(room_a.state(), RoomState::Left, "Room A not Left");
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_leave_predecessor_before_successor_no_error() -> Result<(), anyhow::Error> {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let user = user_id!("@example:localhost");
+    let room_a_id = room_id!("!room_a_id:localhost");
+    let room_b_id = room_id!("!room_b_id:localhost");
+    let create_room_a_event_id = event_id!("$create_room_a_event_id:localhost");
+    let tombstone_room_a_event_id = event_id!("$tombstone_room_a_event_id:localhost");
+    let create_room_b_event_id = event_id!("$create_room_b_event_id:localhost");
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(
+                JoinedRoomBuilder::new(room_a_id).add_state_event(
+                    EventFactory::new()
+                        .create(user, RoomVersionId::V1)
+                        .room(room_a_id)
+                        .sender(user)
+                        .event_id(create_room_a_event_id),
+                ),
+            );
+        })
+        .await;
+
+    let room_a = client.get_room(room_a_id).expect("Room A not created");
+
+    server.mock_upgrade_room().ok_with(room_b_id).mount().await;
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder
+                .add_joined_room(
+                    JoinedRoomBuilder::new(room_a_id).add_state_event(
+                        EventFactory::new()
+                            .room_tombstone("This room (A) repelaced by Room B!", room_b_id)
+                            .room(room_a_id)
+                            .sender(user)
+                            .event_id(tombstone_room_a_event_id),
+                    ),
+                )
+                .add_joined_room(
+                    JoinedRoomBuilder::new(room_b_id).add_state_event(
+                        EventFactory::new()
+                            .create(user, RoomVersionId::V2)
+                            .predecessor(room_a_id)
+                            .room(room_b_id)
+                            .sender(user)
+                            .event_id(create_room_b_event_id),
+                    ),
+                );
+        })
+        .await;
+
+    let upgrade_req = UpgradeRoomRequest::new(room_a_id.to_owned(), RoomVersionId::V11);
+    let _response = client.send(upgrade_req).await?;
+
+    assert!(room_a.is_tombstoned(), "Room A not tombstoned.");
+
+    let room_b = client.get_room(room_b_id).expect("Room B not created");
+
+    server.mock_room_leave().ok(room_b_id).mount().await;
+
+    assert_eq!(room_a.state(), RoomState::Joined, "Room A not Joined");
+    assert_eq!(room_b.state(), RoomState::Joined, "Room B not Joined");
+
+    let res = room_a.leave().await;
+
+    assert_eq!(room_b.state(), RoomState::Joined, "Room B Left");
+    assert_eq!(room_a.state(), RoomState::Left, "Room A not Left");
+    assert!(res.is_ok(), "Error leaving Room A");
+
+    let res = room_b.leave().await;
+
+    assert_eq!(room_b.state(), RoomState::Left, "Room B not Left");
+    assert_eq!(room_a.state(), RoomState::Left, "Room A not Left");
+    assert!(res.is_ok(), "Error leaving Room B: {res:?}");
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_leave_room_with_fake_predecessor_no_error() -> Result<(), anyhow::Error> {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let user = user_id!("@example:localhost");
+    let room_id = room_id!("!room_id:localhost");
+    let fake_room_id = room_id!("!fake_room_id:localhost");
+    let create_room_event_id = event_id!("$create_room_event_id:localhost");
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(
+                JoinedRoomBuilder::new(room_id).add_state_event(
+                    EventFactory::new()
+                        .create(user, RoomVersionId::V2)
+                        .predecessor(fake_room_id)
+                        .room(room_id)
+                        .sender(user)
+                        .event_id(create_room_event_id),
+                ),
+            );
+        })
+        .await;
+
+    let room = client.get_room(room_id).expect("Room not created");
+
+    server.mock_room_leave().ok(room_id).mount().await;
+
+    assert_eq!(room.state(), RoomState::Joined, "Room not Joined");
+
+    let res = room.leave().await;
+
+    assert_eq!(room.state(), RoomState::Left, "Room not Left");
+    assert!(res.is_ok(), "Error leaving Room: {res:?}");
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_leave_room_fails_with_error() -> Result<(), anyhow::Error> {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let user = user_id!("@example:localhost");
+    let room_id = room_id!("!room_id:localhost");
+    let create_room_event_id = event_id!("$create_room_event_id:localhost");
+
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(
+                JoinedRoomBuilder::new(room_id).add_state_event(
+                    EventFactory::new()
+                        .create(user, RoomVersionId::V2)
+                        .room(room_id)
+                        .sender(user)
+                        .event_id(create_room_event_id),
+                ),
+            );
+        })
+        .await;
+
+    let room = client.get_room(room_id).expect("Room not created");
+
+    server
+        .mock_room_leave()
+        .respond_with(
+            ResponseTemplate::new(429).set_body_json(json!({"errcode": "M_LIMIT_EXCEEDED"})),
+        )
+        .mount()
+        .await;
+
+    assert_eq!(room.state(), RoomState::Joined, "Room not Joined");
+
+    let res = room.leave().await;
+
+    assert!(res.is_err(), "Should have returned Error");
+    assert_eq!(room.state(), RoomState::Joined, "Room should still be joined");
 
     Ok(())
 }
@@ -690,12 +936,12 @@ async fn test_get_power_level_for_user() {
 
     let power_level_admin =
         room.get_user_power_level(user_id!("@example:localhost")).await.unwrap();
-    assert_eq!(power_level_admin, 100);
+    assert_eq!(power_level_admin, int!(100));
 
     // This user either does not exist in the room or has no special power level
     let power_level_unknown =
         room.get_user_power_level(user_id!("@non-existing:localhost")).await.unwrap();
-    assert_eq!(power_level_unknown, 0);
+    assert_eq!(power_level_unknown, int!(0));
 }
 
 #[async_test]
@@ -800,7 +1046,9 @@ async fn test_call_notifications_ring_for_dms() {
     let (client, server) = logged_in_client_with_server().await;
 
     let mut sync_builder = SyncResponseBuilder::new();
-    let room_builder = JoinedRoomBuilder::default().add_state_event(StateTestEvent::PowerLevels);
+    let room_builder = JoinedRoomBuilder::default()
+        .add_state_event(StateTestEvent::Create)
+        .add_state_event(StateTestEvent::PowerLevels);
     sync_builder.add_joined_room(room_builder);
     sync_builder.add_global_account_data_event(GlobalAccountDataTestEvent::Direct);
 
@@ -845,7 +1093,9 @@ async fn test_call_notifications_notify_for_rooms() {
     let (client, server) = logged_in_client_with_server().await;
 
     let mut sync_builder = SyncResponseBuilder::new();
-    let room_builder = JoinedRoomBuilder::default().add_state_event(StateTestEvent::PowerLevels);
+    let room_builder = JoinedRoomBuilder::default()
+        .add_state_event(StateTestEvent::Create)
+        .add_state_event(StateTestEvent::PowerLevels);
     sync_builder.add_joined_room(room_builder);
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
 
@@ -895,7 +1145,9 @@ async fn test_call_notifications_dont_notify_room_without_mention_powerlevel() {
         json!({"room": 101});
 
     sync_builder.add_joined_room(
-        JoinedRoomBuilder::default().add_state_event(StateTestEvent::Custom(power_level_event)),
+        JoinedRoomBuilder::default()
+            .add_state_event(StateTestEvent::Create)
+            .add_state_event(StateTestEvent::Custom(power_level_event)),
     );
 
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
@@ -1381,5 +1633,5 @@ async fn test_report_room() {
     let _response = client.sync_once(sync_settings).await.unwrap();
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
-    room.report_room(Some(reason.to_owned())).await.unwrap();
+    room.report_room(reason.to_owned()).await.unwrap();
 }

@@ -34,7 +34,7 @@ pub fn space_children_info(room: &matrix_sdk::Room) -> Vec<SpaceChildInfo> {
                 space_children.push(
                     SpaceChildInfo::new(
                         r.to_string(),
-                        ev.content.order.clone(),
+                        ev.content.order.as_ref().map(|order| order.0.into()),
                         ev.content.suggested,
                     )
                 );

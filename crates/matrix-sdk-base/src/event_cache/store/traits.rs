@@ -16,17 +16,17 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
+    AsyncTraitDeps,
     linked_chunk::{
         ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
         RawChunk, Update,
     },
-    AsyncTraitDeps,
 };
-use ruma::{events::relation::RelationType, EventId, MxcUri, OwnedEventId, RoomId};
+use ruma::{EventId, MxcUri, OwnedEventId, RoomId, events::relation::RelationType};
 
 use super::{
-    media::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
     EventCacheStoreError,
+    media::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
 };
 use crate::{
     event_cache::{Event, Gap},
@@ -128,6 +128,9 @@ pub trait EventCacheStore: AsyncTraitDeps {
     ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error>;
 
     /// Find an event by its ID in a room.
+    ///
+    /// This method must return events saved either in any linked chunks, *or*
+    /// events saved "out-of-band" with the [`Self::save_event`] method.
     async fn find_event(
         &self,
         room_id: &RoomId,
@@ -147,6 +150,9 @@ pub trait EventCacheStore: AsyncTraitDeps {
     ///
     /// An additional filter can be provided to only retrieve related events for
     /// a certain relationship.
+    ///
+    /// This method must return events saved either in any linked chunks, *or*
+    /// events saved "out-of-band" with the [`Self::save_event`] method.
     async fn find_event_relations(
         &self,
         room_id: &RoomId,
@@ -238,7 +244,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
     ///
     /// * `uri` - The `MxcUri` of the media file.
     async fn get_media_content_for_uri(&self, uri: &MxcUri)
-        -> Result<Option<Vec<u8>>, Self::Error>;
+    -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Remove all the media files' content associated to an `MxcUri` from the
     /// media store.
@@ -462,6 +468,12 @@ pub type DynEventCacheStore = dyn EventCacheStore<Error = EventCacheStoreError>;
 pub trait IntoEventCacheStore {
     #[doc(hidden)]
     fn into_event_cache_store(self) -> Arc<DynEventCacheStore>;
+}
+
+impl IntoEventCacheStore for Arc<DynEventCacheStore> {
+    fn into_event_cache_store(self) -> Arc<DynEventCacheStore> {
+        self
+    }
 }
 
 impl<T> IntoEventCacheStore for T

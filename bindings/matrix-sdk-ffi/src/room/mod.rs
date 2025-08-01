@@ -494,7 +494,7 @@ impl Room {
     /// # Errors
     ///
     /// Returns an error if the room is not found or on rate limit
-    pub async fn report_room(&self, reason: Option<String>) -> Result<(), ClientError> {
+    pub async fn report_room(&self, reason: String) -> Result<(), ClientError> {
         self.inner.report_room(reason).await?;
 
         Ok(())
@@ -1180,6 +1180,59 @@ impl Room {
 
         Ok(Arc::new(RoomPreview::new(AsyncRuntimeDropped::new(client), room_preview)))
     }
+
+    /// Toggle a MSC4306 subscription to a thread in this room, based on the
+    /// thread root event id.
+    ///
+    /// If `subscribed` is `true`, it will subscribe to the thread, with a
+    /// precision that the subscription was manually requested by the user
+    /// (i.e. not automatic).
+    ///
+    /// If the thread was already subscribed to (resp. unsubscribed from), while
+    /// trying to subscribe to it (resp. unsubscribe from it), it will do
+    /// nothing, i.e. subscribing (resp. unsubscribing) to a thread is an
+    /// idempotent operation.
+    pub async fn set_thread_subscription(
+        &self,
+        thread_root_event_id: String,
+        subscribed: bool,
+    ) -> Result<(), ClientError> {
+        let thread_root = EventId::parse(thread_root_event_id)?;
+        if subscribed {
+            // This is a manual subscription.
+            let automatic = false;
+            self.inner.subscribe_thread(thread_root, automatic).await?;
+        } else {
+            self.inner.unsubscribe_thread(thread_root).await?;
+        }
+        Ok(())
+    }
+
+    /// Return the current MSC4306 thread subscription for the given thread root
+    /// in this room.
+    ///
+    /// Returns `None` if the thread doesn't exist, or isn't subscribed to, or
+    /// the server can't handle MSC4306; otherwise, returns the thread
+    /// subscription status.
+    pub async fn fetch_thread_subscription(
+        &self,
+        thread_root_event_id: String,
+    ) -> Result<Option<ThreadSubscription>, ClientError> {
+        let thread_root = EventId::parse(thread_root_event_id)?;
+        Ok(self
+            .inner
+            .fetch_thread_subscription(thread_root)
+            .await?
+            .map(|sub| ThreadSubscription { automatic: sub.automatic }))
+    }
+}
+
+/// Status of a thread subscription (MSC4306).
+#[derive(uniffi::Record)]
+pub struct ThreadSubscription {
+    /// Whether the thread subscription happened automatically (e.g. after a
+    /// mention) or if it was manually requested by the user.
+    automatic: bool,
 }
 
 /// A listener for receiving new live location shares in a room.
@@ -1545,13 +1598,10 @@ impl From<SdkSuccessorRoom> for SuccessorRoom {
 pub struct PredecessorRoom {
     /// The ID of the replacement room.
     pub room_id: String,
-
-    /// The event ID of the last known event in the predecesssor room.
-    pub last_event_id: String,
 }
 
 impl From<SdkPredecessorRoom> for PredecessorRoom {
     fn from(value: SdkPredecessorRoom) -> Self {
-        Self { room_id: value.room_id.to_string(), last_event_id: value.last_event_id.to_string() }
+        Self { room_id: value.room_id.to_string() }
     }
 }

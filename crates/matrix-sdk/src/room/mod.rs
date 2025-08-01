@@ -26,7 +26,9 @@ use std::{
 use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
-use futures_util::{future::join_all, stream::FuturesUnordered};
+use futures_util::{
+    future::join_all, stream as futures_stream, stream::FuturesUnordered, StreamExt,
+};
 use http::StatusCode;
 #[cfg(feature = "e2e-encryption")]
 pub use identity_status_changes::IdentityStatusChanges;
@@ -76,8 +78,9 @@ use ruma::{
         receipt::create_receipt,
         redact::redact_event,
         room::{get_room_event, report_content, report_room},
-        state::{get_state_events_for_key, send_state_event},
+        state::{get_state_event_for_key, send_state_event},
         tag::{create_tag, delete_tag},
+        threads::{get_thread_subscription, subscribe_thread, unsubscribe_thread},
         typing::create_typing_event::{self, v3::Typing},
     },
     assign,
@@ -101,7 +104,9 @@ use ruma::{
             },
             name::RoomNameEventContent,
             pinned_events::RoomPinnedEventsEventContent,
-            power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
+            power_levels::{
+                RoomPowerLevels, RoomPowerLevelsEventContent, RoomPowerLevelsSource, UserPowerLevel,
+            },
             server_acl::RoomServerAclEventContent,
             topic::RoomTopicEventContent,
             ImageInfo, MediaSource, ThumbnailInfo,
@@ -115,6 +120,7 @@ use ruma::{
         RoomAccountDataEventType, StateEventContent, StateEventType, StaticEventContent,
         StaticStateEventContent, SyncStateEvent,
     },
+    int,
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
     time::Instant,
@@ -124,7 +130,6 @@ use ruma::{
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tokio::{join, sync::broadcast};
-use tokio_stream::StreamExt;
 use tracing::{debug, error, info, instrument, trace, warn};
 
 use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent};
@@ -317,13 +322,16 @@ impl Room {
     /// Only invited and joined rooms can be left.
     #[doc(alias = "reject_invitation")]
     #[instrument(skip_all, fields(room_id = ?self.inner.room_id()))]
-    pub async fn leave(&self) -> Result<()> {
+    async fn leave_impl(&self) -> (Result<()>, &Room) {
         let state = self.state();
         if state == RoomState::Left {
-            return Err(Error::WrongRoomState(Box::new(WrongRoomState::new(
-                "Joined or Invited",
-                state,
-            ))));
+            return (
+                Err(Error::WrongRoomState(Box::new(WrongRoomState::new(
+                    "Joined or Invited",
+                    state,
+                )))),
+                self,
+            );
         }
 
         // If the room was in Invited state we should also forget it when declining the
@@ -351,11 +359,13 @@ impl Room {
             error!(?error, ignore_error, should_forget, "Failed to leave the room");
 
             if !ignore_error {
-                return Err(error.into());
+                return (Err(error.into()), self);
             }
         }
 
-        self.client.base_client().room_left(self.room_id()).await?;
+        if let Err(e) = self.client.base_client().room_left(self.room_id()).await {
+            return (Err(e.into()), self);
+        }
 
         if should_forget {
             trace!("Trying to forget the room");
@@ -365,7 +375,59 @@ impl Room {
             }
         }
 
-        Ok(())
+        (Ok(()), self)
+    }
+
+    /// Leave this room and all predecessors.
+    /// If any room was in [`RoomState::Invited`] state, it'll also be forgotten
+    /// automatically.
+    ///
+    /// Only invited and joined rooms can be left.
+    /// Will return an error if the current room fails to leave but
+    /// will only warn if a predecessor fails to leave.
+    pub async fn leave(&self) -> Result<()> {
+        let mut rooms: Vec<Room> = vec![self.clone()];
+        let mut current_room = self;
+
+        while let Some(predecessor) = current_room.predecessor_room() {
+            let maybe_predecessor_room = current_room.client.get_room(&predecessor.room_id);
+
+            if let Some(predecessor_room) = maybe_predecessor_room {
+                rooms.push(predecessor_room.clone());
+                current_room = rooms.last().expect("Room just pushed so can't be empty");
+            } else {
+                warn!("Cannot find predecessor room");
+                break;
+            }
+        }
+
+        let batch_size = 5;
+
+        let rooms_futures: Vec<_> = rooms
+            .iter()
+            .filter_map(|room| match room.state() {
+                RoomState::Joined | RoomState::Invited | RoomState::Knocked => {
+                    Some(room.leave_impl())
+                }
+                RoomState::Banned | RoomState::Left => None,
+            })
+            .collect();
+
+        let mut futures_stream = futures_stream::iter(rooms_futures).buffer_unordered(batch_size);
+
+        let mut maybe_this_room_failed_with: Option<Error> = None;
+
+        while let Some(result) = futures_stream.next().await {
+            if let (Err(e), room) = result {
+                if room.room_id() == self.room_id() {
+                    maybe_this_room_failed_with = Some(e);
+                } else {
+                    warn!("Failure while attempting to leave predecessor room: {e:?}");
+                }
+            }
+        }
+
+        maybe_this_room_failed_with.map_or(Ok(()), Err)
     }
 
     /// Join this room.
@@ -579,7 +641,7 @@ impl Room {
             SyncMessageLikeEvent::Original(_),
         ))) = event.deserialize_as::<AnySyncTimelineEvent>()
         {
-            if let Ok(event) = self.decrypt_event(event.cast_ref(), push_ctx).await {
+            if let Ok(event) = self.decrypt_event(event.cast_ref_unchecked(), push_ctx).await {
                 return event;
             }
         }
@@ -753,15 +815,17 @@ impl Room {
             .encryption_state_deduplicated_handler
             .run(self.room_id().to_owned(), async move {
                 // Request the event from the server.
-                let request = get_state_events_for_key::v3::Request::new(
+                let request = get_state_event_for_key::v3::Request::new(
                     self.room_id().to_owned(),
                     StateEventType::RoomEncryption,
                     "".to_owned(),
                 );
                 let response = match self.client.send(request).await {
-                    Ok(response) => {
-                        Some(response.content.deserialize_as::<RoomEncryptionEventContent>()?)
-                    }
+                    Ok(response) => Some(
+                        response
+                            .into_content()
+                            .deserialize_as_unchecked::<RoomEncryptionEventContent>()?,
+                    ),
                     Err(err) if err.client_api_error_kind() == Some(&ErrorKind::NotFound) => None,
                     Err(err) => return Err(err.into()),
                 };
@@ -954,7 +1018,9 @@ impl Room {
     /// ```
     pub async fn get_state_events_static<C>(&self) -> Result<Vec<RawSyncOrStrippedState<C>>>
     where
-        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
         C::Redacted: RedactedStateEventContent,
     {
         Ok(self.client.state_store().get_state_events_static(self.room_id()).await?)
@@ -998,7 +1064,9 @@ impl Room {
         state_keys: I,
     ) -> Result<Vec<RawSyncOrStrippedState<C>>>
     where
-        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
         C::StateKey: Borrow<K>,
         C::Redacted: RedactedStateEventContent,
         K: AsRef<str> + Sized + Sync + 'a,
@@ -1045,7 +1113,9 @@ impl Room {
     /// ```
     pub async fn get_state_event_static<C>(&self) -> Result<Option<RawSyncOrStrippedState<C>>>
     where
-        C: StaticEventContent + StaticStateEventContent<StateKey = EmptyStateKey> + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent<StateKey = EmptyStateKey>
+            + RedactContent,
         C::Redacted: RedactedStateEventContent,
     {
         self.get_state_event_static_for_key(&EmptyStateKey).await
@@ -1075,7 +1145,9 @@ impl Room {
         state_key: &K,
     ) -> Result<Option<RawSyncOrStrippedState<C>>>
     where
-        C: StaticEventContent + StaticStateEventContent + RedactContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False>
+            + StaticStateEventContent
+            + RedactContent,
         C::StateKey: Borrow<K>,
         C::Redacted: RedactedStateEventContent,
         K: AsRef<str> + ?Sized + Sync,
@@ -1194,9 +1266,9 @@ impl Room {
     /// ```
     pub async fn account_data_static<C>(&self) -> Result<Option<Raw<RoomAccountDataEvent<C>>>>
     where
-        C: StaticEventContent + RoomAccountDataEventContent,
+        C: StaticEventContent<IsPrefix = ruma::events::False> + RoomAccountDataEventContent,
     {
-        Ok(self.account_data(C::TYPE.into()).await?.map(Raw::cast))
+        Ok(self.account_data(C::TYPE.into()).await?.map(Raw::cast_unchecked))
     }
 
     /// Check if all members of this room are verified and all their devices are
@@ -1264,7 +1336,7 @@ impl Room {
     /// use matrix_sdk::ruma::{
     ///     events::{
     ///         marked_unread::MarkedUnreadEventContent,
-    ///         AnyRoomAccountDataEventContent, EventContent,
+    ///         AnyRoomAccountDataEventContent, RoomAccountDataEventContent,
     ///     },
     ///     serde::Raw,
     /// };
@@ -2410,7 +2482,7 @@ impl Room {
             }
         }
 
-        self.send_state_event(RoomPowerLevelsEventContent::from(power_levels)).await
+        self.send_state_event(RoomPowerLevelsEventContent::try_from(power_levels)?).await
     }
 
     /// Applies a set of power level changes to this room.
@@ -2420,7 +2492,7 @@ impl Room {
     pub async fn apply_power_level_changes(&self, changes: RoomPowerLevelChanges) -> Result<()> {
         let mut power_levels = self.power_levels().await?;
         power_levels.apply(changes)?;
-        self.send_state_event(RoomPowerLevelsEventContent::from(power_levels)).await?;
+        self.send_state_event(RoomPowerLevelsEventContent::try_from(power_levels)?).await?;
         Ok(())
     }
 
@@ -2428,7 +2500,11 @@ impl Room {
     ///
     /// [spec]: https://spec.matrix.org/v1.9/client-server-api/#mroompower_levels
     pub async fn reset_power_levels(&self) -> Result<RoomPowerLevels> {
-        let default_power_levels = RoomPowerLevels::from(RoomPowerLevelsEventContent::new());
+        let creators = self.creators().unwrap_or_default();
+        let rules = self.clone_info().room_version_rules_or_default();
+
+        let default_power_levels =
+            RoomPowerLevels::new(RoomPowerLevelsSource::None, &rules.authorization, creators);
         let changes = RoomPowerLevelChanges::from(default_power_levels);
         self.apply_power_level_changes(changes).await?;
         Ok(self.power_levels().await?)
@@ -2447,9 +2523,9 @@ impl Room {
     ///
     /// This method checks the `RoomPowerLevels` events instead of loading the
     /// member list and looking for the member.
-    pub async fn get_user_power_level(&self, user_id: &UserId) -> Result<i64> {
+    pub async fn get_user_power_level(&self, user_id: &UserId) -> Result<UserPowerLevel> {
         let event = self.power_levels().await?;
-        Ok(event.for_user(user_id).into())
+        Ok(event.for_user(user_id))
     }
 
     /// Gets a map with the `UserId` of users with power levels other than `0`
@@ -2769,7 +2845,7 @@ impl Room {
         let max = members
             .iter()
             .max_by_key(|member| member.power_level())
-            .filter(|max| max.power_level() >= 50)
+            .filter(|max| max.power_level() >= int!(50))
             .map(|member| member.user_id().server_name());
 
         // Sort the servers by population.
@@ -2963,13 +3039,15 @@ impl Room {
 
         let power_levels = self.power_levels().await.ok().map(Into::into);
 
-        Ok(Some(PushConditionRoomCtx {
-            user_id: user_id.to_owned(),
-            room_id: room_id.to_owned(),
-            member_count: UInt::new(member_count).unwrap_or(UInt::MAX),
-            user_display_name,
-            power_levels,
-        }))
+        Ok(Some(assign!(
+            PushConditionRoomCtx::new(
+                room_id.to_owned(),
+                UInt::new(member_count).unwrap_or(UInt::MAX),
+                user_id.to_owned(),
+                user_display_name,
+            ),
+            { power_levels }
+        )))
     }
 
     /// Retrieves a [`PushContext`] that can be used to compute the push
@@ -3186,9 +3264,8 @@ impl Room {
     /// # Errors
     ///
     /// Returns an error if the room is not found or on rate limit
-    pub async fn report_room(&self, reason: Option<String>) -> Result<report_room::v3::Response> {
-        let mut request = report_room::v3::Request::new(self.inner.room_id().to_owned());
-        request.reason = reason;
+    pub async fn report_room(&self, reason: String) -> Result<report_room::v3::Response> {
+        let request = report_room::v3::Request::new(self.inner.room_id().to_owned(), reason);
 
         Ok(self.client.send(request).await?)
     }
@@ -3445,7 +3522,7 @@ impl Room {
     pub async fn load_pinned_events(&self) -> Result<Option<Vec<OwnedEventId>>> {
         let response = self
             .client
-            .send(get_state_events_for_key::v3::Request::new(
+            .send(get_state_event_for_key::v3::Request::new(
                 self.room_id().to_owned(),
                 StateEventType::RoomPinnedEvents,
                 "".to_owned(),
@@ -3453,9 +3530,12 @@ impl Room {
             .await;
 
         match response {
-            Ok(response) => {
-                Ok(Some(response.content.deserialize_as::<RoomPinnedEventsEventContent>()?.pinned))
-            }
+            Ok(response) => Ok(Some(
+                response
+                    .into_content()
+                    .deserialize_as_unchecked::<RoomPinnedEventsEventContent>()?
+                    .pinned,
+            )),
             Err(http_error) => match http_error.as_client_api_error() {
                 Some(error) if error.status_code == StatusCode::NOT_FOUND => Ok(None),
                 _ => Err(http_error.into()),
@@ -3663,6 +3743,101 @@ impl Room {
     ) -> Result<Relations> {
         opts.send(self, event_id).await
     }
+
+    /// Subscribe to a given thread in this room.
+    ///
+    /// This will subscribe the user to the thread, so that they will receive
+    /// notifications for that thread specifically.
+    ///
+    /// # Arguments
+    ///
+    /// - `thread_root`: The ID of the thread root event to subscribe to.
+    /// - `automatic`: Whether the subscription was made automatically by a
+    ///   client, not by manual user choice. If there was a previous automatic
+    ///   subscription, and that's set to `true` (i.e. we're now subscribing
+    ///   manually), the subscription will be overridden to a manual one
+    ///   instead.
+    ///
+    /// # Returns
+    ///
+    /// - A 404 error if the event isn't known, or isn't a thread root.
+    /// - An `Ok` result if the subscription was successful.
+    pub async fn subscribe_thread(&self, thread_root: OwnedEventId, automatic: bool) -> Result<()> {
+        self.client
+            .send(subscribe_thread::unstable::Request::new(
+                self.room_id().to_owned(),
+                thread_root,
+                automatic,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Unsubscribe from a given thread in this room.
+    ///
+    /// # Arguments
+    ///
+    /// - `thread_root`: The ID of the thread root event to unsubscribe to.
+    ///
+    /// # Returns
+    ///
+    /// - An `Ok` result if the unsubscription was successful, or the thread was
+    ///   already unsubscribed.
+    /// - A 404 error if the event isn't known, or isn't a thread root.
+    pub async fn unsubscribe_thread(&self, thread_root: OwnedEventId) -> Result<()> {
+        self.client
+            .send(unsubscribe_thread::unstable::Request::new(
+                self.room_id().to_owned(),
+                thread_root,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Return the current thread subscription for the given thread root in this
+    /// room.
+    ///
+    /// # Arguments
+    ///
+    /// - `thread_root`: The ID of the thread root event to get the subscription
+    ///   for.
+    ///
+    /// # Returns
+    ///
+    /// - An `Ok` result with `Some(ThreadSubscription)` if the subscription
+    ///   exists.
+    /// - An `Ok` result with `None` if the subscription does not exist, or the
+    ///   event couldn't be found, or the event isn't a thread.
+    /// - An error if the request fails for any other reason, such as a network
+    ///   error.
+    pub async fn fetch_thread_subscription(
+        &self,
+        thread_root: OwnedEventId,
+    ) -> Result<Option<ThreadSubscription>> {
+        let result = self
+            .client
+            .send(get_thread_subscription::unstable::Request::new(
+                self.room_id().to_owned(),
+                thread_root,
+            ))
+            .await;
+
+        match result {
+            Ok(response) => Ok(Some(ThreadSubscription { automatic: response.automatic })),
+            Err(http_error) => match http_error.as_client_api_error() {
+                Some(error) if error.status_code == StatusCode::NOT_FOUND => Ok(None),
+                _ => Err(http_error.into()),
+            },
+        }
+    }
+}
+
+/// Status of a thread subscription.
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadSubscription {
+    /// Whether the subscription was made automatically by a client, not by
+    /// manual user choice.
+    pub automatic: bool,
 }
 
 #[cfg(feature = "e2e-encryption")]

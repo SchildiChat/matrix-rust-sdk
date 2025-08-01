@@ -14,16 +14,22 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use bitflags::bitflags;
 use eyeball::Subscriber;
-use matrix_sdk_common::{deserialized_responses::TimelineEventKind, ROOM_VERSION_FALLBACK};
+use matrix_sdk_common::{
+    ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK, deserialized_responses::TimelineEventKind,
+};
 use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId,
+    OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId,
     api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
     assign,
     events::{
+        AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
+        SyncStateEvent,
         beacon_info::BeaconInfoEventContent,
         call::member::{CallMemberEventContent, CallMemberStateKey, MembershipData},
         direct::OwnedDirectUserIdentifier,
@@ -41,13 +47,10 @@ use ruma::{
             topic::RoomTopicEventContent,
         },
         tag::{TagEventContent, TagName, Tags},
-        AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent, RedactContent,
-        RedactedStateEventContent, StateEventType, StaticStateEventContent, SyncStateEvent,
     },
     room::RoomType,
+    room_version_rules::{AuthorizationRules, RedactionRules, RoomVersionRules},
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId,
-    OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, field::debug, info, instrument, warn};
@@ -57,13 +60,13 @@ use super::{
     RoomHero, RoomNotableTags, RoomState, RoomSummary,
 };
 use crate::{
+    MinimalStateEvent, OriginalMinimalStateEvent,
     deserialized_responses::RawSyncOrStrippedState,
     latest_event::LatestEvent,
     notification_settings::RoomNotificationMode,
     read_receipts::RoomReadReceipts,
     store::{DynStateStore, StateStoreExt},
     sync::UnreadNotificationsCount,
-    MinimalStateEvent, OriginalMinimalStateEvent,
 };
 
 // SC start
@@ -235,7 +238,8 @@ impl BaseRoomInfo {
                 self.tombstone = Some(t.into());
             }
             AnySyncStateEvent::RoomPowerLevels(p) => {
-                self.max_power_level = p.power_levels().max().into();
+                // The rules and creators do not affect the max power level.
+                self.max_power_level = p.power_levels(&AuthorizationRules::V1, vec![]).max().into();
             }
             AnySyncStateEvent::SpaceChild(s) => {
                 self.space_children.remove(s.state_key());
@@ -318,7 +322,8 @@ impl BaseRoomInfo {
                 self.tombstone = Some(t.into());
             }
             AnyStrippedStateEvent::RoomPowerLevels(p) => {
-                self.max_power_level = p.power_levels().max().into();
+                // The rules and creators do not affect the max power level.
+                self.max_power_level = p.power_levels(&AuthorizationRules::V1, vec![]).max().into();
             }
             AnyStrippedStateEvent::SpaceChild(s) => {
                 self.space_children.remove(&s.state_key);
@@ -340,27 +345,48 @@ impl BaseRoomInfo {
     }
 
     pub(super) fn handle_redaction(&mut self, redacts: &EventId) {
-        let room_version = self.room_version().unwrap_or(&ROOM_VERSION_FALLBACK).to_owned();
+        let redaction_rules = self
+            .room_version()
+            .and_then(|room_version| room_version.rules())
+            .unwrap_or(ROOM_VERSION_RULES_FALLBACK)
+            .redaction;
 
-        // FIXME: Use let chains once available to get rid of unwrap()s
-        if self.avatar.has_event_id(redacts) {
-            self.avatar.as_mut().unwrap().redact(&room_version);
-        } else if self.canonical_alias.has_event_id(redacts) {
-            self.canonical_alias.as_mut().unwrap().redact(&room_version);
-        } else if self.create.has_event_id(redacts) {
-            self.create.as_mut().unwrap().redact(&room_version);
-        } else if self.guest_access.has_event_id(redacts) {
-            self.guest_access.as_mut().unwrap().redact(&room_version);
-        } else if self.history_visibility.has_event_id(redacts) {
-            self.history_visibility.as_mut().unwrap().redact(&room_version);
-        } else if self.join_rules.has_event_id(redacts) {
-            self.join_rules.as_mut().unwrap().redact(&room_version);
-        } else if self.name.has_event_id(redacts) {
-            self.name.as_mut().unwrap().redact(&room_version);
-        } else if self.tombstone.has_event_id(redacts) {
-            self.tombstone.as_mut().unwrap().redact(&room_version);
-        } else if self.topic.has_event_id(redacts) {
-            self.topic.as_mut().unwrap().redact(&room_version);
+        if let Some(ev) = &mut self.avatar
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.canonical_alias
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.create
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.guest_access
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.history_visibility
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.join_rules
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.name
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.tombstone
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.topic
+            && ev.event_id() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
         } else {
             self.space_children.retain(|_, s| s.event_id() != Some(redacts));
             self.rtc_member_events
@@ -406,20 +432,6 @@ impl Default for BaseRoomInfo {
             notable_tags: RoomNotableTags::empty(),
             pinned_events: None,
         }
-    }
-}
-
-trait OptionExt {
-    fn has_event_id(&self, ev_id: &EventId) -> bool;
-}
-
-impl<C> OptionExt for Option<MinimalStateEvent<C>>
-where
-    C: StaticStateEventContent + RedactContent,
-    C::Redacted: RedactedStateEventContent,
-{
-    fn has_event_id(&self, ev_id: &EventId) -> bool {
-        self.as_ref().is_some_and(|ev| ev.event_id() == Some(ev_id))
     }
 }
 
@@ -474,11 +486,11 @@ pub struct RoomInfo {
     /// room state.
     pub(crate) base_info: Box<BaseRoomInfo>,
 
-    /// Did we already warn about an unknown room version in
-    /// [`RoomInfo::room_version_or_default`]? This is done to avoid
-    /// spamming about unknown room versions in the log for the same room.
+    /// Whether we already warned about unknown room version rules in
+    /// [`RoomInfo::room_version_rules_or_default`]. This is done to avoid
+    /// spamming about unknown room versions rules in the log for the same room.
     #[serde(skip)]
-    pub(crate) warned_about_unknown_room_version: Arc<AtomicBool>,
+    pub(crate) warned_about_unknown_room_version_rules: Arc<AtomicBool>,
 
     /// Cached display name, useful for sync access.
     ///
@@ -530,7 +542,7 @@ impl RoomInfo {
             latest_event: None,
             read_receipts: Default::default(),
             base_info: Box::new(BaseRoomInfo::new()),
-            warned_about_unknown_room_version: Arc::new(false.into()),
+            warned_about_unknown_room_version_rules: Arc::new(false.into()),
             cached_display_name: None,
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
@@ -699,9 +711,9 @@ impl RoomInfo {
         event: &SyncRoomRedactionEvent,
         _raw: &Raw<SyncRoomRedactionEvent>,
     ) {
-        let room_version = self.room_version_or_default();
+        let redaction_rules = self.room_version_rules_or_default().redaction;
 
-        let Some(redacts) = event.redacts(&room_version) else {
+        let Some(redacts) = event.redacts(&redaction_rules) else {
             info!("Can't apply redaction, redacts field is missing");
             return;
         };
@@ -710,7 +722,7 @@ impl RoomInfo {
         if let Some(latest_event) = &mut self.latest_event {
             tracing::trace!("Checking if redaction applies to latest event");
             if latest_event.event_id().as_deref() == Some(redacts) {
-                match apply_redaction(latest_event.event().raw(), _raw, &room_version) {
+                match apply_redaction(latest_event.event().raw(), _raw, &redaction_rules) {
                     Some(redacted) => {
                         // Even if the original event was encrypted, redaction removes all its
                         // fields so it cannot possibly be successfully decrypted after redaction.
@@ -876,24 +888,26 @@ impl RoomInfo {
         self.base_info.room_version()
     }
 
-    /// Get the room version of this room, or a sensible default.
+    /// Get the room version rules of this room, or a sensible default.
     ///
-    /// Will warn (at most once) if the room creation event is missing from this
-    /// [`RoomInfo`].
-    pub fn room_version_or_default(&self) -> RoomVersionId {
+    /// Will warn (at most once) if the room create event is missing from this
+    /// [`RoomInfo`] or if the room version is unsupported.
+    pub fn room_version_rules_or_default(&self) -> RoomVersionRules {
         use std::sync::atomic::Ordering;
 
-        self.base_info.room_version().cloned().unwrap_or_else(|| {
-            if self
-                .warned_about_unknown_room_version
-                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                warn!("Unknown room version, falling back to {ROOM_VERSION_FALLBACK}");
-            }
+        self.base_info.room_version().and_then(|room_version| room_version.rules()).unwrap_or_else(
+            || {
+                if self
+                    .warned_about_unknown_room_version_rules
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    warn!("Unable to get the room version rules, defaulting to rules for room version {ROOM_VERSION_FALLBACK}");
+                }
 
-            ROOM_VERSION_FALLBACK
-        })
+                ROOM_VERSION_RULES_FALLBACK
+            },
+        )
     }
 
     /// Get the room type of this room.
@@ -904,11 +918,11 @@ impl RoomInfo {
         }
     }
 
-    /// Get the creator of this room.
-    pub fn creator(&self) -> Option<&UserId> {
+    /// Get the creators of this room.
+    pub fn creators(&self) -> Option<Vec<OwnedUserId>> {
         match self.base_info.create.as_ref()? {
-            MinimalStateEvent::Original(ev) => Some(&ev.content.creator),
-            MinimalStateEvent::Redacted(ev) => Some(&ev.content.creator),
+            MinimalStateEvent::Original(ev) => Some(ev.content.creators()),
+            MinimalStateEvent::Redacted(ev) => Some(ev.content.creators()),
         }
     }
 
@@ -1143,9 +1157,9 @@ pub(crate) enum SyncInfo {
 pub fn apply_redaction(
     event: &Raw<AnySyncTimelineEvent>,
     raw_redaction: &Raw<SyncRoomRedactionEvent>,
-    room_version: &RoomVersionId,
+    rules: &RedactionRules,
 ) -> Option<Raw<AnySyncTimelineEvent>> {
-    use ruma::canonical_json::{redact_in_place, RedactedBecause};
+    use ruma::canonical_json::{RedactedBecause, redact_in_place};
 
     let mut event_json = match event.deserialize_as() {
         Ok(json) => json,
@@ -1163,7 +1177,7 @@ pub fn apply_redaction(
         }
     };
 
-    let redact_result = redact_in_place(&mut event_json, room_version, Some(redacted_because));
+    let redact_result = redact_in_place(&mut event_json, rules, Some(redacted_because));
 
     if let Err(e) = redact_result {
         warn!("Failed to redact event: {e}");
@@ -1171,7 +1185,7 @@ pub fn apply_redaction(
     }
 
     let raw = Raw::new(&event_json).expect("CanonicalJsonObject must be serializable");
-    Some(raw.cast())
+    Some(raw.cast_unchecked())
 }
 
 /// Indicates that a notable update of `RoomInfo` has been applied, and why.
@@ -1241,7 +1255,7 @@ mod tests {
     use matrix_sdk_common::deserialized_responses::TimelineEvent;
     use matrix_sdk_test::{
         async_test,
-        test_json::{sync_events::PINNED_EVENTS, TAG},
+        test_json::{TAG, sync_events::PINNED_EVENTS},
     };
     use ruma::{
         assign, events::room::pinned_events::RoomPinnedEventsEventContent, owned_event_id,
@@ -1252,12 +1266,12 @@ mod tests {
 
     use super::{BaseRoomInfo, RoomInfo, SyncInfo};
     use crate::{
+        RoomDisplayName, RoomHero, RoomState, StateChanges,
         latest_event::LatestEvent,
         notification_settings::RoomNotificationMode,
         room::{RoomNotableTags, RoomSummary},
         store::{IntoStateStore, MemoryStore},
         sync::UnreadNotificationsCount,
-        RoomDisplayName, RoomHero, RoomState, StateChanges,
     };
 
     #[test]
@@ -1293,7 +1307,7 @@ mod tests {
                 assign!(BaseRoomInfo::new(), { pinned_events: Some(RoomPinnedEventsEventContent::new(vec![owned_event_id!("$a")])) }),
             ),
             read_receipts: Default::default(),
-            warned_about_unknown_room_version: Arc::new(false.into()),
+            warned_about_unknown_room_version_rules: Arc::new(false.into()),
             cached_display_name: None,
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
@@ -1438,11 +1452,11 @@ mod tests {
         // Add events to the store.
         let mut changes = StateChanges::default();
 
-        let raw_tag_event = Raw::new(&*TAG).unwrap().cast();
+        let raw_tag_event = Raw::new(&*TAG).unwrap().cast_unchecked();
         let tag_event = raw_tag_event.deserialize().unwrap();
         changes.add_room_account_data(&room_info.room_id, tag_event, raw_tag_event);
 
-        let raw_pinned_events_event = Raw::new(&*PINNED_EVENTS).unwrap().cast();
+        let raw_pinned_events_event = Raw::new(&*PINNED_EVENTS).unwrap().cast_unchecked();
         let pinned_events_event = raw_pinned_events_event.deserialize().unwrap();
         changes.add_state_event(&room_info.room_id, pinned_events_event, raw_pinned_events_event);
 

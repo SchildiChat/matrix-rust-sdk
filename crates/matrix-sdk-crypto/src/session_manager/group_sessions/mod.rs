@@ -602,7 +602,7 @@ impl GroupSessionManager {
         for (user_id, device_map) in &request.messages {
             for (device, content) in device_map {
                 let message_id: Option<&str> = content
-                    .deserialize_as::<ContentStub<'_>>()
+                    .deserialize_as_unchecked::<ContentStub<'_>>()
                     .expect("We should be able to deserialize the content we generated")
                     .message_id;
 
@@ -1068,7 +1068,7 @@ mod tests {
             requests::ToDeviceRequest,
             DeviceKeys, EventEncryptionAlgorithm,
         },
-        EncryptionSettings, LocalTrust, OlmMachine,
+        DecryptionSettings, EncryptionSettings, LocalTrust, OlmMachine, TrustRequirement,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1243,7 +1243,7 @@ mod tests {
                 for message in r.messages.values() {
                     message.iter().for_each(|(_, content)| {
                         let withheld: RoomKeyWithheldContent =
-                            content.deserialize_as::<RoomKeyWithheldContent>().unwrap();
+                            content.deserialize_as_unchecked::<RoomKeyWithheldContent>().unwrap();
 
                         if let MegolmV1AesSha2(content) = withheld {
                             if content.withheld_code() == code {
@@ -1528,7 +1528,7 @@ mod tests {
                 let device_key = DeviceIdOrAllDevices::from(device_id!("MWVTUXDNNM").to_owned());
                 let content = &r.messages[user_id][&device_key];
                 let withheld: RoomKeyWithheldContent =
-                    content.deserialize_as::<RoomKeyWithheldContent>().unwrap();
+                    content.deserialize_as_unchecked::<RoomKeyWithheldContent>().unwrap();
                 if let MegolmV1AesSha2(content) = withheld {
                     content.withheld_code() == WithheldCode::Blacklisted
                 } else {
@@ -1649,7 +1649,12 @@ mod tests {
                 unused_fallback_keys: None,
                 next_batch_token: None,
             };
-            let (decrypted, _) = machine.receive_sync_changes(sync_changes).await.unwrap();
+
+            let decryption_settings =
+                DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+            let (decrypted, _) =
+                machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
         }
@@ -1714,7 +1719,12 @@ mod tests {
                 unused_fallback_keys: None,
                 next_batch_token: None,
             };
-            let (decrypted, _) = machine.receive_sync_changes(sync_changes).await.unwrap();
+
+            let decryption_settings =
+                DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+            let (decrypted, _) =
+                machine.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
 
             assert_eq!(1, decrypted.len());
         }
@@ -1812,7 +1822,7 @@ mod tests {
             .unwrap();
         let to_device = EncryptedToDeviceEvent::new(
             alice.user_id().to_owned(),
-            bob_message.cast_ref().deserialize().unwrap(),
+            bob_message.deserialize_as_unchecked().unwrap(),
         );
 
         let sync_changes = EncryptionSyncChanges {
@@ -1822,7 +1832,12 @@ mod tests {
             unused_fallback_keys: None,
             next_batch_token: None,
         };
-        let (decrypted, _) = bob.receive_sync_changes(sync_changes).await.unwrap();
+
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
+        let (decrypted, _) =
+            bob.receive_sync_changes(sync_changes, &decryption_settings).await.unwrap();
         assert_eq!(1, decrypted.len());
         use crate::types::events::EventType;
         assert_let!(

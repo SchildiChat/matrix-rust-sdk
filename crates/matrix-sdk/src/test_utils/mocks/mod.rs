@@ -35,17 +35,19 @@ use ruma::{
     directory::PublicRoomsChunk,
     encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
     events::{
-        receipt::ReceiptThread, room::member::RoomMemberEvent, AnyStateEvent, AnyTimelineEvent,
-        GlobalAccountDataEventType, MessageLikeEventType, RoomAccountDataEventType, StateEventType,
+        receipt::ReceiptThread, room::member::RoomMemberEvent, AnyStateEvent, AnySyncTimelineEvent,
+        AnyTimelineEvent, GlobalAccountDataEventType, MessageLikeEventType,
+        RoomAccountDataEventType, StateEventType,
     },
     media::Method,
     serde::Raw,
     time::Duration,
-    DeviceId, EventId, MxcUri, OwnedDeviceId, OwnedEventId, OwnedOneTimeKeyId, OwnedRoomId,
-    OwnedUserId, RoomId, ServerName, UserId,
+    DeviceId, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedDeviceId, OwnedEventId,
+    OwnedOneTimeKeyId, OwnedRoomId, OwnedUserId, RoomId, ServerName, UserId,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{from_value, json, Value};
+use tokio::sync::oneshot::{self, Receiver};
 use wiremock::{
     matchers::{body_json, body_partial_json, header, method, path, path_regex, query_param},
     Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
@@ -342,6 +344,36 @@ impl MatrixMockServer {
         .expect_default_access_token()
     }
 
+    /// Creates a prebuilt mock for joining a room.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{ruma::{room_id, event_id}, test_utils::mocks::MatrixMockServer};
+    /// use serde_json::json;
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    /// let room_id = room_id!("!test:localhost");
+    ///
+    /// mock_server.mock_room_join(room_id).ok().mount();
+    ///
+    /// let room = client.join_room_by_id(room_id).await?;
+    ///
+    /// assert_eq!(
+    ///     room_id,
+    ///     room.room_id(),
+    ///     "The room ID we mocked should match the one we received when we joined the room"
+    /// );
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn mock_room_join(&self, room_id: &RoomId) -> MockEndpoint<'_, JoinRoomEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path_regex(format!("^/_matrix/client/v3/rooms/{room_id}/join")));
+        self.mock_endpoint(mock, JoinRoomEndpoint { room_id: room_id.to_owned() })
+    }
+
     /// Creates a prebuilt mock for sending an event in a room.
     ///
     /// Note: works with *any* room.
@@ -382,7 +414,7 @@ impl MatrixMockServer {
     pub fn mock_room_send(&self) -> MockEndpoint<'_, RoomSendEndpoint> {
         let mock = Mock::given(method("PUT"))
             .and(path_regex(r"^/_matrix/client/v3/rooms/.*/send/.*".to_owned()));
-        self.mock_endpoint(mock, RoomSendEndpoint).expect_default_access_token()
+        self.mock_endpoint(mock, RoomSendEndpoint)
     }
 
     /// Creates a prebuilt mock for sending a state event in a room.
@@ -561,7 +593,7 @@ impl MatrixMockServer {
     /// Create a prebuilt mock for uploading media.
     pub fn mock_upload(&self) -> MockEndpoint<'_, UploadEndpoint> {
         let mock = Mock::given(method("POST")).and(path("/_matrix/media/v3/upload"));
-        self.mock_endpoint(mock, UploadEndpoint).expect_default_access_token()
+        self.mock_endpoint(mock, UploadEndpoint)
     }
 
     /// Create a prebuilt mock for resolving room aliases.
@@ -910,8 +942,7 @@ impl MatrixMockServer {
     ///     .event_id(event_id)
     ///     .sender(alice_user_id)
     ///     .state_key(alice_user_id)
-    ///     .into_raw_timeline()
-    ///     .cast();
+    ///     .into_raw();
     ///
     /// mock_server
     ///     .mock_get_members()
@@ -1197,7 +1228,7 @@ impl MatrixMockServer {
         &self,
     ) -> MockEndpoint<'_, AuthenticatedMediaConfigEndpoint> {
         let mock = Mock::given(method("GET")).and(path("/_matrix/client/v1/media/config"));
-        self.mock_endpoint(mock, AuthenticatedMediaConfigEndpoint).expect_default_access_token()
+        self.mock_endpoint(mock, AuthenticatedMediaConfigEndpoint)
     }
 
     /// Create a prebuilt mock for the endpoint used to log into a session.
@@ -1226,6 +1257,13 @@ impl MatrixMockServer {
     pub fn mock_create_room(&self) -> MockEndpoint<'_, CreateRoomEndpoint> {
         let mock = Mock::given(method("POST")).and(path("/_matrix/client/v3/createRoom"));
         self.mock_endpoint(mock, CreateRoomEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to upgrade a room.
+    pub fn mock_upgrade_room(&self) -> MockEndpoint<'_, UpgradeRoomEndpoint> {
+        let mock =
+            Mock::given(method("POST")).and(path_regex("/_matrix/client/v3/rooms/.*/upgrade"));
+        self.mock_endpoint(mock, UpgradeRoomEndpoint).expect_default_access_token()
     }
 
     /// Create a prebuilt mock for the endpoint used to pre-allocate a MXC URI
@@ -1296,6 +1334,32 @@ impl MatrixMockServer {
             .and(query_param("height", height.to_string()))
             .and(query_param("animated", animated.to_string()));
         self.mock_endpoint(mock, AuthedMediaThumbnailEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get a thread
+    /// subscription in a given room.
+    pub fn mock_get_thread_subscription(&self) -> MockEndpoint<'_, GetThreadSubscriptionEndpoint> {
+        let mock = Mock::given(method("GET"));
+        self.mock_endpoint(mock, GetThreadSubscriptionEndpoint::default())
+            .expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to define a thread
+    /// subscription in a given room.
+    pub fn mock_put_thread_subscription(&self) -> MockEndpoint<'_, PutThreadSubscriptionEndpoint> {
+        let mock = Mock::given(method("PUT"));
+        self.mock_endpoint(mock, PutThreadSubscriptionEndpoint::default())
+            .expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to delete a thread
+    /// subscription in a given room.
+    pub fn mock_delete_thread_subscription(
+        &self,
+    ) -> MockEndpoint<'_, DeleteThreadSubscriptionEndpoint> {
+        let mock = Mock::given(method("DELETE"));
+        self.mock_endpoint(mock, DeleteThreadSubscriptionEndpoint::default())
+            .expect_default_access_token()
     }
 }
 
@@ -1832,6 +1896,102 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     pub fn ok(self, returned_event_id: impl Into<OwnedEventId>) -> MatrixMock<'a> {
         self.ok_with_event_id(returned_event_id.into())
     }
+
+    /// Returns a send endpoint that emulates success, i.e. the event has been
+    /// sent with the given event id.
+    ///
+    /// The sent event is captured and can be accessed using the returned
+    /// [`Receiver`]. The [`Receiver`] is valid only for a send call. The given
+    /// `event_sender` are added to the event JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::{
+    ///         event_id, events::room::message::RoomMessageEventContent, room_id,
+    ///     },
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    /// use matrix_sdk_test::JoinedRoomBuilder;
+    ///
+    /// let room_id = room_id!("!room_id:localhost");
+    /// let event_id = event_id!("$some_id");
+    ///
+    /// let server = MatrixMockServer::new().await;
+    /// let client = server.client_builder().build().await;
+    ///
+    /// let user_id = client.user_id().expect("We should have a user ID by now");
+    ///
+    /// let (receiver, mock) =
+    ///     server.mock_room_send().ok_with_capture(event_id, user_id);
+    ///
+    /// server
+    ///     .mock_sync()
+    ///     .ok_and_run(&client, |builder| {
+    ///         builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    ///     })
+    ///     .await;
+    ///
+    /// // Mock any additional endpoints that might be needed to send the message.
+    ///
+    /// let room = client
+    ///     .get_room(room_id)
+    ///     .expect("We should have access to our room now");
+    ///
+    /// let event_id = room
+    ///     .send(RoomMessageEventContent::text_plain("It's a secret to everybody"))
+    ///     .await
+    ///     .expect("We should be able to send an initial message")
+    ///     .event_id;
+    ///
+    /// let event = receiver.await?;
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn ok_with_capture(
+        self,
+        returned_event_id: impl Into<OwnedEventId>,
+        event_sender: impl Into<OwnedUserId>,
+    ) -> (Receiver<Raw<AnySyncTimelineEvent>>, MatrixMock<'a>) {
+        let event_id = returned_event_id.into();
+        let event_sender = event_sender.into();
+
+        let (sender, receiver) = oneshot::channel();
+        let sender = Arc::new(Mutex::new(Some(sender)));
+
+        let ret = self.respond_with(move |request: &Request| {
+            if let Some(sender) = sender.lock().unwrap().take() {
+                let uri = &request.url;
+                let path_segments = uri.path_segments();
+                let maybe_event_type = path_segments.and_then(|mut s| s.nth_back(1));
+                let event_type = maybe_event_type
+                    .as_ref()
+                    .map(|&e| e.to_owned())
+                    .unwrap_or("m.room.message".to_owned());
+
+                let body: Value =
+                    request.body_json().expect("The received body should be valid JSON");
+
+                let event = json!({
+                    "event_id": event_id.clone(),
+                    "sender": event_sender,
+                    "type": event_type,
+                    "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+                    "content": body,
+                });
+
+                let event: Raw<AnySyncTimelineEvent> = from_value(event)
+                    .expect("We should be able to create a raw event from the content");
+
+                sender.send(event).expect("We should be able to send the event to the receiver");
+            }
+
+            ResponseTemplate::new(200).set_body_json(json!({ "event_id": event_id.clone() }))
+        });
+
+        (receiver, ret)
+    }
 }
 
 /// A prebuilt mock for sending a state event in a room.
@@ -1857,7 +2017,11 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     /// ```
     /// # tokio_test::block_on(async {
     /// use matrix_sdk::{
-    ///     ruma::{room_id, event_id, events::room::power_levels::RoomPowerLevelsEventContent},
+    ///     ruma::{
+    ///         room_id, event_id,
+    ///         events::room::power_levels::RoomPowerLevelsEventContent,
+    ///         room_version_rules::AuthorizationRules
+    ///     },
     ///     test_utils::mocks::MatrixMockServer
     /// };
     /// use serde_json::json;
@@ -1882,7 +2046,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     ///     .mount()
     ///     .await;
     ///
-    /// let mut content = RoomPowerLevelsEventContent::new();
+    /// let mut content = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
     /// // Update the power level to a non default value.
     /// // Otherwise it will be skipped from serialization.
     /// content.redact = 51.into();
@@ -1918,6 +2082,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     ///         },
     ///         events::StateEventType,
     ///         room_id,
+    ///         room_version_rules::AuthorizationRules,
     ///     },
     ///     test_utils::mocks::MatrixMockServer,
     /// };
@@ -1943,7 +2108,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     /// // The `m.room.reaction` event type should not be mocked by the server.
     /// assert!(response_not_mocked.is_err());
     ///
-    /// let response = room.send_state_event(RoomPowerLevelsEventContent::new()).await?;
+    /// let response = room.send_state_event(RoomPowerLevelsEventContent::new(&AuthorizationRules::V1)).await?;
     /// // The `m.room.message` event type should be mocked by the server.
     /// assert_eq!(
     ///     event_id, response.event_id,
@@ -2444,8 +2609,58 @@ impl<'a> MockEndpoint<'a, UploadEndpoint> {
         Self { mock: self.mock.and(header("content-type", content_type)), ..self }
     }
 
-    /// Returns a redact endpoint that emulates success, i.e. the redaction
-    /// event has been sent with the given event id.
+    /// Returns a upload endpoint that emulates success, i.e. the media has been
+    /// uploaded to the media server and can be accessed using the given
+    /// event has been sent with the given [`MxcUri`].
+    ///
+    /// The uploaded content is captured and can be accessed using the returned
+    /// [`Receiver`]. The [`Receiver`] is valid only for a single media
+    /// upload.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{
+    ///     ruma::{event_id, mxc_uri, room_id},
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mxid = mxc_uri!("mxc://localhost/12345");
+    ///
+    /// let server = MatrixMockServer::new().await;
+    /// let (receiver, upload_mock) = server.mock_upload().ok_with_capture(mxid);
+    /// let client = server.client_builder().build().await;
+    ///
+    /// client.media().upload(&mime::TEXT_PLAIN, vec![1, 2, 3, 4, 5], None).await?;
+    ///
+    /// let uploaded = receiver.await?;
+    ///
+    /// assert_eq!(uploaded, vec![1, 2, 3, 4, 5]);
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn ok_with_capture(self, mxc_id: &MxcUri) -> (Receiver<Vec<u8>>, MatrixMock<'a>) {
+        let (sender, receiver) = oneshot::channel();
+        let sender = Arc::new(Mutex::new(Some(sender)));
+        let response_body = json!({"content_uri": mxc_id});
+
+        let ret = self.respond_with(move |request: &Request| {
+            let maybe_sender = sender.lock().unwrap().take();
+
+            if let Some(sender) = maybe_sender {
+                let body = request.body.clone();
+                let _ = sender.send(body);
+            }
+
+            ResponseTemplate::new(200).set_body_json(response_body.clone())
+        });
+
+        (receiver, ret)
+    }
+
+    /// Returns a upload endpoint that emulates success, i.e. the media has been
+    /// uploaded to the media server and can be accessed using the given
+    /// event has been sent with the given [`MxcUri`].
     pub fn ok(self, mxc_id: &MxcUri) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "content_uri": mxc_id
@@ -3255,9 +3470,6 @@ impl<'a> MockEndpoint<'a, LoginEndpoint> {
 
     /// Returns a given response on POST /login requests
     ///
-    /// This function
-    /// to-device messages sent via the `/sendToDevice` endpoint.
-    ///
     /// # Arguments
     ///
     /// * `response` - The response that the mock server sends on POST /login
@@ -3269,7 +3481,7 @@ impl<'a> MockEndpoint<'a, LoginEndpoint> {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```
     /// use matrix_sdk::test_utils::mocks::{
     ///     LoginResponseTemplate200, MatrixMockServer,
     /// };
@@ -3451,6 +3663,19 @@ impl<'a> MockEndpoint<'a, CreateRoomEndpoint> {
     }
 }
 
+/// A prebuilt mock for `POST /rooms/{roomId}/upgrade` requests.
+pub struct UpgradeRoomEndpoint;
+
+impl<'a> MockEndpoint<'a, UpgradeRoomEndpoint> {
+    /// Returns a successful response with desired replacement_room ID.
+    pub fn ok_with(self, new_room_id: &RoomId) -> MatrixMock<'a> {
+        self.respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "replacement_room": new_room_id.as_str()})),
+        )
+    }
+}
+
 /// A prebuilt mock for `POST /media/v1/create` requests.
 pub struct MediaAllocateEndpoint;
 
@@ -3481,6 +3706,13 @@ impl<'a> MockEndpoint<'a, MediaDownloadEndpoint> {
     /// Returns a successful response with a plain text content.
     pub fn ok_plain_text(self) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_string("Hello, World!"))
+    }
+
+    /// Returns a successful response with the given bytes.
+    pub fn ok_bytes(self, bytes: Vec<u8>) -> MatrixMock<'a> {
+        self.respond_with(
+            ResponseTemplate::new(200).set_body_raw(bytes, "application/octet-stream"),
+        )
     }
 
     /// Returns a successful response with a fake image content.
@@ -3529,5 +3761,139 @@ impl<'a> MockEndpoint<'a, AuthedMediaThumbnailEndpoint> {
         self.respond_with(
             ResponseTemplate::new(200).set_body_raw(b"binaryjpegthumbnaildata", "image/jpeg"),
         )
+    }
+}
+
+/// A prebuilt mock for `GET /client/v3/rooms/{room_id}/join` requests.
+pub struct JoinRoomEndpoint {
+    room_id: OwnedRoomId,
+}
+
+impl<'a> MockEndpoint<'a, JoinRoomEndpoint> {
+    /// Returns a successful response using the provided [`RoomId`].
+    pub fn ok(self) -> MatrixMock<'a> {
+        let room_id = self.endpoint.room_id.to_owned();
+
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "room_id": room_id,
+        })))
+    }
+}
+
+#[derive(Default)]
+struct ThreadSubscriptionMatchers {
+    /// Optional room id to match in the query.
+    room_id: Option<OwnedRoomId>,
+    /// Optional thread root event id to match in the query.
+    thread_root: Option<OwnedEventId>,
+}
+
+impl ThreadSubscriptionMatchers {
+    /// Match the request parameter against a specific room id.
+    fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
+        self.room_id = Some(room_id);
+        self
+    }
+
+    /// Match the request parameter against a specific thread root event id.
+    fn match_thread_id(mut self, thread_root: OwnedEventId) -> Self {
+        self.thread_root = Some(thread_root);
+        self
+    }
+
+    /// Compute the final URI for the thread subscription endpoint.
+    fn endpoint_regexp_uri(&self) -> String {
+        if self.room_id.is_some() || self.thread_root.is_some() {
+            format!(
+                "^/_matrix/client/unstable/io.element.msc4306/rooms/{}/thread/{}/subscription$",
+                self.room_id.as_deref().map(|s| s.as_str()).unwrap_or(".*"),
+                self.thread_root.as_deref().map(|s| s.as_str()).unwrap_or(".*").replace("$", "\\$")
+            )
+        } else {
+            "^/_matrix/client/unstable/io.element.msc4306/rooms/.*/thread/.*/subscription$"
+                .to_owned()
+        }
+    }
+}
+
+/// A prebuilt mock for `GET
+/// /client/*/rooms/{room_id}/threads/{thread_root}/subscription`
+#[derive(Default)]
+pub struct GetThreadSubscriptionEndpoint {
+    matchers: ThreadSubscriptionMatchers,
+}
+
+impl<'a> MockEndpoint<'a, GetThreadSubscriptionEndpoint> {
+    /// Returns a successful response for the given thread subscription.
+    pub fn ok(mut self, automatic: bool) -> MatrixMock<'a> {
+        self.mock = self.mock.and(path_regex(self.endpoint.matchers.endpoint_regexp_uri()));
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "automatic": automatic
+        })))
+    }
+
+    /// Match the request parameter against a specific room id.
+    pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
+        self
+    }
+    /// Match the request parameter against a specific thread root event id.
+    pub fn match_thread_id(mut self, thread_root: OwnedEventId) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_thread_id(thread_root);
+        self
+    }
+}
+
+/// A prebuilt mock for `PUT
+/// /client/*/rooms/{room_id}/threads/{thread_root}/subscription`
+#[derive(Default)]
+pub struct PutThreadSubscriptionEndpoint {
+    matchers: ThreadSubscriptionMatchers,
+}
+
+impl<'a> MockEndpoint<'a, PutThreadSubscriptionEndpoint> {
+    /// Returns a successful response for the given setting of thread
+    /// subscription.
+    pub fn ok(mut self) -> MatrixMock<'a> {
+        self.mock = self.mock.and(path_regex(self.endpoint.matchers.endpoint_regexp_uri()));
+        self.respond_with(ResponseTemplate::new(200))
+    }
+
+    /// Match the request parameter against a specific room id.
+    pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
+        self
+    }
+    /// Match the request parameter against a specific thread root event id.
+    pub fn match_thread_id(mut self, thread_root: OwnedEventId) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_thread_id(thread_root);
+        self
+    }
+}
+
+/// A prebuilt mock for `DELETE
+/// /client/*/rooms/{room_id}/threads/{thread_root}/subscription`
+#[derive(Default)]
+pub struct DeleteThreadSubscriptionEndpoint {
+    matchers: ThreadSubscriptionMatchers,
+}
+
+impl<'a> MockEndpoint<'a, DeleteThreadSubscriptionEndpoint> {
+    /// Returns a successful response for the deletion of a given thread
+    /// subscription.
+    pub fn ok(mut self) -> MatrixMock<'a> {
+        self.mock = self.mock.and(path_regex(self.endpoint.matchers.endpoint_regexp_uri()));
+        self.respond_with(ResponseTemplate::new(200))
+    }
+
+    /// Match the request parameter against a specific room id.
+    pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
+        self
+    }
+    /// Match the request parameter against a specific thread root event id.
+    pub fn match_thread_id(mut self, thread_root: OwnedEventId) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_thread_id(thread_root);
+        self
     }
 }

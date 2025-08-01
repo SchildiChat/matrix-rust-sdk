@@ -19,7 +19,7 @@ use crate::{
 pub struct RoomInfo {
     id: String,
     encryption_state: EncryptionState,
-    creator: Option<String>,
+    creators: Option<Vec<String>>,
     /// The room's name from the room state event if received from sync, or one
     /// that's been computed otherwise.
     display_name: Option<String>,
@@ -81,6 +81,11 @@ pub struct RoomInfo {
     ///
     /// Can be missing if the room power levels event is missing from the store.
     power_levels: Option<Arc<RoomPowerLevels>>,
+    /// This room's version.
+    room_version: Option<String>,
+    /// Whether creators are privileged over every other user (have infinite
+    /// power level).
+    privileged_creators_role: bool,
 }
 
 impl RoomInfo {
@@ -131,7 +136,9 @@ impl RoomInfo {
         Ok(Self {
             id: room.room_id().to_string(),
             encryption_state: room.encryption_state(),
-            creator: room.creator().as_ref().map(ToString::to_string),
+            creators: room
+                .creators()
+                .map(|creators| creators.into_iter().map(Into::into).collect()),
             display_name: room.cached_display_name().map(|name| name.to_string()),
             raw_name: room.name(),
             topic: room.topic(),
@@ -182,7 +189,13 @@ impl RoomInfo {
             pinned_event_ids,
             join_rule,
             history_visibility: room.history_visibility_or_default().try_into()?,
-            power_levels //: power_levels.map(Arc::new),
+            power_levels, //: power_levels.map(Arc::new),
+            room_version: room.version().map(|version| version.to_string()),
+            privileged_creators_role: room
+                .version()
+                .and_then(|version| version.rules())
+                .map(|rules| rules.authorization.explicitly_privilege_room_creators)
+                .unwrap_or_default(),
         })
     }
 }

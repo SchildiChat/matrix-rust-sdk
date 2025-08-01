@@ -16,7 +16,7 @@ default-members = ["benchmarks", "crates/*", "labs/*"]
 resolver = "2"
 
 [workspace.package]
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "1.0.95"
@@ -51,6 +51,7 @@ insta = { version = "1.42.1", features = ["json", "redactions"] }
 itertools = "0.14.0"
 js-sys = "0.3.69"
 mime = "0.3.17"
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "timing-resistant-secret-traits"] }
 once_cell = "1.20.2"
 pbkdf2 = { version = "0.12.2" }
 pin-project-lite = "0.2.16"
@@ -58,12 +59,9 @@ proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false }
 rmp-serde = "1.3.0"
-# Be careful to use commits from the https://github.com/ruma/ruma/tree/ruma-0.12
-# branch until a proper release with breaking changes happens.
-ruma = { git = "https://github.com/SchildiChat/ruma", rev = "e178b5e84", features = [
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "f7afc65df", features = [
     "client-api-c",
     "compat-upload-signatures",
-    "compat-user-id",
     "compat-arbitrary-length-ids",
     "compat-tag-info",
     "compat-encrypted-stickers",
@@ -80,8 +78,9 @@ ruma = { git = "https://github.com/SchildiChat/ruma", rev = "e178b5e84", feature
     "unstable-msc4171",
     "unstable-msc4278",
     "unstable-msc4286",
+    "unstable-msc4306"
 ] }
-ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "e178b5e84" }
+ruma-common = { git = "https://github.com/SchildiChat/ruma", rev = "f7afc65df" }
 sentry = "0.36.0"
 sentry-tracing = "0.36.0"
 serde = { version = "1.0.217", features = ["rc"] }
@@ -183,6 +182,10 @@ inherits = "release"
 lto = false
 # Get symbol names for profiling purposes.
 debug = true
+
+[profile.bench]
+inherits = "release"
+lto = false
 
 [patch.crates-io]
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
