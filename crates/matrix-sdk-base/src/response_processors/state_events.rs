@@ -107,24 +107,16 @@ pub mod sync {
                 }
 
                 AnySyncStateEvent::RoomCreate(create) => {
-                    if super::is_create_event_valid(
+                    let edited_create = super::validate_create_event_predecessor(
                         context,
                         room_info.room_id(),
                         create,
                         state_store,
-                    ) {
-                        room_info.handle_state_event(event);
-                    } else {
-                        error!(
-                            room_id = ?room_info.room_id(),
-                            ?create,
-                            "`m.create.tombstone` event is invalid, it creates a loop"
-                        );
+                    );
 
-                        // Do not add the event to `room_info`.
-                        // Do not add the event to `context.state_changes.state`.
-                        continue;
-                    }
+                    room_info.handle_state_event(
+                        edited_create.map(Into::into).as_ref().unwrap_or(event),
+                    );
                 }
 
                 AnySyncStateEvent::RoomTombstone(tombstone) => {
@@ -212,8 +204,10 @@ pub mod sync {
 pub mod stripped {
     use std::{collections::BTreeMap, iter};
 
-    use ruma::{events::AnyStrippedStateEvent, push::Action};
-    use tracing::instrument;
+    use ruma::{
+        api::client::sync::sync_events::StrippedState, events::AnyStrippedStateEvent, push::Action,
+    };
+    use tracing::{instrument, warn};
 
     use super::{
         super::{notification, timeline},
@@ -221,11 +215,20 @@ pub mod stripped {
     };
     use crate::{Result, Room, RoomInfo};
 
-    /// Collect [`AnyStrippedStateEvent`] to [`AnyStrippedStateEvent`].
+    /// Collect [`Raw<StrippedState>`] to [`AnyStrippedStateEvent`].
     pub fn collect(
-        raw_events: &[Raw<AnyStrippedStateEvent>],
-    ) -> (Vec<Raw<AnyStrippedStateEvent>>, Vec<AnyStrippedStateEvent>) {
-        super::collect(raw_events)
+        raw_events: &[Raw<StrippedState>],
+    ) -> (Vec<Raw<StrippedState>>, Vec<AnyStrippedStateEvent>) {
+        raw_events
+            .iter()
+            .filter_map(|raw_event| match raw_event.deserialize_as() {
+                Ok(event) => Some((raw_event.clone(), event)),
+                Err(e) => {
+                    warn!("Couldn't deserialize stripped state event: {e}");
+                    None
+                }
+            })
+            .unzip()
     }
 
     /// Dispatch the stripped state events.
@@ -247,7 +250,7 @@ pub mod stripped {
     #[instrument(skip_all, fields(room_id = ?room_info.room_id))]
     pub(crate) async fn dispatch_invite_or_knock(
         context: &mut Context,
-        (raw_events, events): (&[Raw<AnyStrippedStateEvent>], &[AnyStrippedStateEvent]),
+        (raw_events, events): (&[Raw<StrippedState>], &[AnyStrippedStateEvent]),
         room: &Room,
         room_info: &mut RoomInfo,
         mut notification: notification::Notification<'_>,
@@ -306,31 +309,47 @@ where
         .unzip()
 }
 
-/// Check if `m.room.create` isn't creating a loop of rooms.
-pub fn is_create_event_valid(
+/// Check if the `predecessor` in `m.room.create` isn't creating a loop of
+/// rooms.
+///
+/// If it is, we return a clone of the event with the predecessor removed.
+pub fn validate_create_event_predecessor(
     context: &mut Context,
     room_id: &RoomId,
     event: &SyncStateEvent<RoomCreateEventContent>,
     state_store: &BaseStateStore,
-) -> bool {
+) -> Option<SyncStateEvent<RoomCreateEventContent>> {
     let mut already_seen = BTreeSet::new();
     already_seen.insert(room_id.to_owned());
 
-    let Some(mut predecessor_room_id) = event
-        .as_original()
-        .and_then(|event| Some(event.content.predecessor.as_ref()?.room_id.clone()))
+    // Redacted and non-redacted create events use the same content type.
+    let content = match event {
+        SyncStateEvent::Original(event) => &event.content,
+        SyncStateEvent::Redacted(event) => &event.content,
+    };
+
+    let Some(mut predecessor_room_id) =
+        content.predecessor.as_ref().map(|predecessor| predecessor.room_id.clone())
     else {
-        // `true` means no problem. No predecessor = no problem here.
-        return true;
+        // No predecessor = no problem here.
+        return None;
     };
 
     loop {
         // We must check immediately if the `predecessor_room_id` is in `already_seen`
         // in case of a room is created and marks itself as its predecessor in a single
         // sync.
-        if already_seen.contains(AsRef::<RoomId>::as_ref(&predecessor_room_id)) {
+        if already_seen.contains(&predecessor_room_id) {
             // Ahhh, there is a loop with `m.room.create` events!
-            return false;
+            // We remove the predecessor so that we don't process it later.
+            let mut event = event.clone();
+
+            match &mut event {
+                SyncStateEvent::Original(event) => event.content.predecessor.take(),
+                SyncStateEvent::Redacted(event) => event.content.predecessor.take(),
+            };
+
+            return Some(event);
         }
 
         already_seen.insert(predecessor_room_id.clone());
@@ -355,7 +374,7 @@ pub fn is_create_event_valid(
         predecessor_room_id = next_predecessor_room_id;
     }
 
-    true
+    None
 }
 
 /// Check if `m.room.tombstone` isn't creating a loop of rooms.
@@ -409,6 +428,7 @@ pub fn is_tombstone_event_valid(
 
 #[cfg(test)]
 mod tests {
+    use assert_matches2::assert_matches;
     use matrix_sdk_test::{
         DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
         event_factory::EventFactory,
@@ -909,11 +929,12 @@ mod tests {
             // The sync doesn't fail but…
             assert!(client.receive_sync_response(response).await.is_ok());
 
-            // … the state event has not been saved.
+            // … the predecessor has not been saved.
             let room_0 = client.get_room(room_id_0).unwrap();
 
             assert!(room_0.predecessor_room().is_none(), "room 0 must not have a predecessor");
             assert!(room_0.successor_room().is_none(), "room 0 must not have a successor");
+            assert_matches!(room_0.create_content(), Some(_), "room 0 must have a create content");
         }
     }
 
@@ -950,11 +971,12 @@ mod tests {
             // The sync doesn't fail but…
             assert!(client.receive_sync_response(response).await.is_ok());
 
-            // … the state event has not been saved.
+            // … the tombstone event and the predecessor have not been saved.
             let room_0 = client.get_room(room_id_0).unwrap();
 
             assert!(room_0.predecessor_room().is_none(), "room 0 must not have a predecessor");
             assert!(room_0.successor_room().is_none(), "room 0 must not have a successor");
+            assert_matches!(room_0.create_content(), Some(_), "room 0 must have a create content");
         }
     }
 
@@ -1059,6 +1081,7 @@ mod tests {
             // this state event is missing because it creates a loop
             assert!(room_2.predecessor_room().is_none(), "room 2 must not have a predecessor");
             assert!(room_2.successor_room().is_none(), "room 2 must not have a successor",);
+            assert_matches!(room_2.create_content(), Some(_), "room 2 must have a create content");
         }
     }
 

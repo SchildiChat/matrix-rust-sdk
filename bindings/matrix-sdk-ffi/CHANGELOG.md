@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 
 ### Breaking changes:
 
+- `TimelineDiff` is now exported as a true `uniffi::Enum` instead of the weird `uniffi::Object` hybrid. This matches
+  both `RoomDirectorySearchEntryUpdate` and `RoomListEntriesUpdate` and can be used in the same way.
+  ([#5474](https://github.com/matrix-org/matrix-rust-sdk/pull/5474))
 - The `creator` field of `RoomInfo` has been renamed to `creators` and can now contain a list of
   user IDs, to reflect that a room can now have several creators, as introduced in room version 12.
   ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
@@ -64,6 +67,7 @@ All notable changes to this project will be documented in this file.
   calling `Client::login_with_qr_code`. ([#5388](https://github.com/matrix-org/matrix-rust-sdk/pull/5388))
 - The MSRV has been bumped to Rust 1.88.
   ([#5431](https://github.com/matrix-org/matrix-rust-sdk/pull/5431))
+- `Room::send_call_notification` and `Room::send_call_notification_if_needed` have been removed, since the event type they send is outdated, and `Client` is not actually supposed to be able to join MatrixRTC sessions (yet). In practice, users of these methods probably already rely on another MatrixRTC implementation to participate in sessions, and such an implementation should be capable of sending notifications itself.
 
 ## [0.13.0] - 2025-07-10
 

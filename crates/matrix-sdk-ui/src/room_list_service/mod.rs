@@ -69,11 +69,15 @@ use matrix_sdk::{
 pub use room_list::*;
 use ruma::{
     OwnedRoomId, RoomId, UInt, api::client::sync::sync_events::v5 as http, assign,
-    directory::RoomTypeFilter, events::StateEventType,
+    events::StateEventType,
 };
 pub use state::*;
 use thiserror::Error;
 use tracing::{debug, error};
+
+// SC start
+use ruma::directory::RoomTypeFilter;
+// SC end
 
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
@@ -178,7 +182,6 @@ impl RoomListService {
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
                         // returned. If true, only invited rooms are returned.
                         is_invite: None,
-                        not_room_types: vec![RoomTypeFilter::Space],
                     }))),
             )
             .await

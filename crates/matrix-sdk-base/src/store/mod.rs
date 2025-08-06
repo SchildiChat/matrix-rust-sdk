@@ -47,11 +47,12 @@ pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 use observable_map::ObservableMap;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
+    api::client::sync::sync_events::StrippedState,
     events::{
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
-        AnySyncStateEvent, EmptyStateKey, GlobalAccountDataEventType, RedactContent,
-        RedactedStateEventContent, RoomAccountDataEventType, StateEventType, StaticEventContent,
-        StaticStateEventContent, StrippedStateEvent, SyncStateEvent,
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent, EmptyStateKey,
+        GlobalAccountDataEventType, RedactContent, RedactedStateEventContent,
+        RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
+        StrippedStateEvent, SyncStateEvent,
         presence::PresenceEvent,
         receipt::ReceiptEventContent,
         room::{
@@ -102,20 +103,25 @@ pub enum StoreError {
     /// An error happened in the underlying database backend.
     #[error(transparent)]
     Backend(Box<dyn std::error::Error + Send + Sync>),
+
     /// An error happened while serializing or deserializing some data.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
     /// An error happened while deserializing a Matrix identifier, e.g. an user
     /// id.
     #[error(transparent)]
     Identifier(#[from] ruma::IdParseError),
+
     /// The store is locked with a passphrase and an incorrect passphrase was
     /// given.
     #[error("The store failed to be unlocked")]
     StoreLocked,
+
     /// An unencrypted store was tried to be unlocked with a passphrase.
     #[error("The store is not encrypted but was tried to be opened with a passphrase")]
     UnencryptedStore,
+
     /// The store failed to encrypt or decrypt some data.
     #[error("Error encrypting or decrypting data from the store: {0}")]
     Encryption(#[from] StoreEncryptionError),
@@ -130,11 +136,19 @@ pub enum StoreError {
         version: {0}, latest version: {1}"
     )]
     UnsupportedDatabaseVersion(usize, usize),
+
     /// Redacting an event in the store has failed.
     ///
     /// This should never happen.
     #[error("Redaction failed: {0}")]
     Redaction(#[source] ruma::canonical_json::RedactionError),
+
+    /// The store contains invalid data.
+    #[error("The store contains invalid data: {details}")]
+    InvalidData {
+        /// Details about which data is invalid, and how.
+        details: String,
+    },
 }
 
 impl StoreError {
@@ -465,6 +479,47 @@ pub enum RoomLoadSettings {
     One(OwnedRoomId),
 }
 
+/// Status of a thread subscription, as saved in the state store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadStatus {
+    /// The thread is subscribed to.
+    Subscribed {
+        /// Whether the subscription was made automatically by a client, not by
+        /// manual user choice.
+        automatic: bool,
+    },
+    /// The thread is unsubscribed to (it won't cause any notifications or
+    /// automatic subscription anymore).
+    Unsubscribed,
+}
+
+impl ThreadStatus {
+    /// Convert the current [`ThreadStatus`] into a string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThreadStatus::Subscribed { automatic } => {
+                if *automatic {
+                    "automatic"
+                } else {
+                    "manual"
+                }
+            }
+            ThreadStatus::Unsubscribed => "unsubscribed",
+        }
+    }
+
+    /// Convert a string representation into a [`ThreadStatus`], if it is a
+    /// valid one, or `None` otherwise.
+    pub fn from_value(s: &str) -> Option<Self> {
+        match s {
+            "automatic" => Some(ThreadStatus::Subscribed { automatic: true }),
+            "manual" => Some(ThreadStatus::Subscribed { automatic: false }),
+            "unsubscribed" => Some(ThreadStatus::Unsubscribed),
+            _ => None,
+        }
+    }
+}
+
 /// Store state changes and pass them to the StateStore.
 #[derive(Clone, Debug, Default)]
 pub struct StateChanges {
@@ -503,11 +558,9 @@ pub struct StateChanges {
     pub redactions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, Raw<SyncRoomRedactionEvent>>>,
 
     /// A mapping of `RoomId` to a map of event type to a map of state key to
-    /// `AnyStrippedStateEvent`.
-    pub stripped_state: BTreeMap<
-        OwnedRoomId,
-        BTreeMap<StateEventType, BTreeMap<String, Raw<AnyStrippedStateEvent>>>,
-    >,
+    /// `StrippedState`.
+    pub stripped_state:
+        BTreeMap<OwnedRoomId, BTreeMap<StateEventType, BTreeMap<String, Raw<StrippedState>>>>,
 
     /// A map from room id to a map of a display name and a set of user ids that
     /// share that display name in the given room.
