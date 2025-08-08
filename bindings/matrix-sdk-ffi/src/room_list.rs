@@ -29,7 +29,7 @@ use crate::{
 };
 
 // SC start
-use matrix_sdk_ui::room_list_service::filters::new_filter_sc_rooms;
+use matrix_sdk_ui::room_list_service::filters::{new_filter_sc_rooms, new_filter_is_space};
 // SC end
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -463,6 +463,7 @@ pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
     NonSpace,
+    IsSpace,
     NonLeft,
     // Not { filter: RoomListEntriesDynamicFilterKind } - requires recursive enum
     // support in uniffi https://github.com/mozilla/uniffi-rs/issues/396
@@ -506,6 +507,7 @@ impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
             )),
             Kind::NonLeft => Box::new(new_filter_non_left()),
             Kind::NonSpace => Box::new(new_filter_non_space()),
+            Kind::IsSpace => Box::new(new_filter_is_space()),
             Kind::Joined => Box::new(new_filter_joined()),
             Kind::Unread => Box::new(new_filter_unread()),
             Kind::Favourite => Box::new(new_filter_favourite()),
