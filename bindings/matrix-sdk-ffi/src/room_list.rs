@@ -105,13 +105,6 @@ impl RoomListService {
         }))
     }
 
-    async fn all_spaces(self: Arc<Self>) -> Result<Arc<RoomList>, RoomListError> {
-        Ok(Arc::new(RoomList {
-            room_list_service: self.clone(),
-            inner: Arc::new(self.inner.all_spaces().await.map_err(RoomListError::from)?),
-        }))
-    }
-
     fn sync_indicator(
         &self,
         delay_before_showing_in_ms: u32,

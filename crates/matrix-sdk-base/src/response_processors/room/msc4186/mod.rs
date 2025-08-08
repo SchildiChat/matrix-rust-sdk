@@ -88,15 +88,6 @@ pub async fn update_any_room(
     // Find or create the room in the store
     let is_new_room = !state_store.room_exists(room_id);
 
-    let is_space = state_events.iter().find(|ev| matches!(ev, AnySyncStateEvent::RoomCreate { .. }))
-        .and_then(|ev|
-            if let ruma::events::AnyFullStateEventContent::RoomCreate(ruma::events::FullStateEventContent::Original { content, .. }) = ev.content() {
-                content.room_type.map(|t| t == ruma::room::RoomType::Space)
-            } else {
-                None
-            }
-    );
-
     let invite_state_events =
         room_response.invite_state.as_ref().map(|events| state_events::stripped::collect(events));
 
@@ -109,7 +100,6 @@ pub async fn update_any_room(
         user_id,
         room_id,
         room_info_notable_update_sender,
-        is_space,
     );
 
     room_info.mark_state_partially_synced();
@@ -244,7 +234,6 @@ fn membership(
     user_id: &UserId,
     room_id: &RoomId,
     room_info_notable_update_sender: Sender<RoomInfoNotableUpdate>,
-    is_space: Option<bool>,
 ) -> (Room, RoomInfo, Option<RoomUpdateKind>) {
     // There are invite state events. It means the room can be:
     //
@@ -271,7 +260,6 @@ fn membership(
                     room_id,
                     RoomState::Knocked,
                     room_info_notable_update_sender,
-                    is_space,
                 );
                 let mut room_info = room.clone_info();
                 // Override the room state if the room already exists.
@@ -290,7 +278,6 @@ fn membership(
                     room_id,
                     RoomState::Invited,
                     room_info_notable_update_sender,
-                    is_space,
                 );
                 let mut room_info = room.clone_info();
                 // Override the room state if the room already exists.
@@ -307,7 +294,7 @@ fn membership(
     // learn more.
     else {
         let room =
-            store.get_or_create_room(room_id, RoomState::Joined, room_info_notable_update_sender, is_space);
+            store.get_or_create_room(room_id, RoomState::Joined, room_info_notable_update_sender);
         let mut room_info = room.clone_info();
 
         // We default to considering this room joined if it's not an invite. If it's

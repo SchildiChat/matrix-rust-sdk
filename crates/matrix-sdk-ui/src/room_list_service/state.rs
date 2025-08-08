@@ -23,7 +23,6 @@ use ruma::time::{Duration, Instant};
 use super::Error;
 
 pub const ALL_ROOMS_LIST_NAME: &str = "all_rooms";
-pub const ALL_SPACES_LIST_NAME: &str = "all_spaces";
 
 /// The state of the [`super::RoomList`].
 #[derive(Clone, Debug, PartialEq)]

@@ -180,9 +180,6 @@ pub(crate) struct BaseStateStore {
     pub(super) sync_token: Arc<RwLock<Option<String>>>,
     /// All rooms the store knows about.
     rooms: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
-    /// SC: All spaces the store knows about.
-    spaces: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
-    non_spaces: Arc<StdRwLock<ObservableMap<OwnedRoomId, Room>>>,
     /// A lock to synchronize access to the store, such that data by the sync is
     /// never overwritten.
     sync_lock: Arc<Mutex<()>>,
@@ -197,8 +194,6 @@ impl BaseStateStore {
             room_load_settings: Default::default(),
             sync_token: Default::default(),
             rooms: Arc::new(StdRwLock::new(ObservableMap::new())),
-            spaces: Arc::new(StdRwLock::new(ObservableMap::new())),
-            non_spaces: Arc::new(StdRwLock::new(ObservableMap::new())),
             sync_lock: Default::default(),
         }
     }
@@ -230,8 +225,6 @@ impl BaseStateStore {
         let room_infos = self.load_and_migrate_room_infos(room_load_settings).await?;
 
         let mut rooms = self.rooms.write().unwrap();
-        let mut spaces = self.spaces.write().unwrap();
-        let mut non_spaces = self.non_spaces.write().unwrap();
 
         for room_info in room_infos {
             let new_room = Room::restore(
@@ -241,13 +234,6 @@ impl BaseStateStore {
                 room_info_notable_update_sender.clone(),
             );
             let new_room_id = new_room.room_id().to_owned();
-
-            // SC: Also insert into spaces list
-            if Some(ruma::room::RoomType::Space) == new_room.room_type() {
-                spaces.insert(new_room_id.clone(), new_room.clone());
-            } else {
-                non_spaces.insert(new_room_id.clone(), new_room.clone());
-            }
 
             rooms.insert(new_room_id, new_room);
         }
@@ -344,13 +330,8 @@ impl BaseStateStore {
     /// rooms.
     pub fn rooms_stream(
         &self,
-        spaces: bool,
     ) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + use<>) {
-        if spaces {
-            self.spaces.read()
-       } else {
-            self.non_spaces.read()
-        }.unwrap().stream()
+        self.rooms.read().unwrap().stream()
     }
 
     /// Get the room with the given room id.
@@ -370,12 +351,11 @@ impl BaseStateStore {
         room_id: &RoomId,
         room_state: RoomState,
         room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
-        is_space: Option<bool>,
     ) -> Room {
         let user_id =
             &self.session_meta.get().expect("Creating room while not being logged in").user_id;
 
-        let result = self.rooms
+        self.rooms
             .write()
             .unwrap()
             .get_or_create(room_id, || {
@@ -387,13 +367,7 @@ impl BaseStateStore {
                     room_info_notable_update_sender,
                 )
             })
-            .clone();
-        if is_space == Some(true) || (is_space == None && result.room_type() == Some(ruma::room::RoomType::Space)) {
-            self.spaces.write().unwrap().get_or_create(room_id, || result.clone());
-        } else {
-            self.non_spaces.write().unwrap().get_or_create(room_id, || result.clone());
-        }
-        result
+            .clone()
     }
 
     /// Forget the room with the given room ID.

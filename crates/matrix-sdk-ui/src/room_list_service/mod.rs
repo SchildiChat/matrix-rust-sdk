@@ -75,10 +75,6 @@ pub use state::*;
 use thiserror::Error;
 use tracing::{debug, error};
 
-// SC start
-use ruma::directory::RoomTypeFilter;
-// SC end
-
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
 const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
@@ -182,33 +178,6 @@ impl RoomListService {
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
                         // returned. If true, only invited rooms are returned.
                         is_invite: None,
-                    }))),
-            )
-            .await
-            .map_err(Error::SlidingSync)?
-            .add_cached_list(
-                SlidingSyncList::builder(ALL_SPACES_LIST_NAME)
-                    .sync_mode(
-                        // Spec says leaving away the range should return the full list,
-                        // but we don't have a SyncMode for that (yet)
-                        SlidingSyncMode::new_selective().add_range(0..=u32::MAX),
-                    )
-                    .timeline_limit(0)
-                    .required_state(vec![
-                        (StateEventType::RoomName, "".to_owned()),
-                        (StateEventType::RoomAvatar, "".to_owned()),
-                        (StateEventType::RoomCanonicalAlias, "".to_owned()),
-                        (StateEventType::RoomCreate, "".to_owned()),
-                        (StateEventType::SpaceChild, "*".to_owned()),
-                        // Future use?
-                        (StateEventType::RoomEncryption, "".to_owned()),
-                        (StateEventType::RoomMember, "$LAZY".to_owned()),
-                        (StateEventType::RoomMember, "$ME".to_owned()),
-                        (StateEventType::RoomPowerLevels, "".to_owned()),
-                    ])
-                    .filters(Some(assign!(http::request::ListFilters::default(), {
-                        is_invite: Some(false),
-                        room_types: vec![RoomTypeFilter::Space],
                     }))),
             )
             .await
@@ -417,19 +386,13 @@ impl RoomListService {
         self.state_machine.subscribe()
     }
 
-    async fn list_for(&self, sliding_sync_list_name: &str, is_space_list: bool) -> Result<RoomList, Error> {
-        RoomList::new(&self.client, &self.sliding_sync, sliding_sync_list_name, self.state(), is_space_list).await
+    async fn list_for(&self, sliding_sync_list_name: &str) -> Result<RoomList, Error> {
+        RoomList::new(&self.client, &self.sliding_sync, sliding_sync_list_name, self.state()).await
     }
 
     /// Get a [`RoomList`] for all rooms.
     pub async fn all_rooms(&self) -> Result<RoomList, Error> {
-        //self.list_for(ALL_ROOMS_LIST_NAME).await
-        self.list_for(ALL_ROOMS_LIST_NAME, false).await
-    }
-
-    /// Get a [`RoomList`] for spaces
-    pub async fn all_spaces(&self) -> Result<RoomList, Error> {
-        self.list_for(ALL_SPACES_LIST_NAME, true).await
+        self.list_for(ALL_ROOMS_LIST_NAME).await
     }
 
     /// Get a [`Room`] if it exists.

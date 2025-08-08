@@ -275,9 +275,8 @@ impl BaseClient {
     /// rooms.
     pub fn rooms_stream(
         &self,
-        spaces: bool,
     ) -> (Vector<Room>, impl Stream<Item = Vec<VectorDiff<Room>>> + use<>) {
-        self.state_store.rooms_stream(spaces)
+        self.state_store.rooms_stream()
     }
 
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist
@@ -287,7 +286,6 @@ impl BaseClient {
             room_id,
             room_state,
             self.room_info_notable_update_sender.clone(),
-            None,
         )
     }
 
@@ -405,7 +403,6 @@ impl BaseClient {
             room_id,
             RoomState::Knocked,
             self.room_info_notable_update_sender.clone(),
-            None,
         );
 
         if room.state() != RoomState::Knocked {
@@ -471,7 +468,6 @@ impl BaseClient {
             room_id,
             RoomState::Joined,
             self.room_info_notable_update_sender.clone(),
-            None,
         );
 
         // If the state isn't `RoomState::Joined` then this means that we knew about
@@ -525,7 +521,6 @@ impl BaseClient {
             room_id,
             RoomState::Left,
             self.room_info_notable_update_sender.clone(),
-            None,
         );
 
         if room.state() != RoomState::Left {
