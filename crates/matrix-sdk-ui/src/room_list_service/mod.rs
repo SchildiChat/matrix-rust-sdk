@@ -87,6 +87,7 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomAvatar, ""),
     (StateEventType::RoomCanonicalAlias, ""),
     (StateEventType::RoomPowerLevels, ""),
+    (StateEventType::SpaceChild, "*"),
     (StateEventType::CallMember, "*"),
     (StateEventType::RoomJoinRules, ""),
     (StateEventType::RoomTombstone, ""),
