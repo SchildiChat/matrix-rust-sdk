@@ -6,10 +6,12 @@ use ruma::{
     api::{
         IncomingResponse,
         client::sync::sync_events::v3::{
-            InvitedRoom, JoinedRoom, KnockedRoom, LeftRoom, Response as SyncResponse,
+            InvitedRoom, JoinedRoom, KnockedRoom, LeftRoom, Response as SyncResponse, State,
         },
     },
-    events::{AnyGlobalAccountDataEvent, AnyToDeviceEvent, presence::PresenceEvent},
+    events::{
+        AnyGlobalAccountDataEvent, AnySyncStateEvent, AnyToDeviceEvent, presence::PresenceEvent,
+    },
     serde::Raw,
 };
 use serde_json::{Value as JsonValue, from_value as from_json_value, json};
@@ -29,8 +31,7 @@ pub use joined_room::JoinedRoomBuilder;
 pub use knocked_room::KnockedRoomBuilder;
 pub use left_room::LeftRoomBuilder;
 pub use test_event::{
-    GlobalAccountDataTestEvent, PresenceTestEvent, RoomAccountDataTestEvent, StateTestEvent,
-    StrippedStateTestEvent,
+    PresenceTestEvent, RoomAccountDataTestEvent, StateTestEvent, StrippedStateTestEvent,
 };
 
 /// The `SyncResponseBuilder` struct can be used to easily generate valid sync
@@ -135,27 +136,17 @@ impl SyncResponseBuilder {
     }
 
     /// Add global account data.
-    pub fn add_global_account_data_event(
+    pub fn add_global_account_data(
         &mut self,
-        event: GlobalAccountDataTestEvent,
+        event: impl Into<Raw<AnyGlobalAccountDataEvent>>,
     ) -> &mut Self {
-        let val = match event {
-            GlobalAccountDataTestEvent::Direct => test_json::DIRECT.to_owned(),
-            GlobalAccountDataTestEvent::PushRules => test_json::PUSH_RULES.to_owned(),
-            GlobalAccountDataTestEvent::IgnoredUserList => test_json::IGNORED_USER_LIST.to_owned(),
-            GlobalAccountDataTestEvent::Custom(json) => json,
-        };
-
-        self.account_data.push(from_json_value(val).unwrap());
+        self.account_data.push(event.into());
         self
     }
 
-    /// Add global account data in bulk.
-    pub fn add_global_account_data_bulk<I>(&mut self, events: I) -> &mut Self
-    where
-        I: IntoIterator<Item = Raw<AnyGlobalAccountDataEvent>>,
-    {
-        self.account_data.extend(events);
+    /// Add custom global account data based on a JSON value.
+    pub fn add_custom_global_account_data(&mut self, event: serde_json::Value) -> &mut Self {
+        self.account_data.push(Raw::new(&event).unwrap().cast_unchecked());
         self
     }
 
@@ -245,5 +236,28 @@ impl SyncResponseBuilder {
         self.left_rooms.clear();
         self.knocked_rooms.clear();
         self.presence.clear();
+    }
+}
+
+/// Helper trait to mutate the data in [`State`].
+trait StateMutExt {
+    /// Use the `After` variant rather than `Before`.
+    fn use_state_after(&mut self);
+    /// Access the inner list of state events.
+    fn events_mut(&mut self) -> &mut Vec<Raw<AnySyncStateEvent>>;
+}
+
+impl StateMutExt for State {
+    fn use_state_after(&mut self) {
+        *self = Self::After(Default::default());
+    }
+
+    fn events_mut(&mut self) -> &mut Vec<Raw<AnySyncStateEvent>> {
+        match self {
+            Self::Before(state) => &mut state.events,
+            Self::After(state) => &mut state.events,
+            // We don't allow to construct another variant.
+            _ => unreachable!(),
+        }
     }
 }

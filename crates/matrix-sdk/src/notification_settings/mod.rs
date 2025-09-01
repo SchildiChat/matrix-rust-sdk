@@ -91,36 +91,40 @@ pub struct NotificationSettings {
     rules: Arc<RwLock<Rules>>,
     /// Drop guard of event handler for push rules event.
     _push_rules_event_handler_guard: Arc<EventHandlerDropGuard>,
+    /// Notified every time the push rules change, either due to sync or local
+    /// changes.
     changes_sender: broadcast::Sender<()>,
 }
 
 impl NotificationSettings {
-    /// Build a new `NotificationSettings``
+    /// Build a new [`NotificationSettings`].
     ///
     /// # Arguments
     ///
-    /// * `client` - A `Client` used to perform API calls
-    /// * `ruleset` - A `Ruleset` containing account's owner push rules
+    /// * `client` - A [`Client`] used to perform API calls.
+    /// * `ruleset` - A [`Ruleset`] containing account's owner push rules.
     pub(crate) fn new(client: Client, ruleset: Ruleset) -> Self {
         let changes_sender = broadcast::Sender::new(100);
         let rules = Arc::new(RwLock::new(Rules::new(ruleset)));
 
-        // Listen for PushRulesEvent
+        // Listen for PushRulesEvent.
         let push_rules_event_handler_handle = client.add_event_handler({
             let changes_sender = changes_sender.clone();
-            let rules = Arc::clone(&rules);
+            let rules = rules.clone();
             move |ev: PushRulesEvent| async move {
                 *rules.write().await = Rules::new(ev.content.global);
                 let _ = changes_sender.send(());
             }
         });
+
         let _push_rules_event_handler_guard =
-            client.event_handler_drop_guard(push_rules_event_handler_handle).into();
+            Arc::new(client.event_handler_drop_guard(push_rules_event_handler_handle));
 
         Self { client, rules, _push_rules_event_handler_guard, changes_sender }
     }
 
-    /// Subscribe to changes in the `NotificationSettings`.
+    /// Subscribe to changes to the [`NotificationSettings`] (i.e. changes to
+    /// push rules).
     ///
     /// Changes can happen due to local changes or changes in another session.
     pub fn subscribe_to_changes(&self) -> Receiver<()> {
@@ -567,6 +571,12 @@ impl NotificationSettings {
         }
         Ok(())
     }
+
+    /// Returns the inner ruleset currently known by this
+    /// [`NotificationSettings`] instance.
+    pub async fn ruleset(&self) -> Ruleset {
+        self.rules.read().await.ruleset.clone()
+    }
 }
 
 // The http mocking library is not supported for wasm32
@@ -580,26 +590,26 @@ mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_test::{
         async_test,
+        event_factory::EventFactory,
         notification_settings::{build_ruleset, get_server_default_ruleset},
-        test_json,
+        TestResult,
     };
     use ruma::{
+        owned_room_id,
         push::{
             Action, AnyPushRuleRef, NewPatternedPushRule, NewPushRule, PredefinedContentRuleId,
-            PredefinedOverrideRuleId, PredefinedUnderrideRuleId, RuleKind,
+            PredefinedOverrideRuleId, PredefinedUnderrideRuleId, RuleKind, Ruleset,
         },
         OwnedRoomId, RoomId,
     };
-    use serde_json::json;
     use stream_assert::{assert_next_eq, assert_pending};
     use tokio_stream::wrappers::BroadcastStream;
     use wiremock::{
-        matchers::{header, method, path, path_regex},
+        matchers::{method, path, path_regex},
         Mock, MockServer, ResponseTemplate,
     };
 
     use crate::{
-        config::SyncSettings,
         error::NotificationSettingsError,
         notification_settings::{
             IsEncrypted, IsOneToOne, NotificationSettings, RoomNotificationMode,
@@ -609,7 +619,7 @@ mod tests {
     };
 
     fn get_test_room_id() -> OwnedRoomId {
-        RoomId::parse("!AAAaAAAAAaaAAaaaaa:matrix.org").unwrap()
+        owned_room_id!("!AAAaAAAAAaaAAaaaaa:matrix.org")
     }
 
     fn from_insert_rules(
@@ -628,33 +638,30 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_subscribe_to_changes() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+    async fn test_subscribe_to_changes() -> TestResult {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
         let settings = client.notification_settings().await;
-
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/sync"))
-            .and(header("authorization", "Bearer 1234"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "next_batch": "1234",
-                "account_data": {
-                    "events": [*test_json::PUSH_RULES]
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
 
         let subscriber = settings.subscribe_to_changes();
         let mut stream = BroadcastStream::new(subscriber);
 
         assert_pending!(stream);
 
-        client.sync_once(SyncSettings::default()).await.unwrap();
+        server
+            .mock_sync()
+            .ok_and_run(&client, |sync_response_builder| {
+                let f = EventFactory::new();
+                sync_response_builder.add_global_account_data(
+                    f.push_rules(Ruleset::server_default(client.user_id().unwrap())),
+                );
+            })
+            .await;
 
         assert_next_eq!(stream, Ok(()));
         assert_pending!(stream);
+
+        Ok(())
     }
 
     #[async_test]
@@ -733,37 +740,39 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_get_default_room_notification_mode_all_messages() {
+    async fn test_get_default_room_notification_mode_all_messages() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_actions(
-                RuleKind::Underride,
-                PredefinedUnderrideRuleId::RoomOneToOne,
-                vec![Action::Notify],
-            )
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::RoomOneToOne,
+            vec![Action::Notify],
+        )?;
 
         let settings = NotificationSettings::new(client, ruleset);
         assert_eq!(
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes).await,
             RoomNotificationMode::AllMessages
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_get_default_room_notification_mode_mentions_and_keywords() {
+    async fn test_get_default_room_notification_mode_mentions_and_keywords() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
         // The default mode must be `MentionsAndKeywords` if the corresponding Underride
         // rule doesn't notify
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_actions(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, vec![])
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::RoomOneToOne,
+            vec![],
+        )?;
 
         let settings = NotificationSettings::new(client.to_owned(), ruleset.to_owned());
         assert_eq!(
@@ -773,19 +782,19 @@ mod tests {
 
         // The default mode must be `MentionsAndKeywords` if the corresponding Underride
         // rule is disabled
-        ruleset
-            .set_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, false)
-            .unwrap();
+        ruleset.set_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
         assert_eq!(
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes).await,
             RoomNotificationMode::MentionsAndKeywordsOnly
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_contains_keyword_rules() {
+    async fn test_contains_keyword_rules() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -802,52 +811,53 @@ mod tests {
             "keyword".into(),
             vec![Action::Notify],
         );
-        ruleset.insert(NewPushRule::Content(rule), None, None).unwrap();
+        ruleset.insert(NewPushRule::Content(rule), None, None)?;
 
         let settings = NotificationSettings::new(client, ruleset);
         let contains_keywords_rules = settings.contains_keyword_rules().await;
         assert!(contains_keywords_rules);
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_is_push_rule_enabled() {
+    async fn test_is_push_rule_enabled() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
         // Initial state: Reaction disabled
         let mut ruleset = get_server_default_ruleset();
-        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, false).unwrap();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, false)?;
 
         let settings = NotificationSettings::new(client.clone(), ruleset);
 
         let enabled = settings
             .is_push_rule_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction)
-            .await
-            .unwrap();
+            .await?;
 
         assert!(!enabled);
 
         // Initial state: Reaction enabled
         let mut ruleset = get_server_default_ruleset();
-        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, true).unwrap();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, true)?;
 
         let settings = NotificationSettings::new(client, ruleset);
 
         let enabled = settings
             .is_push_rule_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction)
-            .await
-            .unwrap();
+            .await?;
 
         assert!(enabled);
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_push_rule_enabled() {
+    async fn test_set_push_rule_enabled() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
-        let mut ruleset = client.account().push_rules().await.unwrap();
+        let mut ruleset = client.account().push_rules().await?;
         // Initial state
-        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, false).unwrap();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
 
@@ -860,8 +870,7 @@ mod tests {
 
         settings
             .set_push_rule_enabled(RuleKind::Override, PredefinedOverrideRuleId::Reaction, true)
-            .await
-            .unwrap();
+            .await?;
 
         // The ruleset must have been updated
         let rules = settings.rules.read().await;
@@ -869,18 +878,17 @@ mod tests {
             rules.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::Reaction).unwrap();
         assert!(rule.enabled());
 
-        server.verify().await
+        server.verify().await;
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_push_rule_enabled_api_error() {
+    async fn test_set_push_rule_enabled_api_error() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
-        let mut ruleset = client.account().push_rules().await.unwrap();
+        let mut ruleset = client.account().push_rules().await?;
         // Initial state
-        ruleset
-            .set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, false)
-            .unwrap();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention, false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
 
@@ -904,10 +912,12 @@ mod tests {
         let rule =
             rules.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::IsUserMention).unwrap();
         assert!(!rule.enabled());
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_room_notification_mode() {
+    async fn test_set_room_notification_mode() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -926,17 +936,18 @@ mod tests {
             RoomNotificationMode::Mute,
         ];
         for new_mode in new_modes {
-            settings.set_room_notification_mode(&room_id, new_mode).await.unwrap();
-
+            settings.set_room_notification_mode(&room_id, new_mode).await?;
             assert_eq!(
                 new_mode,
                 settings.get_user_defined_room_notification_mode(&room_id).await.unwrap()
             );
         }
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_room_notification_mode_requests_order() {
+    async fn test_set_room_notification_mode_requests_order() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -987,14 +998,15 @@ mod tests {
 
         // Set the new mode to `Mute`, this will add a new `Override` rule without
         // action and remove the `Room` rule.
-        settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute).await.unwrap();
+        settings.set_room_notification_mode(&room_id, RoomNotificationMode::Mute).await?;
 
         assert_eq!(
             RoomNotificationMode::Mute,
             settings.get_user_defined_room_notification_mode(&room_id).await.unwrap()
         );
 
-        server.verify().await
+        server.verify().await;
+        Ok(())
     }
 
     #[async_test]
@@ -1062,11 +1074,11 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_delete_user_defined_room_rules() {
+    async fn test_delete_user_defined_room_rules() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
-        let room_id_a = RoomId::parse("!AAAaAAAAAaaAAaaaaa:matrix.org").unwrap();
-        let room_id_b = RoomId::parse("!BBBbBBBBBbbBBbbbbb:matrix.org").unwrap();
+        let room_id_a = owned_room_id!("!AAAaAAAAAaaAAaaaaa:matrix.org");
+        let room_id_b = owned_room_id!("!BBBbBBBBBbbBBbbbbb:matrix.org");
 
         Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
 
@@ -1081,16 +1093,17 @@ mod tests {
         );
 
         // Delete all user defined rules for room_id_a
-        settings.delete_user_defined_room_rules(&room_id_a).await.unwrap();
+        settings.delete_user_defined_room_rules(&room_id_a).await?;
 
         // Only the rules for room_id_b should remain
         let updated_rules = settings.rules.read().await;
         assert_eq!(updated_rules.get_custom_rules_for_room(&room_id_b).len(), 2);
         assert!(updated_rules.get_custom_rules_for_room(&room_id_a).is_empty());
+        Ok(())
     }
 
     #[async_test]
-    async fn test_unmute_room_not_muted() {
+    async fn test_unmute_room_not_muted() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let room_id = get_test_room_id();
@@ -1103,7 +1116,7 @@ mod tests {
         );
 
         // Unmute the room
-        settings.unmute_room(&room_id, IsEncrypted::Yes, IsOneToOne::Yes).await.unwrap();
+        settings.unmute_room(&room_id, IsEncrypted::Yes, IsOneToOne::Yes).await?;
 
         // The ruleset must not be modified
         assert_eq!(
@@ -1119,10 +1132,12 @@ mod tests {
                 assert!(rule.actions.is_empty());
             }
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_unmute_room() {
+    async fn test_unmute_room() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
@@ -1137,14 +1152,16 @@ mod tests {
         );
 
         // Unmute the room
-        settings.unmute_room(&room_id, IsEncrypted::No, IsOneToOne::Yes).await.unwrap();
+        settings.unmute_room(&room_id, IsEncrypted::No, IsOneToOne::Yes).await?;
 
         // The user defined mode must have been removed
         assert!(settings.get_user_defined_room_notification_mode(&room_id).await.is_none());
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_unmute_room_default_mode() {
+    async fn test_unmute_room_default_mode() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         let client = logged_in_client(Some(server.uri())).await;
@@ -1152,7 +1169,7 @@ mod tests {
         let settings = client.notification_settings().await;
 
         // Unmute the room
-        settings.unmute_room(&room_id, IsEncrypted::No, IsOneToOne::Yes).await.unwrap();
+        settings.unmute_room(&room_id, IsEncrypted::No, IsOneToOne::Yes).await?;
 
         // The new mode must be `AllMessages`
         assert_eq!(
@@ -1168,31 +1185,29 @@ mod tests {
                 assert!(!rule.actions.is_empty());
             }
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_default_room_notification_mode() {
+    async fn test_set_default_room_notification_mode() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         let client = logged_in_client(Some(server.uri())).await;
 
         // If the initial mode is `AllMessages`
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_actions(
-                RuleKind::Underride,
-                PredefinedUnderrideRuleId::Message,
-                vec![Action::Notify],
-            )
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::Message,
+            vec![Action::Notify],
+        )?;
 
-        ruleset
-            .set_actions(
-                RuleKind::Underride,
-                PredefinedUnderrideRuleId::PollStart,
-                vec![Action::Notify],
-            )
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::PollStart,
+            vec![Action::Notify],
+        )?;
 
         let settings = NotificationSettings::new(client, ruleset);
         assert_eq!(
@@ -1207,8 +1222,7 @@ mod tests {
                 IsOneToOne::No,
                 RoomNotificationMode::MentionsAndKeywordsOnly,
             )
-            .await
-            .unwrap();
+            .await?;
 
         // The list of actions for this rule must be empty
         assert_matches!(settings.rules.read().await.ruleset.get(RuleKind::Underride, PredefinedUnderrideRuleId::Message),
@@ -1229,31 +1243,29 @@ mod tests {
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::No).await,
             RoomNotificationMode::MentionsAndKeywordsOnly
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_default_room_notification_mode_one_to_one() {
+    async fn test_set_default_room_notification_mode_one_to_one() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         let client = logged_in_client(Some(server.uri())).await;
 
         // If the initial mode is `AllMessages`
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_actions(
-                RuleKind::Underride,
-                PredefinedUnderrideRuleId::RoomOneToOne,
-                vec![Action::Notify],
-            )
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::RoomOneToOne,
+            vec![Action::Notify],
+        )?;
 
-        ruleset
-            .set_actions(
-                RuleKind::Underride,
-                PredefinedUnderrideRuleId::PollStartOneToOne,
-                vec![Action::Notify],
-            )
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::PollStartOneToOne,
+            vec![Action::Notify],
+        )?;
 
         let settings = NotificationSettings::new(client, ruleset);
         assert_eq!(
@@ -1268,8 +1280,7 @@ mod tests {
                 IsOneToOne::Yes,
                 RoomNotificationMode::MentionsAndKeywordsOnly,
             )
-            .await
-            .unwrap();
+            .await?;
 
         // The list of actions for this rule must be empty
         assert_matches!(settings.rules.read().await.ruleset.get(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne),
@@ -1290,28 +1301,32 @@ mod tests {
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes).await,
             RoomNotificationMode::MentionsAndKeywordsOnly
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_default_room_notification_mode_enables_rules() {
+    async fn test_set_default_room_notification_mode_enables_rules() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         let client = logged_in_client(Some(server.uri())).await;
 
         // If the initial mode is `MentionsAndKeywordsOnly`
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .set_actions(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, vec![])
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::RoomOneToOne,
+            vec![],
+        )?;
 
-        ruleset
-            .set_actions(RuleKind::Underride, PredefinedUnderrideRuleId::PollStartOneToOne, vec![])
-            .unwrap();
+        ruleset.set_actions(
+            RuleKind::Underride,
+            PredefinedUnderrideRuleId::PollStartOneToOne,
+            vec![],
+        )?;
 
         // Disable one of the rules that will be updated
-        ruleset
-            .set_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, false)
-            .unwrap();
+        ruleset.set_enabled(RuleKind::Underride, PredefinedUnderrideRuleId::RoomOneToOne, false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
 
@@ -1322,8 +1337,7 @@ mod tests {
                 IsOneToOne::Yes,
                 RoomNotificationMode::AllMessages,
             )
-            .await
-            .unwrap();
+            .await?;
 
         // The new mode returned should be `AllMessages` which means that the disabled
         // rule (`RoomOneToOne`) has been enabled.
@@ -1331,10 +1345,12 @@ mod tests {
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::Yes).await,
             RoomNotificationMode::AllMessages
         );
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_list_keywords() {
+    async fn test_list_keywords() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -1348,51 +1364,39 @@ mod tests {
 
         // Initial state: 3 rules, 2 keywords
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "a".to_owned(),
-                    "a".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new("a".to_owned(), "a".to_owned(), vec![])),
+            None,
+            None,
+        )?;
         // Test deduplication.
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "a_bis".to_owned(),
-                    "a".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "b".to_owned(),
-                    "b".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "a_bis".to_owned(),
+                "a".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new("b".to_owned(), "b".to_owned(), vec![])),
+            None,
+            None,
+        )?;
 
         let settings = NotificationSettings::new(client, ruleset);
 
         let keywords = settings.enabled_keywords().await;
         assert_eq!(keywords.len(), 2);
         assert!(keywords.get("a").is_some());
-        assert!(keywords.get("b").is_some())
+        assert!(keywords.get("b").is_some());
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_add_keyword_missing() {
+    async fn test_add_keyword_missing() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let settings = client.notification_settings().await;
@@ -1404,7 +1408,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        settings.add_keyword("banana".to_owned()).await.unwrap();
+        settings.add_keyword("banana".to_owned()).await?;
 
         // The ruleset must have been updated.
         let keywords = settings.enabled_keywords().await;
@@ -1412,41 +1416,38 @@ mod tests {
         assert!(keywords.get("banana").is_some());
 
         // Rule exists.
-        let rule_enabled =
-            settings.is_push_rule_enabled(RuleKind::Content, "banana").await.unwrap();
-        assert!(rule_enabled)
+        let rule_enabled = settings.is_push_rule_enabled(RuleKind::Content, "banana").await?;
+        assert!(rule_enabled);
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_add_keyword_disabled() {
+    async fn test_add_keyword_disabled() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "banana_two".to_owned(),
-                    "banana".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset.set_enabled(RuleKind::Content, "banana_two", false).unwrap();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "banana_one".to_owned(),
-                    "banana".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset.set_enabled(RuleKind::Content, "banana_one", false).unwrap();
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "banana_two".to_owned(),
+                "banana".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.set_enabled(RuleKind::Content, "banana_two", false)?;
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "banana_one".to_owned(),
+                "banana".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.set_enabled(RuleKind::Content, "banana_one", false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
         Mock::given(method("PUT"))
@@ -1456,7 +1457,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        settings.add_keyword("banana".to_owned()).await.unwrap();
+        settings.add_keyword("banana".to_owned()).await?;
 
         // The ruleset must have been updated.
         let keywords = settings.enabled_keywords().await;
@@ -1466,45 +1467,43 @@ mod tests {
 
         // The first rule was enabled.
         let first_rule_enabled =
-            settings.is_push_rule_enabled(RuleKind::Content, "banana_one").await.unwrap();
+            settings.is_push_rule_enabled(RuleKind::Content, "banana_one").await?;
         assert!(first_rule_enabled);
         let second_rule_enabled =
-            settings.is_push_rule_enabled(RuleKind::Content, "banana_two").await.unwrap();
+            settings.is_push_rule_enabled(RuleKind::Content, "banana_two").await?;
         assert!(!second_rule_enabled);
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_add_keyword_noop() {
+    async fn test_add_keyword_noop() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "banana_two".to_owned(),
-                    "banana".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "banana_one".to_owned(),
-                    "banana".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset.set_enabled(RuleKind::Content, "banana_one", false).unwrap();
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "banana_two".to_owned(),
+                "banana".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "banana_one".to_owned(),
+                "banana".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.set_enabled(RuleKind::Content, "banana_one", false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
-        settings.add_keyword("banana".to_owned()).await.unwrap();
+        settings.add_keyword("banana".to_owned()).await?;
 
         // Nothing changed.
         let keywords = settings.enabled_keywords().await;
@@ -1513,42 +1512,40 @@ mod tests {
         assert!(keywords.get("banana").is_some());
 
         let first_rule_enabled =
-            settings.is_push_rule_enabled(RuleKind::Content, "banana_one").await.unwrap();
+            settings.is_push_rule_enabled(RuleKind::Content, "banana_one").await?;
         assert!(!first_rule_enabled);
         let second_rule_enabled =
-            settings.is_push_rule_enabled(RuleKind::Content, "banana_two").await.unwrap();
+            settings.is_push_rule_enabled(RuleKind::Content, "banana_two").await?;
         assert!(second_rule_enabled);
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_remove_keyword_all() {
+    async fn test_remove_keyword_all() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
         let mut ruleset = get_server_default_ruleset();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "banana_two".to_owned(),
-                    "banana".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset
-            .insert(
-                NewPushRule::Content(NewPatternedPushRule::new(
-                    "banana_one".to_owned(),
-                    "banana".to_owned(),
-                    vec![],
-                )),
-                None,
-                None,
-            )
-            .unwrap();
-        ruleset.set_enabled(RuleKind::Content, "banana_one", false).unwrap();
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "banana_two".to_owned(),
+                "banana".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.insert(
+            NewPushRule::Content(NewPatternedPushRule::new(
+                "banana_one".to_owned(),
+                "banana".to_owned(),
+                vec![],
+            )),
+            None,
+            None,
+        )?;
+        ruleset.set_enabled(RuleKind::Content, "banana_one", false)?;
 
         let settings = NotificationSettings::new(client, ruleset);
 
@@ -1565,7 +1562,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        settings.remove_keyword("banana").await.unwrap();
+        settings.remove_keyword("banana").await?;
 
         // The ruleset must have been updated.
         let keywords = settings.enabled_keywords().await;
@@ -1578,19 +1575,22 @@ mod tests {
         let second_rule_error =
             settings.is_push_rule_enabled(RuleKind::Content, "banana_two").await.unwrap_err();
         assert_matches!(second_rule_error, NotificationSettingsError::RuleNotFound(_));
+
+        Ok(())
     }
 
     #[async_test]
-    async fn test_remove_keyword_noop() {
+    async fn test_remove_keyword_noop() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let settings = client.notification_settings().await;
 
-        settings.remove_keyword("banana").await.unwrap();
+        settings.remove_keyword("banana").await?;
+        Ok(())
     }
 
     #[async_test]
-    async fn test_set_default_room_notification_mode_missing_poll_start() {
+    async fn test_set_default_room_notification_mode_missing_poll_start() -> TestResult {
         let server = MockServer::start().await;
         Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)).mount(&server).await;
         let client = logged_in_client(Some(server.uri())).await;
@@ -1612,8 +1612,7 @@ mod tests {
                 IsOneToOne::No,
                 RoomNotificationMode::MentionsAndKeywordsOnly,
             )
-            .await
-            .unwrap();
+            .await?;
 
         // the new mode returned by `get_default_room_notification_mode()` should
         // reflect the change.
@@ -1621,10 +1620,11 @@ mod tests {
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::No).await,
             RoomNotificationMode::MentionsAndKeywordsOnly
         );
+        Ok(())
     }
 
     #[async_test]
-    async fn test_create_custom_conditional_push_rule() {
+    async fn test_create_custom_conditional_push_rule() -> TestResult {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let settings = client.notification_settings().await;
@@ -1649,14 +1649,15 @@ mod tests {
                 actions.clone(),
                 conditions.clone(),
             )
-            .await
-            .unwrap();
+            .await?;
 
         let rules = settings.rules.read().await;
         let rule = rules.ruleset.get(RuleKind::Override, "custom_rule").unwrap();
 
         assert_eq!(rule.rule_id(), "custom_rule");
         assert!(rule.enabled());
+
+        Ok(())
     }
 
     #[async_test]
@@ -1685,7 +1686,7 @@ mod tests {
 
     #[async_test]
     #[allow(deprecated)]
-    async fn test_enable_mention_ignore_missing_legacy_push_rules() {
+    async fn test_enable_mention_ignore_missing_legacy_push_rules() -> TestResult {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
         let mut ruleset = get_server_default_ruleset();
@@ -1740,8 +1741,7 @@ mod tests {
                 PredefinedOverrideRuleId::IsUserMention,
                 false,
             )
-            .await
-            .unwrap();
+            .await?;
 
         server
             .mock_enable_push_rule(RuleKind::Override, PredefinedOverrideRuleId::IsRoomMention)
@@ -1756,7 +1756,8 @@ mod tests {
                 PredefinedOverrideRuleId::IsRoomMention,
                 false,
             )
-            .await
-            .unwrap();
+            .await?;
+
+        Ok(())
     }
 }

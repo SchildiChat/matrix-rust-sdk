@@ -1,8 +1,6 @@
 use ruma::{
-    api::client::sync::sync_events::StrippedState,
     events::{
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent,
-        presence::PresenceEvent,
+        AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent, presence::PresenceEvent,
     },
     serde::Raw,
 };
@@ -16,6 +14,7 @@ pub enum StateTestEvent {
     Aliases,
     Create,
     Encryption,
+    EncryptionWithEncryptedStateEvents,
     HistoryVisibility,
     JoinRules,
     Member,
@@ -41,6 +40,9 @@ impl From<StateTestEvent> for JsonValue {
             StateTestEvent::Aliases => test_json::sync_events::ALIASES.to_owned(),
             StateTestEvent::Create => test_json::sync_events::CREATE.to_owned(),
             StateTestEvent::Encryption => test_json::sync_events::ENCRYPTION.to_owned(),
+            StateTestEvent::EncryptionWithEncryptedStateEvents => {
+                test_json::sync_events::ENCRYPTION_WITH_ENCRYPTED_STATE_EVENTS.to_owned()
+            }
             StateTestEvent::HistoryVisibility => {
                 test_json::sync_events::HISTORY_VISIBILITY.to_owned()
             }
@@ -90,7 +92,7 @@ impl From<StrippedStateTestEvent> for JsonValue {
     }
 }
 
-impl From<StrippedStateTestEvent> for Raw<StrippedState> {
+impl From<StrippedStateTestEvent> for Raw<AnyStrippedStateEvent> {
     fn from(val: StrippedStateTestEvent) -> Self {
         from_json_value(val.into()).unwrap()
     }
@@ -140,33 +142,6 @@ impl From<PresenceTestEvent> for JsonValue {
 
 impl From<PresenceTestEvent> for Raw<PresenceEvent> {
     fn from(val: PresenceTestEvent) -> Self {
-        from_json_value(val.into()).unwrap()
-    }
-}
-
-/// Test events that can be added to the global account data.
-pub enum GlobalAccountDataTestEvent {
-    Direct,
-    PushRules,
-    IgnoredUserList,
-    Custom(JsonValue),
-}
-
-impl From<GlobalAccountDataTestEvent> for JsonValue {
-    fn from(val: GlobalAccountDataTestEvent) -> Self {
-        match val {
-            GlobalAccountDataTestEvent::Direct => test_json::sync_events::DIRECT.to_owned(),
-            GlobalAccountDataTestEvent::PushRules => test_json::sync_events::PUSH_RULES.to_owned(),
-            GlobalAccountDataTestEvent::IgnoredUserList => {
-                test_json::sync_events::IGNORED_USER_LIST.to_owned()
-            }
-            GlobalAccountDataTestEvent::Custom(json) => json,
-        }
-    }
-}
-
-impl From<GlobalAccountDataTestEvent> for Raw<AnyGlobalAccountDataEvent> {
-    fn from(val: GlobalAccountDataTestEvent) -> Self {
         from_json_value(val.into()).unwrap()
     }
 }

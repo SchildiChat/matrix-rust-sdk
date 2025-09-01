@@ -50,7 +50,10 @@ use serde::Deserialize;
 use serde_json::{from_value, json, Value};
 use tokio::sync::oneshot::{self, Receiver};
 use wiremock::{
-    matchers::{body_json, body_partial_json, header, method, path, path_regex, query_param},
+    matchers::{
+        body_json, body_partial_json, header, method, path, path_regex, query_param,
+        query_param_is_missing,
+    },
     Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
 };
 
@@ -342,7 +345,6 @@ impl MatrixMockServer {
             mock,
             SyncEndpoint { sync_response_builder: self.sync_response_builder.clone() },
         )
-        .expect_default_access_token()
     }
 
     /// Creates a prebuilt mock for joining a room.
@@ -1224,12 +1226,19 @@ impl MatrixMockServer {
     }
 
     /// Create a prebuilt mock for the endpoint used to get the media config of
-    /// the homeserver.
+    /// the homeserver that requires authentication.
     pub fn mock_authenticated_media_config(
         &self,
     ) -> MockEndpoint<'_, AuthenticatedMediaConfigEndpoint> {
         let mock = Mock::given(method("GET")).and(path("/_matrix/client/v1/media/config"));
         self.mock_endpoint(mock, AuthenticatedMediaConfigEndpoint)
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get the media config of
+    /// the homeserver without requiring authentication.
+    pub fn mock_media_config(&self) -> MockEndpoint<'_, MediaConfigEndpoint> {
+        let mock = Mock::given(method("GET")).and(path("/_matrix/media/v3/config"));
+        self.mock_endpoint(mock, MediaConfigEndpoint)
     }
 
     /// Create a prebuilt mock for the endpoint used to log into a session.
@@ -1374,6 +1383,67 @@ impl MatrixMockServer {
             "^/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/enabled",
         )));
         self.mock_endpoint(mock, EnablePushRuleEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to set push rules actions.
+    pub fn mock_set_push_rules_actions(
+        &self,
+        kind: RuleKind,
+        rule_id: PushRuleIdSpec<'_>,
+    ) -> MockEndpoint<'_, SetPushRulesActionsEndpoint> {
+        let rule_id = rule_id.to_path();
+        let mock = Mock::given(method("PUT")).and(path_regex(format!(
+            "^/_matrix/client/v3/pushrules/global/{kind}/{rule_id}/actions",
+        )));
+        self.mock_endpoint(mock, SetPushRulesActionsEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to set push rules.
+    pub fn mock_set_push_rules(
+        &self,
+        kind: RuleKind,
+        rule_id: PushRuleIdSpec<'_>,
+    ) -> MockEndpoint<'_, SetPushRulesEndpoint> {
+        let rule_id = rule_id.to_path();
+        let mock = Mock::given(method("PUT"))
+            .and(path_regex(format!("^/_matrix/client/v3/pushrules/global/{kind}/{rule_id}$",)));
+        self.mock_endpoint(mock, SetPushRulesEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to delete push rules.
+    pub fn mock_delete_push_rules(
+        &self,
+        kind: RuleKind,
+        rule_id: PushRuleIdSpec<'_>,
+    ) -> MockEndpoint<'_, DeletePushRulesEndpoint> {
+        let rule_id = rule_id.to_path();
+        let mock = Mock::given(method("DELETE"))
+            .and(path_regex(format!("^/_matrix/client/v3/pushrules/global/{kind}/{rule_id}$",)));
+        self.mock_endpoint(mock, DeletePushRulesEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the federation version endpoint.
+    pub fn mock_federation_version(&self) -> MockEndpoint<'_, FederationVersionEndpoint> {
+        let mock = Mock::given(method("GET")).and(path("/_matrix/federation/v1/version"));
+        self.mock_endpoint(mock, FederationVersionEndpoint)
+    }
+}
+
+/// A specification for a push rule ID.
+pub enum PushRuleIdSpec<'a> {
+    /// A precise rule ID.
+    Some(&'a str),
+    /// Any rule ID should match.
+    Any,
+}
+
+impl<'a> PushRuleIdSpec<'a> {
+    /// Convert this [`PushRuleIdSpec`] to a path.
+    pub fn to_path(&self) -> &str {
+        match self {
+            PushRuleIdSpec::Some(id) => id,
+            PushRuleIdSpec::Any => "[^/]*",
+        }
     }
 }
 
@@ -1547,6 +1617,15 @@ impl<'a, T> MockEndpoint<'a, T> {
     /// Expect authentication with the given access token on this endpoint.
     pub fn expect_access_token(mut self, access_token: &'static str) -> Self {
         self.expected_access_token = ExpectedAccessToken::Custom(access_token);
+        self
+    }
+
+    /// Don't expect authentication with an access token on this endpoint.
+    ///
+    /// This should be used to override the default behavior of the endpoint,
+    /// when the access token is unknown for example.
+    pub fn do_not_expect_access_token(mut self) -> Self {
+        self.expected_access_token = ExpectedAccessToken::None;
         self
     }
 
@@ -2314,7 +2393,30 @@ pub struct SyncEndpoint {
     sync_response_builder: Arc<Mutex<SyncResponseBuilder>>,
 }
 
-impl MockEndpoint<'_, SyncEndpoint> {
+impl<'a> MockEndpoint<'a, SyncEndpoint> {
+    /// Expect the given timeout, or lack thereof, in the request.
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        if let Some(timeout) = timeout {
+            self.mock = self.mock.and(query_param("timeout", timeout.as_millis().to_string()));
+        } else {
+            self.mock = self.mock.and(query_param_is_missing("timeout"));
+        }
+
+        self
+    }
+
+    /// Mocks the sync endpoint, using the given function to generate the
+    /// response.
+    pub fn ok<F: FnOnce(&mut SyncResponseBuilder)>(self, func: F) -> MatrixMock<'a> {
+        let json_response = {
+            let mut builder = self.endpoint.sync_response_builder.lock().unwrap();
+            func(&mut builder);
+            builder.build_json_sync_response()
+        };
+
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json_response))
+    }
+
     /// Temporarily mocks the sync with the given endpoint and runs a client
     /// sync with it.
     ///
@@ -2346,17 +2448,7 @@ impl MockEndpoint<'_, SyncEndpoint> {
     /// # anyhow::Ok(()) });
     /// ```
     pub async fn ok_and_run<F: FnOnce(&mut SyncResponseBuilder)>(self, client: &Client, func: F) {
-        let json_response = {
-            let mut builder = self.endpoint.sync_response_builder.lock().unwrap();
-            func(&mut builder);
-            builder.build_json_sync_response()
-        };
-
-        let _scope = self
-            .mock
-            .respond_with(ResponseTemplate::new(200).set_body_json(json_response))
-            .mount_as_scoped(self.server)
-            .await;
+        let _scope = self.ok(func).mount_as_scoped().await;
 
         let _response = client.sync_once(Default::default()).await.unwrap();
     }
@@ -2393,6 +2485,36 @@ impl<'a> MockEndpoint<'a, EncryptionStateEndpoint> {
         self.respond_with(
             ResponseTemplate::new(200).set_body_json(&*test_json::sync_events::ENCRYPTION_CONTENT),
         )
+    }
+
+    /// Marks the room as encrypted, opting into experimental state event
+    /// encryption.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::{ruma::room_id, test_utils::mocks::MatrixMockServer};
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_room_state_encryption().state_encrypted().mount().await;
+    ///
+    /// let room = mock_server
+    ///     .sync_joined_room(&client, room_id!("!room_id:localhost"))
+    ///     .await;
+    ///
+    /// assert!(
+    ///     room.latest_encryption_state().await?.is_state_encrypted(),
+    ///     "The room should be marked as state encrypted."
+    /// );
+    /// # anyhow::Ok(()) });
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub fn state_encrypted(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(
+            &*test_json::sync_events::ENCRYPTION_WITH_ENCRYPTED_STATE_EVENTS_CONTENT,
+        ))
     }
 
     /// Marks the room as not encrypted.
@@ -2505,15 +2627,16 @@ impl<'a> MockEndpoint<'a, RoomEventContextEndpoint> {
         self
     }
 
-    /// Returns an endpoint that emulates success
+    /// Returns an endpoint that emulates success.
     pub fn ok(
         self,
         event: TimelineEvent,
         start: impl Into<String>,
         end: impl Into<String>,
+        state_events: Vec<Raw<AnyStateEvent>>,
     ) -> MatrixMock<'a> {
         let event_path = if self.endpoint.match_event_id {
-            let event_id = event.kind.event_id().expect("an event id is required");
+            let event_id = event.event_id().expect("an event id is required");
             // The event id should begin with `$`, which would be taken as the end of the
             // regex so we need to escape it
             event_id.as_str().replace("$", "\\$")
@@ -2531,7 +2654,7 @@ impl<'a> MockEndpoint<'a, RoomEventContextEndpoint> {
                 "event": event.into_raw().json(),
                 "end": end.into(),
                 "start": start.into(),
-                "state": []
+                "state": state_events
             })));
         MatrixMock { server: self.server, mock }
     }
@@ -3479,6 +3602,18 @@ impl<'a> MockEndpoint<'a, AuthenticatedMediaConfigEndpoint> {
     }
 }
 
+/// A prebuilt mock for `GET /_matrix/media/v3/config` request.
+pub struct MediaConfigEndpoint;
+
+impl<'a> MockEndpoint<'a, MediaConfigEndpoint> {
+    /// Returns a successful response with the provided max upload size.
+    pub fn ok(self, max_upload_size: UInt) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "m.upload.size": max_upload_size,
+        })))
+    }
+}
+
 /// A prebuilt mock for `POST /login` requests.
 pub struct LoginEndpoint;
 
@@ -3728,13 +3863,6 @@ impl<'a> MockEndpoint<'a, MediaDownloadEndpoint> {
         self.respond_with(ResponseTemplate::new(200).set_body_string("Hello, World!"))
     }
 
-    /// Returns a successful response with the given bytes.
-    pub fn ok_bytes(self, bytes: Vec<u8>) -> MatrixMock<'a> {
-        self.respond_with(
-            ResponseTemplate::new(200).set_body_raw(bytes, "application/octet-stream"),
-        )
-    }
-
     /// Returns a successful response with a fake image content.
     pub fn ok_image(self) -> MatrixMock<'a> {
         self.respond_with(
@@ -3762,6 +3890,13 @@ impl<'a> MockEndpoint<'a, AuthedMediaDownloadEndpoint> {
     /// Returns a successful response with a plain text content.
     pub fn ok_plain_text(self) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_string("Hello, World!"))
+    }
+
+    /// Returns a successful response with the given bytes.
+    pub fn ok_bytes(self, bytes: Vec<u8>) -> MatrixMock<'a> {
+        self.respond_with(
+            ResponseTemplate::new(200).set_body_raw(bytes, "application/octet-stream"),
+        )
     }
 
     /// Returns a successful response with a fake image content.
@@ -3879,6 +4014,17 @@ impl<'a> MockEndpoint<'a, PutThreadSubscriptionEndpoint> {
         self.respond_with(ResponseTemplate::new(200))
     }
 
+    /// Returns that the server skipped an automated thread subscription,
+    /// because the user unsubscribed to the thread after the event id passed in
+    /// the automatic subscription.
+    pub fn conflicting_unsubscription(mut self) -> MatrixMock<'a> {
+        self.mock = self.mock.and(path_regex(self.endpoint.matchers.endpoint_regexp_uri()));
+        self.respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "errcode": "IO.ELEMENT.MSC4306.M_CONFLICTING_UNSUBSCRIPTION",
+            "error": "the user unsubscribed after the subscription event id"
+        })))
+    }
+
     /// Match the request parameter against a specific room id.
     pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
         self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
@@ -3887,6 +4033,13 @@ impl<'a> MockEndpoint<'a, PutThreadSubscriptionEndpoint> {
     /// Match the request parameter against a specific thread root event id.
     pub fn match_thread_id(mut self, thread_root: OwnedEventId) -> Self {
         self.endpoint.matchers = self.endpoint.matchers.match_thread_id(thread_root);
+        self
+    }
+    /// Match the request body's `automatic` field against a specific event id.
+    pub fn match_automatic_event_id(mut self, up_to_event_id: &EventId) -> Self {
+        self.mock = self.mock.and(body_json(json!({
+            "automatic": up_to_event_id
+        })));
         self
     }
 }
@@ -3926,5 +4079,60 @@ impl<'a> MockEndpoint<'a, EnablePushRuleEndpoint> {
     /// Returns a successful empty JSON response.
     pub fn ok(self) -> MatrixMock<'a> {
         self.ok_empty_json()
+    }
+}
+
+/// A prebuilt mock for `PUT
+/// /_matrix/client/v3/pushrules/global/{kind}/{ruleId}/actions`.
+pub struct SetPushRulesActionsEndpoint;
+
+impl<'a> MockEndpoint<'a, SetPushRulesActionsEndpoint> {
+    /// Returns a successful empty JSON response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
+    }
+}
+
+/// A prebuilt mock for `PUT
+/// /_matrix/client/v3/pushrules/global/{kind}/{ruleId}`.
+pub struct SetPushRulesEndpoint;
+
+impl<'a> MockEndpoint<'a, SetPushRulesEndpoint> {
+    /// Returns a successful empty JSON response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
+    }
+}
+
+/// A prebuilt mock for `DELETE
+/// /_matrix/client/v3/pushrules/global/{kind}/{ruleId}`.
+pub struct DeletePushRulesEndpoint;
+
+impl<'a> MockEndpoint<'a, DeletePushRulesEndpoint> {
+    /// Returns a successful empty JSON response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
+    }
+}
+
+/// A prebuilt mock for the federation version endpoint.
+pub struct FederationVersionEndpoint;
+
+impl<'a> MockEndpoint<'a, FederationVersionEndpoint> {
+    /// Returns a successful response with the given server name and version.
+    pub fn ok(self, server_name: &str, version: &str) -> MatrixMock<'a> {
+        let response_body = json!({
+            "server": {
+                "name": server_name,
+                "version": version
+            }
+        });
+        self.respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+    }
+
+    /// Returns a successful response with empty/missing server information.
+    pub fn ok_empty(self) -> MatrixMock<'a> {
+        let response_body = json!({});
+        self.respond_with(ResponseTemplate::new(200).set_body_json(response_body))
     }
 }

@@ -93,6 +93,9 @@ pub struct StoredRoomKeyBundleData {
     /// The user that sent us this data.
     pub sender_user: OwnedUserId,
 
+    /// The [`Curve25519PublicKey`] of the device that sent us this data.
+    pub sender_key: Curve25519PublicKey,
+
     /// Information about the sender of this data and how much we trust that
     /// information.
     pub sender_data: SenderData,
@@ -411,6 +414,11 @@ pub struct RoomSettings {
     /// The encryption algorithm that should be used in the room.
     pub algorithm: EventEncryptionAlgorithm,
 
+    /// Whether state event encryption is enabled.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    #[serde(default)]
+    pub encrypt_state_events: bool,
+
     /// Should untrusted devices receive the room key, or should they be
     /// excluded from the conversation.
     pub only_allow_trusted_devices: bool,
@@ -428,6 +436,8 @@ impl Default for RoomSettings {
     fn default() -> Self {
         Self {
             algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2,
+            #[cfg(feature = "experimental-encrypted-state-events")]
+            encrypt_state_events: false,
             only_allow_trusted_devices: false,
             session_rotation_period: None,
             session_rotation_period_messages: None,
@@ -491,13 +501,19 @@ pub struct RoomKeyBundleInfo {
     /// The user ID of the person that sent us the historic room key bundle.
     pub sender: OwnedUserId,
 
+    /// The [`Curve25519PublicKey`] of the device that sent us this data.
+    pub sender_key: Curve25519PublicKey,
+
     /// The ID of the room the bundle should be used in.
     pub room_id: OwnedRoomId,
 }
 
 impl From<&StoredRoomKeyBundleData> for RoomKeyBundleInfo {
     fn from(value: &StoredRoomKeyBundleData) -> Self {
-        let StoredRoomKeyBundleData { sender_user, sender_data: _, bundle_data } = value;
-        Self { sender: sender_user.clone(), room_id: bundle_data.room_id.clone() }
+        let StoredRoomKeyBundleData { sender_user, sender_data: _, bundle_data, sender_key } =
+            value;
+        let sender_key = *sender_key;
+
+        Self { sender: sender_user.clone(), room_id: bundle_data.room_id.clone(), sender_key }
     }
 }

@@ -17,6 +17,9 @@
 
 use std::pin::Pin;
 
+#[cfg(test)]
+matrix_sdk_test_utils::init_tracing_for_tests!();
+
 use futures_core::Future;
 #[doc(no_inline)]
 pub use ruma;
@@ -42,7 +45,7 @@ pub mod ttl_cache;
 #[cfg(all(target_family = "wasm", not(tarpaulin_include)))]
 pub mod js_tracing;
 
-use ruma::{room_version_rules::RoomVersionRules, RoomVersionId};
+use ruma::{RoomVersionId, room_version_rules::RoomVersionRules};
 pub use store_locks::LEASE_DURATION_MS;
 
 /// Alias for `Send` on non-wasm, empty trait (implemented by everything) on

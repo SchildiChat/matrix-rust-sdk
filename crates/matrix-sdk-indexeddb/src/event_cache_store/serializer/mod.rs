@@ -71,12 +71,12 @@ impl IndexeddbEventCacheStoreSerializer {
     ///
     /// Note that the particular key which is encoded is defined by the type
     /// `K`.
-    pub fn encode_key<T, K>(&self, room_id: &RoomId, components: &K::KeyComponents) -> K
+    pub fn encode_key<T, K>(&self, components: K::KeyComponents<'_>) -> K
     where
         T: Indexed,
         K: IndexedKey<T>,
     {
-        K::encode(room_id, components, &self.inner)
+        K::encode(components, &self.inner)
     }
 
     /// Encodes a key for a [`Indexed`] type as a [`JsValue`].
@@ -85,14 +85,13 @@ impl IndexeddbEventCacheStoreSerializer {
     /// `K`.
     pub fn encode_key_as_value<T, K>(
         &self,
-        room_id: &RoomId,
-        components: &K::KeyComponents,
+        components: K::KeyComponents<'_>,
     ) -> Result<JsValue, serde_wasm_bindgen::Error>
     where
         T: Indexed,
         K: IndexedKey<T> + Serialize,
     {
-        serde_wasm_bindgen::to_value(&self.encode_key::<T, K>(room_id, components))
+        serde_wasm_bindgen::to_value(&self.encode_key::<T, K>(components))
     }
 
     /// Encodes a key component range for an [`Indexed`] type.
@@ -101,23 +100,17 @@ impl IndexeddbEventCacheStoreSerializer {
     /// `K`.
     pub fn encode_key_range<T, K>(
         &self,
-        room_id: &RoomId,
         range: impl Into<IndexedKeyRange<K>>,
     ) -> Result<IdbKeyRange, serde_wasm_bindgen::Error>
     where
         T: Indexed,
-        K: IndexedKeyBounds<T> + Serialize,
+        K: Serialize,
     {
         use serde_wasm_bindgen::to_value;
         Ok(match range.into() {
             IndexedKeyRange::Only(key) => IdbKeyRange::only(&to_value(&key)?)?,
             IndexedKeyRange::Bound(lower, upper) => {
                 IdbKeyRange::bound(&to_value(&lower)?, &to_value(&upper)?)?
-            }
-            IndexedKeyRange::All => {
-                let lower = to_value(&K::lower_key(room_id, &self.inner))?;
-                let upper = to_value(&K::upper_key(room_id, &self.inner))?;
-                IdbKeyRange::bound(&lower, &upper).expect("construct key range")
             }
         })
     }
@@ -128,45 +121,36 @@ impl IndexeddbEventCacheStoreSerializer {
     /// `K`.
     pub fn encode_key_component_range<'a, T, K>(
         &self,
-        room_id: &RoomId,
-        range: impl Into<IndexedKeyRange<&'a K::KeyComponents>>,
+        range: impl Into<IndexedKeyRange<K::KeyComponents<'a>>>,
     ) -> Result<IdbKeyRange, serde_wasm_bindgen::Error>
     where
         T: Indexed,
-        K: IndexedKeyComponentBounds<T> + Serialize,
-        K::KeyComponents: 'a,
+        K: IndexedKey<T> + Serialize,
     {
         let range = match range.into() {
             IndexedKeyRange::Only(components) => {
-                IndexedKeyRange::Only(K::encode(room_id, components, &self.inner))
+                IndexedKeyRange::Only(K::encode(components, &self.inner))
             }
             IndexedKeyRange::Bound(lower, upper) => {
-                let lower = K::encode(room_id, lower, &self.inner);
-                let upper = K::encode(room_id, upper, &self.inner);
-                IndexedKeyRange::Bound(lower, upper)
-            }
-            IndexedKeyRange::All => {
-                let lower = K::lower_key(room_id, &self.inner);
-                let upper = K::upper_key(room_id, &self.inner);
+                let lower = K::encode(lower, &self.inner);
+                let upper = K::encode(upper, &self.inner);
                 IndexedKeyRange::Bound(lower, upper)
             }
         };
-        self.encode_key_range::<T, K>(room_id, range)
+        self.encode_key_range::<T, K>(range)
     }
 
     /// Serializes an [`Indexed`] type into a [`JsValue`]
     pub fn serialize<T>(
         &self,
-        room_id: &RoomId,
         t: &T,
     ) -> Result<JsValue, IndexeddbEventCacheStoreSerializerError<T::Error>>
     where
         T: Indexed,
         T::IndexedType: Serialize,
     {
-        let indexed = t
-            .to_indexed(room_id, &self.inner)
-            .map_err(IndexeddbEventCacheStoreSerializerError::Indexing)?;
+        let indexed =
+            t.to_indexed(&self.inner).map_err(IndexeddbEventCacheStoreSerializerError::Indexing)?;
         serde_wasm_bindgen::to_value(&indexed).map_err(Into::into)
     }
 

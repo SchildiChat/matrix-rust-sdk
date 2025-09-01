@@ -23,11 +23,10 @@ use matrix_sdk_common::{ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK};
 use ruma::{
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
     OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
-    api::client::sync::sync_events::StrippedState,
     canonical_json::{RedactedBecause, redact},
     events::{
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent,
-        GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
+        AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::member::{MembershipState, StrippedRoomMemberEvent, SyncRoomMemberEvent},
@@ -46,7 +45,7 @@ use super::{
 use crate::{
     MinimalRoomMemberEvent, RoomMemberships, StateStoreDataKey, StateStoreDataValue,
     deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
-    store::{QueueWedgeError, ThreadStatus},
+    store::{QueueWedgeError, ThreadSubscription},
 };
 
 #[derive(Debug, Default)]
@@ -69,7 +68,7 @@ struct MemoryStoreInner {
     room_account_data:
         HashMap<OwnedRoomId, HashMap<RoomAccountDataEventType, Raw<AnyRoomAccountDataEvent>>>,
     stripped_room_state:
-        HashMap<OwnedRoomId, HashMap<StateEventType, HashMap<String, Raw<StrippedState>>>>,
+        HashMap<OwnedRoomId, HashMap<StateEventType, HashMap<String, Raw<AnyStrippedStateEvent>>>>,
     stripped_members: HashMap<OwnedRoomId, HashMap<OwnedUserId, MembershipState>>,
     presence: HashMap<OwnedUserId, Raw<PresenceEvent>>,
     room_user_receipts: HashMap<
@@ -84,7 +83,7 @@ struct MemoryStoreInner {
     send_queue_events: BTreeMap<OwnedRoomId, Vec<QueuedRequest>>,
     dependent_send_queue_events: BTreeMap<OwnedRoomId, Vec<DependentQueuedRequest>>,
     seen_knock_requests: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, OwnedUserId>>,
-    thread_subscriptions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, ThreadStatus>>,
+    thread_subscriptions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, ThreadSubscription>>,
 }
 
 /// In-memory, non-persistent implementation of the `StateStore`.
@@ -958,7 +957,7 @@ impl StateStore for MemoryStore {
         &self,
         room: &RoomId,
         thread_id: &EventId,
-        status: ThreadStatus,
+        subscription: ThreadSubscription,
     ) -> Result<(), Self::Error> {
         self.inner
             .write()
@@ -966,7 +965,7 @@ impl StateStore for MemoryStore {
             .thread_subscriptions
             .entry(room.to_owned())
             .or_default()
-            .insert(thread_id.to_owned(), status);
+            .insert(thread_id.to_owned(), subscription);
         Ok(())
     }
 
@@ -974,13 +973,34 @@ impl StateStore for MemoryStore {
         &self,
         room: &RoomId,
         thread_id: &EventId,
-    ) -> Result<Option<ThreadStatus>, Self::Error> {
+    ) -> Result<Option<ThreadSubscription>, Self::Error> {
         let inner = self.inner.read().unwrap();
         Ok(inner
             .thread_subscriptions
             .get(room)
             .and_then(|subscriptions| subscriptions.get(thread_id))
             .copied())
+    }
+
+    async fn remove_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<(), Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+
+        let Some(room_subs) = inner.thread_subscriptions.get_mut(room) else {
+            return Ok(());
+        };
+
+        room_subs.remove(thread_id);
+
+        if room_subs.is_empty() {
+            // If there are no more subscriptions for this room, remove the room entry.
+            inner.thread_subscriptions.remove(room);
+        }
+
+        Ok(())
     }
 }
 

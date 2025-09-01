@@ -949,7 +949,7 @@ macro_rules! cryptostore_integration_tests {
                 let id = TransactionId::new();
                 let info: SecretInfo = MegolmV1AesSha2Content {
                     room_id: room_id!("!test:localhost").to_owned(),
-                    sender_key,
+                    sender_key: Some(sender_key),
                     session_id: "test_session_id".to_owned(),
                 }
                 .into();
@@ -1010,7 +1010,7 @@ macro_rules! cryptostore_integration_tests {
                 let id = TransactionId::new();
                 let info: SecretInfo = MegolmV1AesSha2Content {
                     room_id: room_id!("!test:localhost").to_owned(),
-                    sender_key: account.identity_keys().curve25519,
+                    sender_key: Some(account.identity_keys().curve25519),
                     session_id: "test_session_id".to_owned(),
                 }
                 .into();
@@ -1163,6 +1163,8 @@ macro_rules! cryptostore_integration_tests {
                 let room_1 = room_id!("!test_1:localhost");
                 let settings_1 = RoomSettings {
                     algorithm: EventEncryptionAlgorithm::MegolmV1AesSha2,
+                    #[cfg(feature = "experimental-encrypted-state-events")]
+                    encrypt_state_events: false,
                     only_allow_trusted_devices: true,
                     session_rotation_period: Some(Duration::from_secs(10)),
                     session_rotation_period_messages: Some(123),
@@ -1304,6 +1306,7 @@ macro_rules! cryptostore_integration_tests {
 
                     StoredRoomKeyBundleData {
                         sender_user: sender_user.to_owned(),
+                        sender_key: Curve25519PublicKey::from_bytes([0u8; 32]),
                         sender_data: SenderData::unknown(),
                         bundle_data: RoomKeyBundleContent {
                             room_id: room_id!("!room:example.org").to_owned(),

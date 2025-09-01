@@ -151,9 +151,16 @@ impl fmt::Debug for BaseClient {
 /// explicitly opted into).
 #[derive(Clone, Copy, Debug)]
 pub enum ThreadingSupport {
-    /// Threading enabled
-    Enabled,
-    /// Threading disabled
+    /// Threading enabled.
+    Enabled {
+        /// Enable client-wide thread subscriptions support (MSC4306 / MSC4308).
+        ///
+        /// This may cause filtering out of thread subscriptions, and loading
+        /// the thread subscriptions via the sliding sync extension,
+        /// when the room list service is being used.
+        with_subscriptions: bool,
+    },
+    /// Threading disabled.
     Disabled,
 }
 
@@ -457,7 +464,7 @@ impl BaseClient {
     /// let room = client.room_joined(&room_id, maybe_inviter).await?;
     ///
     /// assert_eq!(room.state(), RoomState::Joined);
-    /// # anyhow::Ok(()) };
+    /// # matrix_sdk_test::TestResult::Ok(()) };
     /// ```
     pub async fn room_joined(
         &self,
@@ -1699,18 +1706,10 @@ mod tests {
         let mut subscriber = client.subscribe_to_ignore_user_list_changes();
         assert!(subscriber.next().now_or_never().is_none());
 
+        let f = EventFactory::new();
         let mut sync_builder = SyncResponseBuilder::new();
         let response = sync_builder
-            .add_global_account_data_event(matrix_sdk_test::GlobalAccountDataTestEvent::Custom(
-                json!({
-                    "content": {
-                        "ignored_users": {
-                            *BOB: {}
-                        }
-                    },
-                    "type": "m.ignored_user_list",
-                }),
-            ))
+            .add_global_account_data(f.ignored_user_list([(*BOB).into()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
@@ -1719,16 +1718,7 @@ mod tests {
 
         // Receive the same response.
         let response = sync_builder
-            .add_global_account_data_event(matrix_sdk_test::GlobalAccountDataTestEvent::Custom(
-                json!({
-                    "content": {
-                        "ignored_users": {
-                            *BOB: {}
-                        }
-                    },
-                    "type": "m.ignored_user_list",
-                }),
-            ))
+            .add_global_account_data(f.ignored_user_list([(*BOB).into()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
@@ -1736,16 +1726,8 @@ mod tests {
         assert!(subscriber.next().now_or_never().is_none());
 
         // Now remove Bob from the ignored list.
-        let response = sync_builder
-            .add_global_account_data_event(matrix_sdk_test::GlobalAccountDataTestEvent::Custom(
-                json!({
-                    "content": {
-                        "ignored_users": {}
-                    },
-                    "type": "m.ignored_user_list",
-                }),
-            ))
-            .build_sync_response();
+        let response =
+            sync_builder.add_global_account_data(f.ignored_user_list([])).build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
         assert_let!(Some(ignored) = subscriber.next().await);
@@ -1758,17 +1740,9 @@ mod tests {
         let client = logged_in_base_client(None).await;
 
         let mut sync_builder = SyncResponseBuilder::new();
+        let f = EventFactory::new();
         let response = sync_builder
-            .add_global_account_data_event(matrix_sdk_test::GlobalAccountDataTestEvent::Custom(
-                json!({
-                    "content": {
-                        "ignored_users": {
-                            ignored_user_id: {}
-                        }
-                    },
-                    "type": "m.ignored_user_list",
-                }),
-            ))
+            .add_global_account_data(f.ignored_user_list([ignored_user_id.to_owned()]))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 

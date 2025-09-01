@@ -54,16 +54,12 @@ use futures_core::Stream;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use matrix_sdk_base::{
     deserialized_responses::{EncryptionInfo, TimelineEvent},
+    sync::State,
     SendOutsideWasm, SyncOutsideWasm,
 };
 use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use pin_project_lite::pin_project;
-use ruma::{
-    events::{AnySyncStateEvent, BooleanType},
-    push::Action,
-    serde::Raw,
-    OwnedRoomId,
-};
+use ruma::{events::BooleanType, push::Action, serde::Raw, OwnedRoomId};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::{debug, error, field::debug, instrument, warn};
@@ -413,7 +409,7 @@ impl Client {
     pub(crate) async fn handle_sync_state_events(
         &self,
         room: Option<&Room>,
-        state_events: &[Raw<AnySyncStateEvent>],
+        state: &State,
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
         struct StateEventDetails<'a> {
@@ -421,6 +417,11 @@ impl Client {
             event_type: Cow<'a, str>,
             unsigned: Option<UnsignedDetails>,
         }
+
+        let state_events = match state {
+            State::Before(events) => events,
+            State::After(events) => events,
+        };
 
         // Event handlers for possibly-redacted state events
         self.handle_sync_events(HandlerKind::State, room, state_events).await?;
@@ -1350,7 +1351,7 @@ mod tests {
 
         let mut response_builder = SyncResponseBuilder::new();
         let response = response_builder
-            .add_global_account_data_bulk([Raw::new(&json!({
+            .add_custom_global_account_data(json!({
                 "content": {
                     "algorithm": "m.secret_storage.v1.aes-hmac-sha2",
                     "iv": "gH2iNpiETFhApvW6/FFEJQ",
@@ -1363,8 +1364,6 @@ mod tests {
                 },
                 "type": "m.secret_storage.key.foobar",
             }))
-            .unwrap()
-            .cast_unchecked()])
             .build_sync_response();
         client.process_sync(response).await?;
 

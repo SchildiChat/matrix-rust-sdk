@@ -47,12 +47,11 @@ pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 use observable_map::ObservableMap;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
-    api::client::sync::sync_events::StrippedState,
     events::{
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent, EmptyStateKey,
-        GlobalAccountDataEventType, RedactContent, RedactedStateEventContent,
-        RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
-        StrippedStateEvent, SyncStateEvent,
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
+        AnySyncStateEvent, EmptyStateKey, GlobalAccountDataEventType, RedactContent,
+        RedactedStateEventContent, RoomAccountDataEventType, StateEventType, StaticEventContent,
+        StaticStateEventContent, StrippedStateEvent, SyncStateEvent,
         presence::PresenceEvent,
         receipt::ReceiptEventContent,
         room::{
@@ -453,42 +452,26 @@ pub enum RoomLoadSettings {
     One(OwnedRoomId),
 }
 
-/// Status of a thread subscription, as saved in the state store.
+/// A thread subscription, as saved in the state store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadStatus {
-    /// The thread is subscribed to.
-    Subscribed {
-        /// Whether the subscription was made automatically by a client, not by
-        /// manual user choice.
-        automatic: bool,
-    },
-    /// The thread is unsubscribed to (it won't cause any notifications or
-    /// automatic subscription anymore).
-    Unsubscribed,
+pub struct ThreadSubscription {
+    /// Whether the subscription was made automatically by a client, not by
+    /// manual user choice.
+    pub automatic: bool,
 }
 
-impl ThreadStatus {
-    /// Convert the current [`ThreadStatus`] into a string representation.
+impl ThreadSubscription {
+    /// Convert the current [`ThreadSubscription`] into a string representation.
     pub fn as_str(&self) -> &'static str {
-        match self {
-            ThreadStatus::Subscribed { automatic } => {
-                if *automatic {
-                    "automatic"
-                } else {
-                    "manual"
-                }
-            }
-            ThreadStatus::Unsubscribed => "unsubscribed",
-        }
+        if self.automatic { "automatic" } else { "manual" }
     }
 
-    /// Convert a string representation into a [`ThreadStatus`], if it is a
-    /// valid one, or `None` otherwise.
+    /// Convert a string representation into a [`ThreadSubscription`], if it is
+    /// a valid one, or `None` otherwise.
     pub fn from_value(s: &str) -> Option<Self> {
         match s {
-            "automatic" => Some(ThreadStatus::Subscribed { automatic: true }),
-            "manual" => Some(ThreadStatus::Subscribed { automatic: false }),
-            "unsubscribed" => Some(ThreadStatus::Unsubscribed),
+            "automatic" => Some(Self { automatic: true }),
+            "manual" => Some(Self { automatic: false }),
             _ => None,
         }
     }
@@ -533,8 +516,10 @@ pub struct StateChanges {
 
     /// A mapping of `RoomId` to a map of event type to a map of state key to
     /// `StrippedState`.
-    pub stripped_state:
-        BTreeMap<OwnedRoomId, BTreeMap<StateEventType, BTreeMap<String, Raw<StrippedState>>>>,
+    pub stripped_state: BTreeMap<
+        OwnedRoomId,
+        BTreeMap<StateEventType, BTreeMap<String, Raw<AnyStrippedStateEvent>>>,
+    >,
 
     /// A map from room id to a map of a display name and a set of user ids that
     /// share that display name in the given room.
