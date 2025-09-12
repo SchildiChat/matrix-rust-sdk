@@ -30,7 +30,13 @@ use matrix_sdk_test::{
 };
 use percent_encoding::{AsciiSet, CONTROLS};
 use ruma::{
-    api::client::{receipt::create_receipt::v3::ReceiptType, room::Visibility},
+    api::client::{
+        receipt::create_receipt::v3::ReceiptType,
+        room::Visibility,
+        threads::get_thread_subscriptions_changes::unstable::{
+            ThreadSubscription, ThreadUnsubscription,
+        },
+    },
     device_id,
     directory::PublicRoomsChunk,
     encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
@@ -1346,29 +1352,33 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, AuthedMediaThumbnailEndpoint).expect_default_access_token()
     }
 
-    /// Create a prebuilt mock for the endpoint used to get a thread
-    /// subscription in a given room.
-    pub fn mock_get_thread_subscription(&self) -> MockEndpoint<'_, GetThreadSubscriptionEndpoint> {
+    /// Create a prebuilt mock for the endpoint used to get a single thread
+    /// subscription status in a given room.
+    pub fn mock_room_get_thread_subscription(
+        &self,
+    ) -> MockEndpoint<'_, RoomGetThreadSubscriptionEndpoint> {
         let mock = Mock::given(method("GET"));
-        self.mock_endpoint(mock, GetThreadSubscriptionEndpoint::default())
+        self.mock_endpoint(mock, RoomGetThreadSubscriptionEndpoint::default())
             .expect_default_access_token()
     }
 
     /// Create a prebuilt mock for the endpoint used to define a thread
     /// subscription in a given room.
-    pub fn mock_put_thread_subscription(&self) -> MockEndpoint<'_, PutThreadSubscriptionEndpoint> {
+    pub fn mock_room_put_thread_subscription(
+        &self,
+    ) -> MockEndpoint<'_, RoomPutThreadSubscriptionEndpoint> {
         let mock = Mock::given(method("PUT"));
-        self.mock_endpoint(mock, PutThreadSubscriptionEndpoint::default())
+        self.mock_endpoint(mock, RoomPutThreadSubscriptionEndpoint::default())
             .expect_default_access_token()
     }
 
     /// Create a prebuilt mock for the endpoint used to delete a thread
     /// subscription in a given room.
-    pub fn mock_delete_thread_subscription(
+    pub fn mock_room_delete_thread_subscription(
         &self,
-    ) -> MockEndpoint<'_, DeleteThreadSubscriptionEndpoint> {
+    ) -> MockEndpoint<'_, RoomDeleteThreadSubscriptionEndpoint> {
         let mock = Mock::given(method("DELETE"));
-        self.mock_endpoint(mock, DeleteThreadSubscriptionEndpoint::default())
+        self.mock_endpoint(mock, RoomDeleteThreadSubscriptionEndpoint::default())
             .expect_default_access_token()
     }
 
@@ -1426,6 +1436,24 @@ impl MatrixMockServer {
     pub fn mock_federation_version(&self) -> MockEndpoint<'_, FederationVersionEndpoint> {
         let mock = Mock::given(method("GET")).and(path("/_matrix/federation/v1/version"));
         self.mock_endpoint(mock, FederationVersionEndpoint)
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get all thread
+    /// subscriptions across all rooms.
+    pub fn mock_get_thread_subscriptions(
+        &self,
+    ) -> MockEndpoint<'_, GetThreadSubscriptionsEndpoint> {
+        let mock = Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/unstable/io.element.msc4308/thread_subscriptions$"));
+        self.mock_endpoint(mock, GetThreadSubscriptionsEndpoint::default())
+            .expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to retrieve a space tree
+    pub fn mock_get_hierarchy(&self) -> MockEndpoint<'_, GetHierarchyEndpoint> {
+        let mock =
+            Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/v1/rooms/.*/hierarchy"));
+        self.mock_endpoint(mock, GetHierarchyEndpoint).expect_default_access_token()
     }
 }
 
@@ -3974,11 +4002,11 @@ impl ThreadSubscriptionMatchers {
 /// A prebuilt mock for `GET
 /// /client/*/rooms/{room_id}/threads/{thread_root}/subscription`
 #[derive(Default)]
-pub struct GetThreadSubscriptionEndpoint {
+pub struct RoomGetThreadSubscriptionEndpoint {
     matchers: ThreadSubscriptionMatchers,
 }
 
-impl<'a> MockEndpoint<'a, GetThreadSubscriptionEndpoint> {
+impl<'a> MockEndpoint<'a, RoomGetThreadSubscriptionEndpoint> {
     /// Returns a successful response for the given thread subscription.
     pub fn ok(mut self, automatic: bool) -> MatrixMock<'a> {
         self.mock = self.mock.and(path_regex(self.endpoint.matchers.endpoint_regexp_uri()));
@@ -4002,11 +4030,11 @@ impl<'a> MockEndpoint<'a, GetThreadSubscriptionEndpoint> {
 /// A prebuilt mock for `PUT
 /// /client/*/rooms/{room_id}/threads/{thread_root}/subscription`
 #[derive(Default)]
-pub struct PutThreadSubscriptionEndpoint {
+pub struct RoomPutThreadSubscriptionEndpoint {
     matchers: ThreadSubscriptionMatchers,
 }
 
-impl<'a> MockEndpoint<'a, PutThreadSubscriptionEndpoint> {
+impl<'a> MockEndpoint<'a, RoomPutThreadSubscriptionEndpoint> {
     /// Returns a successful response for the given setting of thread
     /// subscription.
     pub fn ok(mut self) -> MatrixMock<'a> {
@@ -4047,11 +4075,11 @@ impl<'a> MockEndpoint<'a, PutThreadSubscriptionEndpoint> {
 /// A prebuilt mock for `DELETE
 /// /client/*/rooms/{room_id}/threads/{thread_root}/subscription`
 #[derive(Default)]
-pub struct DeleteThreadSubscriptionEndpoint {
+pub struct RoomDeleteThreadSubscriptionEndpoint {
     matchers: ThreadSubscriptionMatchers,
 }
 
-impl<'a> MockEndpoint<'a, DeleteThreadSubscriptionEndpoint> {
+impl<'a> MockEndpoint<'a, RoomDeleteThreadSubscriptionEndpoint> {
     /// Returns a successful response for the deletion of a given thread
     /// subscription.
     pub fn ok(mut self) -> MatrixMock<'a> {
@@ -4134,5 +4162,121 @@ impl<'a> MockEndpoint<'a, FederationVersionEndpoint> {
     pub fn ok_empty(self) -> MatrixMock<'a> {
         let response_body = json!({});
         self.respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+    }
+}
+
+/// A prebuilt mock for `GET ^/_matrix/client/v3/thread_subscriptions`.
+#[derive(Default)]
+pub struct GetThreadSubscriptionsEndpoint {
+    /// New thread subscriptions per (room id, thread root event id).
+    subscribed: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, ThreadSubscription>>,
+    /// New thread unsubscriptions per (room id, thread root event id).
+    unsubscribed: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, ThreadUnsubscription>>,
+}
+
+impl<'a> MockEndpoint<'a, GetThreadSubscriptionsEndpoint> {
+    /// Add a single thread subscription to the response.
+    pub fn add_subscription(
+        mut self,
+        room_id: OwnedRoomId,
+        thread_root: OwnedEventId,
+        subscription: ThreadSubscription,
+    ) -> Self {
+        self.endpoint.subscribed.entry(room_id).or_default().insert(thread_root, subscription);
+        self
+    }
+
+    /// Add a single thread unsubscription to the response.
+    pub fn add_unsubcription(
+        mut self,
+        room_id: OwnedRoomId,
+        thread_root: OwnedEventId,
+        unsubscription: ThreadUnsubscription,
+    ) -> Self {
+        self.endpoint.unsubscribed.entry(room_id).or_default().insert(thread_root, unsubscription);
+        self
+    }
+
+    /// Match the `from` query parameter to a given value.
+    pub fn match_from(self, from: &str) -> Self {
+        Self { mock: self.mock.and(query_param("from", from)), ..self }
+    }
+    /// Match the `to` query parameter to a given value.
+    pub fn match_to(self, to: &str) -> Self {
+        Self { mock: self.mock.and(query_param("to", to)), ..self }
+    }
+
+    /// Returns a successful response with the given thread subscriptions, and
+    /// "end" parameter to be used in the next query.
+    pub fn ok(self, end: Option<String>) -> MatrixMock<'a> {
+        let response_body = json!({
+            "subscribed": self.endpoint.subscribed,
+            "unsubscribed": self.endpoint.unsubscribed,
+            "end": end,
+        });
+        self.respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+    }
+}
+
+/// A prebuilt mock for `GET /client/*/rooms/{roomId}/hierarchy`
+#[derive(Default)]
+pub struct GetHierarchyEndpoint;
+
+impl<'a> MockEndpoint<'a, GetHierarchyEndpoint> {
+    /// Returns a successful response containing the given room IDs.
+    pub fn ok_with_room_ids(self, room_ids: Vec<&RoomId>) -> MatrixMock<'a> {
+        let rooms = room_ids
+            .iter()
+            .map(|id| {
+                json!({
+                  "room_id": id,
+                  "num_joined_members": 1,
+                  "world_readable": false,
+                  "guest_can_join": false,
+                  "children_state": []
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rooms": rooms,
+        })))
+    }
+
+    /// Returns a successful response containing the given room IDs and children
+    /// states
+    pub fn ok_with_room_ids_and_children_state(
+        self,
+        room_ids: Vec<&RoomId>,
+        children_state: Vec<&RoomId>,
+    ) -> MatrixMock<'a> {
+        let children_state = children_state
+            .into_iter()
+            .map(|id| json!({ "type": "m.space.child", "state_key": id }))
+            .collect::<Vec<_>>();
+
+        let rooms = room_ids
+            .iter()
+            .map(|id| {
+                json!({
+                  "room_id": id,
+                  "num_joined_members": 1,
+                  "world_readable": false,
+                  "guest_can_join": false,
+                  "children_state": children_state
+                })
+            })
+            .collect::<Vec<_>>();
+
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rooms": rooms,
+        })))
+    }
+
+    /// Returns a successful response with an empty list of rooms.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rooms": []
+        })))
     }
 }

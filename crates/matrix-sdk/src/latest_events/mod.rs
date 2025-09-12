@@ -59,7 +59,7 @@ pub use error::LatestEventsError;
 use eyeball::{AsyncLock, Subscriber};
 use futures_util::FutureExt;
 use latest_event::LatestEvent;
-pub use latest_event::{LatestEventContent, LatestEventValue};
+pub use latest_event::{LatestEventValue, LocalLatestEventValue, RemoteLatestEventValue};
 use matrix_sdk_common::executor::{spawn, AbortOnDrop, JoinHandleExt as _};
 use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
 use tokio::{
@@ -290,9 +290,7 @@ impl RegisteredRooms {
                     if room_latest_event.per_thread.contains_key(thread_id).not() {
                         room_latest_event.per_thread.insert(
                             thread_id.to_owned(),
-                            room_latest_event
-                                .create_latest_event_for(room_id, Some(thread_id))
-                                .await,
+                            room_latest_event.create_latest_event_for(Some(thread_id)).await,
                         );
                     }
                 }
@@ -464,40 +462,25 @@ impl RoomLatestEvents {
         };
 
         Ok(Some(Self {
-            for_the_room: Self::create_latest_event_for_inner(
-                room_id,
-                None,
-                &room_event_cache,
-                &weak_room,
-            )
-            .await,
+            for_the_room: Self::create_latest_event_for_inner(&weak_room, None, &room_event_cache)
+                .await,
             per_thread: HashMap::new(),
             weak_room,
             room_event_cache,
         }))
     }
 
-    async fn create_latest_event_for(
-        &self,
-        room_id: &RoomId,
-        thread_id: Option<&EventId>,
-    ) -> LatestEvent {
-        Self::create_latest_event_for_inner(
-            room_id,
-            thread_id,
-            &self.room_event_cache,
-            &self.weak_room,
-        )
-        .await
+    async fn create_latest_event_for(&self, thread_id: Option<&EventId>) -> LatestEvent {
+        Self::create_latest_event_for_inner(&self.weak_room, thread_id, &self.room_event_cache)
+            .await
     }
 
     async fn create_latest_event_for_inner(
-        room_id: &RoomId,
+        weak_room: &WeakRoom,
         thread_id: Option<&EventId>,
         room_event_cache: &RoomEventCache,
-        weak_room: &WeakRoom,
     ) -> LatestEvent {
-        LatestEvent::new(room_id, thread_id, room_event_cache, weak_room).await
+        LatestEvent::new(weak_room, thread_id, room_event_cache).await
     }
 
     /// Get the [`LatestEvent`] for the room.
@@ -742,16 +725,21 @@ mod tests {
 
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
+        deserialized_responses::TimelineEventKind,
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
         RoomState,
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder};
-    use ruma::{event_id, owned_room_id, room_id, user_id, OwnedTransactionId};
+    use ruma::{
+        event_id,
+        events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent},
+        owned_room_id, room_id, user_id, OwnedTransactionId,
+    };
     use stream_assert::assert_pending;
 
     use super::{
-        broadcast, listen_to_event_cache_and_send_queue_updates, mpsc, HashSet, LatestEventContent,
-        LatestEventValue, RoomEventCacheGenericUpdate, RoomRegistration, RoomSendQueueUpdate,
+        broadcast, listen_to_event_cache_and_send_queue_updates, mpsc, HashSet, LatestEventValue,
+        RemoteLatestEventValue, RoomEventCacheGenericUpdate, RoomRegistration, RoomSendQueueUpdate,
         SendQueueUpdate,
     };
     use crate::test_utils::mocks::MatrixMockServer;
@@ -1272,8 +1260,17 @@ mod tests {
         // latest event!
         assert_matches!(
             latest_event_stream.get().await,
-            LatestEventValue::Remote(LatestEventContent::RoomMessage(message_content)) => {
-                assert_eq!(message_content.body(), "world");
+            LatestEventValue::Remote(RemoteLatestEventValue { kind: TimelineEventKind::PlainText { event }, .. }) => {
+                assert_matches!(
+                    event.deserialize().unwrap(),
+                    AnySyncTimelineEvent::MessageLike(
+                        AnySyncMessageLikeEvent::RoomMessage(
+                            SyncMessageLikeEvent::Original(message_content)
+                        )
+                    ) => {
+                        assert_eq!(message_content.content.body(), "world");
+                    }
+                );
             }
         );
 
@@ -1295,8 +1292,17 @@ mod tests {
         // `compute_latest_events` which has updated the latest event value.
         assert_matches!(
             latest_event_stream.next().await,
-            Some(LatestEventValue::Remote(LatestEventContent::RoomMessage(message_content))) => {
-                assert_eq!(message_content.body(), "raclette !");
+            Some(LatestEventValue::Remote(RemoteLatestEventValue { kind: TimelineEventKind::PlainText { event }, .. })) => {
+                assert_matches!(
+                    event.deserialize().unwrap(),
+                    AnySyncTimelineEvent::MessageLike(
+                        AnySyncMessageLikeEvent::RoomMessage(
+                            SyncMessageLikeEvent::Original(message_content)
+                        )
+                    ) => {
+                        assert_eq!(message_content.content.body(), "raclette !");
+                    }
+                );
             }
         );
     }

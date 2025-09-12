@@ -26,6 +26,7 @@ mod ruma;
 mod runtime;
 mod session_verification;
 mod space_child_info;
+mod spaces;
 mod sync_service;
 mod task_handle;
 mod timeline;

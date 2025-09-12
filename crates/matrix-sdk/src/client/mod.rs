@@ -61,6 +61,7 @@ use ruma::{
             room::create_room,
             session::login::v3::DiscoveryInfo,
             sync::sync_events,
+            threads::get_thread_subscriptions_changes,
             uiaa,
             user_directory::search_users,
         },
@@ -636,8 +637,7 @@ impl Client {
     }
 
     /// Returns a receiver that gets events for each room info update. To watch
-    /// for new events, use `receiver.resubscribe()`. Each event contains the
-    /// room and a boolean whether this event should trigger a room list update.
+    /// for new events, use `receiver.resubscribe()`.
     pub fn room_info_notable_update_receiver(&self) -> broadcast::Receiver<RoomInfoNotableUpdate> {
         self.base_client().room_info_notable_update_receiver()
     }
@@ -1241,6 +1241,15 @@ impl Client {
     /// Returns the left rooms this client knows about.
     pub fn left_rooms(&self) -> Vec<Room> {
         self.rooms_filtered(RoomStateFilter::LEFT)
+    }
+
+    /// Returns the joined space rooms this client knows about.
+    pub fn joined_space_rooms(&self) -> Vec<Room> {
+        self.base_client()
+            .rooms_filtered(RoomStateFilter::JOINED)
+            .into_iter()
+            .flat_map(|room| room.is_space().then_some(Room::new(self.clone(), room)))
+            .collect()
     }
 
     /// Get a room with the given room id.
@@ -2893,6 +2902,25 @@ impl Client {
             ThreadingSupport::Enabled { with_subscriptions } => with_subscriptions,
             ThreadingSupport::Disabled => false,
         }
+    }
+
+    /// Fetch thread subscriptions changes between `from` and up to `to`.
+    ///
+    /// The `limit` optional parameter can be used to limit the number of
+    /// entries in a response. It can also be overridden by the server, if
+    /// it's deemed too large.
+    pub async fn fetch_thread_subscriptions(
+        &self,
+        from: Option<String>,
+        to: Option<String>,
+        limit: Option<UInt>,
+    ) -> Result<get_thread_subscriptions_changes::unstable::Response> {
+        let request = assign!(get_thread_subscriptions_changes::unstable::Request::new(), {
+            from,
+            to,
+            limit,
+        });
+        Ok(self.send(request).await?)
     }
 }
 

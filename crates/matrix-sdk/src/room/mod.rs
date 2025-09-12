@@ -32,9 +32,11 @@ use futures_util::{
 use http::StatusCode;
 #[cfg(feature = "e2e-encryption")]
 pub use identity_status_changes::IdentityStatusChanges;
+#[cfg(feature = "experimental-encrypted-state-events")]
+use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
-pub use matrix_sdk_base::store::ThreadSubscription;
+pub use matrix_sdk_base::store::StoredThreadSubscription;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::{crypto::RoomEventDecryptionResult, deserialized_responses::EncryptionInfo};
 use matrix_sdk_base::{
@@ -43,7 +45,7 @@ use matrix_sdk_base::{
     },
     event_cache::store::media::IgnoreMediaRetentionPolicy,
     media::MediaThumbnailSettings,
-    store::StateStoreExt,
+    store::{StateStoreExt, ThreadSubscriptionStatus},
     ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, SendOutsideWasm,
     StateChanges, StateStoreDataKey, StateStoreDataValue,
 };
@@ -63,6 +65,8 @@ use reply::Reply;
 use ruma::events::room::message::GalleryItemType;
 #[cfg(any(feature = "experimental-search", feature = "e2e-encryption"))]
 use ruma::events::AnySyncMessageLikeEvent;
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::events::AnySyncStateEvent;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
     room::encrypted::OriginalSyncRoomEncryptedEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
@@ -130,6 +134,11 @@ use ruma::{
     time::Instant,
     EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
+};
+#[cfg(feature = "experimental-encrypted-state-events")]
+use ruma::{
+    events::room::encrypted::unstable_state::OriginalSyncStateRoomEncryptedEvent,
+    serde::JsonCastable,
 };
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -204,6 +213,14 @@ impl Deref for Room {
 
 const TYPING_NOTICE_TIMEOUT: Duration = Duration::from_secs(4);
 const TYPING_NOTICE_RESEND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A thread subscription, according to the semantics of MSC4306.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadSubscription {
+    /// Whether the subscription was made automatically by a client, not by
+    /// manual user choice.
+    pub automatic: bool,
+}
 
 /// Context allowing to compute the push actions for a given event.
 #[derive(Debug)]
@@ -679,6 +696,7 @@ impl Room {
     /// decrypted if needs be.
     ///
     /// Only logs from the crypto crate will indicate a failure to decrypt.
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
     #[allow(clippy::unused_async)] // Used only in e2e-encryption.
     async fn try_decrypt_event(
         &self,
@@ -693,6 +711,56 @@ impl Room {
             if let Ok(event) = self.decrypt_event(event.cast_ref_unchecked(), push_ctx).await {
                 return event;
             }
+        }
+
+        let mut event = TimelineEvent::from_plaintext(event.cast());
+        if let Some(push_ctx) = push_ctx {
+            event.set_push_actions(push_ctx.for_event(event.raw()).await);
+        }
+
+        event
+    }
+
+    /// Returns a wrapping `TimelineEvent` for the input `AnyTimelineEvent`,
+    /// decrypted if needs be.
+    ///
+    /// Only logs from the crypto crate will indicate a failure to decrypt.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    #[allow(clippy::unused_async)] // Used only in e2e-encryption.
+    async fn try_decrypt_event(
+        &self,
+        event: Raw<AnyTimelineEvent>,
+        push_ctx: Option<&PushContext>,
+    ) -> TimelineEvent {
+        // If we have either an encrypted message-like or state event, try to decrypt.
+        match event.deserialize_as::<AnySyncTimelineEvent>() {
+            Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+                SyncMessageLikeEvent::Original(_),
+            ))) => {
+                if let Ok(event) = self
+                    .decrypt_event(
+                        event.cast_ref_unchecked::<OriginalSyncRoomEncryptedEvent>(),
+                        push_ctx,
+                    )
+                    .await
+                {
+                    return event;
+                }
+            }
+            Ok(AnySyncTimelineEvent::State(AnySyncStateEvent::RoomEncrypted(
+                SyncStateEvent::Original(_),
+            ))) => {
+                if let Ok(event) = self
+                    .decrypt_event(
+                        event.cast_ref_unchecked::<OriginalSyncStateRoomEncryptedEvent>(),
+                        push_ctx,
+                    )
+                    .await
+                {
+                    return event;
+                }
+            }
+            _ => {}
         }
 
         let mut event = TimelineEvent::from_plaintext(event.cast());
@@ -1215,20 +1283,20 @@ impl Room {
         // Implements this algorithm:
         // https://spec.matrix.org/v1.8/client-server-api/#mspaceparent-relationships
 
-        // Get all m.room.parent events for this room
+        // Get all m.space.parent events for this room
         Ok(self
             .get_state_events_static::<SpaceParentEventContent>()
             .await?
             .into_iter()
             // Extract state key (ie. the parent's id) and sender
-            .flat_map(|parent_event| match parent_event.deserialize() {
+            .filter_map(|parent_event| match parent_event.deserialize() {
                 Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
                     Some((e.state_key.to_owned(), e.sender))
                 }
                 Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => None,
                 Ok(SyncOrStrippedState::Stripped(e)) => Some((e.state_key.to_owned(), e.sender)),
                 Err(e) => {
-                    info!(room_id = ?self.room_id(), "Could not deserialize m.room.parent: {e}");
+                    info!(room_id = ?self.room_id(), "Could not deserialize m.space.parent: {e}");
                     None
                 }
             })
@@ -1239,7 +1307,7 @@ impl Room {
                     // TODO: try peeking into the room
                     return Ok(ParentSpace::Unverifiable(state_key));
                 };
-                // Get the m.room.child state of the parent with this room's id
+                // Get the m.space.child state of the parent with this room's id
                 // as state key.
                 if let Some(child_event) = parent_room
                     .get_state_event_static_for_key::<SpaceChildEventContent, _>(self.room_id())
@@ -1247,7 +1315,7 @@ impl Room {
                 {
                     match child_event.deserialize() {
                         Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(_))) => {
-                            // There is a valid m.room.child in the parent pointing to
+                            // There is a valid m.space.child in the parent pointing to
                             // this room
                             return Ok(ParentSpace::Reciprocal(parent_room));
                         }
@@ -1256,7 +1324,7 @@ impl Room {
                         Err(e) => {
                             info!(
                                 room_id = ?self.room_id(), parent_room_id = ?state_key,
-                                "Could not deserialize m.room.child: {e}"
+                                "Could not deserialize m.space.child: {e}"
                             );
                         }
                     }
@@ -1266,7 +1334,7 @@ impl Room {
                     // relationship: https://spec.matrix.org/v1.8/client-server-api/#mspacechild
                 }
 
-                // No reciprocal m.room.child found, let's check if the sender has the
+                // No reciprocal m.space.child found, let's check if the sender has the
                 // power to set it
                 let Some(member) = parent_room.get_member(&sender).await? else {
                     // Sender is not even in the parent room
@@ -1585,6 +1653,7 @@ impl Room {
     /// Returns the decrypted event. In the case of a decryption error, returns
     /// a `TimelineEvent` representing the decryption error.
     #[cfg(feature = "e2e-encryption")]
+    #[cfg(not(feature = "experimental-encrypted-state-events"))]
     pub async fn decrypt_event(
         &self,
         event: &Raw<OriginalSyncRoomEncryptedEvent>,
@@ -1615,6 +1684,50 @@ impl Room {
                     .backups()
                     .maybe_download_room_key(self.room_id().to_owned(), event.clone());
                 Ok(TimelineEvent::from_utd(event.clone().cast(), utd_info))
+            }
+        }
+    }
+
+    /// Tries to decrypt a room event.
+    ///
+    /// # Arguments
+    /// * `event` - The room event to be decrypted.
+    ///
+    /// Returns the decrypted event. In the case of a decryption error, returns
+    /// a `TimelineEvent` representing the decryption error.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub async fn decrypt_event<T: JsonCastable<EncryptedEvent>>(
+        &self,
+        event: &Raw<T>,
+        push_ctx: Option<&PushContext>,
+    ) -> Result<TimelineEvent> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        match machine
+            .try_decrypt_room_event(
+                event.cast_ref(),
+                self.inner.room_id(),
+                self.client.decryption_settings(),
+            )
+            .await?
+        {
+            RoomEventDecryptionResult::Decrypted(decrypted) => {
+                let push_actions = if let Some(push_ctx) = push_ctx {
+                    Some(push_ctx.for_event(&decrypted.event).await)
+                } else {
+                    None
+                };
+                Ok(TimelineEvent::from_decrypted(decrypted, push_actions))
+            }
+            RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
+                self.client
+                    .encryption()
+                    .backups()
+                    .maybe_download_room_key(self.room_id().to_owned(), event.clone());
+                // Cast safety: Anything that can be cast to EncryptedEvent must be a timeline
+                // event.
+                Ok(TimelineEvent::from_utd(event.clone().cast_unchecked(), utd_info))
             }
         }
     }
@@ -4088,13 +4201,19 @@ impl Room {
         {
             Ok(_response) => {
                 trace!("Server acknowledged the thread subscription; saving in db");
+
                 // Immediately save the result into the database.
                 self.client
                     .state_store()
                     .upsert_thread_subscription(
                         self.room_id(),
                         &thread_root,
-                        ThreadSubscription { automatic: is_automatic },
+                        StoredThreadSubscription {
+                            status: ThreadSubscriptionStatus::Subscribed {
+                                automatic: is_automatic,
+                            },
+                            bump_stamp: None,
+                        },
                     )
                     .await?;
 
@@ -4131,6 +4250,8 @@ impl Room {
             // If we have a previous subscription, we should only send the new one if it's
             // manual and the previous one was automatic.
             if !prev_sub.automatic || automatic.is_some() {
+                // Either we had already a manual subscription, or we had an automatic one and
+                // the new one is automatic too: nothing to do!
                 return Ok(());
             }
         }
@@ -4160,7 +4281,17 @@ impl Room {
         trace!("Server acknowledged the thread subscription removal; removed it from db too");
 
         // Immediately save the result into the database.
-        self.client.state_store().remove_thread_subscription(self.room_id(), &thread_root).await?;
+        self.client
+            .state_store()
+            .upsert_thread_subscription(
+                self.room_id(),
+                &thread_root,
+                StoredThreadSubscription {
+                    status: ThreadSubscriptionStatus::Unsubscribed,
+                    bump_stamp: None,
+                },
+            )
+            .await?;
 
         Ok(())
     }
@@ -4206,7 +4337,14 @@ impl Room {
         if let Some(sub) = &subscription {
             self.client
                 .state_store()
-                .upsert_thread_subscription(self.room_id(), &thread_root, *sub)
+                .upsert_thread_subscription(
+                    self.room_id(),
+                    &thread_root,
+                    StoredThreadSubscription {
+                        status: ThreadSubscriptionStatus::Subscribed { automatic: sub.automatic },
+                        bump_stamp: None,
+                    },
+                )
                 .await?;
         } else {
             // If the subscription was not found, remove it from the database.
@@ -4375,7 +4513,7 @@ pub enum ParentSpace {
     Reciprocal(Room),
     /// The room recognizes the given room as its parent, but the parent does
     /// not recognizes it as its child. However, the author of the
-    /// `m.room.parent` event in the room has a sufficient power level in the
+    /// `m.space.parent` event in the room has a sufficient power level in the
     /// parent to create the child event.
     WithPowerlevel(Room),
     /// The room recognizes the given room as its parent, but the parent does
