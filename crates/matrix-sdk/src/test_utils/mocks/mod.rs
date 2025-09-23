@@ -19,20 +19,25 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{atomic::AtomicU32, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU32},
 };
 
 use js_int::UInt;
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
+#[cfg(feature = "experimental-element-recent-emojis")]
+use matrix_sdk_base::recent_emojis::RecentEmojisContent;
 use matrix_sdk_test::{
-    test_json, InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
-    SyncResponseBuilder,
+    InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
+    SyncResponseBuilder, test_json,
 };
 use percent_encoding::{AsciiSet, CONTROLS};
 use ruma::{
+    DeviceId, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedDeviceId, OwnedEventId,
+    OwnedOneTimeKeyId, OwnedRoomId, OwnedUserId, RoomId, ServerName, UserId,
     api::client::{
         receipt::create_receipt::v3::ReceiptType,
         room::Visibility,
+        sync::sync_events::v5,
         threads::get_thread_subscriptions_changes::unstable::{
             ThreadSubscription, ThreadUnsubscription,
         },
@@ -41,26 +46,24 @@ use ruma::{
     directory::PublicRoomsChunk,
     encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
     events::{
-        receipt::ReceiptThread, room::member::RoomMemberEvent, AnyStateEvent, AnySyncTimelineEvent,
-        AnyTimelineEvent, GlobalAccountDataEventType, MessageLikeEventType,
-        RoomAccountDataEventType, StateEventType,
+        AnyStateEvent, AnySyncTimelineEvent, AnyTimelineEvent, GlobalAccountDataEventType,
+        MessageLikeEventType, RoomAccountDataEventType, StateEventType, receipt::ReceiptThread,
+        room::member::RoomMemberEvent,
     },
     media::Method,
     push::RuleKind,
     serde::Raw,
     time::Duration,
-    DeviceId, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedDeviceId, OwnedEventId,
-    OwnedOneTimeKeyId, OwnedRoomId, OwnedUserId, RoomId, ServerName, UserId,
 };
 use serde::Deserialize;
-use serde_json::{from_value, json, Value};
+use serde_json::{Value, from_value, json};
 use tokio::sync::oneshot::{self, Receiver};
 use wiremock::{
+    Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
     matchers::{
         body_json, body_partial_json, header, method, path, path_regex, query_param,
         query_param_is_missing,
     },
-    Mock, MockBuilder, MockGuard, MockServer, Request, Respond, ResponseTemplate, Times,
 };
 
 #[cfg(feature = "e2e-encryption")]
@@ -68,7 +71,7 @@ pub mod encryption;
 pub mod oauth;
 
 use super::client::MockClientBuilder;
-use crate::{room::IncludeRelations, Client, OwnedServerName, Room};
+use crate::{Client, OwnedServerName, Room, SlidingSyncBuilder, room::IncludeRelations};
 
 /// Structure used to store the crypto keys uploaded to the server.
 /// They will be served back to clients when requested.
@@ -351,6 +354,13 @@ impl MatrixMockServer {
             mock,
             SyncEndpoint { sync_response_builder: self.sync_response_builder.clone() },
         )
+    }
+
+    /// Mocks the sliding sync endpoint.
+    pub fn mock_sliding_sync(&self) -> MockEndpoint<'_, SlidingSyncEndpoint> {
+        let mock = Mock::given(method("POST"))
+            .and(path("/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"));
+        self.mock_endpoint(mock, SlidingSyncEndpoint)
     }
 
     /// Creates a prebuilt mock for joining a room.
@@ -1175,20 +1185,15 @@ impl MatrixMockServer {
     ///
     /// ```
     /// tokio_test::block_on(async {
+    /// use js_int::uint;
     /// use matrix_sdk::test_utils::mocks::MatrixMockServer;
-    /// use serde_json::json;
-    /// use ruma::events::media_preview_config::MediaPreviews;
     ///
     /// let mock_server = MatrixMockServer::new().await;
     /// let client = mock_server.client_builder().build().await;
     ///
-    /// mock_server.mock_global_account_data().ok(
+    /// mock_server.mock_get_recent_emojis().ok(
     ///     client.user_id().unwrap(),
-    ///     ruma::events::GlobalAccountDataEventType::MediaPreviewConfig,
-    ///     json!({
-    ///         "media_previews": "private",
-    ///         "invite_avatars": "off"
-    ///     })
+    ///     vec![(":)".to_string(), uint!(1))]
     /// )
     /// .mock_once()
     /// .mount()
@@ -1198,9 +1203,46 @@ impl MatrixMockServer {
     ///
     /// # anyhow::Ok(()) });
     /// ```
-    pub fn mock_global_account_data(&self) -> MockEndpoint<'_, GlobalAccountDataEndpoint> {
+    #[cfg(feature = "experimental-element-recent-emojis")]
+    pub fn mock_get_recent_emojis(&self) -> MockEndpoint<'_, GetRecentEmojisEndpoint> {
         let mock = Mock::given(method("GET"));
-        self.mock_endpoint(mock, GlobalAccountDataEndpoint).expect_default_access_token()
+        self.mock_endpoint(mock, GetRecentEmojisEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint that updates the global account
+    /// data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// tokio_test::block_on(async {
+    /// use js_int::uint;
+    /// use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    /// use ruma::user_id;
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    /// let user_id = client.user_id().unwrap();
+    ///
+    /// mock.server.mock_get_recent_emojis()
+    /// .ok(user_id, vec![(":D".to_string(), uint!(1))])
+    /// .mock_once()
+    /// .mount()
+    /// .await;
+    /// mock_server.mock_add_recent_emojis()
+    /// .ok(user_id)
+    /// .mock_once()
+    /// .mount()
+    /// .await;
+    /// // Calls both get and update recent emoji endpoints, with an update value
+    /// client.account().add_recent_emoji(":D").await.unwrap();
+    ///
+    /// # anyhow::Ok(()) });
+    /// ```
+    #[cfg(feature = "experimental-element-recent-emojis")]
+    pub fn mock_add_recent_emojis(&self) -> MockEndpoint<'_, UpdateRecentEmojisEndpoint> {
+        let mock = Mock::given(method("PUT"));
+        self.mock_endpoint(mock, UpdateRecentEmojisEndpoint::new()).expect_default_access_token()
     }
 
     /// Create a prebuilt mock for the endpoint used to send a single receipt.
@@ -1550,8 +1592,8 @@ fn percent_encoded_path(path: &str) -> String {
 /// [`Mock::mount`] or [`Mock::mount_as_scoped`] without having to pass the
 /// [`MockServer`] reference (i.e. call `mount()` instead of `mount(&server)`).
 pub struct MatrixMock<'a> {
-    mock: Mock,
-    server: &'a MockServer,
+    pub(super) mock: Mock,
+    pub(super) server: &'a MockServer,
 }
 
 impl MatrixMock<'_> {
@@ -3459,41 +3501,73 @@ impl<'a> MockEndpoint<'a, RoomRelationsEndpoint> {
     }
 }
 
-/// A prebuilt mock for the global account data endpoint.
-pub struct GlobalAccountDataEndpoint;
+/// Helper function to set up a [`MockBuilder`] so it intercepts the account
+/// data URLs.
+fn global_account_data_mock_builder(
+    builder: MockBuilder,
+    user_id: &UserId,
+    event_type: GlobalAccountDataEventType,
+) -> MockBuilder {
+    builder
+        .and(path_regex(format!(r"^/_matrix/client/v3/user/{user_id}/account_data/{event_type}",)))
+}
 
-impl<'a> MockEndpoint<'a, GlobalAccountDataEndpoint> {
-    /// Returns a mock for a successful global account data event.
-    pub fn ok(
-        self,
-        user_id: &UserId,
-        event_type: GlobalAccountDataEventType,
-        json_response: Value,
-    ) -> MatrixMock<'a> {
-        let mock = self
-            .mock
-            .and(path_regex(format!(
-                r"^/_matrix/client/v3/user/{user_id}/account_data/{event_type}"
-            )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json_response));
+/// A prebuilt mock for a `GET
+/// /_matrix/client/v3/user/{userId}/account_data/io.element.recent_emoji`
+/// request, which fetches the recently used emojis in the account data.
+#[cfg(feature = "experimental-element-recent-emojis")]
+pub struct GetRecentEmojisEndpoint;
+
+#[cfg(feature = "experimental-element-recent-emojis")]
+impl<'a> MockEndpoint<'a, GetRecentEmojisEndpoint> {
+    /// Returns a mock for a successful fetch of the recently used emojis in the
+    /// account data.
+    pub fn ok(self, user_id: &UserId, emojis: Vec<(String, UInt)>) -> MatrixMock<'a> {
+        let mock =
+            global_account_data_mock_builder(self.mock, user_id, "io.element.recent_emoji".into())
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({ "recent_emoji": emojis })),
+                );
         MatrixMock { server: self.server, mock }
     }
+}
 
-    /// Returns a mock for a not found global account data event.
-    pub fn not_found(
-        self,
-        user_id: &UserId,
-        event_type: GlobalAccountDataEventType,
-    ) -> MatrixMock<'a> {
-        let mock = self
-            .mock
-            .and(path_regex(format!(
-                r"^/_matrix/client/v3/user/{user_id}/account_data/{event_type}"
-            )))
-            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
-                "errcode": "M_NOT_FOUND",
-                "error": "Not found"
-            })));
+/// A prebuilt mock for a `PUT
+/// /_matrix/client/v3/user/{userId}/account_data/io.element.recent_emoji`
+/// request, which updates the recently used emojis in the account data.
+#[cfg(feature = "experimental-element-recent-emojis")]
+pub struct UpdateRecentEmojisEndpoint {
+    pub(crate) request_body: Option<Vec<(String, UInt)>>,
+}
+
+#[cfg(feature = "experimental-element-recent-emojis")]
+impl UpdateRecentEmojisEndpoint {
+    /// Creates a new instance of the recent update recent emojis mock endpoint.
+    fn new() -> Self {
+        Self { request_body: None }
+    }
+}
+
+#[cfg(feature = "experimental-element-recent-emojis")]
+impl<'a> MockEndpoint<'a, UpdateRecentEmojisEndpoint> {
+    /// Returns a mock that will check the body of the request, making sure its
+    /// contents match the provided list of emojis.
+    pub fn match_emojis_in_request_body(self, emojis: Vec<(String, UInt)>) -> Self {
+        Self::new(
+            self.server,
+            self.mock.and(body_json(json!(RecentEmojisContent::new(emojis)))),
+            self.endpoint,
+        )
+    }
+
+    /// Returns a mock for a successful update of the recent emojis account data
+    /// event. The request body contents should match the provided emoji
+    /// list.
+    #[cfg(feature = "experimental-element-recent-emojis")]
+    pub fn ok(self, user_id: &UserId) -> MatrixMock<'a> {
+        let mock =
+            global_account_data_mock_builder(self.mock, user_id, "io.element.recent_emoji".into())
+                .respond_with(ResponseTemplate::new(200).set_body_json(()));
         MatrixMock { server: self.server, mock }
     }
 }
@@ -4172,6 +4246,8 @@ pub struct GetThreadSubscriptionsEndpoint {
     subscribed: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, ThreadSubscription>>,
     /// New thread unsubscriptions per (room id, thread root event id).
     unsubscribed: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, ThreadUnsubscription>>,
+    /// Optional delay to respond to the query.
+    delay: Option<Duration>,
 }
 
 impl<'a> MockEndpoint<'a, GetThreadSubscriptionsEndpoint> {
@@ -4197,6 +4273,12 @@ impl<'a> MockEndpoint<'a, GetThreadSubscriptionsEndpoint> {
         self
     }
 
+    /// Respond with a given delay to the query.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.endpoint.delay = Some(delay);
+        self
+    }
+
     /// Match the `from` query parameter to a given value.
     pub fn match_from(self, from: &str) -> Self {
         Self { mock: self.mock.and(query_param("from", from)), ..self }
@@ -4214,7 +4296,14 @@ impl<'a> MockEndpoint<'a, GetThreadSubscriptionsEndpoint> {
             "unsubscribed": self.endpoint.unsubscribed,
             "end": end,
         });
-        self.respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+
+        let mut template = ResponseTemplate::new(200).set_body_json(response_body);
+
+        if let Some(delay) = self.endpoint.delay {
+            template = template.set_delay(delay);
+        }
+
+        self.respond_with(template)
     }
 }
 
@@ -4248,11 +4337,20 @@ impl<'a> MockEndpoint<'a, GetHierarchyEndpoint> {
     pub fn ok_with_room_ids_and_children_state(
         self,
         room_ids: Vec<&RoomId>,
-        children_state: Vec<&RoomId>,
+        children_state: Vec<(&RoomId, Vec<&ServerName>)>,
     ) -> MatrixMock<'a> {
         let children_state = children_state
             .into_iter()
-            .map(|id| json!({ "type": "m.space.child", "state_key": id }))
+            .map(|(id, via)| {
+                json!({
+                    "type":
+                    "m.space.child",
+                    "state_key": id,
+                    "content": { "via": via },
+                    "sender": "@bob:matrix.org",
+                    "origin_server_ts": MilliSecondsSinceUnixEpoch::now()
+                })
+            })
             .collect::<Vec<_>>();
 
         let rooms = room_ids
@@ -4278,5 +4376,41 @@ impl<'a> MockEndpoint<'a, GetHierarchyEndpoint> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "rooms": []
         })))
+    }
+}
+
+/// A prebuilt mock for running simplified sliding sync.
+pub struct SlidingSyncEndpoint;
+
+impl<'a> MockEndpoint<'a, SlidingSyncEndpoint> {
+    /// Mocks the sliding sync endpoint with the given response.
+    pub fn ok(self, response: v5::Response) -> MatrixMock<'a> {
+        // A bit silly that we need to destructure all the fields ourselves, but
+        // Response isn't serializable :'(
+        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "txn_id": response.txn_id,
+            "pos": response.pos,
+            "lists": response.lists,
+            "rooms": response.rooms,
+            "extensions": response.extensions,
+        })))
+    }
+
+    /// Temporarily mocks the sync with the given endpoint and runs a client
+    /// sync with it.
+    ///
+    /// After calling this function, the sync endpoint isn't mocked anymore.
+    pub async fn ok_and_run<F: FnOnce(SlidingSyncBuilder) -> SlidingSyncBuilder>(
+        self,
+        client: &Client,
+        on_builder: F,
+        response: v5::Response,
+    ) {
+        let _scope = self.ok(response).mount_as_scoped().await;
+
+        let sliding_sync =
+            on_builder(client.sliding_sync("test_id").unwrap()).build().await.unwrap();
+
+        let _summary = sliding_sync.sync_once().await.unwrap();
     }
 }

@@ -37,39 +37,39 @@ use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_util::future::{join_all, try_join_all};
 use matrix_sdk_base::{
+    ThreadingSupport,
+    cross_process_lock::CrossProcessLockError,
     deserialized_responses::{AmbiguityChange, TimelineEvent},
     event_cache::{
-        store::{EventCacheStoreError, EventCacheStoreLock},
         Gap,
+        store::{EventCacheStoreError, EventCacheStoreLock},
     },
     executor::AbortOnDrop,
-    linked_chunk::{self, lazy_loader::LazyLoaderError, OwnedLinkedChunkId},
+    linked_chunk::{self, OwnedLinkedChunkId, lazy_loader::LazyLoaderError},
     serde_helpers::extract_thread_root_from_content,
-    store_locks::LockStoreError,
     sync::RoomUpdates,
-    timer, ThreadingSupport,
+    timer,
 };
-use matrix_sdk_common::executor::{spawn, JoinHandle};
+use matrix_sdk_common::executor::{JoinHandle, spawn};
 use room::RoomEventCacheState;
-#[cfg(feature = "experimental-search")]
-use ruma::events::AnySyncMessageLikeEvent;
 use ruma::{
-    events::AnySyncEphemeralRoomEvent, serde::Raw, OwnedEventId, OwnedRoomId, OwnedTransactionId,
-    RoomId,
+    OwnedEventId, OwnedRoomId, OwnedTransactionId, RoomId, events::AnySyncEphemeralRoomEvent,
+    serde::Raw,
 };
 use tokio::{
     select,
     sync::{
-        broadcast::{channel, error::RecvError, Receiver, Sender},
-        mpsc, Mutex, RwLock,
+        Mutex, RwLock,
+        broadcast::{Receiver, Sender, channel, error::RecvError},
+        mpsc,
     },
 };
-use tracing::{debug, error, info, info_span, instrument, trace, warn, Instrument as _, Span};
+use tracing::{Instrument as _, Span, debug, error, info, info_span, instrument, trace, warn};
 
 use crate::{
+    Client,
     client::WeakClient,
     send_queue::{LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate},
-    Client,
 };
 
 mod deduplicator;
@@ -111,7 +111,7 @@ pub enum EventCacheError {
 
     /// An error happening when attempting to (cross-process) lock storage.
     #[error(transparent)]
-    LockingStorage(#[from] LockStoreError),
+    LockingStorage(#[from] CrossProcessLockError),
 
     /// The [`EventCache`] owns a weak reference to the [`Client`] it pertains
     /// to. It's possible this weak reference points to nothing anymore, at
@@ -725,47 +725,44 @@ impl EventCache {
                         return;
                     };
 
+                    let maybe_room_cache = client.event_cache().for_room(&room_id).await;
+                    let Ok((room_cache, _drop_handles)) = maybe_room_cache else {
+                        warn!(for_room = %room_id, "Failed to get RoomEventCache: {maybe_room_cache:?}");
+                        continue;
+                    };
+
+                    let maybe_room = client.get_room(&room_id);
+                    let Some(room) = maybe_room else {
+                        warn!(get_room = %room_id, "Failed to get room while indexing: {maybe_room:?}");
+                        continue;
+                    };
+                    let redaction_rules =
+                        room.clone_info().room_version_rules_or_default().redaction;
+
                     let mut search_index_guard = client.search_index().lock().await;
 
-                    for event in timeline_events {
-                        if let Some(message_event) = parse_timeline_event_for_search_index(&event) {
-                            if let Err(err) =
-                                search_index_guard.handle_event(message_event, &room_id)
-                            {
-                                warn!("Failed to handle event for indexing: {err}")
-                            }
-                        }
+                    if let Err(err) = search_index_guard
+                        .bulk_handle_timeline_event(
+                            timeline_events,
+                            &room_cache,
+                            &room_id,
+                            &redaction_rules,
+                        )
+                        .await
+                    {
+                        error!("Failed to handle events for indexing: {err}")
                     }
                 }
                 Err(RecvError::Closed) => {
-                    debug!("Linked chunk update channel has been closed, exiting thread subscriber task");
+                    debug!(
+                        "Linked chunk update channel has been closed, exiting thread subscriber task"
+                    );
                     break;
                 }
                 Err(RecvError::Lagged(num_skipped)) => {
                     warn!(num_skipped, "Lagged behind linked chunk updates");
                 }
             }
-        }
-    }
-}
-
-#[cfg(feature = "experimental-search")]
-fn parse_timeline_event_for_search_index(event: &TimelineEvent) -> Option<AnySyncMessageLikeEvent> {
-    use ruma::events::AnySyncTimelineEvent;
-
-    if event.kind.is_utd() {
-        return None;
-    }
-
-    match event.raw().deserialize() {
-        Ok(event) => match event {
-            AnySyncTimelineEvent::MessageLike(event) => Some(event),
-            AnySyncTimelineEvent::State(_) => None,
-        },
-
-        Err(e) => {
-            warn!("failed to parse event: {e:?}");
-            None
         }
     }
 }
@@ -1168,12 +1165,12 @@ mod tests {
     use assert_matches::assert_matches;
     use futures_util::FutureExt as _;
     use matrix_sdk_base::{
+        RoomState,
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
         sync::{JoinedRoomUpdate, RoomUpdates, Timeline},
-        RoomState,
     };
     use matrix_sdk_test::{
-        async_test, event_factory::EventFactory, JoinedRoomBuilder, SyncResponseBuilder,
+        JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
     };
     use ruma::{event_id, room_id, serde::Raw, user_id};
     use serde_json::json;
@@ -1362,11 +1359,13 @@ mod tests {
                     },
                     Update::PushItems {
                         at: Position::new(ChunkIdentifier::new(0), 0),
-                        items: vec![event_factory
-                            .text_msg("hello")
-                            .sender(user)
-                            .event_id(event_id!("$ev0"))
-                            .into_event()],
+                        items: vec![
+                            event_factory
+                                .text_msg("hello")
+                                .sender(user)
+                                .event_id(event_id!("$ev0"))
+                                .into_event(),
+                        ],
                     },
                 ],
             )
@@ -1437,11 +1436,13 @@ mod tests {
                     },
                     Update::PushItems {
                         at: Position::new(ChunkIdentifier::new(2), 0),
-                        items: vec![event_factory
-                            .text_msg("hello")
-                            .sender(user)
-                            .event_id(event_id!("$ev0"))
-                            .into_event()],
+                        items: vec![
+                            event_factory
+                                .text_msg("hello")
+                                .sender(user)
+                                .event_id(event_id!("$ev0"))
+                                .into_event(),
+                        ],
                     },
                     // Non-empty items chunk.
                     Update::NewItemsChunk {
@@ -1451,11 +1452,13 @@ mod tests {
                     },
                     Update::PushItems {
                         at: Position::new(ChunkIdentifier::new(3), 0),
-                        items: vec![event_factory
-                            .text_msg("world")
-                            .sender(user)
-                            .event_id(event_id!("$ev1"))
-                            .into_event()],
+                        items: vec![
+                            event_factory
+                                .text_msg("world")
+                                .sender(user)
+                                .event_id(event_id!("$ev1"))
+                                .into_event(),
+                        ],
                     },
                 ],
             )

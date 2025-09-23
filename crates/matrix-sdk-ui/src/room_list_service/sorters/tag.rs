@@ -1,20 +1,20 @@
 use std::cmp::Ordering;
 use matrix_sdk::RoomState;
 
-use super::{Room, Sorter};
+use super::{RoomListItem, Sorter};
 
 struct TagMatcher<F>
 where
-    F: Fn(&Room, &Room) -> (u8, u8),
+    F: Fn(&RoomListItem, &RoomListItem) -> (u8, u8),
 {
     order_key: F,
 }
 
 impl<F> TagMatcher<F>
 where
-    F: Fn(&Room, &Room) -> (u8, u8),
+    F: Fn(&RoomListItem, &RoomListItem) -> (u8, u8),
 {
-    fn matches(&self, left: &Room, right: &Room) -> Ordering {
+    fn matches(&self, left: &RoomListItem, right: &RoomListItem) -> Ordering {
         // Same workaround as for recency sorter - not sure if required?
         if left.room_id() == right.room_id() {
             return Ordering::Greater;
@@ -33,7 +33,7 @@ pub fn new_sorter(pin_favorites: bool, bury_low_priority: bool) -> impl Sorter {
     move |left, right| -> Ordering { matcher.matches(left, right) }
 }
 
-fn room_to_tag_weight(room: &Room, pin_favorites: bool, bury_low_priority: bool) -> u8 {
+fn room_to_tag_weight(room: &RoomListItem, pin_favorites: bool, bury_low_priority: bool) -> u8 {
     if room.state() == RoomState::Invited {
         0
     } else if pin_favorites && room.is_favourite() {

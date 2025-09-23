@@ -26,9 +26,9 @@ use matrix_sdk_base::{
 use matrix_sdk_test::DEFAULT_TEST_ROOM_ID;
 use ruma::room_id;
 
-use crate::event_cache_store::{
-    transaction::IndexeddbEventCacheStoreTransactionError, IndexeddbEventCacheStore,
-    IndexeddbEventCacheStoreError,
+use crate::{
+    event_cache_store::{IndexeddbEventCacheStore, IndexeddbEventCacheStoreError},
+    transaction::TransactionError,
 };
 
 pub async fn test_linked_chunk_new_items_chunk(store: IndexeddbEventCacheStore) {
@@ -423,9 +423,7 @@ pub async fn test_linked_chunk_update_is_a_transaction(store: IndexeddbEventCach
     // The operation fails with a constraint violation error.
     assert_matches!(
         err,
-        IndexeddbEventCacheStoreError::Transaction(
-            IndexeddbEventCacheStoreTransactionError::DomException { .. }
-        )
+        IndexeddbEventCacheStoreError::Transaction(TransactionError::DomException { .. })
     );
 
     // If the updates have been handled transactionally, then no new chunks should
@@ -680,33 +678,6 @@ macro_rules! indexeddb_event_cache_store_integration_tests {
                 let store = get_event_cache_store().await.expect("Failed to get event cache store");
                 $crate::event_cache_store::integration_tests::test_load_previous_chunk(store)
                     .await
-            }
-        }
-    };
-}
-
-/// This is a partial copy of
-/// [`matrix_sdk_base::event_cache_store_media_integration_tests`] that contains
-/// tests for functions of [`EventCacheStoreMedia`] that are implemented by
-/// [`IndexeddbEventCacheStore`].
-///
-/// This is useful for adding functionality to [`IndexeddbEventCacheStore`] over
-/// multiple pull requests. Once a full implementation [`EventCacheStoreMedia`]
-/// exists, this will be replaced with the actual integration tests referenced
-/// above.
-#[macro_export]
-macro_rules! event_cache_store_media_integration_tests {
-    () => {
-        mod event_cache_store_media_integration_tests {
-            use matrix_sdk_base::event_cache::store::media::EventCacheStoreMediaIntegrationTests;
-            use matrix_sdk_test::async_test;
-
-            use super::get_event_cache_store;
-
-            #[async_test]
-            async fn test_store_media_retention_policy() {
-                let event_cache_store_media = get_event_cache_store().await.unwrap();
-                event_cache_store_media.test_store_media_retention_policy().await;
             }
         }
     };

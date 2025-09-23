@@ -78,17 +78,12 @@ impl SpaceService {
     }
 
     /// Returns a `SpaceRoomList` for the given space ID.
-    #[allow(clippy::unused_async)]
-    // This method doesn't need to be async but if its not the FFI layer panics
-    // with "there is no no reactor running, must be called from the context
-    // of a Tokio 1.x runtime" error because the underlying constructor spawns
-    // an async task.
     pub async fn space_room_list(
         &self,
         space_id: String,
     ) -> Result<Arc<SpaceRoomList>, ClientError> {
         let space_id = RoomId::parse(space_id)?;
-        Ok(Arc::new(SpaceRoomList::new(self.inner.space_room_list(space_id))))
+        Ok(Arc::new(SpaceRoomList::new(self.inner.space_room_list(space_id).await)))
     }
 }
 
@@ -115,6 +110,27 @@ impl SpaceRoomList {
 
 #[matrix_sdk_ffi_macros::export]
 impl SpaceRoomList {
+    /// Returns the space of the room list if known.
+    pub fn space(&self) -> Option<SpaceRoom> {
+        self.inner.space().map(Into::into)
+    }
+
+    /// Subscribe to space updates.
+    pub fn subscribe_to_space_updates(
+        &self,
+        listener: Box<dyn SpaceRoomListSpaceListener>,
+    ) -> Arc<TaskHandle> {
+        let space_updates = self.inner.subscribe_to_space_updates();
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            pin_mut!(space_updates);
+
+            while let Some(space) = space_updates.next().await {
+                listener.on_update(space.map(Into::into));
+            }
+        })))
+    }
+
     /// Returns if the room list is currently paginating or not.
     pub fn pagination_state(&self) -> SpaceRoomListPaginationState {
         self.inner.pagination_state()
@@ -167,6 +183,11 @@ impl SpaceRoomList {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait SpaceRoomListSpaceListener: SendOutsideWasm + SyncOutsideWasm + Debug {
+    fn on_update(&self, space: Option<SpaceRoom>);
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait SpaceRoomListPaginationStateListener: SendOutsideWasm + SyncOutsideWasm + Debug {
     fn on_update(&self, pagination_state: SpaceRoomListPaginationState);
 }
@@ -206,12 +227,19 @@ pub struct SpaceRoom {
     /// Whether guest users may join the room and participate in it.
     pub guest_can_join: bool,
 
+    /// Whether this room is a direct room.
+    ///
+    /// Only set if the room is known to the client otherwise we
+    /// assume DMs shouldn't be exposed publicly in spaces.
+    pub is_direct: Option<bool>,
     /// The number of children room this has, if a space.
     pub children_count: u64,
     /// Whether this room is joined, left etc.
     pub state: Option<Membership>,
     /// A list of room members considered to be heroes.
     pub heroes: Option<Vec<RoomHero>>,
+    /// The via parameters of the room.
+    pub via: Vec<String>,
 }
 
 impl From<UISpaceRoom> for SpaceRoom {
@@ -227,9 +255,11 @@ impl From<UISpaceRoom> for SpaceRoom {
             join_rule: room.join_rule.map(Into::into),
             world_readable: room.world_readable,
             guest_can_join: room.guest_can_join,
+            is_direct: room.is_direct,
             children_count: room.children_count,
             state: room.state.map(Into::into),
             heroes: room.heroes.map(|heroes| heroes.into_iter().map(Into::into).collect()),
+            via: room.via.into_iter().map(Into::into).collect(),
         }
     }
 }

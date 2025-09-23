@@ -14,7 +14,7 @@
 
 use matrix_sdk::{Room, RoomHero, RoomState};
 use ruma::{
-    OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId,
+    OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName,
     events::room::{guest_access::GuestAccess, history_visibility::HistoryVisibility},
     room::{JoinRuleSummary, RoomSummary, RoomType},
 };
@@ -44,12 +44,19 @@ pub struct SpaceRoom {
     /// Whether guest users may join the room and participate in it.
     pub guest_can_join: bool,
 
+    /// Whether this room is a direct room.
+    ///
+    /// Only set if the room is known to the client otherwise we
+    /// assume DMs shouldn't be exposed publicly in spaces.
+    pub is_direct: Option<bool>,
     /// The number of children room this has, if a space.
     pub children_count: u64,
     /// Whether this room is joined, left etc.
     pub state: Option<RoomState>,
     /// A list of room members considered to be heroes.
     pub heroes: Option<Vec<RoomHero>>,
+    /// The via parameters of the room.
+    pub via: Vec<OwnedServerName>,
 }
 
 impl SpaceRoom {
@@ -59,6 +66,7 @@ impl SpaceRoom {
         summary: &RoomSummary,
         known_room: Option<Room>,
         children_count: u64,
+        via: Vec<OwnedServerName>,
     ) -> Self {
         Self {
             room_id: summary.room_id.clone(),
@@ -71,14 +79,16 @@ impl SpaceRoom {
             join_rule: Some(summary.join_rule.clone()),
             world_readable: Some(summary.world_readable),
             guest_can_join: summary.guest_can_join,
+            is_direct: known_room.as_ref().map(|r| r.direct_targets_length() != 0),
             children_count,
             state: known_room.as_ref().map(|r| r.state()),
             heroes: known_room.map(|r| r.heroes()),
+            via,
         }
     }
 
     /// Build a `SpaceRoom` from a room already known to this client.
-    pub(crate) fn new_from_known(known_room: Room, children_count: u64) -> Self {
+    pub(crate) fn new_from_known(known_room: &Room, children_count: u64) -> Self {
         let room_info = known_room.clone_info();
 
         Self {
@@ -94,9 +104,11 @@ impl SpaceRoom {
                 .history_visibility()
                 .map(|vis| *vis == HistoryVisibility::WorldReadable),
             guest_can_join: known_room.guest_access() == GuestAccess::CanJoin,
+            is_direct: Some(known_room.direct_targets_length() != 0),
             children_count,
             state: Some(known_room.state()),
             heroes: Some(room_info.heroes().to_vec()),
+            via: vec![],
         }
     }
 }

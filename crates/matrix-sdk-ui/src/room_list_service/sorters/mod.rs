@@ -14,6 +14,7 @@
 
 //! A collection of room sorters.
 
+mod latest_event;
 mod lexicographic;
 mod name;
 mod recency;
@@ -22,21 +23,22 @@ mod tag;
 
 use std::cmp::Ordering;
 
+pub use latest_event::new_sorter as new_sorter_latest_event;
 pub use lexicographic::new_sorter as new_sorter_lexicographic;
 pub use name::new_sorter as new_sorter_name;
 pub use recency::new_sorter as new_sorter_recency;
 pub use unread::new_sorter as new_sorter_unread;
 pub use tag::new_sorter as new_sorter_tag;
 
-use super::Room;
+use super::RoomListItem;
 
 /// A trait “alias” that represents a _sorter_.
 ///
 /// A sorter is simply a function that receives two `&Room`s and returns a
 /// [`Ordering`].
-pub trait Sorter: Fn(&Room, &Room) -> Ordering {}
+pub trait Sorter: Fn(&RoomListItem, &RoomListItem) -> Ordering {}
 
-impl<F> Sorter for F where F: Fn(&Room, &Room) -> Ordering {}
+impl<F> Sorter for F where F: Fn(&RoomListItem, &RoomListItem) -> Ordering {}
 
 /// Type alias for a boxed sorter function.
 #[cfg(not(target_family = "wasm"))]

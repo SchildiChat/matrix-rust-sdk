@@ -79,7 +79,6 @@ pub use joined::new_filter as new_filter_joined;
 pub use low_priority::new_filter as new_filter_low_priority;
 #[cfg(test)]
 use matrix_sdk::Client;
-use matrix_sdk::Room;
 #[cfg(test)]
 use matrix_sdk_test::{JoinedRoomBuilder, SyncResponseBuilder};
 pub use non_left::new_filter as new_filter_non_left;
@@ -99,12 +98,14 @@ use wiremock::{
 
 pub use sc_rooms::new_filter as new_filter_sc_rooms;
 
+use super::RoomListItem;
+
 /// A trait “alias” that represents a _filter_.
 ///
 /// A filter is simply a function that receives a `&Room` and returns a `bool`.
-pub trait Filter: Fn(&Room) -> bool {}
+pub trait Filter: Fn(&RoomListItem) -> bool {}
 
-impl<F> Filter for F where F: Fn(&Room) -> bool {}
+impl<F> Filter for F where F: Fn(&RoomListItem) -> bool {}
 
 /// Type alias for a boxed filter function.
 #[cfg(not(target_family = "wasm"))]
@@ -124,7 +125,7 @@ pub(super) async fn new_rooms<const N: usize>(
     room_ids: [&RoomId; N],
     client: &Client,
     server: &MockServer,
-) -> [Room; N] {
+) -> [RoomListItem; N] {
     let mut response_builder = SyncResponseBuilder::default();
 
     for room_id in room_ids {
@@ -142,7 +143,7 @@ pub(super) async fn new_rooms<const N: usize>(
 
     let _response = client.sync_once(Default::default()).await.unwrap();
 
-    room_ids.map(|room_id| client.get_room(room_id).unwrap())
+    room_ids.map(|room_id| client.get_room(room_id).unwrap().into())
 }
 
 #[cfg(test)]

@@ -1,19 +1,19 @@
 use std::cmp::Ordering;
 
-use super::{Room, Sorter};
+use super::{RoomListItem, Sorter};
 
 struct UnreadMatcher<F>
 where
-    F: Fn(&Room, &Room) -> (u8, u8),
+    F: Fn(&RoomListItem, &RoomListItem) -> (u8, u8),
 {
     order_key: F,
 }
 
 impl<F> UnreadMatcher<F>
 where
-    F: Fn(&Room, &Room) -> (u8, u8),
+    F: Fn(&RoomListItem, &RoomListItem) -> (u8, u8),
 {
-    fn matches(&self, left: &Room, right: &Room) -> Ordering {
+    fn matches(&self, left: &RoomListItem, right: &RoomListItem) -> Ordering {
         // Same workaround as for recency sorter - not sure if required?
         if left.room_id() == right.room_id() {
             return Ordering::Greater;
@@ -32,7 +32,7 @@ pub fn new_sorter(client_generated_counts: bool, with_silent_unread: bool) -> im
     move |left, right| -> Ordering { matcher.matches(left, right) }
 }
 
-fn room_to_unread_weight(room: &Room, client_generated_counts: bool, with_silent_unread: bool) -> u8 {
+fn room_to_unread_weight(room: &RoomListItem, client_generated_counts: bool, with_silent_unread: bool) -> u8 {
     if client_generated_counts {
         counts_to_unread_weight(
             room.is_marked_unread(),

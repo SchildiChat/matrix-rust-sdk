@@ -19,16 +19,16 @@ pub use matrix_sdk_base::latest_event::{
     LatestEventValue, LocalLatestEventValue, RemoteLatestEventValue,
 };
 use matrix_sdk_base::{
-    deserialized_responses::TimelineEvent, store::SerializableEventContent,
-    RoomInfoNotableUpdateReasons, StateChanges,
+    RoomInfoNotableUpdateReasons, StateChanges, deserialized_responses::TimelineEvent,
+    store::SerializableEventContent,
 };
 use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, TransactionId, UserId,
     events::{
+        AnyMessageLikeEventContent, AnySyncStateEvent, AnySyncTimelineEvent, SyncStateEvent,
         relation::RelationType,
         room::{member::MembershipState, message::MessageType, power_levels::RoomPowerLevels},
-        AnyMessageLikeEventContent, AnySyncStateEvent, AnySyncTimelineEvent, SyncStateEvent,
     },
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, TransactionId, UserId,
 };
 use tracing::{error, instrument, warn};
 
@@ -170,17 +170,17 @@ impl LatestEvent {
 mod tests_latest_event {
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
+        RoomInfoNotableUpdateReasons, RoomState,
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
         store::StoreConfig,
-        RoomInfoNotableUpdateReasons, RoomState,
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
-        event_id,
-        events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
+        MilliSecondsSinceUnixEpoch, OwnedTransactionId, event_id,
+        events::{AnyMessageLikeEventContent, room::message::RoomMessageEventContent},
         room_id,
         serde::Raw,
-        user_id, MilliSecondsSinceUnixEpoch, OwnedTransactionId,
+        user_id,
     };
 
     use super::{LatestEvent, LatestEventValue, LocalLatestEventValue, SerializableEventContent};
@@ -412,10 +412,9 @@ mod tests_latest_event {
                         },
                         Update::PushItems {
                             at: Position::new(ChunkIdentifier::new(0), 0),
-                            items: vec![event_factory
-                                .text_msg("A")
-                                .event_id(event_id!("$ev0"))
-                                .into()],
+                            items: vec![
+                                event_factory.text_msg("A").event_id(event_id!("$ev0")).into(),
+                            ],
                         },
                     ],
                 )
@@ -552,7 +551,10 @@ impl LatestEventValueBuilder {
                         }
 
                         Err(error) => {
-                            error!(?error, "Failed to deserialize an event from `RoomSendQueueUpdate::NewLocalEvent`");
+                            error!(
+                                ?error,
+                                "Failed to deserialize an event from `RoomSendQueueUpdate::NewLocalEvent`"
+                            );
 
                             LatestEventValue::None
                         }
@@ -639,7 +641,10 @@ impl LatestEventValueBuilder {
                         }
 
                         Err(error) => {
-                            error!(?error, "Failed to deserialize an event from `RoomSendQueueUpdate::ReplacedLocalEvent`");
+                            error!(
+                                ?error,
+                                "Failed to deserialize an event from `RoomSendQueueUpdate::ReplacedLocalEvent`"
+                            );
 
                             return LatestEventValue::None;
                         }
@@ -926,23 +931,23 @@ fn filter_timeline_event(
         AnySyncTimelineEvent::State(state) => {
             // … but we make an exception for knocked state events _if_ the current user
             // can either accept or decline them.
-            if let AnySyncStateEvent::RoomMember(member) = state {
-                if matches!(member.membership(), MembershipState::Knock) {
-                    let can_accept_or_decline_knocks = match power_levels {
-                        Some((own_user_id, room_power_levels)) => {
-                            room_power_levels.user_can_invite(own_user_id)
-                                || room_power_levels.user_can_kick(own_user_id)
-                        }
-                        _ => false,
-                    };
-
-                    // The current user can act on the knock changes, so they should be
-                    // displayed
-                    if can_accept_or_decline_knocks {
-                        // We can only decide whether the user can accept or decline knocks if the
-                        // event isn't redacted.
-                        return matches!(member, SyncStateEvent::Original(_));
+            if let AnySyncStateEvent::RoomMember(member) = state
+                && matches!(member.membership(), MembershipState::Knock)
+            {
+                let can_accept_or_decline_knocks = match power_levels {
+                    Some((own_user_id, room_power_levels)) => {
+                        room_power_levels.user_can_invite(own_user_id)
+                            || room_power_levels.user_can_kick(own_user_id)
                     }
+                    _ => false,
+                };
+
+                // The current user can act on the knock changes, so they should be
+                // displayed
+                if can_accept_or_decline_knocks {
+                    // We can only decide whether the user can accept or decline knocks if the
+                    // event isn't redacted.
+                    return matches!(member, SyncStateEvent::Original(_));
                 }
             }
 
@@ -977,7 +982,7 @@ fn filter_any_message_like_event_content(event: AnyMessageLikeEventContent) -> b
 
         AnyMessageLikeEventContent::UnstablePollStart(_)
         | AnyMessageLikeEventContent::CallInvite(_)
-        | AnyMessageLikeEventContent::CallNotify(_)
+        | AnyMessageLikeEventContent::RtcNotification(_)
         | AnyMessageLikeEventContent::Sticker(_) => true,
 
         // Encrypted events are not suitable.
@@ -993,7 +998,11 @@ mod tests_latest_event_content {
     use std::ops::Not;
 
     use matrix_sdk_test::event_factory::EventFactory;
-    use ruma::{event_id, events::room::message::RoomMessageEventContent, user_id};
+    use ruma::{
+        event_id,
+        events::{room::message::RoomMessageEventContent, rtc::notification::NotificationType},
+        owned_user_id, user_id,
+    };
 
     use super::filter_timeline_event;
 
@@ -1089,16 +1098,16 @@ mod tests_latest_event_content {
     }
 
     #[test]
-    fn test_call_notify() {
+    fn test_rtc_notification() {
         assert_latest_event_content!(
             event | event_factory | {
                 event_factory
-                    .call_notify(
-                        "call_id".to_owned(),
-                        ruma::events::call::notify::ApplicationType::Call,
-                        ruma::events::call::notify::NotifyType::Ring,
-                        ruma::events::Mentions::new(),
+                     .rtc_notification(
+                        NotificationType::Ring,
                     )
+                    .mentions(vec![owned_user_id!("@alice:server.name")])
+                    .relates_to_membership_state_event(ruma::OwnedEventId::try_from("$abc:server.name").unwrap())
+                    .lifetime(60)
                     .into_event()
             }
             is a candidate
@@ -1240,7 +1249,7 @@ mod tests_latest_event_content {
 
     #[test]
     fn test_room_message_verification_request() {
-        use ruma::{events::room::message, OwnedDeviceId};
+        use ruma::{OwnedDeviceId, events::room::message};
 
         assert_latest_event_content!(
             event | event_factory | {
@@ -1264,9 +1273,9 @@ mod tests_latest_event_content {
 mod tests_latest_event_values_for_local_events {
     use assert_matches::assert_matches;
     use ruma::{
-        events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
-        serde::Raw,
         MilliSecondsSinceUnixEpoch, OwnedTransactionId,
+        events::{AnyMessageLikeEventContent, room::message::RoomMessageEventContent},
+        serde::Raw,
     };
     use serde_json::json;
 
@@ -1506,20 +1515,20 @@ mod tests_latest_event_value_builder {
 
     use assert_matches::assert_matches;
     use matrix_sdk_base::{
+        RoomState,
         deserialized_responses::TimelineEventKind,
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
         store::SerializableEventContent,
-        RoomState,
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
-        event_id,
+        MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedTransactionId, event_id,
         events::{
-            reaction::ReactionEventContent, relation::Annotation,
-            room::message::RoomMessageEventContent, AnyMessageLikeEventContent,
-            AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+            AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+            SyncMessageLikeEvent, reaction::ReactionEventContent, relation::Annotation,
+            room::message::RoomMessageEventContent,
         },
-        room_id, user_id, MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedTransactionId,
+        room_id, user_id,
     };
 
     use super::{
@@ -1527,11 +1536,11 @@ mod tests_latest_event_value_builder {
         RemoteLatestEventValue, RoomEventCache, RoomSendQueueUpdate,
     };
     use crate::{
+        Client, Error,
         client::WeakClient,
         room::WeakRoom,
         send_queue::{AbstractProgress, LocalEcho, LocalEchoContent, RoomSendQueue, SendHandle},
         test_utils::mocks::MatrixMockServer,
-        Client, Error,
     };
 
     macro_rules! assert_remote_value_matches_room_message_with_body {
@@ -2208,10 +2217,9 @@ mod tests_latest_event_value_builder {
                         },
                         Update::PushItems {
                             at: Position::new(ChunkIdentifier::new(0), 0),
-                            items: vec![event_factory
-                                .text_msg("hello")
-                                .event_id(event_id_0)
-                                .into()],
+                            items: vec![
+                                event_factory.text_msg("hello").event_id(event_id_0).into(),
+                            ],
                         },
                     ],
                 )

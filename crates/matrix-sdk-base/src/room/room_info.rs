@@ -89,12 +89,12 @@ pub struct InviteAcceptanceDetails {
 impl Room {
     /// Subscribe to the inner `RoomInfo`.
     pub fn subscribe_info(&self) -> Subscriber<RoomInfo> {
-        self.inner.subscribe()
+        self.info.subscribe()
     }
 
     /// Clone the inner `RoomInfo`.
     pub fn clone_info(&self) -> RoomInfo {
-        self.inner.get()
+        self.info.get()
     }
 
     /// Update the summary with given RoomInfo.
@@ -103,7 +103,7 @@ impl Room {
         room_info: RoomInfo,
         room_info_notable_update_reasons: RoomInfoNotableUpdateReasons,
     ) {
-        self.inner.set(room_info);
+        self.info.set(room_info);
 
         if !room_info_notable_update_reasons.is_empty() {
             // Ignore error if no receiver exists.
@@ -517,17 +517,27 @@ pub struct RoomInfo {
 
     /// The recency stamp of this room.
     ///
-    /// It's not to be confused with `origin_server_ts` of the latest event.
-    /// Sliding Sync might "ignore” some events when computing the recency
-    /// stamp of the room. Thus, using this `recency_stamp` value is
-    /// more accurate than relying on the latest event.
+    /// It's not to be confused with the `origin_server_ts` value of an event.
+    /// Sliding Sync might “ignore” some events when computing the recency
+    /// stamp of the room. The recency stamp must be considered as an opaque
+    /// unsigned integer value.
+    ///
+    /// # Sorting rooms
+    ///
+    /// The recency stamp is designed to _sort_ rooms between them. The room
+    /// with the highest stamp should be at the top of a room list. However, in
+    /// some situation, it might be inaccurate (for example if the server and
+    /// the client disagree on which events should increment the recency stamp).
+    /// The [`LatestEventValue`] might be a useful alternative to sort rooms
+    /// between them as it's all computed client-side. In this case, the recency
+    /// stamp nicely acts as a default fallback.
     #[serde(default)]
-    pub(crate) recency_stamp: Option<u64>,
+    pub(crate) recency_stamp: Option<RoomRecencyStamp>,
 
     /// A timestamp remembering when we observed the user accepting an invite on
     /// this current device.
     ///
-    /// This is useful to remember if the user accepted this a join on this
+    /// This is useful to remember if the user accepted this join on this
     /// specific client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) invite_acceptance_details: Option<InviteAcceptanceDetails>,
@@ -1084,8 +1094,8 @@ impl RoomInfo {
 
     /// Updates the recency stamp of this room.
     ///
-    /// Please read [`Self::recency_stamp`] to learn more.
-    pub(crate) fn update_recency_stamp(&mut self, stamp: u64) {
+    /// Please read `Self::recency_stamp` to learn more.
+    pub fn update_recency_stamp(&mut self, stamp: RoomRecencyStamp) {
         self.recency_stamp = Some(stamp);
     }
 
@@ -1170,6 +1180,24 @@ impl RoomInfo {
     }
 }
 
+/// Type to represent a `RoomInfo::recency_stamp`.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(transparent)]
+pub struct RoomRecencyStamp(u64);
+
+impl From<u64> for RoomRecencyStamp {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<RoomRecencyStamp> for u64 {
+    fn from(value: RoomRecencyStamp) -> Self {
+        value.0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum SyncInfo {
     /// We only know the room exists and whether it is in invite / joined / left
@@ -1228,7 +1256,7 @@ pub fn apply_redaction(
 /// A room info notable update is an update that can be interesting for other
 /// parts of the code. This mechanism is used in coordination with
 /// [`BaseClient::room_info_notable_update_receiver`][baseclient] (and
-/// `Room::inner` plus `Room::room_info_notable_update_sender`) where `RoomInfo`
+/// `Room::info` plus `Room::room_info_notable_update_sender`) where `RoomInfo`
 /// can be observed and some of its updates can be spread to listeners.
 ///
 /// [baseclient]: crate::BaseClient::room_info_notable_update_receiver
@@ -1348,7 +1376,7 @@ mod tests {
             cached_display_name: None,
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
-            recency_stamp: Some(42),
+            recency_stamp: Some(42.into()),
             invite_acceptance_details: None,
         };
 
@@ -1376,7 +1404,8 @@ mod tests {
             "latest_event": {
                 "event": {
                     "kind": {"PlainText": {"event": {"sender": "@u:i.uk"}}},
-                    "thread_summary": "None"
+                    "thread_summary": "None",
+                    "timestamp": null,
                 },
             },
             "new_latest_event": "None",
@@ -1597,7 +1626,7 @@ mod tests {
             info.cached_user_defined_notification_mode.as_ref(),
             Some(&RoomNotificationMode::Mute)
         );
-        assert_eq!(info.recency_stamp.as_ref(), Some(&42));
+        assert_eq!(info.recency_stamp.as_ref(), Some(&42.into()));
     }
 
     // Ensure we can still deserialize RoomInfos before we added things to its

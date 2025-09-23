@@ -6,7 +6,7 @@ use assert_matches2::assert_let;
 use matrix_sdk_base::{deserialized_responses::TimelineEvent, store::RoomLoadSettings};
 use ruma::{
     api::MatrixVersion,
-    events::{room::message::MessageType, AnySyncMessageLikeEvent, AnySyncTimelineEvent},
+    events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, room::message::MessageType},
 };
 use url::Url;
 
@@ -15,7 +15,7 @@ pub mod client;
 pub mod mocks;
 
 use self::client::mock_matrix_session;
-use crate::{config::RequestConfig, Client, ClientBuilder};
+use crate::{Client, ClientBuilder, config::RequestConfig};
 
 /// Checks that an event is a message-like text event with the given text.
 #[track_caller]
@@ -157,6 +157,9 @@ macro_rules! assert_next_matches_with_timeout {
     };
     ($stream:expr, $pat:pat => $arm:expr) => {
         $crate::assert_next_matches_with_timeout!($stream, 100, $pat => $arm)
+    };
+    ($stream:expr, $timeout_ms:expr, $pat:pat) => {
+        $crate::assert_next_matches_with_timeout!($stream, $timeout_ms, $pat => {})
     };
     ($stream:expr, $timeout_ms:expr, $pat:pat => $arm:expr) => {
         match $crate::assert_next_with_timeout!(&mut $stream, $timeout_ms) {

@@ -10,6 +10,7 @@ exclude = [
 version = 2
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "Unmaintained paste crate, not critical." },
+    { id = "RUSTSEC-2025-0056", reason = "Unmaintained adler crate, not a direct dependency" },
 ]
 
 [licenses]
@@ -17,6 +18,7 @@ version = 2
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "CDLA-Permissive-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
@@ -28,15 +30,6 @@ allow = [
 ]
 exceptions = [
     { allow = ["Unicode-DFS-2016"], crate = "unicode-ident" },
-    { allow = ["CDDL-1.0"], crate = "inferno" },
-    { allow = ["LicenseRef-ring"], crate = "ring" },
-]
-
-[[licenses.clarify]]
-name = "ring"
-expression = "LicenseRef-ring"
-license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 },
 ]
 
 [bans]
