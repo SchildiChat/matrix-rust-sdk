@@ -232,34 +232,13 @@ impl RoomDataProvider for Room {
         event_id: &'a EventId,
         receipt_thread: ReceiptThread,
     ) -> IndexMap<OwnedUserId, Receipt> {
-        let mut result = match self
-            .load_event_receipts(ReceiptType::Read, receipt_thread.clone(), event_id)
-            .await
-        {
+        match self.load_event_receipts(ReceiptType::Read, receipt_thread.clone(), event_id).await {
             Ok(receipts) => receipts.into_iter().collect(),
             Err(e) => {
                 error!(?event_id, ?receipt_thread, "Failed to get read receipts for event: {e}");
                 IndexMap::new()
             }
-        };
-
-        if receipt_thread == ReceiptThread::Unthreaded {
-            // Include the main thread receipts as well, to be maximally compatible with
-            // clients using either the unthreaded or main thread receipt type.
-            let main_thread_receipts = match self
-                .load_event_receipts(ReceiptType::Read, ReceiptThread::Main, event_id)
-                .await
-            {
-                Ok(receipts) => receipts,
-                Err(e) => {
-                    error!(?event_id, "Failed to get main thread read receipts for event: {e}");
-                    Vec::new()
-                }
-            };
-            result.extend(main_thread_receipts);
         }
-
-        result
     }
 
     async fn push_context(&self) -> Option<PushContext> {

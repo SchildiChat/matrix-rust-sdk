@@ -560,12 +560,37 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
         trace!(%event_id, "loading initial receipts for an event");
 
         let receipt_thread = self.focus.receipt_thread();
-        let read_receipts = room_data_provider.load_event_receipts(event_id, receipt_thread).await;
+
+        let receipts = if matches!(receipt_thread, ReceiptThread::Unthreaded | ReceiptThread::Main)
+        {
+            // If the requested receipt thread is unthreaded or main, we maintain maximal
+            // compatibility with clients using either unthreaded or main-thread read
+            // receipts by allowing both here.
+
+            // First, load the main receipts.
+            let mut main_receipts =
+                room_data_provider.load_event_receipts(event_id, ReceiptThread::Main).await;
+
+            // Then, load the unthreaded receipts.
+            let unthreaded_receipts =
+                room_data_provider.load_event_receipts(event_id, ReceiptThread::Unthreaded).await;
+
+            // We can safely extend both here: if a key is already set, then that means that
+            // the user has the unthreaded and main receipt on the main event,
+            // which is fine, and something we display as the one user receipt.
+            main_receipts.extend(unthreaded_receipts);
+            main_receipts
+        } else {
+            // In all other cases, return what's requested, and only that (threaded
+            // receipts).
+            room_data_provider.load_event_receipts(event_id, receipt_thread.clone()).await
+        };
+
         let own_user_id = room_data_provider.own_user_id();
 
         // Since they are explicit read receipts, we need to check if they are
         // superseded by implicit read receipts.
-        for (user_id, receipt) in read_receipts {
+        for (user_id, receipt) in receipts {
             let full_receipt = FullReceipt {
                 event_id,
                 user_id: &user_id,

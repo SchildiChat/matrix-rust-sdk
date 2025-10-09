@@ -238,7 +238,7 @@ impl RoomListService {
     ///
     /// It's the main method of this entire API. Calling `sync` allows to
     /// receive updates on the room list: new rooms, rooms updates etc. Those
-    /// updates can be read with [`RoomList::entries`] for example. This method
+    /// updates can be read with `RoomList::entries` for example. This method
     /// returns a [`Stream`] where produced items only hold an empty value
     /// in case of a sync success, otherwise an error.
     ///
@@ -249,7 +249,7 @@ impl RoomListService {
     /// the state machine.
     ///
     /// This should be used only for testing. In practice, most users should be
-    /// using the [`SyncService`] instead.
+    /// using the [`SyncService`](crate::sync_service::SyncService) instead.
     #[doc(hidden)]
     pub fn sync(&self) -> impl Stream<Item = Result<(), Error>> + '_ {
         stream! {
@@ -324,7 +324,7 @@ impl RoomListService {
     /// state-machine into the [`State::Terminated`] state.
     ///
     /// This should be used only for testing. In practice, most users should be
-    /// using the [`SyncService`] instead.
+    /// using the [`SyncService`](crate::sync_service::SyncService) instead.
     #[doc(hidden)]
     pub fn stop_sync(&self) -> Result<(), Error> {
         self.sliding_sync.stop_sync().map_err(Error::SlidingSync)
@@ -332,7 +332,7 @@ impl RoomListService {
 
     /// Force the sliding sync session to expire.
     ///
-    /// This is used by [`SyncService`][crate::SyncService].
+    /// This is used by [`SyncService`](crate::sync_service::SyncService).
     ///
     /// **Warning**: This method **must not** be called while the sync loop is
     /// running!
@@ -467,13 +467,15 @@ impl RoomListService {
 
         // Before subscribing, let's listen these rooms to calculate their latest
         // events.
-        let latest_events = self.client.latest_events().await;
+        if self.client.event_cache().has_subscribed() {
+            let latest_events = self.client.latest_events().await;
 
-        for room_id in room_ids {
-            if let Err(error) = latest_events.listen_to_room(room_id).await {
-                // Let's not fail the room subscription. Instead, emit a log because it's very
-                // unlikely to happen.
-                error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+            for room_id in room_ids {
+                if let Err(error) = latest_events.listen_to_room(room_id).await {
+                    // Let's not fail the room subscription. Instead, emit a log because it's very
+                    // unlikely to happen.
+                    error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+                }
             }
         }
 

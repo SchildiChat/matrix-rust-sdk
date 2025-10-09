@@ -16,18 +16,23 @@
 
 use std::time::Duration;
 
-use assert_matches2::assert_let;
+use assert_matches2::{assert_let, assert_matches};
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
     config::{SyncSettings, SyncToken},
-    test_utils::logged_in_client_with_server,
+    test_utils::{
+        logged_in_client_with_server,
+        mocks::{MatrixMockServer, RoomContextResponseTemplate, RoomRelationsResponseTemplate},
+    },
 };
 use matrix_sdk_test::{
     ALICE, BOB, JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
     mocks::mock_encryption_state,
 };
-use matrix_sdk_ui::timeline::{TimelineBuilder, TimelineFocus};
+use matrix_sdk_ui::timeline::{
+    TimelineBuilder, TimelineFocus, TimelineItemKind, VirtualTimelineItem,
+};
 use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id};
 use stream_assert::assert_pending;
 use tokio::time::sleep;
@@ -417,4 +422,196 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
 
     // And nothing more.
     assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_focused_timeline_handles_threaded_event() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let user_id = client.user_id().unwrap();
+
+    let prev_thread_event_id = event_id!("$prev:example.org");
+    let root_thread_id = event_id!("$root-id:example.org");
+
+    let f = EventFactory::new().room(room_id).sender(user_id);
+    let threaded_event =
+        f.text_msg("Hey").in_thread(root_thread_id, prev_thread_event_id).into_event();
+    let threaded_event_id = threaded_event.event_id().unwrap().clone();
+
+    // Mock the initial /context request to check if the event is in a thread.
+    let events_before = vec![
+        f.text_msg("Unrelated before 1").into_event(),
+        f.text_msg("Unrelated before 2").into_event(),
+    ];
+    let events_after = vec![
+        f.text_msg("Unrelated after 1").into_event(),
+        f.text_msg("Unrelated after 2").into_event(),
+    ];
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(threaded_event)
+            .events_before(events_before)
+            .events_after(events_after)
+            .start("prev_token_1")
+            .end("next_token_1"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let focus = TimelineFocus::Event {
+        target: threaded_event_id,
+        num_context_events: 10,
+        hide_threaded_events: false,
+    };
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(focus)
+        .build()
+        .await
+        .expect("Could not build focused timeline");
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_date_divider());
+    assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "Hey");
+
+    // We paginate back once
+    server
+        .mock_room_relations()
+        .match_from("prev_token_1")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Prev")
+                    .sender(user_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("prev_token_1".to_owned()),
+            next_batch: Some("prev_token_2".to_owned()),
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let start_of_timeline =
+        timeline.paginate_backwards(10).await.expect("Could not paginate backwards");
+    assert!(!start_of_timeline);
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 3);
+    // The new item loaded is added at the start
+    assert_let!(VectorDiff::PushFront { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev");
+    // So is the new date divider
+    assert_let!(VectorDiff::PushFront { value: item } = &timeline_updates[1]);
+    assert_matches!(item.kind(), TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(_)));
+    // The previous date divider is removed
+    assert_let!(VectorDiff::Remove { index } = &timeline_updates[2]);
+    assert_eq!(*index, 2);
+
+    // We paginate back until the start of the timeline, which will trigger an
+    // /event request for the initial item.
+    server
+        .mock_room_relations()
+        .match_from("prev_token_2")
+        .ok(RoomRelationsResponseTemplate {
+            // No items returned as the thread root is not part of the /relations response
+            chunk: vec![],
+            prev_batch: Some("prev_token_2".to_owned()),
+            next_batch: None,
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    server
+        .mock_room_event()
+        .room(room_id)
+        .ok(f.text_msg("Root").sender(user_id).event_id(root_thread_id).into_event())
+        .mock_once()
+        .mount()
+        .await;
+
+    let start_of_timeline =
+        timeline.paginate_backwards(10).await.expect("Could not paginate backwards a 2nd time");
+    assert!(start_of_timeline);
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 3);
+    // Same as before, the previous event is added at the front
+    assert_let!(VectorDiff::PushFront { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Root");
+    // Then the new date divider
+    assert_let!(VectorDiff::PushFront { value: item } = &timeline_updates[1]);
+    assert_matches!(item.kind(), TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(_)));
+    // And the old date divider is removed
+    assert_let!(VectorDiff::Remove { index } = &timeline_updates[2]);
+    assert_eq!(*index, 2);
+
+    // Then we paginate forwards
+    server
+        .mock_room_relations()
+        .match_from("next_token_1")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next1")
+                    .sender(user_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("next_token_1".to_owned()),
+            next_batch: Some("next_token_2".to_owned()),
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards");
+    assert!(!end_of_timeline);
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next1");
+
+    // And we do it again until we can't
+    server
+        .mock_room_relations()
+        .match_from("next_token_2")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next2")
+                    .sender(user_id)
+                    .event_id(prev_thread_event_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("next_token_2".to_owned()),
+            next_batch: None,
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards a 2nd time");
+    assert!(end_of_timeline);
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next2");
 }

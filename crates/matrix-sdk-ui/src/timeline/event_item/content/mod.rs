@@ -27,10 +27,7 @@ use ruma::{
             room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
             user::PolicyRuleUserEventContent,
         },
-        poll::unstable_start::{
-            NewUnstablePollStartEventContent, SyncUnstablePollStartEvent,
-            UnstablePollStartEventContent,
-        },
+        poll::unstable_start::{SyncUnstablePollStartEvent, UnstablePollStartEventContent},
         room::{
             aliases::RoomAliasesEventContent,
             avatar::RoomAvatarEventContent,
@@ -62,6 +59,7 @@ use tracing::warn;
 
 mod message;
 mod msg_like;
+pub(super) mod other;
 pub(crate) mod pinned_events;
 mod polls;
 mod reply;
@@ -74,6 +72,7 @@ pub(in crate::timeline) use self::message::{
 pub use self::{
     message::Message,
     msg_like::{MsgLikeContent, MsgLikeKind, ThreadSummary},
+    other::OtherMessageLike,
     polls::{PollResult, PollState},
     reply::{EmbeddedEvent, InReplyToDetails},
 };
@@ -292,9 +291,7 @@ impl TimelineItemContent {
                 }
             });
 
-        let mut poll = PollState::new(NewUnstablePollStartEventContent::new(
-            event.content.poll_start().clone(),
-        ));
+        let mut poll = PollState::new(event.content.poll_start().clone(), None);
         if let Some(edit) = edit {
             poll = poll.edit(edit).expect("the poll can't be ended yet!"); // TODO or can it?
         }

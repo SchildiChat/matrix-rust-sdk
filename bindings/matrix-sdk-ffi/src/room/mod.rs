@@ -45,6 +45,7 @@ use crate::{
     chunk_iterator::ChunkIterator,
     client::{JoinRule, RoomVisibility},
     error::{ClientError, MediaInfoError, NotYetImplemented, RoomError},
+    event::TimelineEvent,
     identity_status_change::IdentityStatusChange,
     live_location_share::{LastLocation, LiveLocationShare},
     room_member::{RoomMember, RoomMemberWithSenderInfo},
@@ -1218,6 +1219,22 @@ impl Room {
             .fetch_thread_subscription(thread_root)
             .await?
             .map(|sub| ThreadSubscription { automatic: sub.automatic }))
+    }
+
+    /// Either loads the event associated with the `event_id` from the event
+    /// cache or fetches it from the homeserver.
+    pub async fn load_or_fetch_event(
+        &self,
+        event_id: String,
+    ) -> Result<TimelineEvent, ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let timeline_event = self.inner.load_or_fetch_event(&event_id, None).await?;
+        Ok(timeline_event
+            .kind
+            .into_raw()
+            .deserialize()?
+            .into_full_event(self.inner.room_id().to_owned())
+            .into())
     }
 }
 

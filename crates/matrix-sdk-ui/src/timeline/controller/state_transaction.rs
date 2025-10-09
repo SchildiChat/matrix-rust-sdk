@@ -410,10 +410,12 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 room_data_provider.is_pinned_event(event.event_id())
             }
 
-            TimelineFocusKind::Event { hide_threaded_events, paginator: _ } => {
+            TimelineFocusKind::Event { paginator } => {
                 // If the timeline's filtering out in-thread events, don't add items for
                 // threaded events.
-                if thread_root.is_some() && *hide_threaded_events {
+                let hide_threaded_events =
+                    paginator.get().is_some_and(|paginator| paginator.hide_threaded_events());
+                if thread_root.is_some() && hide_threaded_events {
                     return false;
                 }
 
@@ -556,6 +558,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
 
     // Attempt to load a thread's latest reply as an embedded timeline item, either
     // using the event cache or the storage.
+    #[instrument(skip(self, room_data_provider))]
     async fn fetch_latest_thread_reply(
         &mut self,
         event_id: &EventId,

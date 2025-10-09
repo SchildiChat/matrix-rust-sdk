@@ -1758,37 +1758,42 @@ impl Client {
             }
         }))))
     }
-
-    /// Adds a recently used emoji to the list and uploads the updated
-    /// `io.element.recent_emoji` content to the global account data.
-    #[cfg(feature = "experimental-element-recent-emojis")]
-    pub async fn add_recent_emoji(&self, emoji: String) -> Result<(), ClientError> {
-        Ok(self.inner.account().add_recent_emoji(&emoji).await?)
-    }
-
-    /// Gets the list of recently used emojis from the `io.element.recent_emoji`
-    /// global account data.
-    #[cfg(feature = "experimental-element-recent-emojis")]
-    pub async fn get_recent_emojis(&self) -> Result<Vec<RecentEmoji>, ClientError> {
-        Ok(self
-            .inner
-            .account()
-            .get_recent_emojis(false)
-            .await?
-            .into_iter()
-            .map(|(emoji, count)| RecentEmoji { emoji, count: count.into() })
-            .collect::<Vec<RecentEmoji>>())
-    }
 }
 
-/// Represents an emoji recently used for reactions.
 #[cfg(feature = "experimental-element-recent-emojis")]
-#[derive(Debug, uniffi::Record)]
-pub struct RecentEmoji {
-    /// The actual emoji text representation.
-    pub emoji: String,
-    /// The number of times this emoji has been used for reactions.
-    pub count: u64,
+mod recent_emoji {
+    use crate::{client::Client, error::ClientError};
+
+    /// Represents an emoji recently used for reactions.
+    #[derive(Debug, uniffi::Record)]
+    pub struct RecentEmoji {
+        /// The actual emoji text representation.
+        pub emoji: String,
+        /// The number of times this emoji has been used for reactions.
+        pub count: u64,
+    }
+
+    #[matrix_sdk_ffi_macros::export]
+    impl Client {
+        /// Adds a recently used emoji to the list and uploads the updated
+        /// `io.element.recent_emoji` content to the global account data.
+        pub async fn add_recent_emoji(&self, emoji: String) -> Result<(), ClientError> {
+            Ok(self.inner.account().add_recent_emoji(&emoji).await?)
+        }
+
+        /// Gets the list of recently used emojis from the
+        /// `io.element.recent_emoji` global account data.
+        pub async fn get_recent_emojis(&self) -> Result<Vec<RecentEmoji>, ClientError> {
+            Ok(self
+                .inner
+                .account()
+                .get_recent_emojis(false)
+                .await?
+                .into_iter()
+                .map(|(emoji, count)| RecentEmoji { emoji, count: count.into() })
+                .collect::<Vec<RecentEmoji>>())
+        }
+    }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
@@ -2091,24 +2096,24 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         if value.is_encrypted {
             let content =
                 RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(url) = value.avatar {
             let mut content = RoomAvatarEventContent::new();
             content.url = Some(url.into());
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(join_rule_override) = value.join_rule_override {
             let content = RoomJoinRulesEventContent::new(join_rule_override.try_into()?);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(history_visibility_override) = value.history_visibility_override {
             let content =
                 RoomHistoryVisibilityEventContent::new(history_visibility_override.try_into()?);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         request.initial_state = initial_state;

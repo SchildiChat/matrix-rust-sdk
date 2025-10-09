@@ -46,9 +46,9 @@ mod remote;
 pub use self::{
     content::{
         AnyOtherFullStateEventContent, EmbeddedEvent, EncryptedMessage, InReplyToDetails,
-        MemberProfileChange, MembershipChange, Message, MsgLikeContent, MsgLikeKind, OtherState,
-        PollResult, PollState, RoomMembershipChange, RoomPinnedEventsChange, Sticker,
-        ThreadSummary, TimelineItemContent,
+        MemberProfileChange, MembershipChange, Message, MsgLikeContent, MsgLikeKind,
+        OtherMessageLike, OtherState, PollResult, PollState, RoomMembershipChange,
+        RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineItemContent,
     },
     local::{EventSendState, MediaUploadProgress},
 };
@@ -608,7 +608,8 @@ impl EventTimelineItem {
                 MsgLikeKind::Sticker(_)
                 | MsgLikeKind::Poll(_)
                 | MsgLikeKind::Redacted
-                | MsgLikeKind::UnableToDecrypt(_) => None,
+                | MsgLikeKind::UnableToDecrypt(_)
+                | MsgLikeKind::Other(_) => None,
             },
             TimelineItemContent::MembershipChange(_)
             | TimelineItemContent::ProfileChange(_)
@@ -1014,7 +1015,7 @@ mod tests {
         let poll = timeline_item.content().as_poll().unwrap();
         assert!(poll.has_been_edited);
         assert_eq!(
-            poll.start_event_content.poll_start.question.text,
+            poll.poll_start.question.text,
             "It's one banana, Michael, how much could it cost?"
         );
     }

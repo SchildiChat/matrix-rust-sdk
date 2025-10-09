@@ -8,7 +8,16 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- [**breaking**] Add `encryption::secret_storage::SecretStorageError::ImportError` to indicate
+  an error that occurred when importing a secret from secret storage.
+  ([#5647](https://github.com/matrix-org/matrix-rust-sdk/pull/5647))
+
 ### Refactor
+
+- [**breaking**] The `caption` and `formatted_caption` fields and methods of `AttachmentConfig`,
+  `GalleryConfig` and `GalleryItemInfo` have been merged into a single field that uses
+  `TextMessageEventContent`.
+  ([#5733](https://github.com/matrix-org/matrix-rust-sdk/pull/5733))
 - The Matrix SDK crate now uses the 2024 edition of Rust.
   ([#5677](https://github.com/matrix-org/matrix-rust-sdk/pull/5677))
 
@@ -60,6 +69,10 @@ All notable changes to this project will be documented in this file.
 
 - [**breaking**] `OAuth::login` now allows requesting additional scopes for the authorization code grant.
   ([#5395](https://github.com/matrix-org/matrix-rust-sdk/pull/5395))
+- [**breaking**] `ThreadedEventsLoader::new` now takes optional `tokens` parameter to customise where the pagination
+  begins ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678).
+- Make `PaginationTokens` `pub`, as well as its `previous` and `next` tokens so they can be assigned from other files
+  ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678).
 
 ### Refactor
 

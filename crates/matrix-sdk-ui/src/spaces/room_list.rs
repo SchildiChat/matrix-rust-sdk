@@ -12,7 +12,7 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use eyeball::{ObservableWriteGuard, SharedObservable, Subscriber};
 use eyeball_im::{ObservableVector, VectorSubscriberBatchedStream};
@@ -22,8 +22,10 @@ use itertools::Itertools;
 use matrix_sdk::{Client, Error, executor::AbortOnDrop, locks::Mutex, paginators::PaginationToken};
 use matrix_sdk_common::executor::spawn;
 use ruma::{
-    OwnedRoomId, OwnedServerName, api::client::space::get_hierarchy,
-    events::space::child::SpaceChildEventContent, uint,
+    OwnedRoomId,
+    api::client::space::get_hierarchy,
+    events::space::child::{HierarchySpaceChildEvent, SpaceChildEventContent},
+    uint,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, warn};
@@ -105,13 +107,15 @@ pub struct SpaceRoomList {
 
     space: SharedObservable<Option<SpaceRoom>>,
 
-    via_parameters: Mutex<Option<HashMap<OwnedRoomId, Vec<OwnedServerName>>>>,
+    children_state: Mutex<Option<HashMap<OwnedRoomId, HierarchySpaceChildEvent>>>,
 
     token: AsyncMutex<PaginationToken>,
 
     pagination_state: SharedObservable<SpaceRoomListPaginationState>,
 
     rooms: Arc<Mutex<ObservableVector<SpaceRoom>>>,
+
+    _space_update_handle: Option<AbortOnDrop<()>>,
 
     _room_update_handle: AbortOnDrop<()>,
 }
@@ -123,7 +127,7 @@ impl SpaceRoomList {
 
         let all_room_updates_receiver = client.subscribe_to_all_room_updates();
 
-        let handle = spawn({
+        let room_update_handle = spawn({
             let client = client.clone();
             let rooms = rooms.clone();
 
@@ -164,28 +168,51 @@ impl SpaceRoomList {
             }
         });
 
-        let space = if let Some(parent) = client.get_room(&space_id) {
+        let space_observable = SharedObservable::new(None);
+
+        let (space_room, space_update_handle) = if let Some(parent) = client.get_room(&space_id) {
             let children_count = parent
                 .get_state_events_static::<SpaceChildEventContent>()
                 .await
                 .map_or(0, |c| c.len() as u64);
 
-            Some(SpaceRoom::new_from_known(&parent, children_count))
+            let mut subscriber = parent.subscribe_info();
+            let space_update_handle = spawn({
+                let client = client.clone();
+                let space_id = space_id.clone();
+                let space_observable = space_observable.clone();
+                async move {
+                    while subscriber.next().await.is_some() {
+                        if let Some(room) = client.get_room(&space_id) {
+                            space_observable
+                                .set(Some(SpaceRoom::new_from_known(&room, children_count)));
+                        }
+                    }
+                }
+            });
+
+            (
+                Some(SpaceRoom::new_from_known(&parent, children_count)),
+                Some(AbortOnDrop::new(space_update_handle)),
+            )
         } else {
-            None
+            (None, None)
         };
+
+        space_observable.set(space_room);
 
         Self {
             client,
             space_id,
-            space: SharedObservable::new(space),
-            via_parameters: Mutex::new(None),
+            space: space_observable,
+            children_state: Mutex::new(None),
             token: AsyncMutex::new(None.into()),
             pagination_state: SharedObservable::new(SpaceRoomListPaginationState::Idle {
                 end_reached: false,
             }),
             rooms,
-            _room_update_handle: AbortOnDrop::new(handle),
+            _space_update_handle: space_update_handle,
+            _room_update_handle: AbortOnDrop::new(room_update_handle),
         }
     }
 
@@ -266,19 +293,19 @@ impl SpaceRoomList {
                     result.rooms.into_iter().partition(|f| f.summary.room_id == self.space_id);
 
                 if let Some(room) = space.first() {
-                    let mut via_parameters = self.via_parameters.lock();
-                    *via_parameters = Some(
-                        room.children_state
-                            .iter()
-                            .filter_map(|event| match event.deserialize() {
-                                Ok(child) => Some((child.state_key, child.content.via)),
-                                Err(error) => {
-                                    warn!("Failed deserializing space child event: {error}");
-                                    None
-                                }
-                            })
-                            .collect::<HashMap<_, _>>(),
-                    );
+                    let mut children_state =
+                        HashMap::<OwnedRoomId, HierarchySpaceChildEvent>::new();
+                    for child_state in &room.children_state {
+                        match child_state.deserialize() {
+                            Ok(child) => {
+                                children_state.insert(child.state_key.clone(), child.clone());
+                            }
+                            Err(error) => {
+                                warn!("Failed deserializing space child event: {error}");
+                            }
+                        }
+                    }
+                    *self.children_state.lock() = Some(children_state);
 
                     let mut space = self.space.write();
                     if space.is_none() {
@@ -294,18 +321,23 @@ impl SpaceRoomList {
                     }
                 }
 
-                let via = (*self.via_parameters.lock()).clone().unwrap_or_default();
+                let children_state = (*self.children_state.lock()).clone().unwrap_or_default();
 
                 children
                     .iter()
                     .map(|room| {
+                        let via = children_state
+                            .get(&room.summary.room_id)
+                            .map(|state| state.content.via.clone());
+
                         SpaceRoom::new_from_summary(
                             &room.summary,
                             self.client.get_room(&room.summary.room_id),
                             room.children_state.len() as u64,
-                            via.get(&room.summary.room_id).cloned().unwrap_or(Default::default()),
+                            via.unwrap_or_default(),
                         )
                     })
+                    .sorted_by(|a, b| Self::compare_rooms(a, b, &children_state))
                     .for_each(|room| rooms.push_back(room));
 
                 self.pagination_state.set(SpaceRoomListPaginationState::Idle {
@@ -321,10 +353,41 @@ impl SpaceRoomList {
             }
         }
     }
+
+    /// Sorts spare rooms by various criteria as defined in
+    /// https://spec.matrix.org/latest/client-server-api/#ordering-of-children-within-a-space
+    fn compare_rooms(
+        a: &SpaceRoom,
+        b: &SpaceRoom,
+        children_state: &HashMap<OwnedRoomId, HierarchySpaceChildEvent>,
+    ) -> Ordering {
+        let a_state = children_state.get(&a.room_id);
+        let b_state = children_state.get(&b.room_id);
+
+        match (a_state, b_state) {
+            (Some(a_state), Some(b_state)) => {
+                match (&a_state.content.order, &b_state.content.order) {
+                    (Some(a_order), Some(b_order)) => a_order
+                        .cmp(b_order)
+                        .then(a_state.origin_server_ts.cmp(&b_state.origin_server_ts))
+                        .then(a.room_id.cmp(&b.room_id)),
+                    (Some(_), None) => Ordering::Greater,
+                    (None, Some(_)) => Ordering::Less,
+                    (None, None) => a_state
+                        .origin_server_ts
+                        .cmp(&b_state.origin_server_ts)
+                        .then(a.room_id.to_string().cmp(&b.room_id.to_string())),
+                }
+            }
+            _ => a.room_id.to_string().cmp(&b.room_id.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{cmp::Ordering, collections::HashMap};
+
     use assert_matches2::{assert_let, assert_matches};
     use eyeball_im::VectorDiff;
     use futures_util::pin_mut;
@@ -333,13 +396,18 @@ mod tests {
         JoinedRoomBuilder, LeftRoomBuilder, async_test, event_factory::EventFactory,
     };
     use ruma::{
-        owned_server_name,
+        OwnedRoomId, RoomId,
+        events::space::child::HierarchySpaceChildEvent,
+        owned_room_id, owned_server_name,
         room::{JoinRuleSummary, RoomSummary},
         room_id, server_name, uint,
     };
+    use serde_json::{from_value, json};
     use stream_assert::{assert_next_eq, assert_next_matches, assert_pending, assert_ready};
 
-    use crate::spaces::{SpaceRoom, SpaceService, room_list::SpaceRoomListPaginationState};
+    use crate::spaces::{
+        SpaceRoom, SpaceRoomList, SpaceService, room_list::SpaceRoomListPaginationState,
+    };
 
     #[async_test]
     async fn test_room_list_pagination() {
@@ -574,6 +642,47 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_parent_space_room_info_update() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let user_id = client.user_id().unwrap();
+        let space_service = SpaceService::new(client.clone());
+        let factory = EventFactory::new();
+
+        server.mock_room_state_encryption().plain().mount().await;
+
+        let parent_space_id = room_id!("!parent_space:example.org");
+
+        server.sync_room(&client, JoinedRoomBuilder::new(parent_space_id)).await;
+
+        let room_list = space_service.space_room_list(parent_space_id.to_owned()).await;
+        assert_let!(Some(parent_space) = room_list.space());
+
+        // The parent space is known to the client
+        let parent_space_subscriber = room_list.subscribe_to_space_updates();
+        pin_mut!(parent_space_subscriber);
+        assert_pending!(parent_space_subscriber);
+
+        // So any room info changes are automatically published
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(parent_space_id)
+                    .add_state_event(factory.room_topic("New room topic").sender(user_id))
+                    .add_state_event(factory.room_name("New room name").sender(user_id)),
+            )
+            .await;
+
+        let mut updated_parent_space = parent_space.clone();
+        updated_parent_space.topic = Some("New room topic".to_owned());
+        updated_parent_space.name = Some("New room name".to_owned());
+        updated_parent_space.display_name = "New room name".to_owned();
+
+        // And the subscription is informed about the change
+        assert_next_eq!(parent_space_subscriber, Some(updated_parent_space));
+    }
+
+    #[async_test]
     async fn test_via_retrieval() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
@@ -639,5 +748,192 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[async_test]
+    async fn test_room_list_sorting() {
+        let mut children_state = HashMap::<OwnedRoomId, HierarchySpaceChildEvent>::new();
+
+        // Rooms not present in the `children_state` should be sorted by their room ID
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(owned_room_id!("!Luana:a.b"), None, None, &mut children_state),
+                &make_space_room(owned_room_id!("!Marțolea:a.b"), None, None, &mut children_state),
+                &children_state,
+            ),
+            Ordering::Less
+        );
+
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(owned_room_id!("!Marțolea:a.b"), None, None, &mut children_state),
+                &make_space_room(owned_room_id!("!Luana:a.b"), None, None, &mut children_state),
+                &children_state,
+            ),
+            Ordering::Greater
+        );
+
+        // Rooms without an order provided through the `children_state` should be
+        // sorted by their `m.space.child` `origin_server_ts`
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(owned_room_id!("!Luana:a.b"), None, Some(1), &mut children_state),
+                &make_space_room(
+                    owned_room_id!("!Marțolea:a.b"),
+                    None,
+                    Some(0),
+                    &mut children_state
+                ),
+                &children_state,
+            ),
+            Ordering::Greater
+        );
+
+        // The `m.space.child` `content.order` field should be used if provided
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(
+                    owned_room_id!("!Joiana:a.b"),
+                    Some("last"),
+                    Some(123),
+                    &mut children_state
+                ),
+                &make_space_room(
+                    owned_room_id!("!Mioara:a.b"),
+                    Some("first"),
+                    Some(234),
+                    &mut children_state
+                ),
+                &children_state,
+            ),
+            Ordering::Greater
+        );
+
+        // The timestamp should be used when the `order` is the same
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(
+                    owned_room_id!("!Joiana:a.b"),
+                    Some("Same pasture"),
+                    Some(1),
+                    &mut children_state
+                ),
+                &make_space_room(
+                    owned_room_id!("!Mioara:a.b"),
+                    Some("Same pasture"),
+                    Some(0),
+                    &mut children_state
+                ),
+                &children_state,
+            ),
+            Ordering::Greater
+        );
+
+        // And the `room_id` should be used when both the `order` and the
+        // `timestamp` are equal
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(
+                    owned_room_id!("!Joiana:a.b"),
+                    Some("same_pasture"),
+                    Some(0),
+                    &mut children_state
+                ),
+                &make_space_room(
+                    owned_room_id!("!Mioara:a.b"),
+                    Some("same_pasture"),
+                    Some(0),
+                    &mut children_state
+                ),
+                &children_state,
+            ),
+            Ordering::Less
+        );
+
+        // Finally, when one of the rooms is missing `children_state` data the
+        // other one should take precedence
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(owned_room_id!("!Viola:a.b"), None, None, &mut children_state),
+                &make_space_room(
+                    owned_room_id!("!Sâmbotina:a.b"),
+                    None,
+                    Some(0),
+                    &mut children_state
+                ),
+                &children_state,
+            ),
+            Ordering::Greater
+        );
+
+        assert_eq!(
+            SpaceRoomList::compare_rooms(
+                &make_space_room(
+                    owned_room_id!("!Sâmbotina:a.b"),
+                    None,
+                    Some(1),
+                    &mut children_state
+                ),
+                &make_space_room(
+                    owned_room_id!("!Dumana:a.b"),
+                    Some("Some pasture"),
+                    Some(1),
+                    &mut children_state
+                ),
+                &children_state,
+            ),
+            Ordering::Less
+        );
+    }
+
+    fn make_space_room(
+        room_id: OwnedRoomId,
+        order: Option<&str>,
+        origin_server_ts: Option<u32>,
+        children_state: &mut HashMap<OwnedRoomId, HierarchySpaceChildEvent>,
+    ) -> SpaceRoom {
+        if let Some(origin_server_ts) = origin_server_ts {
+            children_state.insert(
+                room_id.clone(),
+                hierarchy_space_child_event(&room_id, order, origin_server_ts),
+            );
+        }
+        SpaceRoom {
+            room_id,
+            canonical_alias: None,
+            name: Some("New room name".to_owned()),
+            display_name: "Empty room".to_owned(),
+            topic: None,
+            avatar_url: None,
+            room_type: None,
+            num_joined_members: 0,
+            join_rule: None,
+            world_readable: None,
+            guest_can_join: false,
+            is_direct: None,
+            children_count: 0,
+            state: None,
+            heroes: None,
+            via: vec![],
+        }
+    }
+
+    fn hierarchy_space_child_event(
+        room_id: &RoomId,
+        order: Option<&str>,
+        origin_server_ts: u32,
+    ) -> HierarchySpaceChildEvent {
+        let json = json!({
+            "content": {
+                "order": order.unwrap_or(""),
+                "via": []
+            },
+            "origin_server_ts": origin_server_ts,
+            "sender": "@bob:a.b",
+            "state_key": room_id.to_string(),
+            "type": "m.space.child"
+        });
+
+        from_value::<HierarchySpaceChildEvent>(json).unwrap()
     }
 }

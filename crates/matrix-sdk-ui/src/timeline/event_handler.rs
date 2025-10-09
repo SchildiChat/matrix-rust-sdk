@@ -58,7 +58,8 @@ use super::{
     traits::RoomDataProvider,
 };
 use crate::{
-    timeline::controller::aggregations::PendingEdit, unable_to_decrypt_hook::UtdHookManager,
+    timeline::{controller::aggregations::PendingEdit, event_item::OtherMessageLike},
+    unable_to_decrypt_hook::UtdHookManager,
 };
 
 /// When adding an event, useful information related to the source of the event.
@@ -144,6 +145,20 @@ pub(super) enum HandleAggregationKind {
     PollEnd,
 }
 
+impl HandleAggregationKind {
+    /// Returns a small string describing this aggregation, for debug purposes.
+    pub fn debug_string(&self) -> &'static str {
+        match self {
+            HandleAggregationKind::Reaction { .. } => "a reaction",
+            HandleAggregationKind::Redaction => "a redaction",
+            HandleAggregationKind::Edit { .. } => "an edit",
+            HandleAggregationKind::PollResponse { .. } => "a poll response",
+            HandleAggregationKind::PollEdit { .. } => "a poll edit",
+            HandleAggregationKind::PollEnd => "a poll end",
+        }
+    }
+}
+
 /// An action that we want to cause on the timeline.
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -179,8 +194,7 @@ impl TimelineAction {
 
     /// Create a new [`TimelineAction`] from a given remote event.
     ///
-    /// The return value may be `None` if handling the event (be it a new item
-    /// or an aggregation) is not supported for this event type.
+    /// The return value may be `None` if the event was a redacted reaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_event<P: RoomDataProvider>(
         event: AnySyncTimelineEvent,
@@ -244,17 +258,17 @@ impl TimelineAction {
                         // `TimelineEvent` containing an `m.room.encrypted` event without
                         // decrypting it. Possibly this means that encryption has not been
                         // configured. We treat it the same as any other message-like event.
-                        return Self::from_content(
+                        Self::from_content(
                             AnyMessageLikeEventContent::RoomEncrypted(content),
                             in_reply_to,
                             thread_root,
                             thread_summary,
-                        );
+                        )
                     }
                 }
 
                 Some(content) => {
-                    return Self::from_content(content, in_reply_to, thread_root, thread_summary);
+                    Self::from_content(content, in_reply_to, thread_root, thread_summary)
                 }
 
                 None => Self::add_item(redacted_message_or_none(ev.event_type())?),
@@ -301,8 +315,8 @@ impl TimelineAction {
         in_reply_to: Option<InReplyToDetails>,
         thread_root: Option<OwnedEventId>,
         thread_summary: Option<ThreadSummary>,
-    ) -> Option<Self> {
-        Some(match content {
+    ) -> Self {
+        match content {
             AnyMessageLikeEventContent::Reaction(c) => {
                 // This is a reaction to a message.
                 Self::HandleAggregation {
@@ -357,7 +371,7 @@ impl TimelineAction {
             AnyMessageLikeEventContent::UnstablePollStart(UnstablePollStartEventContent::New(
                 c,
             )) => {
-                let poll_state = PollState::new(c);
+                let poll_state = PollState::new(c.poll_start, c.text);
 
                 Self::AddItem {
                     content: TimelineItemContent::MsgLike(MsgLikeContent {
@@ -381,14 +395,20 @@ impl TimelineAction {
                 ),
             },
 
-            _ => {
-                debug!(
-                    "Ignoring message-like event of type `{}`, not supported (yet)",
-                    content.event_type()
-                );
-                return None;
+            event => {
+                let other = OtherMessageLike { event_type: event.event_type() };
+
+                Self::AddItem {
+                    content: TimelineItemContent::MsgLike(MsgLikeContent {
+                        kind: MsgLikeKind::Other(other),
+                        reactions: Default::default(),
+                        thread_root,
+                        in_reply_to,
+                        thread_summary,
+                    }),
+                }
             }
-        })
+        }
     }
 
     pub(super) fn failed_to_parse(event: FailedToParseEvent, error: serde_json::Error) -> Self {

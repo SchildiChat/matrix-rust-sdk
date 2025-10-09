@@ -18,8 +18,9 @@ use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::spaces::{
-    room_list::SpaceRoomListPaginationState, SpaceRoom as UISpaceRoom,
-    SpaceRoomList as UISpaceRoomList, SpaceService as UISpaceService,
+    leave::{LeaveSpaceHandle as UILeaveSpaceHandle, LeaveSpaceRoom as UILeaveSpaceRoom},
+    room_list::SpaceRoomListPaginationState,
+    SpaceRoom as UISpaceRoom, SpaceRoomList as UISpaceRoomList, SpaceService as UISpaceService,
 };
 use ruma::RoomId;
 
@@ -84,6 +85,24 @@ impl SpaceService {
     ) -> Result<Arc<SpaceRoomList>, ClientError> {
         let space_id = RoomId::parse(space_id)?;
         Ok(Arc::new(SpaceRoomList::new(self.inner.space_room_list(space_id).await)))
+    }
+
+    /// Start a space leave process returning a [`LeaveSpaceHandle`] from which
+    /// rooms can be retrieved in reversed BFS order starting from the requested
+    /// `space_id` graph node. If the room is unknown then an error will be
+    /// returned.
+    ///
+    /// Once the rooms to be left are chosen the handle can be used to leave
+    /// them.
+    pub async fn leave_space(
+        &self,
+        space_id: String,
+    ) -> Result<Arc<LeaveSpaceHandle>, ClientError> {
+        let space_id = RoomId::parse(space_id)?;
+
+        let handle = self.inner.leave_space(&space_id).await.map_err(ClientError::from)?;
+
+        Ok(Arc::new(handle.into()))
     }
 }
 
@@ -210,8 +229,11 @@ pub struct SpaceRoom {
     pub room_id: String,
     /// The canonical alias of the room, if any.
     pub canonical_alias: Option<String>,
-    /// The name of the room, if any.
-    pub name: Option<String>,
+    /// The room's name from the room state event if received from sync, or one
+    /// that's been computed otherwise.
+    pub display_name: String,
+    /// Room name as defined by the room state event only.
+    pub raw_name: Option<String>,
     /// The topic of the room, if any.
     pub topic: Option<String>,
     /// The URL for the room's avatar, if one is set.
@@ -247,7 +269,8 @@ impl From<UISpaceRoom> for SpaceRoom {
         Self {
             room_id: room.room_id.into(),
             canonical_alias: room.canonical_alias.map(|alias| alias.into()),
-            name: room.name,
+            display_name: room.display_name,
+            raw_name: room.name,
             topic: room.topic,
             avatar_url: room.avatar_url.map(|url| url.into()),
             room_type: room.room_type.into(),
@@ -302,5 +325,59 @@ impl From<VectorDiff<UISpaceRoom>> for SpaceListUpdate {
                 Self::Reset { values: values.into_iter().map(|v| v.into()).collect() }
             }
         }
+    }
+}
+
+/// The `LeaveSpaceHandle` processes rooms to be left in the order they were
+/// provided by the [`SpaceService`] and annotates them with extra data to
+/// inform the leave process e.g. if the current user is the last room admin.
+///
+/// Once the upstream client decides what rooms should actually be left, the
+/// handle provides a method to execute that too.
+#[derive(uniffi::Object)]
+pub struct LeaveSpaceHandle {
+    inner: UILeaveSpaceHandle,
+}
+
+#[matrix_sdk_ffi_macros::export]
+impl LeaveSpaceHandle {
+    /// A list of rooms to be left which next to normal [`SpaceRoom`] data also
+    /// include leave specific information.
+    pub fn rooms(&self) -> Vec<LeaveSpaceRoom> {
+        let rooms = self.inner.rooms();
+        rooms.iter().map(|room| room.clone().into()).collect()
+    }
+
+    /// Bulk leave the given rooms. Stops when encountering an error.
+    pub async fn leave(&self, room_ids: Vec<String>) -> Result<(), ClientError> {
+        let room_ids = room_ids.iter().map(RoomId::parse).collect::<Result<Vec<_>, _>>()?;
+
+        self.inner
+            .leave(|room| room_ids.contains(&room.space_room.room_id))
+            .await
+            .map_err(ClientError::from)
+    }
+}
+
+impl From<UILeaveSpaceHandle> for LeaveSpaceHandle {
+    fn from(handle: UILeaveSpaceHandle) -> Self {
+        LeaveSpaceHandle { inner: handle }
+    }
+}
+
+/// Space leaving specific room that groups normal [`SpaceRoom`] details with
+/// information about the leaving user's role.
+#[derive(uniffi::Record)]
+pub struct LeaveSpaceRoom {
+    /// The underlying [`SpaceRoom`]
+    space_room: SpaceRoom,
+    /// Whether the user is the last admin in the room. This helps clients
+    /// better inform the user about the consequences of leaving the room.
+    is_last_admin: bool,
+}
+
+impl From<UILeaveSpaceRoom> for LeaveSpaceRoom {
+    fn from(room: UILeaveSpaceRoom) -> Self {
+        LeaveSpaceRoom { space_room: room.space_room.into(), is_last_admin: room.is_last_admin }
     }
 }

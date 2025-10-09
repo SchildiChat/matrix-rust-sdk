@@ -21,7 +21,7 @@ use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     deserialized_responses::TimelineEvent,
     event_cache::{
-        store::{compute_filters_string, extract_event_relation, EventCacheStore},
+        store::{extract_event_relation, EventCacheStore},
         Event, Gap,
     },
     linked_chunk::{
@@ -47,7 +47,7 @@ use crate::{
         repeat_vars, EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
         SqliteKeyValueStoreConnExt, SqliteTransactionExt,
     },
-    OpenStoreError, SqliteStoreConfig,
+    OpenStoreError, Secret, SqliteStoreConfig,
 };
 
 mod keys {
@@ -110,6 +110,15 @@ impl SqliteEventCacheStore {
         Self::open_with_config(SqliteStoreConfig::new(path).passphrase(passphrase)).await
     }
 
+    /// Open the SQLite-based event cache store at the given path using the
+    /// given key to encrypt private data.
+    pub async fn open_with_key(
+        path: impl AsRef<Path>,
+        key: Option<&[u8; 32]>,
+    ) -> Result<Self, OpenStoreError> {
+        Self::open_with_config(SqliteStoreConfig::new(path).key(key)).await
+    }
+
     /// Open the SQLite-based event cache store with the config open config.
     #[instrument(skip(config), fields(path = ?config.path))]
     pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
@@ -117,7 +126,7 @@ impl SqliteEventCacheStore {
 
         let _timer = timer!("open_with_config");
 
-        let SqliteStoreConfig { path, passphrase, pool_config, runtime_config } = config;
+        let SqliteStoreConfig { path, pool_config, runtime_config, secret } = config;
 
         fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
 
@@ -126,25 +135,25 @@ impl SqliteEventCacheStore {
 
         let pool = config.create_pool(Runtime::Tokio1)?;
 
-        let this = Self::open_with_pool(pool, passphrase.as_deref()).await?;
+        let this = Self::open_with_pool(pool, secret).await?;
         this.write().await?.apply_runtime_config(runtime_config).await?;
 
         Ok(this)
     }
 
     /// Open an SQLite-based event cache store using the given SQLite database
-    /// pool. The given passphrase will be used to encrypt private data.
+    /// pool. The given secret will be used to encrypt private data.
     async fn open_with_pool(
         pool: SqlitePool,
-        passphrase: Option<&str>,
+        secret: Option<Secret>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
 
         let version = conn.db_version().await?;
         run_migrations(&conn, version).await?;
 
-        let store_cipher = match passphrase {
-            Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
+        let store_cipher = match secret {
+            Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s).await?)),
             None => None,
         };
 
@@ -156,7 +165,7 @@ impl SqliteEventCacheStore {
         })
     }
 
-    // Acquire a connection for executing read operations.
+    /// Acquire a connection for executing read operations.
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
         trace!("Taking a `read` connection");
@@ -173,7 +182,7 @@ impl SqliteEventCacheStore {
         Ok(connection)
     }
 
-    // Acquire a connection for executing write operations.
+    /// Acquire a connection for executing write operations.
     #[instrument(skip_all)]
     async fn write(&self) -> Result<OwnedMutexGuard<SqliteAsyncConn>> {
         trace!("Taking a `write` connection");
@@ -996,7 +1005,7 @@ impl EventCacheStore for SqliteEventCacheStore {
             .await?
             .with_transaction(move |txn| -> Result<_> {
                 // Find the latest chunk identifier to generate a `ChunkIdentifierGenerator`, and count the number of chunks.
-                let (chunk_identifier_generator, number_of_chunks) = txn
+                let (observed_max_identifier, number_of_chunks) = txn
                     .prepare(
                         "SELECT MAX(id), COUNT(*) FROM linked_chunks WHERE linked_chunk_id = ?"
                     )?
@@ -1014,10 +1023,10 @@ impl EventCacheStore for SqliteEventCacheStore {
                         }
                     )?;
 
-                let chunk_identifier_generator = match chunk_identifier_generator {
-                    Some(last_chunk_identifier) => {
+                let chunk_identifier_generator = match observed_max_identifier {
+                    Some(max_observed_identifier) => {
                         ChunkIdentifierGenerator::new_from_previous_chunk_identifier(
-                            ChunkIdentifier::new(last_chunk_identifier)
+                            ChunkIdentifier::new(max_observed_identifier)
                         )
                     },
                     None => ChunkIdentifierGenerator::new_from_scratch(),
@@ -1381,7 +1390,7 @@ fn find_event_relations_transaction(
         Ok(related)
     };
 
-    let related = if let Some(filters) = compute_filters_string(filters.as_deref()) {
+    let related = if let Some(filters) = filters {
         let question_marks = repeat_vars(filters.len());
         let query = format!(
             "SELECT events.content, event_chunks.chunk_id, event_chunks.position
@@ -1390,7 +1399,16 @@ fn find_event_relations_transaction(
             WHERE relates_to = ? AND room_id = ? AND rel_type IN ({question_marks})"
         );
 
-        let filters: Vec<_> = filters.iter().map(|f| f.to_sql().unwrap()).collect();
+        // First the filters need to be stringified; because `.to_sql()` will borrow
+        // from them, they also need to be stringified onto the stack, so as to
+        // get a stable address (to avoid returning a temporary reference in the
+        // map closure below).
+        let filter_strings: Vec<_> = filters.iter().map(|f| f.to_string()).collect();
+        let filters_params: Vec<_> = filter_strings
+            .iter()
+            .map(|f| f.to_sql().expect("converting a string to SQL should work"))
+            .collect();
+
         let parameters = params_from_iter(
             [
                 hashed_linked_chunk_id.to_sql().expect(
@@ -1405,7 +1423,7 @@ fn find_event_relations_transaction(
                     .expect("We should be able to convert a room ID to a SQLite value"),
             ]
             .into_iter()
-            .chain(filters),
+            .chain(filters_params),
         );
 
         let mut transaction = txn.prepare(&query)?;
