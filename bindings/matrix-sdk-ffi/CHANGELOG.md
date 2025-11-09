@@ -6,17 +6,64 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
-### Breaking changes:
+### Breaking changes
 
+- Add the `sqlite` feature, along with the `indexeddb` feature, to enable either
+  the SQLite or IndexedDB store. The `session_paths`, `session_passphrase`,
+  `session_pool_max_size`, `session_cache_size` and `session_journal_size_limit`
+  methods on `ClientBuilder` have been removed. New methods are added:
+  `ClientBuilder::in_memory_store` if one wants non-persistent stores,
+  `ClientBuilder::sqlite_store` to configure and to use SQLite stores (if
+  the `sqlite` feature is enabled), and `ClientBuilder::indexeddb_store` to
+  configure and to use IndexedDB stores (if the `indexeddb` feature is enabled).
+  ([#5811](https://github.com/matrix-org/matrix-rust-sdk/pull/5811))
+
+  The code:
+
+  ```rust
+  client_builder
+      .session_paths("data_path", "cache_path")
+      .passphrase("foobar")
+  ```
+
+  now becomes:
+
+  ```rust
+  client_builder
+      .sqlite_store(
+          SqliteSessionStoreBuilder::new("data_path", "cache_path")
+              .passphrase("foobar")
+      )
+  ```
+
+- UniFFI was upgraded to `v0.30.0` ([#5808](https://github.com/matrix-org/matrix-rust-sdk/pull/5808)).
+- The `waveform` parameter in `Timeline::send_voice_message` format changed to a list of `f32`
+  between 0 and 1.
+  ([#5732](https://github.com/matrix-org/matrix-rust-sdk/pull/5732))
 - The `normalized_power_level` field has been removed from the `RoomMember`
   struct.
   ([#5635](https://github.com/matrix-org/matrix-rust-sdk/pull/5635))
-
 - Remove the deprecated `CallNotify` event (`org.matrix.msc4075.call.notify`) in favor of the new
   `RtcNotification` event (`org.matrix.msc4075.rtc.notification`).
+  ([#5668](https://github.com/matrix-org/matrix-rust-sdk/pull/5668))
+- Add `QrLoginProgress::SyncingSecrets` to indicate that secrets are being synced between the two
+  devices.
+  ([#5760](https://github.com/matrix-org/matrix-rust-sdk/pull/5760))
+- Add `Room::subscribe_to_send_queue_updates` to observe room send queue updates.
+  ([#5761](https://github.com/matrix-org/matrix-rust-sdk/pull/5761))
+- `Client::login_with_qr_code` now returns a handler that allows performing the flow with either the
+  current device scanning or generating the QR code. Additionally, new errors `HumanQrLoginError::CheckCodeAlreadySent`
+  and `HumanQrLoginError::CheckCodeCannotBeSent` were added.
+  ([#5786](https://github.com/matrix-org/matrix-rust-sdk/pull/5786))
+- `ComposerDraft` now includes attachments alongside the text message.
+  ([#5794](https://github.com/matrix-org/matrix-rust-sdk/pull/5794))
+- Add `Client::subscribe_to_send_queue_updates` to observe global send queue updates.
+  ([#5784](https://github.com/matrix-org/matrix-rust-sdk/pull/5784))
 
-### Features:
+### Features
 
+- Add `Room::mark_as_fully_read_unchecked` so clients can mark a room as read without needing a `Timeline` instance. Note this method is not recommended as it can potentially cause incorrect read receipts, but it can needed in certain cases.
+- Add `Timeline::latest_event_id` to be able to fetch the event id of the latest event of the timeline.
 - Add `Room::load_or_fetch_event` so we can get a `TimelineEvent` given its event id ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678)).
 - Add `TimelineEvent::thread_root_event_id` to expose the thread root event id for this type too ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678)).
 - Add `NotificationSettings::get_raw_push_rules` so clients can fetch the raw JSON content of the push rules of the current user and include it in bug reports ([#5706](https://github.com/matrix-org/matrix-rust-sdk/pull/5706)).
@@ -25,8 +72,8 @@ All notable changes to this project will be documented in this file.
 
 ### Features:
 
-- Add `LowPriority` and `NonLowPriority` variants to `RoomListEntriesDynamicFilterKind` for filtering 
-  rooms based on their low priority status. These filters allow clients to show only low priority rooms 
+- Add `LowPriority` and `NonLowPriority` variants to `RoomListEntriesDynamicFilterKind` for filtering
+  rooms based on their low priority status. These filters allow clients to show only low priority rooms
   or exclude low priority rooms from the room list.
   ([#5508](https://github.com/matrix-org/matrix-rust-sdk/pull/5508))
 - Add `room_version` and `privileged_creators_role` to `RoomInfo` ([#5449](https://github.com/matrix-org/matrix-rust-sdk/pull/5449)).

@@ -14,11 +14,14 @@
 
 use std::iter;
 
-use matrix_sdk_base::media::{MediaFormat, MediaRequestParameters};
+use matrix_sdk_base::{
+    crypto::types::events::room_key_bundle::RoomKeyBundleContent,
+    media::{MediaFormat, MediaRequestParameters},
+};
 use ruma::{OwnedUserId, UserId, events::room::MediaSource};
 use tracing::{info, instrument, warn};
 
-use crate::{Error, Result, Room, crypto::types::events::room_key_bundle::RoomKeyBundleContent};
+use crate::{Error, Result, Room};
 
 /// Share any shareable E2EE history in the given room with the given recipient,
 /// as per [MSC4268].
@@ -132,6 +135,9 @@ pub(crate) async fn maybe_accept_key_bundle(room: &Room, inviter: &UserId) -> Re
 
     // Ensure that we get a fresh list of devices for the inviter, in case we need
     // to recalculate the `SenderData`.
+    // XXX: is this necessary, given (with exclude-insecure-devices), we should have
+    // checked that the inviter device was cross-signed when we received the
+    // to-device message?
     let (req_id, request) =
         olm_machine.query_keys_for_users(iter::once(bundle_info.sender_user.as_ref()));
 

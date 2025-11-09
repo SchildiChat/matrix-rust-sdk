@@ -138,6 +138,8 @@ use std::{
 };
 
 use eyeball::SharedObservable;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::{OlmError, SessionRecipientCollectionError};
 #[cfg(feature = "unstable-msc4274")]
 use matrix_sdk_base::store::FinishGalleryItemInfo;
 use matrix_sdk_base::{
@@ -173,8 +175,6 @@ use ruma::{
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, oneshot};
 use tracing::{debug, error, info, instrument, trace, warn};
 
-#[cfg(feature = "e2e-encryption")]
-use crate::crypto::{OlmError, SessionRecipientCollectionError};
 use crate::{
     Client, Media, Room, TransmissionProgress,
     client::WeakClient,
@@ -303,6 +303,31 @@ impl SendQueue {
     /// room_.
     pub fn subscribe(&self) -> broadcast::Receiver<SendQueueUpdate> {
         self.data().global_update_sender.subscribe()
+    }
+
+    /// Get local echoes from all room send queues.
+    pub async fn local_echoes(
+        &self,
+    ) -> Result<BTreeMap<OwnedRoomId, Vec<LocalEcho>>, RoomSendQueueError> {
+        let room_ids =
+            self.client.state_store().load_rooms_with_unsent_requests().await.unwrap_or_else(
+                |err| {
+                    warn!("error when loading rooms with unsent requests: {err}");
+                    Vec::new()
+                },
+            );
+
+        let mut local_echoes: BTreeMap<OwnedRoomId, Vec<LocalEcho>> = BTreeMap::new();
+
+        for room_id in room_ids {
+            if let Some(room) = self.client.get_room(&room_id) {
+                let queue = self.for_room(room);
+                local_echoes
+                    .insert(room_id.to_owned(), queue.inner.queue.local_echoes(&queue).await?);
+            }
+        }
+
+        Ok(local_echoes)
     }
 
     /// A subscriber to the enablement status (enabled or disabled) of the

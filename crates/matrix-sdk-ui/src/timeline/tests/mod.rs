@@ -29,14 +29,18 @@ use indexmap::IndexMap;
 use matrix_sdk::{
     BoxFuture,
     config::RequestConfig,
-    crypto::{DecryptionSettings, OlmMachine, RoomEventDecryptionResult, TrustRequirement},
     deserialized_responses::{EncryptionInfo, TimelineEvent},
     paginators::{PaginableRoom, PaginatorError, thread::PaginableThread},
     room::{EventWithContextResponse, Messages, MessagesOptions, PushContext, Relations},
     send_queue::RoomSendQueueUpdate,
 };
 use matrix_sdk_base::{
-    RoomInfo, RoomState, crypto::types::events::CryptoContextInfo, latest_event::LatestEvent,
+    RoomInfo, RoomState,
+    crypto::{
+        DecryptionSettings, OlmMachine, RoomEventDecryptionResult, TrustRequirement,
+        types::events::CryptoContextInfo,
+    },
+    latest_event::LatestEvent,
 };
 use matrix_sdk_test::{ALICE, DEFAULT_TEST_ROOM_ID, event_factory::EventFactory};
 use ruma::{
@@ -104,13 +108,6 @@ impl TestTimelineBuilder {
 
     fn internal_id_prefix(mut self, prefix: String) -> Self {
         self.internal_id_prefix = Some(prefix);
-        self
-    }
-
-    fn unable_to_decrypt_hook(mut self, hook: Arc<UtdHookManager>) -> Self {
-        self.utd_hook = Some(hook);
-        // It only makes sense to have a UTD hook for an encrypted room.
-        self.is_room_encrypted = true;
         self
     }
 
@@ -253,6 +250,9 @@ type ReadReceiptMap =
 
 #[derive(Clone, Debug, Default)]
 struct TestRoomDataProvider {
+    /// The ID of our own user.
+    own_user_id: Option<OwnedUserId>,
+
     /// The initial list of user receipts for that room.
     ///
     /// Configurable at construction, static for the lifetime of the provider.
@@ -356,7 +356,7 @@ impl PinnedEventsRoom for TestRoomDataProvider {
 
 impl RoomDataProvider for TestRoomDataProvider {
     fn own_user_id(&self) -> &UserId {
-        &ALICE
+        self.own_user_id.as_deref().unwrap_or(&ALICE)
     }
 
     fn room_version_rules(&self) -> RoomVersionRules {
@@ -415,7 +415,7 @@ impl RoomDataProvider for TestRoomDataProvider {
     }
 
     async fn push_context(&self) -> Option<PushContext> {
-        let push_rules = Ruleset::server_default(&ALICE);
+        let push_rules = Ruleset::server_default(self.own_user_id());
         let power_levels = PushConditionPowerLevelsCtx::new(
             BTreeMap::new(),
             int!(0),
@@ -426,7 +426,7 @@ impl RoomDataProvider for TestRoomDataProvider {
             PushConditionRoomCtx::new(
                 room_id!("!my_room:server.name").to_owned(),
                 uint!(2),
-                ALICE.to_owned(),
+                self.own_user_id().to_owned(),
                 "Alice".to_owned(),
             ),
             { power_levels: Some(power_levels) }

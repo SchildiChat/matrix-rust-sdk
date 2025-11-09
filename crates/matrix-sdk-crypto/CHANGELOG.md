@@ -6,8 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- When constructing a key bundle for history sharing, if we had received a key bundle ourselves, in which one or more sessions was marked as "history not shared", pass that on to the new user.
+  ([#5820](https://github.com/matrix-org/matrix-rust-sdk/pull/5820)
+- Expose new method `CryptoStore::get_withheld_sessions_by_room_id`.
+  ([#5819](https://github.com/matrix-org/matrix-rust-sdk/pull/5819))
+- Use new withheld code in key bundles for sessions not marked as
+  `shared_history`.
+  ([#5807](https://github.com/matrix-org/matrix-rust-sdk/pull/5807)
+- Improve feedback support for shared history when downloading room key
+  bundles.
+  ([#5737](https://github.com/matrix-org/matrix-rust-sdk/pull/5737))
+  - Add `RoomKeyWithheldEntry` enum, wrapping either a received to-device `m.room_key.withheld` event or
+    its content, if derived from a downloaded room key bundle.
+  - `OlmMachine::receive_room_key_bundle` now appends withheld key information to the store.
+  - [**breaking**] `Changes::withheld_session_info` now stores a `RoomKeyWithheldEntry` in each `room-id`-`session-id` entry.
+  - [**breaking**] `CryptoStore::get_withheld_info` now returns `Result<Option<RoomKeyWithheldEntry>>`. This change also affects `MemoryStore`.
+
 ### Bug Fixes
 
+- Fix a bug which caused encrypted to-device messages from unknown devices to be ignored.
+  ([#5763](https://github.com/matrix-org/matrix-rust-sdk/pull/5763))
+- Fix a bug which caused history shared on invite to be ignored when "exclude insecure devices" was enabled.
+  ([#5763](https://github.com/matrix-org/matrix-rust-sdk/pull/5763))
 - Fix a bug introduced in 0.14.0 which meant that the serialization of the value returned by `OtherUserIdentity::verification_request_content` did not include a `msgtype` field.
   ([#5642](https://github.com/matrix-org/matrix-rust-sdk/pull/5642))
 

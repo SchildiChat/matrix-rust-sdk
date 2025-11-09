@@ -1,14 +1,16 @@
-use std::{collections::HashMap, pin::pin, sync::Arc};
+use std::{collections::HashMap, fs, path::PathBuf, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
-    crypto::LocalTrust,
+    encryption::LocalTrust,
     room::{
         edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
         TryFromReportedContentScoreError,
     },
-    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType, EncryptionState,
+    send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    DraftAttachment as SdkDraftAttachment, DraftAttachmentContent, DraftThumbnail, EncryptionState,
     PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
     SuccessorRoom as SdkSuccessorRoom,
 };
@@ -21,11 +23,12 @@ use mime::Mime;
 use ruma::{
     assign,
     events::{
+        receipt::ReceiptThread,
         room::{
             avatar::ImageInfo as RumaAvatarImageInfo,
             history_visibility::HistoryVisibility as RumaHistoryVisibility,
             join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
-            MediaSource,
+            MediaSource as RumaMediaSource,
         },
         AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
@@ -37,24 +40,26 @@ use tracing::{error, warn};
 // SC
 use crate::space_child_info::{SpaceChildInfo, space_children_info};
 use ruma::RoomId;
-use ruma::events::receipt::ReceiptThread;
 // SC end
 
 use self::{power_levels::RoomPowerLevels, room_info::RoomInfo};
 use crate::{
     chunk_iterator::ChunkIterator,
     client::{JoinRule, RoomVisibility},
-    error::{ClientError, MediaInfoError, NotYetImplemented, RoomError},
+    error::{ClientError, MediaInfoError, NotYetImplemented, QueueWedgeError, RoomError},
     event::TimelineEvent,
     identity_status_change::IdentityStatusChange,
     live_location_share::{LastLocation, LiveLocationShare},
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
-    ruma::{ImageInfo, LocationContent},
+    ruma::{
+        AudioInfo, FileInfo, ImageInfo, LocationContent, MediaSource, ThumbnailInfo, VideoInfo,
+    },
     runtime::get_runtime_handle,
     timeline::{
         configuration::{TimelineConfiguration, TimelineFilter},
-        EventTimelineItem, LatestEventValue, ReceiptType, SendHandle, Timeline,
+        AbstractProgress, EventTimelineItem, LatestEventValue, ReceiptType, SendHandle, Timeline,
+        UploadSource,
     },
     utils::{u64_to_uint, AsyncRuntimeDropped},
     TaskHandle,
@@ -689,6 +694,25 @@ impl Room {
         Ok(())
     }
 
+    /// Mark a room as fully read, by attaching a read receipt to the provided
+    /// `event_id`.
+    ///
+    /// **Warning:** using this method is **NOT** recommended, as providing the
+    /// latest event id can cause incorrect read receipts. This method won't
+    /// check if sending the read receipt is necessary or valid. It should
+    /// *only* be used when some constraint prevents you from instantiating a
+    /// [`Timeline`]. For any other case use [`Timeline::mark_as_read`]
+    /// instead.
+    pub async fn mark_as_fully_read_unchecked(&self, event_id: String) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+
+        self.inner
+            .send_single_receipt(ReceiptType::FullyRead.into(), ReceiptThread::Unthreaded, event_id)
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn get_power_levels(&self) -> Result<Arc<RoomPowerLevels>, ClientError> {
         let power_levels = self.inner.power_levels().await.map_err(matrix_sdk::Error::from)?;
         Ok(Arc::new(RoomPowerLevels::new(power_levels, self.inner.own_user_id().to_owned())))
@@ -774,6 +798,37 @@ impl Room {
     /// Enable or disable the send queue for that particular room.
     pub fn enable_send_queue(&self, enable: bool) {
         self.inner.send_queue().set_enabled(enable);
+    }
+
+    /// Subscribe to all send queue updates in this room.
+    ///
+    /// The given listener will be immediately called with
+    /// `RoomSendQueueUpdate::NewLocalEvent` for each local echo existing in
+    /// the queue.
+    pub async fn subscribe_to_send_queue_updates(
+        &self,
+        listener: Box<dyn SendQueueListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let q = self.inner.send_queue();
+        let (local_echoes, mut subscriber) = q.subscribe().await?;
+
+        for local_echo in local_echoes {
+            listener.on_update(RoomSendQueueUpdate::NewLocalEvent {
+                transaction_id: local_echo.transaction_id.into(),
+            });
+        }
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            loop {
+                match subscriber.recv().await {
+                    Ok(update) => match update.try_into() {
+                        Ok(update) => listener.on_update(update),
+                        Err(err) => error!("error when converting send queue update: {err}"),
+                    },
+                    Err(err) => error!("error when listening for send queue updates: {err}"),
+                }
+            }
+        }))))
     }
 
     /// Store the given `ComposerDraft` in the state store using the current
@@ -1422,8 +1477,8 @@ impl TryFrom<ImageInfo> for RumaAvatarImageInfo {
     fn try_from(value: ImageInfo) -> Result<Self, MediaInfoError> {
         let thumbnail_url = if let Some(media_source) = value.thumbnail_source {
             match &media_source.as_ref().media_source {
-                MediaSource::Plain(mxc_uri) => Some(mxc_uri.clone()),
-                MediaSource::Encrypted(_) => return Err(MediaInfoError::InvalidField),
+                RumaMediaSource::Plain(mxc_uri) => Some(mxc_uri.clone()),
+                RumaMediaSource::Encrypted(_) => return Err(MediaInfoError::InvalidField),
             }
         } else {
             None
@@ -1451,21 +1506,257 @@ pub struct ComposerDraft {
     pub html_text: Option<String>,
     /// The type of draft.
     pub draft_type: ComposerDraftType,
+    /// Attachments associated with this draft.
+    pub attachments: Vec<DraftAttachment>,
 }
 
 impl From<SdkComposerDraft> for ComposerDraft {
     fn from(value: SdkComposerDraft) -> Self {
-        let SdkComposerDraft { plain_text, html_text, draft_type } = value;
-        Self { plain_text, html_text, draft_type: draft_type.into() }
+        let SdkComposerDraft { plain_text, html_text, draft_type, attachments } = value;
+        Self {
+            plain_text,
+            html_text,
+            draft_type: draft_type.into(),
+            attachments: attachments.into_iter().map(|a| a.into()).collect(),
+        }
     }
 }
 
 impl TryFrom<ComposerDraft> for SdkComposerDraft {
-    type Error = ruma::IdParseError;
+    type Error = ClientError;
 
     fn try_from(value: ComposerDraft) -> std::result::Result<Self, Self::Error> {
-        let ComposerDraft { plain_text, html_text, draft_type } = value;
-        Ok(Self { plain_text, html_text, draft_type: draft_type.try_into()? })
+        let ComposerDraft { plain_text, html_text, draft_type, attachments } = value;
+        Ok(Self {
+            plain_text,
+            html_text,
+            draft_type: draft_type.try_into()?,
+            attachments: attachments
+                .into_iter()
+                .map(|a| a.try_into())
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+/// An attachment stored with a composer draft.
+#[derive(uniffi::Enum)]
+pub enum DraftAttachment {
+    Audio { audio_info: AudioInfo, source: UploadSource },
+    File { file_info: FileInfo, source: UploadSource },
+    Image { image_info: ImageInfo, source: UploadSource, thumbnail_source: Option<UploadSource> },
+    Video { video_info: VideoInfo, source: UploadSource, thumbnail_source: Option<UploadSource> },
+}
+
+impl From<SdkDraftAttachment> for DraftAttachment {
+    fn from(value: SdkDraftAttachment) -> Self {
+        match value.content {
+            DraftAttachmentContent::Image {
+                data,
+                mimetype,
+                size,
+                width,
+                height,
+                blurhash,
+                thumbnail,
+            } => {
+                let thumbnail_source = thumbnail.as_ref().map(|t| UploadSource::Data {
+                    bytes: t.data.clone(),
+                    filename: t.filename.clone(),
+                });
+                let thumbnail_info = thumbnail.map(|t| ThumbnailInfo {
+                    width: t.width,
+                    height: t.height,
+                    mimetype: t.mimetype,
+                    size: t.size,
+                });
+                DraftAttachment::Image {
+                    image_info: ImageInfo {
+                        height,
+                        width,
+                        mimetype,
+                        size,
+                        thumbnail_info,
+                        thumbnail_source: None,
+                        blurhash,
+                        is_animated: None,
+                    },
+                    source: UploadSource::Data { bytes: data, filename: value.filename },
+                    thumbnail_source,
+                }
+            }
+            DraftAttachmentContent::Video {
+                data,
+                mimetype,
+                size,
+                width,
+                height,
+                duration,
+                blurhash,
+                thumbnail,
+            } => {
+                let thumbnail_source = thumbnail.as_ref().map(|t| UploadSource::Data {
+                    bytes: t.data.clone(),
+                    filename: t.filename.clone(),
+                });
+                let thumbnail_info = thumbnail.map(|t| ThumbnailInfo {
+                    width: t.width,
+                    height: t.height,
+                    mimetype: t.mimetype,
+                    size: t.size,
+                });
+                DraftAttachment::Video {
+                    video_info: VideoInfo {
+                        duration,
+                        height,
+                        width,
+                        mimetype,
+                        size,
+                        thumbnail_info,
+                        thumbnail_source: None,
+                        blurhash,
+                    },
+                    source: UploadSource::Data { bytes: data, filename: value.filename },
+                    thumbnail_source,
+                }
+            }
+            DraftAttachmentContent::Audio { data, mimetype, size, duration } => {
+                DraftAttachment::Audio {
+                    audio_info: AudioInfo { duration, size, mimetype },
+                    source: UploadSource::Data { bytes: data, filename: value.filename },
+                }
+            }
+            DraftAttachmentContent::File { data, mimetype, size } => DraftAttachment::File {
+                file_info: FileInfo {
+                    mimetype,
+                    size,
+                    thumbnail_info: None,
+                    thumbnail_source: None,
+                },
+                source: UploadSource::Data { bytes: data, filename: value.filename },
+            },
+        }
+    }
+}
+
+/// Resolve the bytes and filename from an `UploadSource`, reading the file
+/// contents if needed.
+fn read_upload_source(source: UploadSource) -> Result<(Vec<u8>, String), ClientError> {
+    match source {
+        UploadSource::Data { bytes, filename } => Ok((bytes, filename)),
+        UploadSource::File { filename } => {
+            let path: PathBuf = filename.into();
+            let filename = path
+                .file_name()
+                .ok_or(ClientError::Generic {
+                    msg: "Invalid attachment path".to_owned(),
+                    details: None,
+                })?
+                .to_str()
+                .ok_or(ClientError::Generic {
+                    msg: "Invalid attachment path".to_owned(),
+                    details: None,
+                })?
+                .to_owned();
+
+            let bytes = fs::read(&path).map_err(|_| ClientError::Generic {
+                msg: "Could not load file".to_owned(),
+                details: None,
+            })?;
+
+            Ok((bytes, filename))
+        }
+    }
+}
+
+impl TryFrom<DraftAttachment> for SdkDraftAttachment {
+    type Error = ClientError;
+
+    fn try_from(value: DraftAttachment) -> Result<Self, Self::Error> {
+        match value {
+            DraftAttachment::Image { image_info, source, thumbnail_source, .. } => {
+                let (data, filename) = read_upload_source(source)?;
+                let thumbnail = match (image_info.thumbnail_info, thumbnail_source) {
+                    (Some(info), Some(source)) => {
+                        let (data, filename) = read_upload_source(source)?;
+                        Some(DraftThumbnail {
+                            filename,
+                            data,
+                            mimetype: info.mimetype,
+                            width: info.width,
+                            height: info.height,
+                            size: info.size,
+                        })
+                    }
+                    _ => None,
+                };
+                Ok(Self {
+                    filename,
+                    content: DraftAttachmentContent::Image {
+                        data,
+                        mimetype: image_info.mimetype,
+                        size: image_info.size,
+                        width: image_info.width,
+                        height: image_info.height,
+                        blurhash: image_info.blurhash,
+                        thumbnail,
+                    },
+                })
+            }
+            DraftAttachment::Video { video_info, source, thumbnail_source, .. } => {
+                let (data, filename) = read_upload_source(source)?;
+                let thumbnail = match (video_info.thumbnail_info, thumbnail_source) {
+                    (Some(info), Some(source)) => {
+                        let (data, filename) = read_upload_source(source)?;
+                        Some(DraftThumbnail {
+                            filename,
+                            data,
+                            mimetype: info.mimetype,
+                            width: info.width,
+                            height: info.height,
+                            size: info.size,
+                        })
+                    }
+                    _ => None,
+                };
+                Ok(Self {
+                    filename,
+                    content: DraftAttachmentContent::Video {
+                        data,
+                        mimetype: video_info.mimetype,
+                        size: video_info.size,
+                        width: video_info.width,
+                        height: video_info.height,
+                        duration: video_info.duration,
+                        blurhash: video_info.blurhash,
+                        thumbnail,
+                    },
+                })
+            }
+            DraftAttachment::Audio { audio_info, source, .. } => {
+                let (data, filename) = read_upload_source(source)?;
+                Ok(Self {
+                    filename,
+                    content: DraftAttachmentContent::Audio {
+                        data,
+                        mimetype: audio_info.mimetype,
+                        size: audio_info.size,
+                        duration: audio_info.duration,
+                    },
+                })
+            }
+            DraftAttachment::File { file_info, source, .. } => {
+                let (data, filename) = read_upload_source(source)?;
+                Ok(Self {
+                    filename,
+                    content: DraftAttachmentContent::File {
+                        data,
+                        mimetype: file_info.mimetype,
+                        size: file_info.size,
+                    },
+                })
+            }
+        }
     }
 }
 
@@ -1608,5 +1899,128 @@ pub struct PredecessorRoom {
 impl From<SdkPredecessorRoom> for PredecessorRoom {
     fn from(value: SdkPredecessorRoom) -> Self {
         Self { room_id: value.room_id.to_string() }
+    }
+}
+
+/// A listener to send queue updates in a specific room.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait SendQueueListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called every time the send queue dispatches an update for the given
+    /// room.
+    fn on_update(&self, update: RoomSendQueueUpdate);
+}
+
+/// An update to a room send queue.
+#[derive(uniffi::Enum)]
+pub enum RoomSendQueueUpdate {
+    /// A new local event is being sent.
+    NewLocalEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: String,
+    },
+
+    /// A local event that hadn't been sent to the server yet has been cancelled
+    /// before sending.
+    CancelledLocalEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: String,
+    },
+
+    /// A local event's content has been replaced with something else.
+    ReplacedLocalEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: String,
+    },
+
+    /// An error happened when an event was being sent.
+    ///
+    /// The event has not been removed from the queue. All the send queues
+    /// will be disabled after this happens, and must be manually re-enabled.
+    SendError {
+        /// Transaction id used to identify this event.
+        transaction_id: String,
+        /// Error received while sending the event.
+        error: QueueWedgeError,
+        /// Whether the error is considered recoverable or not.
+        ///
+        /// An error that's recoverable will disable the room's send queue,
+        /// while an unrecoverable error will be parked, until the user
+        /// decides to cancel sending it.
+        is_recoverable: bool,
+    },
+
+    /// The event has been unwedged and sending is now being retried.
+    RetryEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: String,
+    },
+
+    /// The event has been sent to the server, and the query returned
+    /// successfully.
+    SentEvent {
+        /// Transaction id used to identify this event.
+        transaction_id: String,
+        /// Received event id from the send response.
+        event_id: String,
+    },
+
+    /// A media upload (consisting of a file and possibly a thumbnail) has made
+    /// progress.
+    MediaUpload {
+        /// The media event this uploaded media relates to.
+        related_to: String,
+
+        /// The final media source for the file if it has finished uploading.
+        file: Option<Arc<MediaSource>>,
+
+        /// The index of the media within the transaction. A file and its
+        /// thumbnail share the same index. Will always be 0 for non-gallery
+        /// media uploads.
+        index: u64,
+
+        /// The combined upload progress across the file and, if existing, its
+        /// thumbnail. For gallery uploads, the progress is reported per indexed
+        /// gallery item.
+        progress: AbstractProgress,
+    },
+}
+
+impl TryFrom<SdkRoomSendQueueUpdate> for RoomSendQueueUpdate {
+    type Error = ClientError;
+
+    fn try_from(value: SdkRoomSendQueueUpdate) -> std::result::Result<Self, Self::Error> {
+        Ok(match value {
+            SdkRoomSendQueueUpdate::CancelledLocalEvent { transaction_id } => {
+                Self::CancelledLocalEvent { transaction_id: transaction_id.into() }
+            }
+            SdkRoomSendQueueUpdate::MediaUpload { related_to, file, index, progress } => {
+                Self::MediaUpload {
+                    related_to: related_to.into(),
+                    file: file.map(|source| source.try_into().map(Arc::new)).transpose()?,
+                    index,
+                    progress: progress.into(),
+                }
+            }
+            SdkRoomSendQueueUpdate::NewLocalEvent(local_echo) => {
+                Self::NewLocalEvent { transaction_id: local_echo.transaction_id.into() }
+            }
+            SdkRoomSendQueueUpdate::ReplacedLocalEvent { transaction_id, .. } => {
+                Self::ReplacedLocalEvent { transaction_id: transaction_id.into() }
+            }
+            SdkRoomSendQueueUpdate::RetryEvent { transaction_id } => {
+                Self::RetryEvent { transaction_id: transaction_id.into() }
+            }
+            SdkRoomSendQueueUpdate::SendError { transaction_id, error, is_recoverable } => {
+                let as_queue_wedge_error: matrix_sdk::QueueWedgeError = (&*error).into();
+                Self::SendError {
+                    transaction_id: transaction_id.into(),
+                    error: as_queue_wedge_error.into(),
+                    is_recoverable,
+                }
+            }
+            SdkRoomSendQueueUpdate::SentEvent { transaction_id, event_id } => {
+                Self::SentEvent { transaction_id: transaction_id.into(), event_id: event_id.into() }
+            }
+        })
     }
 }
