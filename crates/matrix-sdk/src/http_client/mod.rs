@@ -14,6 +14,7 @@
 
 use std::{
     any::type_name,
+    borrow::Cow,
     fmt::Debug,
     num::NonZeroUsize,
     sync::{
@@ -27,14 +28,17 @@ use bytes::{Bytes, BytesMut};
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
 use http::Method;
+use matrix_sdk_base::SendOutsideWasm;
 use ruma::api::{
-    AuthScheme, OutgoingRequest, SendAccessToken, SupportedVersions,
+    OutgoingRequest, SupportedVersions,
+    auth_scheme::{AuthScheme, SendAccessToken},
     error::{FromHttpResponseError, IntoHttpError},
+    path_builder,
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, field::debug, instrument, trace};
 
-use crate::{config::RequestConfig, error::HttpError};
+use crate::{HttpResult, config::RequestConfig, error::HttpError};
 
 #[cfg(not(target_family = "wasm"))]
 mod native;
@@ -101,26 +105,25 @@ impl HttpClient {
         config: RequestConfig,
         homeserver: String,
         access_token: Option<&str>,
-        supported_versions: &SupportedVersions,
+        path_builder_input: <R::PathBuilder as path_builder::PathBuilder>::Input<'_>,
     ) -> Result<http::Request<Bytes>, IntoHttpError>
     where
         R: OutgoingRequest + Debug,
+        for<'a> R::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
     {
         trace!(request_type = type_name::<R>(), "Serializing request");
 
         let send_access_token = match access_token {
-            Some(access_token) => {
-                if config.force_auth {
-                    SendAccessToken::Always(access_token)
-                } else {
-                    SendAccessToken::IfRequired(access_token)
-                }
-            }
+            Some(access_token) => match (config.force_auth, config.skip_auth) {
+                (true, true) | (true, false) => SendAccessToken::Always(access_token),
+                (false, true) => SendAccessToken::None,
+                (false, false) => SendAccessToken::IfRequired(access_token),
+            },
             None => SendAccessToken::None,
         };
 
         let request = request
-            .try_into_http_request::<BytesMut>(&homeserver, send_access_token, supported_versions)?
+            .try_into_http_request::<BytesMut>(&homeserver, send_access_token, path_builder_input)?
             .map(|body| body.freeze());
 
         Ok(request)
@@ -128,7 +131,7 @@ impl HttpClient {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, request, config, homeserver, access_token, supported_versions, send_progress),
+        skip(self, request, config, homeserver, access_token, path_builder_input, send_progress),
         fields(
             uri,
             method,
@@ -146,11 +149,12 @@ impl HttpClient {
         config: Option<RequestConfig>,
         homeserver: String,
         access_token: Option<&str>,
-        supported_versions: &SupportedVersions,
+        path_builder_input: <R::PathBuilder as path_builder::PathBuilder>::Input<'_>,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<R::IncomingResponse, HttpError>
     where
         R: OutgoingRequest + Debug,
+        for<'a> R::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
         HttpError: From<FromHttpResponseError<R::EndpointError>>,
     {
         let config = match config {
@@ -168,20 +172,8 @@ impl HttpClient {
             // why we record it here, instead of in the #[instrument] macro.
             span.record("config", debug(config)).record("request_id", request_id);
 
-            let auth_scheme = R::METADATA.authentication;
-            match auth_scheme {
-                AuthScheme::AccessToken
-                | AuthScheme::AccessTokenOptional
-                | AuthScheme::AppserviceToken
-                | AuthScheme::AppserviceTokenOptional
-                | AuthScheme::None => {}
-                AuthScheme::ServerSignatures => {
-                    return Err(HttpError::NotClientRequest);
-                }
-            }
-
             let request = self
-                .serialize_request(request, config, homeserver, access_token, supported_versions)
+                .serialize_request(request, config, homeserver, access_token, path_builder_input)
                 .map_err(HttpError::IntoHttp)?;
 
             let method = request.method();
@@ -252,6 +244,50 @@ async fn response_to_http_response(
     let body = response.bytes().await?;
 
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
+}
+
+/// Marker trait to identify the authentication schemes that the
+/// [`Client`](crate::Client) supports.
+///
+/// This trait can also be implemented for custom
+/// [`PathBuilder`](path_builder::PathBuilder)s if necessary.
+pub trait SupportedPathBuilder: path_builder::PathBuilder {
+    fn get_path_builder_input(
+        client: &crate::Client,
+        skip_auth: bool,
+    ) -> impl Future<Output = HttpResult<Self::Input<'static>>> + SendOutsideWasm;
+}
+
+impl SupportedPathBuilder for path_builder::VersionHistory {
+    async fn get_path_builder_input(
+        client: &crate::Client,
+        skip_auth: bool,
+    ) -> HttpResult<Cow<'static, SupportedVersions>> {
+        if skip_auth {
+            let cached_versions = client.get_cached_versions().await;
+
+            let versions = if let Some(versions) = cached_versions {
+                versions
+            } else {
+                // If we're skipping auth we might not get all the supported features, so just
+                // fetch the versions and don't cache them.
+                let request_config = RequestConfig::default().retry_limit(5).skip_auth();
+                let response = client.fetch_server_versions(Some(request_config)).await?;
+
+                response.as_supported_versions()
+            };
+
+            Ok(Cow::Owned(versions))
+        } else {
+            client.supported_versions().await.map(Cow::Owned)
+        }
+    }
+}
+
+impl SupportedPathBuilder for path_builder::SinglePath {
+    async fn get_path_builder_input(_client: &crate::Client, _skip_auth: bool) -> HttpResult<()> {
+        Ok(())
+    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]

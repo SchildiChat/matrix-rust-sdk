@@ -423,6 +423,14 @@ pub enum ThreadSummaryStatus {
 }
 
 impl ThreadSummaryStatus {
+    /// Create a [`ThreadSummaryStatus`] from an optional thread summary.
+    pub fn from_opt(summary: Option<ThreadSummary>) -> Self {
+        match summary {
+            None => ThreadSummaryStatus::None,
+            Some(summary) => ThreadSummaryStatus::Some(summary),
+        }
+    }
+
     /// Is the thread status of this event unknown?
     fn is_unknown(&self) -> bool {
         matches!(self, ThreadSummaryStatus::Unknown)
@@ -1192,6 +1200,13 @@ pub enum WithheldCode {
     #[ruma_enum(rename = "m.no_olm")]
     NoOlm,
 
+    /// Normally used when sharing history, per [MSC4268]: indicates
+    /// that the session was not marked as "shared_history".
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    #[ruma_enum(rename = "io.element.msc4268.history_not_shared", alias = "m.history_not_shared")]
+    HistoryNotShared,
+
     #[doc(hidden)]
     _Custom(PrivOwnedStr),
 }
@@ -1204,6 +1219,7 @@ impl fmt::Display for WithheldCode {
             WithheldCode::Unauthorised => "You are not authorised to read the message.",
             WithheldCode::Unavailable => "The requested key was not found.",
             WithheldCode::NoOlm => "Unable to establish a secure channel.",
+            WithheldCode::HistoryNotShared => "The sender disabled sharing encrypted history.",
             _ => self.as_str(),
         };
 

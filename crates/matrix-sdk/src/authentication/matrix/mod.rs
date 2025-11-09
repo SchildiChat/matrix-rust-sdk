@@ -16,14 +16,15 @@
 
 //! Types to interact with the native Matrix authentication API.
 
-use std::fmt;
 #[cfg(feature = "sso-login")]
 use std::future::Future;
+use std::{borrow::Cow, fmt};
 
 use matrix_sdk_base::{SessionMeta, store::RoomLoadSettings};
 use ruma::{
     api::{
-        OutgoingRequest, SendAccessToken,
+        OutgoingRequest,
+        auth_scheme::SendAccessToken,
         client::{
             account::register,
             session::{
@@ -112,13 +113,13 @@ impl MatrixAuth {
                 .try_into_http_request::<Vec<u8>>(
                     homeserver.as_str(),
                     SendAccessToken::None,
-                    &supported_versions,
+                    Cow::Owned(supported_versions),
                 )
         } else {
             sso_login::v3::Request::new(redirect_url.to_owned()).try_into_http_request::<Vec<u8>>(
                 homeserver.as_str(),
                 SendAccessToken::None,
-                &supported_versions,
+                Cow::Owned(supported_versions),
             )
         };
 

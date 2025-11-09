@@ -4,8 +4,12 @@ use std::{
 };
 
 use camino::{Utf8Path, Utf8PathBuf};
+use cargo_metadata::MetadataCommand;
 use clap::{Args, Subcommand};
-use uniffi_bindgen::{bindings::SwiftBindingGenerator, library_mode::generate_bindings};
+use uniffi_bindgen::{
+    bindings::SwiftBindingGenerator, cargo_metadata::CrateConfigSupplier,
+    library_mode::generate_bindings,
+};
 use xshell::cmd;
 
 use crate::{Result, sh, workspace};
@@ -185,7 +189,19 @@ fn build_library() -> Result<()> {
 }
 
 fn generate_uniffi(library_path: &Utf8Path, ffi_directory: &Utf8Path) -> Result<()> {
-    generate_bindings(library_path, None, &SwiftBindingGenerator, None, ffi_directory, false)?;
+    let manifest_path = std::env::current_dir()?.join("Cargo.toml");
+    println!("manifest path {:?}", manifest_path);
+    let metadata = MetadataCommand::new().manifest_path(&manifest_path).exec()?;
+    let config_supplier: CrateConfigSupplier = metadata.into();
+    generate_bindings(
+        library_path,
+        None,
+        &SwiftBindingGenerator,
+        &config_supplier,
+        None,
+        ffi_directory,
+        false,
+    )?;
     Ok(())
 }
 
@@ -234,6 +250,7 @@ fn build_xcframework(
     consolidate_modulemap_files(&generated_dir, &headers_module_dir)?;
 
     move_files("swift", &generated_dir, &swift_dir)?;
+    apply_uniffi_mocks_workaround(&swift_dir)?;
 
     println!("-- Generating MatrixSDKFFI.xcframework framework");
     let xcframework_path = generated_dir.join("MatrixSDKFFI.xcframework");
@@ -413,5 +430,28 @@ fn consolidate_modulemap_files(source: &Utf8Path, destination: &Utf8Path) -> Res
     }
 
     std::fs::write(destination.join("module.modulemap"), modulemap)?;
+    Ok(())
+}
+
+// Temporary workaround for https://github.com/mozilla/uniffi-rs/issues/2717
+fn apply_uniffi_mocks_workaround(swift_dir: &Utf8Path) -> Result<()> {
+    let regex = regex::Regex::new(r#"(deinit\s*\{\n)(\s*try!\s*rustCall)"#)?;
+
+    for entry in swift_dir.read_dir_utf8()? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let path = entry.path();
+            if path.extension() == Some("swift") {
+                let mut contents = std::fs::read_to_string(path)?;
+                let new_contents =
+                    regex.replace_all(&contents, "$1        guard handle != 0 else { return }\n$2");
+                if new_contents != contents {
+                    contents = new_contents.to_string();
+                    std::fs::write(path, contents)?;
+                }
+            }
+        }
+    }
+
     Ok(())
 }

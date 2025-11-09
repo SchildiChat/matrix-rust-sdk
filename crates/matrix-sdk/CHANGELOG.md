@@ -8,15 +8,37 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add a new `RequestConfig::skip_auth()` option. This is useful to ensure that
+  certain request won't ever include an authorization header.
+  ([#5822](https://github.com/matrix-org/matrix-rust-sdk/pull/5822))
+- Add support for extended profile fields with `Account::fetch_profile_field_of()`,
+  `Account::fetch_profile_field_of_static()`, `Account::set_profile_field()` and
+  `Account::delete_profile_field()`.
+  ([#5771](https://github.com/matrix-org/matrix-rust-sdk/pull/5771))
+- [**breaking**] Remove the `matrix-sdk-crypto` re-export.
+  ([#5769](https://github.com/matrix-org/matrix-rust-sdk/pull/5769))
+- Allow `Client::get_dm_room()` to be called without the `e2e-encryption` crate feature.
+  ([#5787](https://github.com/matrix-org/matrix-rust-sdk/pull/5787))
 - [**breaking**] Add `encryption::secret_storage::SecretStorageError::ImportError` to indicate
   an error that occurred when importing a secret from secret storage.
   ([#5647](https://github.com/matrix-org/matrix-rust-sdk/pull/5647))
 - [**breaking**] Add `authentication::oauth::qrcode::login::LoginProgress::SyncingSecrets` to
   indicate that secrets are being synced between the two devices.
   ([#5760](https://github.com/matrix-org/matrix-rust-sdk/pull/5760))
+- Add `authentication::oauth::OAuth::grant_login_with_qr_code` to reciprocate a login by
+  generating a QR code on the existing device.
+  ([#5801](https://github.com/matrix-org/matrix-rust-sdk/pull/5801))
 
 ### Refactor
 
+- [**breaking**]: `Client::send()` has extra bounds where
+  `Request::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>` and
+  `Request::PathBuilder: SupportedPathBuilder`. This method should still work for any request to the
+  Client-Server API. This allows to drop the `HttpError::NotClientRequest` error in favor of a
+  compile-time error.
+  ([#5781](https://github.com/matrix-org/matrix-rust-sdk/pull/5781),
+   [#5789](https://github.com/matrix-org/matrix-rust-sdk/pull/5789),
+   [#5815](https://github.com/matrix-org/matrix-rust-sdk/pull/5815))
 - [**breaking**]: The `waveform` field was moved from `AttachmentInfo::Voice` to `BaseAudioInfo`,
   allowing to set it for any audio message. Its format also changed, and it is now a list of `f32`
   between 0 and 1.
@@ -83,6 +105,10 @@ All notable changes to this project will be documented in this file.
   begins ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678).
 - Make `PaginationTokens` `pub`, as well as its `previous` and `next` tokens so they can be assigned from other files
   ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678).
+- [**breaking**] `OAuth::login_with_qr_code` now returns a builder that allows performing the flow with either the
+  current device scanning or generating the QR code. Additionally, new errors `SecureChannelError::CannotReceiveCheckCode`
+  and `QRCodeLoginError::ServerReset` were added.
+  ([#5711](https://github.com/matrix-org/matrix-rust-sdk/pull/5711))
 
 ### Refactor
 

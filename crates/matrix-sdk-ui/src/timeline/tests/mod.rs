@@ -29,14 +29,18 @@ use indexmap::IndexMap;
 use matrix_sdk::{
     BoxFuture,
     config::RequestConfig,
-    crypto::{DecryptionSettings, OlmMachine, RoomEventDecryptionResult, TrustRequirement},
     deserialized_responses::{EncryptionInfo, TimelineEvent},
     paginators::{PaginableRoom, PaginatorError, thread::PaginableThread},
     room::{EventWithContextResponse, Messages, MessagesOptions, PushContext, Relations},
     send_queue::RoomSendQueueUpdate,
 };
 use matrix_sdk_base::{
-    RoomInfo, RoomState, crypto::types::events::CryptoContextInfo, latest_event::LatestEvent,
+    RoomInfo, RoomState,
+    crypto::{
+        DecryptionSettings, OlmMachine, RoomEventDecryptionResult, TrustRequirement,
+        types::events::CryptoContextInfo,
+    },
+    latest_event::LatestEvent,
 };
 use matrix_sdk_test::{ALICE, DEFAULT_TEST_ROOM_ID, event_factory::EventFactory};
 use ruma::{
@@ -104,13 +108,6 @@ impl TestTimelineBuilder {
 
     fn internal_id_prefix(mut self, prefix: String) -> Self {
         self.internal_id_prefix = Some(prefix);
-        self
-    }
-
-    fn unable_to_decrypt_hook(mut self, hook: Arc<UtdHookManager>) -> Self {
-        self.utd_hook = Some(hook);
-        // It only makes sense to have a UTD hook for an encrypted room.
-        self.is_room_encrypted = true;
         self
     }
 
@@ -281,11 +278,6 @@ struct TestRoomDataProvider {
 }
 
 impl TestRoomDataProvider {
-    fn with_own_user_id(mut self, user_id: OwnedUserId) -> Self {
-        self.own_user_id = Some(user_id);
-        self
-    }
-
     fn with_initial_user_receipts(mut self, initial_user_receipts: ReadReceiptMap) -> Self {
         self.initial_user_receipts = initial_user_receipts;
         self

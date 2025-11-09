@@ -10,6 +10,8 @@ use anyhow::{anyhow, Context as _};
 use futures_util::pin_mut;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
+#[cfg(feature = "sqlite")]
+use matrix_sdk::STATE_STORE_DATABASE_NAME;
 use matrix_sdk::{
     authentication::oauth::{
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
@@ -39,7 +41,6 @@ use matrix_sdk::{
     sliding_sync::Version as SdkSlidingSyncVersion,
     store::RoomLoadSettings as SdkRoomLoadSettings,
     Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
-    STATE_STORE_DATABASE_NAME,
 };
 use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
@@ -102,8 +103,8 @@ use crate::{
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
-    qr_code::{HumanQrLoginError, QrCodeData, QrLoginProgressListener},
-    room::{RoomHistoryVisibility, RoomInfoListener},
+    qr_code::LoginWithQrCodeHandler,
+    room::{RoomHistoryVisibility, RoomInfoListener, RoomSendQueueUpdate},
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
     ruma::{
@@ -195,6 +196,13 @@ pub trait ProgressWatcher: SyncOutsideWasm + SendOutsideWasm {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
+/// A listener to the global (client-wide) update reporter of the send queue.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait SendQueueRoomUpdateListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called every time the send queue emits an update for a given room.
+    fn on_update(&self, room_id: String, update: RoomSendQueueUpdate);
+}
+
 /// A listener to the global (client-wide) error reporter of the send queue.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait SendQueueRoomErrorListener: SyncOutsideWasm + SendOutsideWasm {
@@ -235,13 +243,18 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 #[derive(uniffi::Object)]
 pub struct Client {
     pub(crate) inner: AsyncRuntimeDropped<MatrixClient>,
+
     delegate: OnceLock<Arc<dyn ClientDelegate>>,
+
     pub(crate) utd_hook_manager: OnceLock<Arc<UtdHookManager>>,
+
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
+
     /// The path to the directory where the state store and the crypto store are
-    /// located, if the `Client` instance has been built with a SQLite store
-    /// backend.
+    /// located, if the `Client` instance has been built with a store (either
+    /// SQLite or IndexedDB).
+    #[cfg_attr(not(feature = "sqlite"), allow(unused))]
     store_path: Option<PathBuf>,
 }
 
@@ -543,43 +556,17 @@ impl Client {
         Ok(())
     }
 
-    /// Log in using the provided [`QrCodeData`]. The `Client` must be built
-    /// by providing [`QrCodeData::server_name`] as the server name for this
-    /// login to succeed.
+    /// Log in using a QR code.
     ///
-    /// This method uses the login mechanism described in [MSC4108]. As such
-    /// this method requires OAuth 2.0 support as well as sliding sync support.
+    /// # Arguments
     ///
-    /// The usage of the progress_listener is required to transfer the
-    /// [`CheckCode`] to the existing client.
-    ///
-    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
-    pub async fn login_with_qr_code(
+    /// * `oidc_configuration` - The data to restore or register the client with
+    ///   the server.
+    pub fn login_with_qr_code(
         self: Arc<Self>,
-        qr_code_data: &QrCodeData,
-        oidc_configuration: &OidcConfiguration,
-        progress_listener: Box<dyn QrLoginProgressListener>,
-    ) -> Result<(), HumanQrLoginError> {
-        let registration_data = oidc_configuration
-            .registration_data()
-            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
-
-        let oauth = self.inner.oauth();
-        let login = oauth.login_with_qr_code(&qr_code_data.inner, Some(&registration_data));
-
-        let mut progress = login.subscribe_to_progress();
-
-        // We create this task, which will get cancelled once it's dropped, just in case
-        // the progress stream doesn't end.
-        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
-            while let Some(state) = progress.next().await {
-                progress_listener.on_update(state.into());
-            }
-        }));
-
-        login.await?;
-
-        Ok(())
+        oidc_configuration: OidcConfiguration,
+    ) -> LoginWithQrCodeHandler {
+        LoginWithQrCodeHandler::new(self.inner.oauth(), oidc_configuration)
     }
 
     /// Restores the client from a `Session`.
@@ -631,6 +618,49 @@ impl Client {
     /// queue.
     pub fn enable_send_queue_upload_progress(&self, enable: bool) {
         self.inner.send_queue().enable_upload_progress(enable);
+    }
+
+    /// Subscribe to the global send queue update reporter, at the
+    /// client-wide level.
+    ///
+    /// The given listener will be immediately called with
+    /// `RoomSendQueueUpdate::NewLocalEvent` for each local echo existing in
+    /// the queue.
+    pub async fn subscribe_to_send_queue_updates(
+        &self,
+        listener: Box<dyn SendQueueRoomUpdateListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let q = self.inner.send_queue();
+        let local_echoes = q.local_echoes().await?;
+        let mut subscriber = q.subscribe();
+
+        for (room_id, local_echoes) in local_echoes {
+            for local_echo in local_echoes {
+                listener.on_update(
+                    room_id.clone().into(),
+                    RoomSendQueueUpdate::NewLocalEvent {
+                        transaction_id: local_echo.transaction_id.into(),
+                    },
+                );
+            }
+        }
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            loop {
+                match subscriber.recv().await {
+                    Ok(update) => {
+                        let room_id = update.room_id.to_string();
+                        match update.update.try_into() {
+                            Ok(update) => listener.on_update(room_id, update),
+                            Err(err) => error!("error when converting send queue update: {err}"),
+                        }
+                    }
+                    Err(err) => {
+                        error!("error when listening to the send queue update reporter: {err}");
+                    }
+                }
+            }
+        }))))
     }
 
     /// Subscribe to the global enablement status of the send queue, at the
@@ -1586,6 +1616,7 @@ impl Client {
             self.inner.event_cache().clear_all_rooms().await?;
 
             // Delete the state store file, if it exists.
+            #[cfg(feature = "sqlite")]
             if let Some(store_path) = &self.store_path {
                 debug!("Removing the state store: {}", store_path.display());
 

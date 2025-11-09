@@ -22,8 +22,10 @@ use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm, boxed_into_future};
 use oauth2::{RequestTokenError, basic::BasicErrorResponseType};
 use ruma::api::{
     OutgoingRequest,
+    auth_scheme::{AuthScheme, SendAccessToken},
     client::{error::ErrorKind, media},
     error::FromHttpResponseError,
+    path_builder::PathBuilder,
 };
 use tracing::{error, trace};
 
@@ -33,6 +35,7 @@ use crate::{
     authentication::oauth::OAuthError,
     config::RequestConfig,
     error::{HttpError, HttpResult},
+    http_client::SupportedPathBuilder,
     media::MediaError,
 };
 
@@ -77,6 +80,9 @@ impl<R> SendRequest<R> {
 impl<R> IntoFuture for SendRequest<R>
 where
     R: OutgoingRequest + Clone + Debug + SendOutsideWasm + SyncOutsideWasm + 'static,
+    for<'a> R::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
+    R::PathBuilder: SupportedPathBuilder,
+    for<'a> <R::PathBuilder as PathBuilder>::Input<'a>: SendOutsideWasm + SyncOutsideWasm,
     R::IncomingResponse: SendOutsideWasm + SyncOutsideWasm,
     HttpError: From<FromHttpResponseError<R::EndpointError>>,
 {

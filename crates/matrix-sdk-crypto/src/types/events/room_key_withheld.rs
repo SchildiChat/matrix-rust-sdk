@@ -17,7 +17,9 @@
 use std::collections::BTreeMap;
 
 use matrix_sdk_common::deserialized_responses::WithheldCode;
-use ruma::{events::AnyToDeviceEventContent, serde::JsonCastable, OwnedDeviceId, OwnedRoomId};
+use ruma::{
+    events::AnyToDeviceEventContent, serde::JsonCastable, OwnedDeviceId, OwnedRoomId, RoomId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vodozemac::Curve25519PublicKey;
@@ -63,7 +65,8 @@ macro_rules! construct_withheld_content {
             WithheldCode::Blacklisted
             | WithheldCode::Unverified
             | WithheldCode::Unauthorised
-            | WithheldCode::Unavailable => {
+            | WithheldCode::Unavailable
+            | WithheldCode::HistoryNotShared => {
                 let content = CommonWithheldCodeContent {
                     $room_id,
                     $session_id,
@@ -82,7 +85,9 @@ macro_rules! construct_withheld_content {
                         .into(),
                 ))
             }
-            _ => unreachable!("Can't create an unknown withheld code content"),
+            WithheldCode::_Custom(_) => {
+                unreachable!("Can't create an unknown withheld code content")
+            }
         }
     };
 }
@@ -149,6 +154,27 @@ impl RoomKeyWithheldContent {
             RoomKeyWithheldContent::Unknown(c) => c.algorithm.to_owned(),
         }
     }
+
+    /// Get the room ID of the withheld session, if known
+    pub fn room_id(&self) -> Option<&RoomId> {
+        match &self {
+            RoomKeyWithheldContent::MegolmV1AesSha2(c) => c.room_id(),
+            #[cfg(feature = "experimental-algorithms")]
+            RoomKeyWithheldContent::MegolmV2AesSha2(c) => c.room_id(),
+            RoomKeyWithheldContent::Unknown(_) => None,
+        }
+    }
+
+    /// Get the megolm session ID of the withheld session, if it is in fact a
+    /// megolm session.
+    pub fn megolm_session_id(&self) -> Option<&str> {
+        match &self {
+            RoomKeyWithheldContent::MegolmV1AesSha2(c) => c.session_id(),
+            #[cfg(feature = "experimental-algorithms")]
+            RoomKeyWithheldContent::MegolmV2AesSha2(c) => c.session_id(),
+            RoomKeyWithheldContent::Unknown(_) => None,
+        }
+    }
 }
 
 impl EventType for RoomKeyWithheldContent {
@@ -178,6 +204,9 @@ pub enum MegolmV1AesSha2WithheldContent {
     Unauthorised(Box<CommonWithheldCodeContent>),
     /// The `m.unavailable` variant of the withheld code content.
     Unavailable(Box<CommonWithheldCodeContent>),
+    /// The `m.history_not_shared` variant of the withheld code content (cf
+    /// [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268)).
+    HistoryNotShared(Box<CommonWithheldCodeContent>),
     /// The `m.no_olm` variant of the withheld code content.
     NoOlm(Box<NoOlmWithheldContent>),
 }
@@ -223,6 +252,32 @@ impl CommonWithheldCodeContent {
 }
 
 impl MegolmV1AesSha2WithheldContent {
+    /// Get the session ID for this content, if available.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            MegolmV1AesSha2WithheldContent::BlackListed(content)
+            | MegolmV1AesSha2WithheldContent::Unverified(content)
+            | MegolmV1AesSha2WithheldContent::Unauthorised(content)
+            | MegolmV1AesSha2WithheldContent::Unavailable(content)
+            | MegolmV1AesSha2WithheldContent::HistoryNotShared(content) => {
+                Some(&content.session_id)
+            }
+            MegolmV1AesSha2WithheldContent::NoOlm(_) => None,
+        }
+    }
+
+    /// Get the room ID for this content, if available.
+    pub fn room_id(&self) -> Option<&RoomId> {
+        match self {
+            MegolmV1AesSha2WithheldContent::BlackListed(content)
+            | MegolmV1AesSha2WithheldContent::Unverified(content)
+            | MegolmV1AesSha2WithheldContent::Unauthorised(content)
+            | MegolmV1AesSha2WithheldContent::Unavailable(content)
+            | MegolmV1AesSha2WithheldContent::HistoryNotShared(content) => Some(&content.room_id),
+            MegolmV1AesSha2WithheldContent::NoOlm(_) => None,
+        }
+    }
+
     /// Get the withheld code for this content
     pub fn withheld_code(&self) -> WithheldCode {
         match self {
@@ -230,6 +285,7 @@ impl MegolmV1AesSha2WithheldContent {
             MegolmV1AesSha2WithheldContent::Unverified(_) => WithheldCode::Unverified,
             MegolmV1AesSha2WithheldContent::Unauthorised(_) => WithheldCode::Unauthorised,
             MegolmV1AesSha2WithheldContent::Unavailable(_) => WithheldCode::Unavailable,
+            MegolmV1AesSha2WithheldContent::HistoryNotShared(_) => WithheldCode::HistoryNotShared,
             MegolmV1AesSha2WithheldContent::NoOlm(_) => WithheldCode::NoOlm,
         }
     }
@@ -242,7 +298,10 @@ impl MegolmV1AesSha2WithheldContent {
             WithheldCode::Unverified => Self::Unverified(content),
             WithheldCode::Unauthorised => Self::Unauthorised(content),
             WithheldCode::Unavailable => Self::Unavailable(content),
-            _ => unreachable!("This constructor requires one of the common withheld codes"),
+            WithheldCode::HistoryNotShared => Self::HistoryNotShared(content),
+            WithheldCode::NoOlm | WithheldCode::_Custom(_) => {
+                unreachable!("This constructor requires one of the common withheld codes")
+            }
         }
     }
 }
@@ -325,14 +384,15 @@ impl TryFrom<WithheldHelper> for RoomKeyWithheldContent {
                 WithheldCode::Blacklisted
                 | WithheldCode::Unverified
                 | WithheldCode::Unauthorised
-                | WithheldCode::Unavailable => {
+                | WithheldCode::Unavailable
+                | WithheldCode::HistoryNotShared => {
                     let content: CommonWithheldCodeContent = serde_json::from_value(value.other)?;
 
                     Self::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::from_code_and_content(
                         value.code, content,
                     ))
                 }
-                _ => unknown(value)?,
+                WithheldCode::_Custom(_) => unknown(value)?,
             },
             #[cfg(feature = "experimental-algorithms")]
             EventEncryptionAlgorithm::MegolmV2AesSha2 => match value.code {
@@ -343,14 +403,15 @@ impl TryFrom<WithheldHelper> for RoomKeyWithheldContent {
                 WithheldCode::Blacklisted
                 | WithheldCode::Unverified
                 | WithheldCode::Unauthorised
-                | WithheldCode::Unavailable => {
+                | WithheldCode::Unavailable
+                | WithheldCode::HistoryNotShared => {
                     let content: CommonWithheldCodeContent = serde_json::from_value(value.other)?;
 
                     Self::MegolmV1AesSha2(MegolmV1AesSha2WithheldContent::from_code_and_content(
                         value.code, content,
                     ))
                 }
-                _ => unknown(value)?,
+                WithheldCode::_Custom(_) => unknown(value)?,
             },
             _ => unknown(value)?,
         })
@@ -373,7 +434,8 @@ impl Serialize for RoomKeyWithheldContent {
                     MegolmV1AesSha2WithheldContent::BlackListed(content)
                     | MegolmV1AesSha2WithheldContent::Unverified(content)
                     | MegolmV1AesSha2WithheldContent::Unauthorised(content)
-                    | MegolmV1AesSha2WithheldContent::Unavailable(content) => WithheldHelper {
+                    | MegolmV1AesSha2WithheldContent::Unavailable(content)
+                    | MegolmV1AesSha2WithheldContent::HistoryNotShared(content) => WithheldHelper {
                         algorithm,
                         code,
                         reason,
@@ -396,7 +458,8 @@ impl Serialize for RoomKeyWithheldContent {
                     MegolmV1AesSha2WithheldContent::BlackListed(content)
                     | MegolmV1AesSha2WithheldContent::Unverified(content)
                     | MegolmV1AesSha2WithheldContent::Unauthorised(content)
-                    | MegolmV1AesSha2WithheldContent::Unavailable(content) => WithheldHelper {
+                    | MegolmV1AesSha2WithheldContent::Unavailable(content)
+                    | MegolmV1AesSha2WithheldContent::HistoryNotShared(content) => WithheldHelper {
                         algorithm,
                         code,
                         reason,
@@ -510,6 +573,7 @@ pub(super) mod tests {
             WithheldCode::Blacklisted,
             WithheldCode::Unauthorised,
             WithheldCode::Unavailable,
+            WithheldCode::HistoryNotShared,
         ];
         for code in codes {
             let json = json(&code);

@@ -28,12 +28,11 @@ use matrix_sdk_crypto::{
     },
     store::{
         types::{
-            BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
-            StoredRoomKeyBundleData,
+            BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
+            RoomKeyWithheldEntry, RoomSettings, StoredRoomKeyBundleData,
         },
         CryptoStore,
     },
-    types::events::room_key_withheld::RoomKeyWithheldEvent,
     Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
 use matrix_sdk_store_encryption::StoreCipher;
@@ -288,6 +287,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
                 "../migrations/crypto_store/011_received_room_key_bundles_with_curve_key.sql"
             ))?;
             txn.set_db_version(11)
+        })
+        .await?;
+    }
+
+    if version < 12 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/012_withheld_code_by_room.sql"
+            ))?;
+            txn.set_db_version(12)
         })
         .await?;
     }
@@ -763,6 +772,14 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             )
             .await
             .optional()?)
+    }
+
+    async fn get_withheld_sessions_by_room_id(&self, room_id: Key) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .prepare("SELECT data FROM direct_withheld_info WHERE room_id = ?1", |mut stmt| {
+                stmt.query((room_id,))?.mapped(|row| row.get(0)).collect()
+            })
+            .await?)
     }
 
     async fn get_room_settings(&self, room_id: Key) -> Result<Option<Vec<u8>>> {
@@ -1379,7 +1396,7 @@ impl CryptoStore for SqliteCryptoStore {
         &self,
         room_id: &RoomId,
         session_id: &str,
-    ) -> Result<Option<RoomKeyWithheldEvent>> {
+    ) -> Result<Option<RoomKeyWithheldEntry>> {
         let room_id = self.encode_key("direct_withheld_info", room_id);
         let session_id = self.encode_key("direct_withheld_info", session_id);
 
@@ -1388,10 +1405,25 @@ impl CryptoStore for SqliteCryptoStore {
             .get_direct_withheld_info(session_id, room_id)
             .await?
             .map(|value| {
-                let info = self.deserialize_json::<RoomKeyWithheldEvent>(&value)?;
+                let info = self.deserialize_json::<RoomKeyWithheldEntry>(&value)?;
                 Ok(info)
             })
             .transpose()
+    }
+
+    async fn get_withheld_sessions_by_room_id(
+        &self,
+        room_id: &RoomId,
+    ) -> matrix_sdk_crypto::store::Result<Vec<RoomKeyWithheldEntry>, Self::Error> {
+        let room_id = self.encode_key("direct_withheld_info", room_id);
+
+        self.acquire()
+            .await?
+            .get_withheld_sessions_by_room_id(room_id)
+            .await?
+            .into_iter()
+            .map(|value| self.deserialize_json(&value))
+            .collect()
     }
 
     async fn get_room_settings(&self, room_id: &RoomId) -> Result<Option<RoomSettings>> {

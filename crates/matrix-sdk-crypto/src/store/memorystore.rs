@@ -45,7 +45,7 @@ use crate::{
         OutboundGroupSession, PickledAccount, PickledInboundGroupSession, PickledSession,
         PrivateCrossSigningIdentity, SenderDataType, StaticAccountData,
     },
-    types::events::room_key_withheld::RoomKeyWithheldEvent,
+    store::types::RoomKeyWithheldEntry,
 };
 
 fn encode_key_info(info: &SecretInfo) -> String {
@@ -97,7 +97,7 @@ pub struct MemoryStore {
     identities: StdRwLock<HashMap<OwnedUserId, String>>,
     outgoing_key_requests: StdRwLock<HashMap<OwnedTransactionId, GossipRequest>>,
     key_requests_by_info: StdRwLock<HashMap<String, OwnedTransactionId>>,
-    direct_withheld_info: StdRwLock<HashMap<OwnedRoomId, HashMap<String, RoomKeyWithheldEvent>>>,
+    direct_withheld_info: StdRwLock<HashMap<OwnedRoomId, HashMap<String, RoomKeyWithheldEntry>>>,
     custom_values: StdRwLock<HashMap<String, Vec<u8>>>,
     leases: StdRwLock<HashMap<String, (String, Instant)>>,
     secret_inbox: StdRwLock<HashMap<String, Vec<GossippedSecret>>>,
@@ -420,12 +420,24 @@ impl CryptoStore for MemoryStore {
         &self,
         room_id: &RoomId,
         session_id: &str,
-    ) -> Result<Option<RoomKeyWithheldEvent>> {
+    ) -> Result<Option<RoomKeyWithheldEntry>> {
         Ok(self
             .direct_withheld_info
             .read()
             .get(room_id)
             .and_then(|e| Some(e.get(session_id)?.to_owned())))
+    }
+
+    async fn get_withheld_sessions_by_room_id(
+        &self,
+        room_id: &RoomId,
+    ) -> crate::store::Result<Vec<RoomKeyWithheldEntry>, Self::Error> {
+        Ok(self
+            .direct_withheld_info
+            .read()
+            .get(room_id)
+            .map(|e| e.values().cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn get_inbound_group_sessions(&self) -> Result<Vec<InboundGroupSession>> {
@@ -1272,11 +1284,10 @@ mod integration_tests {
         store::{
             types::{
                 BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-                RoomSettings, StoredRoomKeyBundleData, TrackedUser,
+                RoomKeyWithheldEntry, RoomSettings, StoredRoomKeyBundleData, TrackedUser,
             },
             CryptoStore,
         },
-        types::events::room_key_withheld::RoomKeyWithheldEvent,
         Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, Session, UserIdentityData,
     };
 
@@ -1372,8 +1383,15 @@ mod integration_tests {
             &self,
             room_id: &RoomId,
             session_id: &str,
-        ) -> Result<Option<RoomKeyWithheldEvent>, Self::Error> {
+        ) -> Result<Option<RoomKeyWithheldEntry>, Self::Error> {
             self.0.get_withheld_info(room_id, session_id).await
+        }
+
+        async fn get_withheld_sessions_by_room_id(
+            &self,
+            room_id: &RoomId,
+        ) -> Result<Vec<RoomKeyWithheldEntry>, Self::Error> {
+            self.0.get_withheld_sessions_by_room_id(room_id).await
         }
 
         async fn get_inbound_group_sessions(
