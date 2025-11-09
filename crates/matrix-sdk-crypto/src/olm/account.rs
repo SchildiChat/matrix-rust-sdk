@@ -1694,10 +1694,40 @@ impl Account {
     /// If the plaintext of the decrypted message includes a
     /// `sender_device_keys` property per [MSC4147], check that it is valid.
     ///
+    /// In particular, we check that:
+    ///
+    ///  * The Curve25519 key in the `sender_device_keys` matches that used to
+    ///    establish the Olm session that was used to decrypt the event.
+    ///
+    ///  * The `sender_device_keys` contains a valid self-signature by the
+    ///    Ed25519 key in the device data.
+    ///
+    ///  * The Ed25519 key in the device data matches that in the `keys` field
+    ///    in the event, for consistency and sanity.
+    ///
+    /// The first two checks are sufficient to bind together the Ed25519 and
+    /// Curve25519 keys:
+    ///
+    ///  * Only the holder of the secret part of the Curve25519 key that was
+    ///    used to construct the Olm session (the 'owner' of that key) can
+    ///    encrypt the device data in that Olm session. By including the Ed25519
+    ///    key in the device data, the owner of the Curve25519 key is claiming
+    ///    ownership of the Ed25519 key.
+    ///
+    ///  * Only the owner of the Ed25519 key can construct the self-signature on
+    ///    the device data. By including the Curve25519 key in the device data
+    ///    and then signing it, the owner of the Ed25519 key is claiming
+    ///    ownership of the Curve25519 key.
+    ///
+    ///  * Since we now have claims in both directions, the two key owners must
+    ///    either be the same entity, or working in sufficiently close
+    ///    collaboration that they can be treated as such.
+    ///
     /// # Arguments
     ///
     /// * `event` - The decrypted and deserialized plaintext of the event.
-    /// * `sender_key` - The curve25519 key of the sender of the event.
+    /// * `sender_key` - The Curve25519 key that the sender used to establish
+    ///   the Olm session that was used to decrypt the event.
     ///
     /// [MSC4147]: https://github.com/matrix-org/matrix-spec-proposals/pull/4147
     fn check_sender_device_keys(
@@ -1709,7 +1739,7 @@ impl Account {
         };
 
         // Check the signature within the device_keys structure
-        let sender_device_data = DeviceData::try_from(sender_device_keys).map_err(|err| {
+        sender_device_keys.check_self_signature().map_err(|err| {
             warn!(
                 "Received a to-device message with sender_device_keys with \
                  invalid signature: {err:?}",
@@ -1719,23 +1749,23 @@ impl Account {
 
         // Check that the Ed25519 key in the sender_device_keys matches the `ed25519`
         // key in the `keys` field in the event.
-        if sender_device_data.ed25519_key() != Some(event.keys().ed25519) {
+        if sender_device_keys.ed25519_key() != Some(event.keys().ed25519) {
             warn!(
                 "Received a to-device message with sender_device_keys with incorrect \
                  ed25519 key: expected {:?}, got {:?}",
                 event.keys().ed25519,
-                sender_device_data.ed25519_key(),
+                sender_device_keys.ed25519_key(),
             );
             return Err(OlmError::EventError(EventError::InvalidSenderDeviceKeys));
         }
 
         // Check that the Curve25519 key in the sender_device_keys matches the key that
         // was used for the Olm session.
-        if sender_device_data.curve25519_key() != Some(sender_key) {
+        if sender_device_keys.curve25519_key() != Some(sender_key) {
             warn!(
                 "Received a to-device message with sender_device_keys with incorrect \
                  curve25519 key: expected {sender_key:?}, got {:?}",
-                sender_device_data.curve25519_key(),
+                sender_device_keys.curve25519_key(),
             );
             return Err(OlmError::EventError(EventError::InvalidSenderDeviceKeys));
         }

@@ -430,9 +430,9 @@ impl OAuth {
     /// let task = tokio::spawn(async move {
     ///     while let Some(state) = progress.next().await {
     ///         match state {
-    ///             LoginProgress::Starting => (),
-    ///             LoginProgress::EstablishingSecureChannel { check_code } => {
-    ///                 let code = check_code.to_digit();
+    ///             LoginProgress::Starting | LoginProgress::SyncingSecrets => (),
+    ///             LoginProgress::EstablishingSecureChannel(progress) => {
+    ///                 let code = progress.check_code.to_digit();
     ///                 println!("Please enter the following code into the other device {code:02}");
     ///             },
     ///             LoginProgress::WaitingForToken { user_code } => {

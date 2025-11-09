@@ -11,15 +11,25 @@ All notable changes to this project will be documented in this file.
 - [**breaking**] Add `encryption::secret_storage::SecretStorageError::ImportError` to indicate
   an error that occurred when importing a secret from secret storage.
   ([#5647](https://github.com/matrix-org/matrix-rust-sdk/pull/5647))
+- [**breaking**] Add `authentication::oauth::qrcode::login::LoginProgress::SyncingSecrets` to
+  indicate that secrets are being synced between the two devices.
+  ([#5760](https://github.com/matrix-org/matrix-rust-sdk/pull/5760))
 
 ### Refactor
 
+- [**breaking**]: The `waveform` field was moved from `AttachmentInfo::Voice` to `BaseAudioInfo`,
+  allowing to set it for any audio message. Its format also changed, and it is now a list of `f32`
+  between 0 and 1.
+  ([#5732](https://github.com/matrix-org/matrix-rust-sdk/pull/5732))
 - [**breaking**] The `caption` and `formatted_caption` fields and methods of `AttachmentConfig`,
   `GalleryConfig` and `GalleryItemInfo` have been merged into a single field that uses
   `TextMessageEventContent`.
   ([#5733](https://github.com/matrix-org/matrix-rust-sdk/pull/5733))
 - The Matrix SDK crate now uses the 2024 edition of Rust.
   ([#5677](https://github.com/matrix-org/matrix-rust-sdk/pull/5677))
+- [**breaking**] Make `LoginProgress::EstablishingSecureChannel` generic in order to reuse it
+  for the currently missing QR login flow.
+  ([#5750](https://github.com/matrix-org/matrix-rust-sdk/pull/5750))
 
 ### Bugfix
 
