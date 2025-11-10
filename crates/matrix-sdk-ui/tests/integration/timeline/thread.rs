@@ -30,6 +30,7 @@ use matrix_sdk_test::{
 };
 use matrix_sdk_ui::timeline::{
     RoomExt as _, TimelineBuilder, TimelineDetails, TimelineEventItemId, TimelineFocus,
+    VirtualTimelineItem,
 };
 use ruma::{
     MilliSecondsSinceUnixEpoch,
@@ -1719,11 +1720,16 @@ async fn test_send_read_receipts() {
     assert_eq!(ev.event_id(), Some(event_id!("$2")));
     assert!(ev.read_receipts().is_empty());
 
-    let ev = initial_items[3].as_event().unwrap();
+    // Since the room has no `m.fully_read` event, the read marker falls back to
+    // the normal read receipt.
+    let ev = initial_items[3].as_virtual().unwrap();
+    assert!(matches!(ev, VirtualTimelineItem::ReadMarker));
+
+    let ev = initial_items[4].as_event().unwrap();
     assert_eq!(ev.event_id(), Some(event_id!("$3")));
     assert!(ev.read_receipts().is_empty());
 
-    let ev = initial_items[4].as_event().unwrap();
+    let ev = initial_items[5].as_event().unwrap();
     assert_eq!(ev.event_id(), Some(event_id!("$4")));
     let rr = ev.read_receipts();
     assert_eq!(rr.len(), 1);
@@ -1824,7 +1830,6 @@ async fn test_permalink_doesnt_listen_to_thread_sync() {
     let room_id = room_id!("!a:b.c");
     let room = server.sync_joined_room(&client, room_id).await;
 
-    // But an event-focused timeline, focused on an in-thread event, is threaded \o/
     let f = EventFactory::new().sender(&ALICE).room(room_id);
     let thread_root = event_id!("$thread_root");
     let event = f
@@ -1889,4 +1894,177 @@ async fn test_permalink_doesnt_listen_to_thread_sync() {
 
     // The stream should still be pending!
     assert_pending!(stream);
+}
+
+#[async_test]
+async fn test_redacted_replied_to_is_updated() {
+    // When we're in a thread, and the thread has one thread reply, and another
+    // in-thread reply to the first threaded reply; if the first threaded reply
+    // is redacted, the second in-thread reply should have its replied-to
+    // information updated correctly.
+    let server = MatrixMockServer::new().await;
+
+    let client = client_with_threading_support(&server).await;
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!a:b.c");
+    let f = EventFactory::new().sender(&ALICE).room(room_id);
+    let thread_root = event_id!("$thread_root");
+    let first_reply = event_id!("$first_reply");
+    let second_reply = event_id!("$second_reply");
+
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.to_owned() })
+        .build()
+        .await
+        .unwrap();
+
+    // Subscribe to the timeline changes.
+    let (initial_items, mut stream) = timeline.subscribe().await;
+    assert!(initial_items.is_empty());
+    assert_pending!(stream);
+
+    // After syncing the initial thread content,
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("hey to you too!")
+                        .event_id(first_reply)
+                        .in_thread(thread_root, thread_root),
+                )
+                .add_timeline_event(
+                    f.text_msg("how are you doing?")
+                        .event_id(second_reply)
+                        .in_thread_reply(thread_root, first_reply),
+                ),
+        )
+        .await;
+
+    // The timeline sees the new events.
+    assert_let_timeout!(Some(timeline_updates) = stream.next());
+    assert_eq!(timeline_updates.len(), 3);
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
+    let ev1 = value.as_event().unwrap();
+    assert_eq!(ev1.event_id(), Some(first_reply));
+
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[1]);
+    let ev2 = value.as_event().unwrap();
+    assert_eq!(ev2.event_id(), Some(second_reply));
+
+    let msglike = ev2.content().as_msglike().unwrap();
+    let in_reply_to = msglike.in_reply_to.as_ref().unwrap();
+    assert_eq!(in_reply_to.event_id, first_reply);
+    assert_let!(TimelineDetails::Ready(replied_to) = &in_reply_to.event);
+    assert!(replied_to.content.is_message());
+
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[2]);
+    assert!(value.is_date_divider());
+
+    // When the first reply is redacted,
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(first_reply).event_id(event_id!("$redaction"))),
+        )
+        .await;
+
+    // The timeline sees the redaction as a removal,
+    assert_let_timeout!(Some(timeline_updates) = stream.next());
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::Remove { index: 1 } = &timeline_updates[0]);
+
+    // And then the replied-to update happens independently.
+    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[1]);
+    let ev2 = value.as_event().unwrap();
+    assert_eq!(ev2.event_id(), Some(second_reply));
+    let msglike = ev2.content().as_msglike().unwrap();
+    let in_reply_to = msglike.in_reply_to.as_ref().unwrap();
+    assert_eq!(in_reply_to.event_id, first_reply);
+    assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
+    assert!(replied_to_event.content.is_redacted());
+}
+
+#[async_test]
+async fn test_redaction_affects_thread_summary() {
+    // When an in-thread event is being redacted, the thread summary of the root
+    // will be correctly updated.
+
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!a:b.c");
+    let f = EventFactory::new().room(room_id).sender(&ALICE);
+
+    let thread_root = event_id!("$thread_root");
+    let thread_reply = event_id!("$thread_reply");
+
+    // Start with an initial sync with a thread root and a threaded reply.
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("thread root").event_id(thread_root))
+                .add_timeline_event(
+                    f.text_msg("thread reply")
+                        .in_thread(thread_root, thread_root)
+                        .event_id(thread_reply),
+                ),
+        )
+        .await;
+
+    // Create a main timeline.
+    let timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Live { hide_threaded_events: true })
+        .build()
+        .await
+        .unwrap();
+
+    let (mut initial_items, mut stream) = timeline.subscribe().await;
+
+    // Wait for the timeline's state to stabilize.
+    if initial_items.is_empty() {
+        assert_let_timeout!(Some(timeline_updates) = stream.next());
+        for up in timeline_updates {
+            up.apply(&mut initial_items);
+        }
+    }
+
+    assert_eq!(initial_items.len(), 2);
+    assert!(initial_items[0].is_date_divider());
+
+    // The root has a summary.
+    let event_item = initial_items[1].as_event().unwrap();
+    assert_eq!(event_item.event_id(), Some(thread_root));
+    let summary = event_item.content().as_msglike().unwrap().thread_summary.as_ref().unwrap();
+    assert_eq!(summary.num_replies, 1);
+    assert_let!(TimelineDetails::Ready(embedded) = &summary.latest_event);
+    assert_eq!(embedded.identifier, TimelineEventItemId::EventId(thread_reply.to_owned()));
+
+    assert_pending!(stream);
+
+    // We receive a redaction over sync for the one reply to the thread root.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(thread_reply).event_id(event_id!("$redaction"))),
+        )
+        .await;
+
+    // The thread summary has disappeared!
+    assert_let_timeout!(Some(timeline_updates) = stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[0]);
+    let event_item = value.as_event().unwrap();
+    assert_eq!(event_item.event_id(), Some(thread_root));
+    assert!(event_item.content().as_msglike().unwrap().thread_summary.is_none());
 }

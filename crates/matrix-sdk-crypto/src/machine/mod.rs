@@ -897,7 +897,7 @@ impl OlmMachine {
         // This function is only ever called by add_room_key via
         // handle_decrypted_to_device_event, so sender, sender_key, and algorithm are
         // already recorded.
-        fields(room_id = ? content.room_id, session_id, message_index)
+        fields(room_id = ? content.room_id, session_id, message_index, shared_history = content.shared_history)
     )]
     async fn handle_key(
         &self,
@@ -1003,14 +1003,16 @@ impl OlmMachine {
 
         if let RoomKeyWithheldContent::MegolmV1AesSha2(
             MegolmV1AesSha2WithheldContent::BlackListed(c)
-            | MegolmV1AesSha2WithheldContent::Unverified(c),
+            | MegolmV1AesSha2WithheldContent::Unverified(c)
+            | MegolmV1AesSha2WithheldContent::Unauthorised(c)
+            | MegolmV1AesSha2WithheldContent::Unavailable(c),
         ) = &event.content
         {
             changes
                 .withheld_session_info
                 .entry(c.room_id.to_owned())
                 .or_default()
-                .insert(c.session_id.to_owned(), event.to_owned());
+                .insert(c.session_id.to_owned(), event.to_owned().into());
         }
     }
 

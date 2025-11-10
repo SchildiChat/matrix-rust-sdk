@@ -388,6 +388,11 @@ impl Timeline {
         Ok(())
     }
 
+    /// Returns the [`EventId`] of the latest event in the timeline.
+    pub async fn latest_event_id(&self) -> Option<String> {
+        self.inner.latest_event().await.and_then(|event| event.event_id().map(ToString::to_string))
+    }
+
     /// Queues an event in the room's send queue so it's processed for
     /// sending later.
     ///
@@ -447,14 +452,12 @@ impl Timeline {
         self: Arc<Self>,
         params: UploadParameters,
         audio_info: AudioInfo,
-        waveform: Vec<u16>,
+        waveform: Vec<f32>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Voice {
-            audio_info: BaseAudioInfo::try_from(&audio_info)
-                .map_err(|_| RoomError::InvalidAttachmentData)?,
-            waveform: Some(waveform),
-        };
-        self.send_attachment(params, attachment_info, audio_info.mimetype, None)
+        let mut info =
+            BaseAudioInfo::try_from(&audio_info).map_err(|_| RoomError::InvalidAttachmentData)?;
+        info.waveform = Some(waveform);
+        self.send_attachment(params, AttachmentInfo::Voice(info), audio_info.mimetype, None)
     }
 
     pub fn send_file(

@@ -5,7 +5,7 @@ expression: bundle
 {
   "room_keys": [
     {
-      "algorithm": "m.megolm.v1.aes-sha2",
+      "algorithm": "[algorithm]",
       "room_id": "!room1:localhost",
       "sender_key": "[alice curve key]",
       "session_id": "AWcCd1w7VlIPYaZeB53LqfgHbQxYjWMY/bCJ7E5ZsVI",
@@ -15,7 +15,7 @@ expression: bundle
       }
     },
     {
-      "algorithm": "m.megolm.v1.aes-sha2",
+      "algorithm": "[algorithm]",
       "room_id": "!room1:localhost",
       "sender_key": "[alice curve key]",
       "session_id": "y1i8rPyf5MMnB0tenJPrMqWO6oAMCKi536z+KrH0tic",
@@ -27,10 +27,10 @@ expression: bundle
   ],
   "withheld": [
     {
-      "algorithm": "m.megolm.v1.aes-sha2",
-      "code": "m.unauthorised",
+      "algorithm": "[algorithm]",
+      "code": "io.element.msc4268.history_not_shared",
       "from_device": "BOB",
-      "reason": "You are not authorised to read the message.",
+      "reason": "The sender disabled sharing encrypted history.",
       "room_id": "!room1:localhost",
       "sender_key": "[alice curve key]",
       "session_id": "lpRzTgD3Nook/Wk62Fm9ECWGnKYZgeCwO1Y+uuPJz/I"

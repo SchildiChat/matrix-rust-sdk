@@ -17,10 +17,10 @@ use std::{borrow::Cow, sync::Arc};
 use as_variant::as_variant;
 use indexmap::IndexMap;
 use matrix_sdk::{
-    crypto::types::events::UtdCause,
     deserialized_responses::{EncryptionInfo, UnableToDecryptInfo},
     send_queue::SendHandle,
 };
+use matrix_sdk_base::crypto::types::events::UtdCause;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
     TransactionId,
@@ -600,7 +600,12 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             &self.meta.room_version_rules,
         ) {
             // Update all events that replied to this message with the edited content.
-            Self::maybe_update_responses(self.meta, self.items, &edited_event_id, &new_item);
+            Self::maybe_update_responses(
+                self.meta,
+                self.items,
+                &edited_event_id,
+                EmbeddedEvent::from_timeline_item(&new_item),
+            );
         }
     }
 
@@ -702,17 +707,25 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             Aggregation::new(self.ctx.flow.timeline_item_id(), AggregationKind::Redaction);
         self.meta.aggregations.add(target.clone(), aggregation.clone());
 
-        if let Some(new_item) = find_item_and_apply_aggregation(
+        find_item_and_apply_aggregation(
             &self.meta.aggregations,
             self.items,
             &target,
             aggregation,
             &self.meta.room_version_rules,
-        ) {
-            // Look for any timeline event that's a reply to the redacted event, and redact
-            // the replied-to event there as well.
-            Self::maybe_update_responses(self.meta, self.items, &redacted, &new_item);
-        }
+        );
+
+        // Even if the redacted event wasn't in the timeline, we can always update
+        // responses with a placeholder "redacted" embedded item.
+        let embedded_event = EmbeddedEvent {
+            content: TimelineItemContent::MsgLike(MsgLikeContent::redacted()),
+            sender: self.ctx.sender.clone(),
+            sender_profile: TimelineDetails::from_initial_value(self.ctx.sender_profile.clone()),
+            timestamp: self.ctx.timestamp,
+            identifier: TimelineEventItemId::EventId(redacted.clone()),
+        };
+
+        Self::maybe_update_responses(self.meta, self.items, &redacted, embedded_event);
     }
 
     /// Attempts to redact an aggregation (e.g. a reaction, a poll response,
@@ -965,7 +978,12 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 trace!("Updating timeline item at position {idx}");
 
                 // Update all events that replied to this previously encrypted message.
-                Self::maybe_update_responses(self.meta, self.items, decrypted_event_id, &item);
+                Self::maybe_update_responses(
+                    self.meta,
+                    self.items,
+                    decrypted_event_id,
+                    EmbeddedEvent::from_timeline_item(&item),
+                );
 
                 let internal_id = self.items[*idx].internal_id.clone();
                 self.items.replace(*idx, TimelineItem::new(item, internal_id));
@@ -1036,7 +1054,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         meta: &mut TimelineMetadata,
         items: &mut ObservableItemsTransaction<'_>,
         target_event_id: &EventId,
-        new_item: &EventTimelineItem,
+        new_embedded_event: EmbeddedEvent,
     ) {
         let Some(replies) = meta.replies.get(target_event_id) else {
             trace!("item has no replies");
@@ -1065,9 +1083,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             trace!(reply_event_id = ?event_item.identifier(), "Updating response to updated event");
             let in_reply_to = InReplyToDetails {
                 event_id: in_reply_to.event_id.clone(),
-                event: TimelineDetails::Ready(Box::new(EmbeddedEvent::from_timeline_item(
-                    new_item,
-                ))),
+                event: TimelineDetails::Ready(Box::new(new_embedded_event.clone())),
             };
 
             let new_reply_content = TimelineItemContent::MsgLike(

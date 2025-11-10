@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Implement new method `CryptoStore::get_withheld_sessions_by_room_id`.
+  ([#5819](https://github.com/matrix-org/matrix-rust-sdk/pull/5819))
+- [**breaking**] `IndexeddbCryptoStore::get_withheld_info` now returns `Result<Option<RoomKeyWithheldEntry>, ...>`.
+  ([#5737](https://github.com/matrix-org/matrix-rust-sdk/pull/5737))
+
+### Performance
+
+- Improve performance of certain media queries in `MediaStore` implementation by storing media content and media metadata
+  in separate object stores in IndexedDB (see [#5795](https://github.com/matrix-org/matrix-rust-sdk/pull/5795)).
+
 ## [0.14.0] - 2025-09-04
 
 No notable changes in this release.
@@ -43,6 +55,7 @@ No notable changes in this release.
 
 - `save_change` performance improvement, all encryption and serialization
   is done now outside of the db transaction.
+
 ### Bug Fixes
 
 - Use the `DisplayName` struct to protect against homoglyph attacks.
