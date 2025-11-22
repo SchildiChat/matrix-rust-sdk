@@ -424,6 +424,17 @@ async fn test_retry_edit_decryption() {
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "This is Error");
 
+    let item =
+        assert_next_matches_with_timeout!(stream, VectorDiff::Set { index: 0, value } => value);
+
+    // TODO: We receive this update twice, since the event cache decrypts things as
+    // well as the timeline.
+    assert_matches!(item.encryption_info(), Some(_));
+    assert_matches!(item.latest_edit_json(), Some(_));
+    assert_let!(Some(msg) = item.content().as_message());
+    assert!(msg.is_edited());
+    assert_eq!(msg.body(), "This is Error");
+
     // (There are no more items)
     assert_pending!(stream);
 }
@@ -917,7 +928,9 @@ async fn test_retry_decryption_updates_reply() {
 
     // We receive the UTD.
     {
-        let event = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+        let event =
+            assert_next_matches_with_timeout!(stream, VectorDiff::PushBack { value } => value);
+
         assert_let!(
             TimelineItemContent::MsgLike(MsgLikeContent {
                 kind: MsgLikeKind::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 {

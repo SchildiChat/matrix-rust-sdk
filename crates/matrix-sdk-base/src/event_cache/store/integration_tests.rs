@@ -14,14 +14,17 @@
 
 //! Trait and macro of integration tests for `EventCacheStore` implementations.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use matrix_sdk_common::{
     deserialized_responses::{
         AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, TimelineEvent, TimelineEventKind,
-        VerificationState,
+        UnableToDecryptInfo, UnableToDecryptReason, VerificationState,
     },
     linked_chunk::{
         ChunkContent, ChunkIdentifier as CId, LinkedChunkId, Position, Update, lazy_loader,
@@ -47,6 +50,24 @@ use crate::event_cache::{Gap, store::DEFAULT_CHUNK_CAPACITY};
 /// Keep in sync with [`check_test_event`].
 pub fn make_test_event(room_id: &RoomId, content: &str) -> TimelineEvent {
     make_test_event_with_event_id(room_id, content, None)
+}
+
+/// Create a `m.room.encrypted` test event with all data filled, for testing
+/// that linked chunk correctly stores event data for encrypted events.
+pub fn make_encrypted_test_event(room_id: &RoomId, session_id: &str) -> TimelineEvent {
+    let device_id = "DEVICEID";
+    let builder = EventFactory::new()
+        .encrypted("", "curve_key", device_id, session_id)
+        .room(room_id)
+        .sender(*ALICE);
+
+    let event = builder.into_raw();
+    let utd_info = UnableToDecryptInfo {
+        session_id: Some(session_id.to_owned()),
+        reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+    };
+
+    TimelineEvent::from_utd(event, utd_info)
 }
 
 /// Same as [`make_test_event`], with an extra event id.
@@ -143,6 +164,9 @@ pub trait EventCacheStoreIntegrationTests {
 
     /// Test that getting all events in a room works as expected.
     async fn test_get_room_events(&self);
+
+    /// Test that getting events in a room of a certain type works as expected.
+    async fn test_get_room_events_filtered(&self);
 
     /// Test that saving an event works as expected.
     async fn test_save_event(&self);
@@ -962,7 +986,10 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         .unwrap();
 
         // Now let's find the events.
-        let events = self.get_room_events(room_id).await.expect("failed to query for room events");
+        let events = self
+            .get_room_events(room_id, None, None)
+            .await
+            .expect("failed to query for room events");
 
         assert_eq!(events.len(), 2);
 
@@ -975,6 +1002,76 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
                 "Expected event {expected:?} not in got events: {got_ids:?}."
             );
         }
+    }
+
+    async fn test_get_room_events_filtered(&self) {
+        macro_rules! assert_expected_events {
+            ($events:expr, [$($item:expr),* $(,)?]) => {{
+                let got_ids: BTreeSet<_> = $events.into_iter().map(|ev| ev.event_id().unwrap()).collect();
+                let expected_ids = BTreeSet::from([$($item.event_id().unwrap()),*]);
+
+                assert_eq!(got_ids, expected_ids);
+            }};
+        }
+
+        let room_id = room_id!("!r0:matrix.org");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let another_room_id = room_id!("!r1:matrix.org");
+        let another_linked_chunk_id = LinkedChunkId::Room(another_room_id);
+
+        let event = |session_id: &str| make_encrypted_test_event(room_id, session_id);
+
+        let first_event = event("session_1");
+        let second_event = event("session_2");
+        let third_event = event("session_3");
+        let fourth_event = make_test_event(room_id, "It's a secret to everybody");
+
+        // Add one event in one room.
+        self.handle_linked_chunk_updates(
+            linked_chunk_id,
+            vec![
+                Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(0), 0),
+                    items: vec![first_event.clone(), second_event.clone(), fourth_event.clone()],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Add an event in a different room.
+        self.handle_linked_chunk_updates(
+            another_linked_chunk_id,
+            vec![
+                Update::NewItemsChunk { previous: None, new: CId::new(0), next: None },
+                Update::PushItems {
+                    at: Position::new(CId::new(0), 0),
+                    items: vec![third_event.clone()],
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Now let's find all the encrypted events of the first room.
+        let events = self
+            .get_room_events(room_id, Some("m.room.encrypted"), None)
+            .await
+            .expect("failed to query for room events");
+
+        assert_eq!(events.len(), 2);
+        assert_expected_events!(events, [first_event, second_event]);
+
+        // Now let's find all the encrypted events which were encrypted using the first
+        // session ID.
+        let events = self
+            .get_room_events(room_id, Some("m.room.encrypted"), Some("session_1"))
+            .await
+            .expect("failed to query for room events");
+
+        assert_eq!(events.len(), 1);
+        assert_expected_events!(events, [first_event]);
     }
 
     async fn test_save_event(&self) {
@@ -1265,6 +1362,13 @@ macro_rules! event_cache_store_integration_tests {
             }
 
             #[async_test]
+            async fn test_get_room_events_filtered() {
+                let event_cache_store =
+                    get_event_cache_store().await.unwrap().into_event_cache_store();
+                event_cache_store.test_get_room_events_filtered().await;
+            }
+
+            #[async_test]
             async fn test_save_event() {
                 let event_cache_store =
                     get_event_cache_store().await.unwrap().into_event_cache_store();
@@ -1304,57 +1408,57 @@ macro_rules! event_cache_store_integration_tests_time {
                 let store = get_event_cache_store().await.unwrap().into_event_cache_store();
 
                 let acquired0 = store.try_take_leased_lock(0, "key", "alice").await.unwrap();
-                assert!(acquired0);
+                assert_eq!(acquired0, Some(1)); // first lock generation
 
                 // Should extend the lease automatically (same holder).
                 let acquired2 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
-                assert!(acquired2);
+                assert_eq!(acquired2, Some(1)); // same lock generation
 
                 // Should extend the lease automatically (same holder + time is ok).
                 let acquired3 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
-                assert!(acquired3);
+                assert_eq!(acquired3, Some(1)); // same lock generation
 
                 // Another attempt at taking the lock should fail, because it's taken.
                 let acquired4 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
-                assert!(!acquired4);
+                assert!(acquired4.is_none()); // not acquired
 
                 // Even if we insist.
                 let acquired5 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
-                assert!(!acquired5);
+                assert!(acquired5.is_none()); // not acquired
 
                 // That's a nice test we got here, go take a little nap.
                 sleep(Duration::from_millis(50)).await;
 
                 // Still too early.
                 let acquired55 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
-                assert!(!acquired55);
+                assert!(acquired55.is_none()); // not acquired
 
                 // Ok you can take another nap then.
                 sleep(Duration::from_millis(250)).await;
 
                 // At some point, we do get the lock.
                 let acquired6 = store.try_take_leased_lock(0, "key", "bob").await.unwrap();
-                assert!(acquired6);
+                assert_eq!(acquired6, Some(2)); // new lock generation!
 
                 sleep(Duration::from_millis(1)).await;
 
                 // The other gets it almost immediately too.
                 let acquired7 = store.try_take_leased_lock(0, "key", "alice").await.unwrap();
-                assert!(acquired7);
+                assert_eq!(acquired7, Some(3)); // new lock generation!
 
                 sleep(Duration::from_millis(1)).await;
 
-                // But when we take a longer lease...
+                // But when we take a longer lease…
                 let acquired8 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
-                assert!(acquired8);
+                assert_eq!(acquired8, Some(4)); // new lock generation!
 
                 // It blocks the other user.
                 let acquired9 = store.try_take_leased_lock(300, "key", "alice").await.unwrap();
-                assert!(!acquired9);
+                assert!(acquired9.is_none()); // not acquired
 
                 // We can hold onto our lease.
                 let acquired10 = store.try_take_leased_lock(300, "key", "bob").await.unwrap();
-                assert!(acquired10);
+                assert_eq!(acquired10, Some(4)); // same lock generation
             }
         }
     };

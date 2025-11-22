@@ -1293,15 +1293,14 @@ async fn test_loading_states() -> Result<(), Error> {
             RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
         );
 
-        // The sync skips the `Init` state, and immediately starts in the `SettingUp`
-        // state, as the sync `pos`ition marker was set.
+        // The sync starts at the `Init` state but the `pos` marker is set to 3.
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = SettingUp => Running,
+            states = Init => SettingUp,
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
-                        "ranges": [[0, 11]],
+                        "ranges": [[0, 19]],
                         "timeline_limit": 1,
                     },
                 },
@@ -2907,7 +2906,12 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
             .mock_versions()
             .ok_custom(&["v1.11"], &features_map)
             .named("/versions, first time")
-            .mock_once()
+            // This used to be a `mock_once()`, but we're not caching the versions in the
+            // `RoomListService::new()` method anymore, so we're now doing a couple more requests
+            // for this. The sync will want to know about the `/versions` once it tries to build
+            // the request path.
+            .up_to_n_times(3)
+            .expect(3..)
             .mount()
             .await;
 
@@ -2989,6 +2993,8 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
                 },
             },
         };
+
+        mock_server.reset().await;
     }
 
     // Then, advertise support with support for MSC4306; the extension will be
@@ -2999,7 +3005,7 @@ async fn test_thread_subscriptions_extension_enabled_only_if_server_advertises_i
         .mock_versions()
         .ok_custom(&["v1.11"], &features_map)
         .named("/versions, second time")
-        .mock_once()
+        .up_to_n_times(2)
         .mount()
         .await;
 

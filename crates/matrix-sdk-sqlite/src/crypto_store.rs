@@ -20,7 +20,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
+use matrix_sdk_base::{cross_process_lock::CrossProcessLockGeneration, timer};
 use matrix_sdk_crypto::{
     olm::{
         InboundGroupSession, OutboundGroupSession, PickledInboundGroupSession,
@@ -46,6 +46,7 @@ use tracing::{debug, instrument, warn};
 use vodozemac::Curve25519PublicKey;
 
 use crate::{
+    connection::{Connection as SqliteAsyncConn, Pool as SqlitePool},
     error::{Error, Result},
     utils::{
         repeat_vars, EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
@@ -102,17 +103,12 @@ impl SqliteCryptoStore {
 
     /// Open the SQLite-based crypto store with the config open config.
     pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
-        let SqliteStoreConfig { path, pool_config, runtime_config, secret } = config;
+        fs::create_dir_all(&config.path).await.map_err(OpenStoreError::CreateDir)?;
 
-        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
+        let pool = config.build_pool_of_connections(DATABASE_NAME)?;
 
-        let mut config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
-        config.pool = Some(pool_config);
-
-        let pool = config.create_pool(Runtime::Tokio1)?;
-
-        let this = Self::open_with_pool(pool, secret).await?;
-        this.pool.get().await?.apply_runtime_config(runtime_config).await?;
+        let this = Self::open_with_pool(pool, config.secret).await?;
+        this.pool.get().await?.apply_runtime_config(config.runtime_config).await?;
 
         Ok(this)
     }
@@ -175,7 +171,7 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 11;
+const DATABASE_VERSION: u8 = 13;
 
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
@@ -297,6 +293,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
                 "../migrations/crypto_store/012_withheld_code_by_room.sql"
             ))?;
             txn.set_db_version(12)
+        })
+        .await?;
+    }
+
+    if version < 13 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/013_lease_locks_with_generation.sql"
+            ))?;
+            txn.set_db_version(13)
         })
         .await?;
     }
@@ -1488,37 +1494,52 @@ impl CryptoStore for SqliteCryptoStore {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn try_take_leased_lock(
         &self,
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<CrossProcessLockGeneration>> {
+        let _timer = timer!("method");
+
         let key = key.to_owned();
         let holder = holder.to_owned();
 
-        let now_ts: u64 = MilliSecondsSinceUnixEpoch::now().get().into();
-        let expiration_ts = now_ts + lease_duration_ms as u64;
+        let now: u64 = MilliSecondsSinceUnixEpoch::now().get().into();
+        let expiration = now + lease_duration_ms as u64;
 
-        let num_touched = self
+        // Learn about the `excluded` keyword in https://sqlite.org/lang_upsert.html.
+        let generation = self
             .acquire()
             .await?
             .with_transaction(move |txn| {
-                txn.execute(
-                    "INSERT INTO lease_locks (key, holder, expiration_ts)
+                txn.query_row(
+                    "INSERT INTO lease_locks (key, holder, expiration)
                     VALUES (?1, ?2, ?3)
                     ON CONFLICT (key)
                     DO
-                        UPDATE SET holder = ?2, expiration_ts = ?3
-                        WHERE holder = ?2
-                        OR expiration_ts < ?4
-                ",
-                    (key, holder, expiration_ts, now_ts),
+                        UPDATE SET
+                            holder = excluded.holder,
+                            expiration = excluded.expiration,
+                            generation =
+                                CASE holder
+                                    WHEN excluded.holder THEN generation
+                                    ELSE generation + 1
+                                END
+                        WHERE
+                            holder = excluded.holder
+                            OR expiration < ?4
+                    RETURNING generation
+                    ",
+                    (key, holder, expiration, now),
+                    |row| row.get(0),
                 )
+                .optional()
             })
             .await?;
 
-        Ok(num_touched == 1)
+        Ok(generation)
     }
 
     async fn next_batch_token(&self) -> Result<Option<String>, Self::Error> {

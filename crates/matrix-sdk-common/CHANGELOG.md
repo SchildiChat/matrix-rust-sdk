@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- [**breaking**] Cross-process lock can be dirty. The `CrossProcess::try_lock_once` now returns a new type `CrossProcessResult`, which is an enum with `Clean`, `Dirty` or `Unobtained` variants. When the lock is dirty it means it's been acquired once, then acquired another time from another holder, so the current holder may want to refresh its internal state.
+  ([#5672](https://github.com/matrix-org/matrix-rust-sdk/pull/5672)).
+
 ## [0.14.0] - 2025-09-04
 
 ### Features
@@ -14,7 +19,7 @@ All notable changes to this project will be documented in this file.
 
 - [**breaking**] Use `Raw<AnyTimelineEvent>` in place of `Raw<AnyMessageLikeEvent>`
   in `DecryptedRoomEvent::event`.
-  ([#5512](https://github.com/matrix-org/matrix-rust-sdk/pull/5512/files)).
+  ([#5512](https://github.com/matrix-org/matrix-rust-sdk/pull/5512)).
   Affects the following functions:
   - `OlmMachine::decrypt_room_event` - existing matches on the result's event field
      should be updated to `AnyTimelineEvent::MessageLike(AnyMessageLikeEvent::...)`
