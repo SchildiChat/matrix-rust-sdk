@@ -19,6 +19,7 @@ use std::{
 };
 
 use bitflags::bitflags;
+use futures_util::future;
 use ruma::{
     Int, MxcUri, OwnedUserId, UserId,
     events::{
@@ -35,7 +36,7 @@ use tracing::debug;
 
 use super::Room;
 use crate::{
-    MinimalRoomMemberEvent,
+    MinimalRoomMemberEvent, StoreError,
     deserialized_responses::{DisplayName, MemberEvent},
     store::{Result as StoreResult, StateStoreExt, ambiguity_map::is_display_name_ambiguous},
 };
@@ -140,17 +141,26 @@ impl Room {
     ///
     /// Async because it can read from storage.
     pub async fn get_member(&self, user_id: &UserId) -> StoreResult<Option<RoomMember>> {
-        let Some(raw_event) = self.store.get_member_event(self.room_id(), user_id).await? else {
-            debug!(%user_id, "Member event not found in state store");
-            return Ok(None);
+        let event = async {
+            let Some(raw_event) = self.store.get_member_event(self.room_id(), user_id).await?
+            else {
+                debug!(%user_id, "Member event not found in state store");
+                return Ok(None);
+            };
+
+            Ok(Some(raw_event.deserialize()?))
+        };
+        let presence = async {
+            let raw_event = self.store.get_presence_event(user_id).await?;
+            Ok::<Option<PresenceEvent>, StoreError>(raw_event.and_then(|e| e.deserialize().ok()))
         };
 
-        let event = raw_event.deserialize()?;
+        let profile = async { self.store.get_profile(self.room_id(), user_id).await };
 
-        let presence =
-            self.store.get_presence_event(user_id).await?.and_then(|e| e.deserialize().ok());
-
-        let profile = self.store.get_profile(self.room_id(), user_id).await?;
+        let (Some(event), presence, profile) = future::try_join3(event, presence, profile).await?
+        else {
+            return Ok(None);
+        };
 
         let display_names = [event.display_name()];
         let room_info = self.member_room_info(&display_names).await?;
@@ -166,18 +176,23 @@ impl Room {
         display_names: &'a [DisplayName],
     ) -> StoreResult<MemberRoomInfo<'a>> {
         let max_power_level = self.max_power_level();
-        let power_levels = self.power_levels_or_default().await;
+        let power_levels = async { Ok(self.power_levels_or_default().await) };
 
         let users_display_names =
-            self.store.get_users_with_display_names(self.room_id(), display_names).await?;
+            self.store.get_users_with_display_names(self.room_id(), display_names);
 
-        let ignored_users = self
-            .store
-            .get_account_data_event_static::<IgnoredUserListEventContent>()
-            .await?
-            .map(|c| c.deserialize())
-            .transpose()?
-            .map(|e| e.content.ignored_users.into_keys().collect());
+        let ignored_users = async {
+            Ok(self
+                .store
+                .get_account_data_event_static::<IgnoredUserListEventContent>()
+                .await?
+                .map(|c| c.deserialize())
+                .transpose()?
+                .map(|e| e.content.ignored_users.into_keys().collect()))
+        };
+
+        let (power_levels, users_display_names, ignored_users) =
+            future::try_join3(power_levels, users_display_names, ignored_users).await?;
 
         Ok(MemberRoomInfo {
             power_levels: power_levels.into(),

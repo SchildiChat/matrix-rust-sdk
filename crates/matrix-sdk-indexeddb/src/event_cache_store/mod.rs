@@ -17,6 +17,10 @@
 use std::{rc::Rc, time::Duration};
 
 use indexed_db_futures::{database::Database, Build};
+#[cfg(target_family = "wasm")]
+use matrix_sdk_base::cross_process_lock::{
+    CrossProcessLockGeneration, FIRST_CROSS_PROCESS_LOCK_GENERATION,
+};
 use matrix_sdk_base::{
     event_cache::{store::EventCacheStore, Event, Gap},
     linked_chunk::{
@@ -103,29 +107,57 @@ impl EventCacheStore for IndexeddbEventCacheStore {
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> Result<bool, IndexeddbEventCacheStoreError> {
+    ) -> Result<Option<CrossProcessLockGeneration>, IndexeddbEventCacheStoreError> {
         let _timer = timer!("method");
-
-        let now = Duration::from_millis(MilliSecondsSinceUnixEpoch::now().get().into());
 
         let transaction =
             self.transaction(&[Lease::OBJECT_STORE], IdbTransactionMode::Readwrite)?;
 
-        if let Some(lease) = transaction.get_lease_by_id(key).await? {
-            if lease.holder != holder && !lease.has_expired(now) {
-                return Ok(false);
-            }
-        }
+        let now = Duration::from_millis(MilliSecondsSinceUnixEpoch::now().get().into());
+        let expiration = now + Duration::from_millis(lease_duration_ms.into());
 
-        transaction
-            .put_lease(&Lease {
-                key: key.to_owned(),
-                holder: holder.to_owned(),
-                expiration: now + Duration::from_millis(lease_duration_ms.into()),
-            })
-            .await?;
-        transaction.commit().await?;
-        Ok(true)
+        let lease = match transaction.get_lease_by_id(key).await? {
+            Some(mut lease) => {
+                if lease.holder == holder {
+                    // We had the lease before, extend it.
+                    lease.expiration = expiration;
+
+                    Some(lease)
+                } else {
+                    // We didn't have it.
+                    if lease.expiration < now {
+                        // Steal it!
+                        lease.holder = holder.to_owned();
+                        lease.expiration = expiration;
+                        lease.generation += 1;
+
+                        Some(lease)
+                    } else {
+                        // We tried our best.
+                        None
+                    }
+                }
+            }
+            None => {
+                let lease = Lease {
+                    key: key.to_owned(),
+                    holder: holder.to_owned(),
+                    expiration,
+                    generation: FIRST_CROSS_PROCESS_LOCK_GENERATION,
+                };
+
+                Some(lease)
+            }
+        };
+
+        Ok(if let Some(lease) = lease {
+            transaction.put_lease(&lease).await?;
+            transaction.commit().await?;
+
+            Some(lease.generation)
+        } else {
+            None
+        })
     }
 
     #[instrument(skip(self, updates))]
@@ -479,14 +511,29 @@ impl EventCacheStore for IndexeddbEventCacheStore {
     async fn get_room_events(
         &self,
         room_id: &RoomId,
+        event_type: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<Vec<Event>, IndexeddbEventCacheStoreError> {
         let _timer = timer!("method");
+
+        // TODO: Make this more efficient so we don't load all events and filter them
+        // here. We should instead only load the relevant events.
 
         let transaction = self.transaction(&[keys::EVENTS], IdbTransactionMode::Readonly)?;
         transaction
             .get_room_events(room_id)
             .await
-            .map(|vec| vec.into_iter().map(Into::into).collect())
+            .map(|vec| {
+                vec.into_iter()
+                    .map(Event::from)
+                    .filter(|e| {
+                        event_type.is_none_or(|event_type| {
+                            Some(event_type) == e.kind.event_type().as_deref()
+                        })
+                    })
+                    .filter(|e| session_id.is_none_or(|s| Some(s) == e.kind.session_id()))
+                    .collect()
+            })
             .map_err(Into::into)
     }
 

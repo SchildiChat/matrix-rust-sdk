@@ -17,6 +17,7 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use matrix_sdk_common::{
     AsyncTraitDeps,
+    cross_process_lock::CrossProcessLockGeneration,
     linked_chunk::{
         ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
         RawChunk, Update,
@@ -46,7 +47,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> Result<bool, Self::Error>;
+    ) -> Result<Option<CrossProcessLockGeneration>, Self::Error>;
 
     /// An [`Update`] reflects an operation that has happened inside a linked
     /// chunk. The linked chunk is used by the event cache to store the events
@@ -158,7 +159,12 @@ pub trait EventCacheStore: AsyncTraitDeps {
     ///
     /// This method must return events saved either in any linked chunks, *or*
     /// events saved "out-of-band" with the [`Self::save_event`] method.
-    async fn get_room_events(&self, room_id: &RoomId) -> Result<Vec<Event>, Self::Error>;
+    async fn get_room_events(
+        &self,
+        room_id: &RoomId,
+        event_type: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Event>, Self::Error>;
 
     /// Save an event, that might or might not be part of an existing linked
     /// chunk.
@@ -191,7 +197,7 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<Option<CrossProcessLockGeneration>, Self::Error> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await.map_err(Into::into)
     }
 
@@ -264,8 +270,13 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         self.0.find_event_relations(room_id, event_id, filter).await.map_err(Into::into)
     }
 
-    async fn get_room_events(&self, room_id: &RoomId) -> Result<Vec<Event>, Self::Error> {
-        self.0.get_room_events(room_id).await.map_err(Into::into)
+    async fn get_room_events(
+        &self,
+        room_id: &RoomId,
+        event_type: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Event>, Self::Error> {
+        self.0.get_room_events(room_id, event_type, session_id).await.map_err(Into::into)
     }
 
     async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error> {

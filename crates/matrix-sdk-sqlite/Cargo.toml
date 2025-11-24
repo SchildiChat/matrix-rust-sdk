@@ -15,7 +15,7 @@ default = ["state-store", "event-cache"]
 testing = ["matrix-sdk-crypto?/testing"]
 
 bundled = ["rusqlite/bundled"]
-crypto-store = ["dep:matrix-sdk-crypto"]
+crypto-store = ["dep:matrix-sdk-base", "dep:matrix-sdk-crypto"]
 event-cache = ["dep:matrix-sdk-base"]
 state-store = ["dep:matrix-sdk-base"]
 
@@ -26,7 +26,8 @@ experimental-encrypted-state-events = [
 [dependencies]
 as_variant.workspace = true
 async-trait.workspace = true
-deadpool-sqlite = "0.12.1"
+deadpool = { version = "0.12.3", features = ["rt_tokio_1"] }
+deadpool-sync = "0.1.4"
 itertools.workspace = true
 matrix-sdk-base = { workspace = true, optional = true }
 matrix-sdk-crypto = { workspace = true, optional = true }

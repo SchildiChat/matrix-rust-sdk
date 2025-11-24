@@ -11,11 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #![cfg_attr(
     not(any(feature = "state-store", feature = "crypto-store", feature = "event-cache")),
     allow(dead_code, unused_imports)
 )]
 
+mod connection;
 #[cfg(feature = "crypto-store")]
 mod crypto_store;
 mod error;
@@ -32,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use deadpool_sqlite::PoolConfig;
+use deadpool::managed::PoolConfig;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(feature = "crypto-store")]
@@ -64,7 +66,7 @@ pub struct SqliteStoreConfig {
     path: PathBuf,
     /// Secret to open the store, if any
     secret: Option<Secret>,
-    /// The pool configuration for [`deadpool_sqlite`].
+    /// The pool configuration for [`deadpool`].
     pool_config: PoolConfig,
     /// The runtime configuration to apply when opening an SQLite connection.
     runtime_config: RuntimeConfig,
@@ -146,9 +148,9 @@ impl SqliteStoreConfig {
         self
     }
 
-    /// Define the maximum pool size for [`deadpool_sqlite`].
+    /// Define the maximum pool size for [`deadpool`].
     ///
-    /// See [`deadpool_sqlite::PoolConfig::max_size`] to learn more.
+    /// See [`deadpool::managed::PoolConfig::max_size`] to learn more.
     pub fn pool_max_size(mut self, max_size: usize) -> Self {
         self.pool_config.max_size = max(POOL_MINIMUM_SIZE, max_size);
         self
@@ -204,6 +206,21 @@ impl SqliteStoreConfig {
     pub fn journal_size_limit(mut self, limit: u32) -> Self {
         self.runtime_config.journal_size_limit = limit;
         self
+    }
+
+    /// Build a pool of active connections to a particular database.
+    pub fn build_pool_of_connections(
+        &self,
+        database_name: &str,
+    ) -> Result<connection::Pool, connection::CreatePoolError> {
+        let path = self.path.join(database_name);
+        let manager = connection::Manager::new(path);
+
+        connection::Pool::builder(manager)
+            .config(self.pool_config)
+            .runtime(connection::RUNTIME)
+            .build()
+            .map_err(connection::CreatePoolError::Build)
     }
 }
 

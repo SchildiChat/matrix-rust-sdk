@@ -1765,7 +1765,32 @@ impl TimelineController {
     /// it's folded into another timeline item.
     pub(crate) async fn latest_event_id(&self) -> Option<OwnedEventId> {
         let state = self.state.read().await;
-        state.items.all_remote_events().last().map(|event_meta| &event_meta.event_id).cloned()
+        let filter_out_thread_events = match self.focus() {
+            TimelineFocusKind::Thread { .. } => false,
+            TimelineFocusKind::Live { hide_threaded_events } => hide_threaded_events.to_owned(),
+            TimelineFocusKind::Event { paginator } => {
+                paginator.get().is_some_and(|paginator| paginator.hide_threaded_events())
+            }
+            _ => true,
+        };
+
+        // In some timelines, threaded events are added to the `AllRemoteEvents`
+        // collection since they need to be taken into account to calculate read
+        // receipts, but we don't want to actually take them into account for returning
+        // the latest event id since they're not visibly in the timeline
+        state
+            .items
+            .all_remote_events()
+            .iter()
+            .rev()
+            .filter_map(|item| {
+                if !filter_out_thread_events || item.thread_root_id.is_none() {
+                    Some(item.event_id.clone())
+                } else {
+                    None
+                }
+            })
+            .next()
     }
 
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]

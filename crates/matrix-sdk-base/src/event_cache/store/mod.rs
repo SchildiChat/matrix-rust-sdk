@@ -28,7 +28,8 @@ mod memory_store;
 mod traits;
 
 use matrix_sdk_common::cross_process_lock::{
-    CrossProcessLock, CrossProcessLockError, CrossProcessLockGuard, TryLock,
+    CrossProcessLock, CrossProcessLockError, CrossProcessLockGeneration, CrossProcessLockGuard,
+    TryLock,
 };
 pub use matrix_sdk_store_encryption::Error as StoreEncryptionError;
 use ruma::{OwnedEventId, events::AnySyncTimelineEvent, serde::Raw};
@@ -83,7 +84,7 @@ impl EventCacheStoreLock {
 
     /// Acquire a spin lock (see [`CrossProcessLock::spin_lock`]).
     pub async fn lock(&self) -> Result<EventCacheStoreLockGuard<'_>, CrossProcessLockError> {
-        let cross_process_lock_guard = self.cross_process_lock.spin_lock(None).await?;
+        let cross_process_lock_guard = self.cross_process_lock.spin_lock(None).await??.into_guard();
 
         Ok(EventCacheStoreLockGuard { cross_process_lock_guard, store: self.store.deref() })
     }
@@ -172,6 +173,12 @@ impl EventCacheStoreError {
     }
 }
 
+impl From<EventCacheStoreError> for CrossProcessLockError {
+    fn from(value: EventCacheStoreError) -> Self {
+        Self::TryLock(Box::new(value))
+    }
+}
+
 /// An `EventCacheStore` specific result type.
 pub type Result<T, E = EventCacheStoreError> = std::result::Result<T, E>;
 
@@ -188,7 +195,7 @@ impl TryLock for LockableEventCacheStore {
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> std::result::Result<bool, Self::LockError> {
+    ) -> std::result::Result<Option<CrossProcessLockGeneration>, Self::LockError> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await
     }
 }

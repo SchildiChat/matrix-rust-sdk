@@ -8,13 +8,15 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- When we receive an inbound Megolm session from two different sources, merge the two copies together to get the best of both.
+  ([#5865](https://github.com/matrix-org/matrix-rust-sdk/pull/5865)
 - When constructing a key bundle for history sharing, if we had received a key bundle ourselves, in which one or more sessions was marked as "history not shared", pass that on to the new user.
   ([#5820](https://github.com/matrix-org/matrix-rust-sdk/pull/5820)
 - Expose new method `CryptoStore::get_withheld_sessions_by_room_id`.
   ([#5819](https://github.com/matrix-org/matrix-rust-sdk/pull/5819))
 - Use new withheld code in key bundles for sessions not marked as
   `shared_history`.
-  ([#5807](https://github.com/matrix-org/matrix-rust-sdk/pull/5807)
+  ([#5807](https://github.com/matrix-org/matrix-rust-sdk/pull/5807), ([#5834](https://github.com/matrix-org/matrix-rust-sdk/pull/5834))
 - Improve feedback support for shared history when downloading room key
   bundles.
   ([#5737](https://github.com/matrix-org/matrix-rust-sdk/pull/5737))
@@ -23,6 +25,10 @@ All notable changes to this project will be documented in this file.
   - `OlmMachine::receive_room_key_bundle` now appends withheld key information to the store.
   - [**breaking**] `Changes::withheld_session_info` now stores a `RoomKeyWithheldEntry` in each `room-id`-`session-id` entry.
   - [**breaking**] `CryptoStore::get_withheld_info` now returns `Result<Option<RoomKeyWithheldEntry>>`. This change also affects `MemoryStore`.
+- [**breaking**] Add `name` fields to some of the variants of
+  `store::SecretImportError` to indicate what secret was being imported when the
+  error occurred.
+  ([#5647](https://github.com/matrix-org/matrix-rust-sdk/pull/5647))
 
 ### Bug Fixes
 
@@ -37,10 +43,6 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- [**breaking**] Add `name` fields to some of the variants of
-  `store::SecretImportError` to indicate what secret was being imported when the
-  error occurred.
-  ([#5647](https://github.com/matrix-org/matrix-rust-sdk/pull/5647))
 - Log message index for Megolm sessions received over encrypted to-device messages. ([#5599](https://github.com/matrix-org/matrix-rust-sdk/pull/5599))
 - Add `RoomSettings::encrypt_state_events` flag. ([#5511](https://github.com/matrix-org/matrix-rust-sdk/pull/5511))
 - Make sure to accept historic room key bundles only if the sender is trusted
