@@ -78,6 +78,15 @@ impl SpaceService {
         })))
     }
 
+    /// Returns a flattened list containing all the spaces where the user has
+    /// permission to send `m.space.child` state events.
+    ///
+    /// Note: Unlike [`Self::joined_spaces()`], this method does not recompute
+    /// the space graph, nor does it notify subscribers about changes.
+    pub async fn editable_spaces(&self) -> Vec<SpaceRoom> {
+        self.inner.editable_spaces().await.into_iter().map(Into::into).collect()
+    }
+
     /// Returns a `SpaceRoomList` for the given space ID.
     pub async fn space_room_list(
         &self,
@@ -85,6 +94,40 @@ impl SpaceService {
     ) -> Result<Arc<SpaceRoomList>, ClientError> {
         let space_id = RoomId::parse(space_id)?;
         Ok(Arc::new(SpaceRoomList::new(self.inner.space_room_list(space_id).await)))
+    }
+
+    /// Returns all known direct-parents of a given space room ID.
+    pub async fn joined_parents_of_child(
+        &self,
+        child_id: String,
+    ) -> Result<Vec<SpaceRoom>, ClientError> {
+        let child_id = RoomId::parse(child_id)?;
+
+        let parents = self.inner.joined_parents_of_child(&child_id).await;
+
+        Ok(parents.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn add_child_to_space(
+        &self,
+        child_id: String,
+        space_id: String,
+    ) -> Result<(), ClientError> {
+        let space_id = RoomId::parse(space_id)?;
+        let child_id = RoomId::parse(child_id)?;
+
+        self.inner.add_child_to_space(child_id, space_id).await.map_err(ClientError::from)
+    }
+
+    pub async fn remove_child_from_space(
+        &self,
+        child_id: String,
+        space_id: String,
+    ) -> Result<(), ClientError> {
+        let space_id = RoomId::parse(space_id)?;
+        let child_id = RoomId::parse(child_id)?;
+
+        self.inner.remove_child_from_space(child_id, space_id).await.map_err(ClientError::from)
     }
 
     /// Start a space leave process returning a [`LeaveSpaceHandle`] from which

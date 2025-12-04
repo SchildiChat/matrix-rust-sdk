@@ -8,6 +8,27 @@ All notable changes to this project will be documented in this file.
 
 ### Breaking changes
 
+- `TimelineConfiguration::track_read_receipts`'s type is now an enum to allow tracking to be enabled for all events
+  (like before) or only for message-like events (which prevents read receipts from being placed on state events).
+  ([#5900](https://github.com/matrix-org/matrix-rust-sdk/pull/5900))
+- `Client::reset_server_info()` has been split into `reset_supported_versions()`
+  and `reset_well_known()`.
+  ([#5910](https://github.com/matrix-org/matrix-rust-sdk/pull/5910))
+
+## [0.15.0] - 2025-11-27
+
+### Breaking changes
+
+- Add `HumanQrLoginError::NotFound` for non-existing / expired rendezvous sessions
+  ([#5898](https://github.com/matrix-org/matrix-rust-sdk/pull/5898))
+- Add `HumanQrGrantLoginError::NotFound` for non-existing / expired rendezvous sessions
+  ([#5898](https://github.com/matrix-org/matrix-rust-sdk/pull/5898))
+- The `LatestEventValue::Local` type gains 2 new fields: `sender` and `profile`.
+  ([#5885](https://github.com/matrix-org/matrix-rust-sdk/pull/5885))
+- The `Encryption::user_identity()` method has received a new argument. The
+  `fallback_to_server` argument controls if we should attempt to fetch the user
+  identity from the homeserver if it wasn't found in the local storage.
+  ([#5870](https://github.com/matrix-org/matrix-rust-sdk/pull/5870))
 - Expose the power level required to modify `m.space.child` on
   `room::power_levels::RoomPowerLevelsValues`.
 - Rename `Client::login_with_qr_code` to `Client::new_login_with_qr_code_handler`.
@@ -66,6 +87,7 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Expose `is_space` in `NotificationRoomInfo`, allowing clients to determine if the room that triggered the notification is a space.
 - Add push actions to `NotificationItem` and replace `SyncNotification` with `NotificationItem`.
   ([#5835](https://github.com/matrix-org/matrix-rust-sdk/pull/5835))
 - Add `Client::new_grant_login_with_qr_code_handler` for granting login to a new device by way of

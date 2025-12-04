@@ -1630,6 +1630,20 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, GetHierarchyEndpoint).expect_default_access_token()
     }
 
+    /// Create a prebuilt mock for the endpoint used to set a space child.
+    pub fn mock_set_space_child(&self) -> MockEndpoint<'_, SetSpaceChildEndpoint> {
+        let mock = Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/state/m.space.child/.*?"));
+        self.mock_endpoint(mock, SetSpaceChildEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to set a space parent.
+    pub fn mock_set_space_parent(&self) -> MockEndpoint<'_, SetSpaceParentEndpoint> {
+        let mock = Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/state/m.space.parent"));
+        self.mock_endpoint(mock, SetSpaceParentEndpoint).expect_default_access_token()
+    }
+
     /// Create a prebuilt mock for the endpoint used to get a profile field.
     pub fn mock_get_profile_field(
         &self,
@@ -1847,7 +1861,7 @@ pub struct MockEndpoint<'a, T> {
 
 impl<'a, T> MockEndpoint<'a, T> {
     fn new(server: &'a MockServer, mock: MockBuilder, endpoint: T) -> Self {
-        Self { server, mock, endpoint, expected_access_token: ExpectedAccessToken::None }
+        Self { server, mock, endpoint, expected_access_token: ExpectedAccessToken::Ignore }
     }
 
     /// Expect authentication with the default access token on this endpoint.
@@ -1862,12 +1876,30 @@ impl<'a, T> MockEndpoint<'a, T> {
         self
     }
 
-    /// Don't expect authentication with an access token on this endpoint.
+    /// Expect authentication with any access token on this endpoint, regardless
+    /// of its value.
     ///
-    /// This should be used to override the default behavior of the endpoint,
-    /// when the access token is unknown for example.
-    pub fn do_not_expect_access_token(mut self) -> Self {
-        self.expected_access_token = ExpectedAccessToken::None;
+    /// This is useful if we don't want to track the value of the access token.
+    pub fn expect_any_access_token(mut self) -> Self {
+        self.expected_access_token = ExpectedAccessToken::Any;
+        self
+    }
+
+    /// Expect no authentication on this endpoint.
+    ///
+    /// This means that the endpoint will not match if an `AUTHENTICATION`
+    /// header is present.
+    pub fn expect_missing_access_token(mut self) -> Self {
+        self.expected_access_token = ExpectedAccessToken::Missing;
+        self
+    }
+
+    /// Ignore the access token on this endpoint.
+    ///
+    /// This should be used to override the default behavior of an endpoint that
+    /// requires access tokens.
+    pub fn ignore_access_token(mut self) -> Self {
+        self.expected_access_token = ExpectedAccessToken::Ignore;
         self
     }
 
@@ -1913,10 +1945,7 @@ impl<'a, T> MockEndpoint<'a, T> {
     /// # anyhow::Ok(()) });
     /// ```
     pub fn respond_with<R: Respond + 'static>(self, func: R) -> MatrixMock<'a> {
-        let mock = self
-            .expected_access_token
-            .maybe_match_authorization_header(self.mock)
-            .respond_with(func);
+        let mock = self.mock.and(self.expected_access_token).respond_with(func);
         MatrixMock { mock, server: self.server }
     }
 
@@ -1952,6 +1981,33 @@ impl<'a, T> MockEndpoint<'a, T> {
     /// ```
     pub fn error500(self) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(500))
+    }
+
+    /// Returns a mocked endpoint that emulates an unimplemented endpoint, i.e
+    /// responds with a 404 HTTP status code and an `M_UNRECOGNIZED` Matrix
+    /// error code.
+    ///
+    /// Note that the default behavior of the mock server is to return a 404
+    /// status code for endpoints that are not mocked with an empty response.
+    ///
+    /// This can be useful to check if an endpoint is called, even if it is not
+    /// implemented by the server.
+    pub fn error_unrecognized(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "errcode": "M_UNRECOGNIZED",
+            "error": "Unrecognized request",
+        })))
+    }
+
+    /// Returns a mocked endpoint that emulates an unknown token error, i.e
+    /// responds with a 401 HTTP status code and an `M_UNKNOWN_TOKEN` Matrix
+    /// error code.
+    pub fn error_unknown_token(self, soft_logout: bool) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "errcode": "M_UNKNOWN_TOKEN",
+            "error": "Unrecognized access token",
+            "soft_logout": soft_logout,
+        })))
     }
 
     /// Internal helper to return an `{ event_id }` JSON struct along with a 200
@@ -2006,25 +2062,44 @@ impl<'a, T> MockEndpoint<'a, T> {
 
 /// The access token to expect on an endpoint.
 enum ExpectedAccessToken {
-    /// We don't expect an access token.
-    None,
+    /// Ignore any access token or lack thereof.
+    Ignore,
 
     /// We expect the default access token.
     Default,
 
     /// We expect the given access token.
     Custom(&'static str),
+
+    /// We expect any access token.
+    Any,
+
+    /// We expect that there is no access token.
+    Missing,
 }
 
 impl ExpectedAccessToken {
-    /// Match an `Authorization` header on the given mock if one is expected.
-    fn maybe_match_authorization_header(&self, mock: MockBuilder) -> MockBuilder {
-        let token = match self {
-            Self::None => return mock,
-            Self::Default => "1234",
-            Self::Custom(token) => token,
-        };
-        mock.and(header(http::header::AUTHORIZATION, format!("Bearer {token}")))
+    /// Get the access token from the given request.
+    fn access_token(request: &Request) -> Option<&str> {
+        request
+            .headers
+            .get(&http::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.is_empty())
+    }
+}
+
+impl wiremock::Match for ExpectedAccessToken {
+    fn matches(&self, request: &Request) -> bool {
+        match self {
+            Self::Ignore => true,
+            Self::Default => Self::access_token(request) == Some("1234"),
+            Self::Custom(token) => Self::access_token(request) == Some(token),
+            Self::Any => Self::access_token(request).is_some(),
+            Self::Missing => request.headers.get(&http::header::AUTHORIZATION).is_none(),
+        }
     }
 }
 
@@ -3453,14 +3528,6 @@ impl<'a> MockEndpoint<'a, WhoAmIEndpoint> {
             "device_id": device_id,
         })))
     }
-
-    /// Returns an error response with an `M_UNKNOWN_TOKEN`.
-    pub fn err_unknown_token(self) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
-            "errcode": "M_UNKNOWN_TOKEN",
-            "error": "Invalid token"
-        })))
-    }
 }
 
 /// A prebuilt mock for `POST /keys/upload` request.
@@ -4677,6 +4744,40 @@ impl<'a> MockEndpoint<'a, GetHierarchyEndpoint> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "rooms": []
         })))
+    }
+}
+
+/// A prebuilt mock for `PUT
+/// /_matrix/client/v3/rooms/{roomId}/state/m.space.child/{stateKey}`
+pub struct SetSpaceChildEndpoint;
+
+impl<'a> MockEndpoint<'a, SetSpaceChildEndpoint> {
+    /// Returns a successful response with a given event id.
+    pub fn ok(self, event_id: OwnedEventId) -> MatrixMock<'a> {
+        self.ok_with_event_id(event_id)
+    }
+
+    /// Returns an error response with a generic error code indicating the
+    /// client is not authorized to set space children.
+    pub fn unauthorized(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(400))
+    }
+}
+
+/// A prebuilt mock for `PUT
+/// /_matrix/client/v3/rooms/{roomId}/state/m.space.parent/{stateKey}`
+pub struct SetSpaceParentEndpoint;
+
+impl<'a> MockEndpoint<'a, SetSpaceParentEndpoint> {
+    /// Returns a successful response with a given event id.
+    pub fn ok(self, event_id: OwnedEventId) -> MatrixMock<'a> {
+        self.ok_with_event_id(event_id)
+    }
+
+    /// Returns an error response with a generic error code indicating the
+    /// client is not authorized to set space parents.
+    pub fn unauthorized(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(400))
     }
 }
 

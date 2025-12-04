@@ -5,6 +5,8 @@ use std::sync::{atomic::AtomicBool, Arc};
 #[cfg(feature = "sentry")]
 use tracing::warn;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+#[cfg(feature = "sentry")]
+use tracing_core::Level;
 use tracing_core::Subscriber;
 use tracing_subscriber::{
     field::RecordFields,
@@ -21,6 +23,8 @@ use tracing_subscriber::{
     EnvFilter, Layer, Registry,
 };
 
+#[cfg(feature = "sentry")]
+use crate::tracing::BRIDGE_SPAN_NAME;
 use crate::{error::ClientError, tracing::LogLevel};
 
 // Adjusted version of tracing_subscriber::fmt::Format
@@ -465,7 +469,14 @@ impl TracingConfiguration {
                     let sentry_guard = sentry::init((
                         sentry_dsn,
                         sentry::ClientOptions {
-                            traces_sample_rate: 0.0,
+                            traces_sampler: Some(Arc::new(|ctx| {
+                                // Make sure bridge spans are always uploaded
+                                if ctx.name() == BRIDGE_SPAN_NAME {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            })),
                             attach_stacktrace: true,
                             release: Some(env!("VERGEN_GIT_SHA").into()),
                             ..sentry::ClientOptions::default()
@@ -499,7 +510,10 @@ impl TracingConfiguration {
 
                             move |metadata| {
                                 if enabled.load(std::sync::atomic::Ordering::SeqCst) {
-                                    sentry_tracing::default_span_filter(metadata)
+                                    matches!(
+                                        metadata.level(),
+                                        &Level::ERROR | &Level::WARN | &Level::INFO | &Level::DEBUG
+                                    )
                                 } else {
                                     // Ignore, if sentry is globally disabled.
                                     false

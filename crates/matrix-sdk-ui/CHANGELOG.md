@@ -8,6 +8,19 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- [**breaking**] `TimelineBuilder::track_read_marker_and_receipts` now takes a parameter to allow tracking to be enabled
+  for all events (like before) or only for message-like events (which prevents read receipts from being placed on state
+  events).
+  ([#5900](https://github.com/matrix-org/matrix-rust-sdk/pull/5900))
+
+## [0.15.0] - 2025-11-27
+
+### Features
+
+- Expose `is_space` in `NotificationItem`, allowing clients to determine if the room that triggered the notification is a space.
+- [**breaking**] The `LatestEventValue::Local` type gains 2 new fields: `sender`
+  and `profile`.
+  ([#5885](https://github.com/matrix-org/matrix-rust-sdk/pull/5885))
 - Add push actions to `NotificationItem`.
   ([#5835](https://github.com/matrix-org/matrix-rust-sdk/pull/5835))
 - Add support for top level space ordering through [MSC3230](https://github.com/matrix-org/matrix-spec-proposals/pull/3230)
@@ -19,6 +32,9 @@ All notable changes to this project will be documented in this file.
   an event.
 - `TimelineFocusKind::Event` can now handle both the existing event pagination and thread pagination if the focused 
   event is part of a thread ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678)).
+- [**breaking**] The `Room` type in `room_list_service` is renamed to
+  `RoomListItem`.
+  ([#5684](https://github.com/matrix-org/matrix-rust-sdk/pull/5684))
 
 ### Bug Fixes
 
@@ -27,12 +43,6 @@ All notable changes to this project will be documented in this file.
   ([#5660](https://github.com/matrix-org/matrix-rust-sdk/pull/5660))
 - Improvement performance of `RoomList` by introducing a new `RoomListItem` type
   (that replaces the `Room` type).
-  ([#5684](https://github.com/matrix-org/matrix-rust-sdk/pull/5684))
-
-### Refactor
-
-- [**breaking**] The `Room` type in `room_list_service` is renamed to
-  `RoomListItem`.
   ([#5684](https://github.com/matrix-org/matrix-rust-sdk/pull/5684))
 
 ## [0.14.0] - 2025-09-04
