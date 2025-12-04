@@ -33,6 +33,7 @@ pub use oauth2::{
     RequestTokenError, StandardErrorResponse,
     basic::{BasicErrorResponse, BasicRequestTokenError},
 };
+use ruma::api::{client::error::ErrorKind, error::FromHttpResponseError};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use url::Url;
@@ -85,7 +86,11 @@ pub enum QRCodeLoginError {
 
     /// An error happened while exchanging messages with the other device.
     #[error(transparent)]
-    SecureChannel(#[from] SecureChannelError),
+    SecureChannel(SecureChannelError),
+
+    /// The rendezvous session was not found and might have expired.
+    #[error("The rendezvous session was not found and might have expired")]
+    NotFound,
 
     /// The cross-process refresh lock failed to be initialized.
     #[error(transparent)]
@@ -117,6 +122,23 @@ pub enum QRCodeLoginError {
     ServerReset(crate::Error),
 }
 
+impl From<SecureChannelError> for QRCodeLoginError {
+    fn from(e: SecureChannelError) -> Self {
+        match e {
+            SecureChannelError::RendezvousChannel(HttpError::Api(ref boxed)) => {
+                if let FromHttpResponseError::Server(api_error) = boxed.as_ref()
+                    && let Some(ErrorKind::NotFound) =
+                        api_error.as_client_api_error().and_then(|e| e.error_kind())
+                {
+                    return Self::NotFound;
+                }
+                Self::SecureChannel(e)
+            }
+            e => Self::SecureChannel(e),
+        }
+    }
+}
+
 /// The error type for failures while trying to grant log in to a new device
 /// using a QR code.
 #[derive(Debug, Error)]
@@ -132,6 +154,10 @@ pub enum QRCodeGrantLoginError {
     /// The device could not be created.
     #[error("The device could not be created")]
     UnableToCreateDevice,
+
+    /// The rendezvous session was not found and might have expired.
+    #[error("The rendezvous session was not found and might have expired")]
+    NotFound,
 
     /// Auth handshake error.
     #[error("Auth handshake error: {0}")]
@@ -149,6 +175,15 @@ pub enum QRCodeGrantLoginError {
 impl From<SecureChannelError> for QRCodeGrantLoginError {
     fn from(e: SecureChannelError) -> Self {
         match e {
+            SecureChannelError::RendezvousChannel(HttpError::Api(ref boxed)) => {
+                if let FromHttpResponseError::Server(api_error) = boxed.as_ref()
+                    && let Some(ErrorKind::NotFound) =
+                        api_error.as_client_api_error().and_then(|e| e.error_kind())
+                {
+                    return Self::NotFound;
+                }
+                Self::Unknown(e.to_string())
+            }
             SecureChannelError::InvalidCheckCode => Self::InvalidCheckCode,
             e => Self::Unknown(e.to_string()),
         }

@@ -6,8 +6,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Refactor
+
+- [**breaking**]: `Client::server_vendor_info()` requires to enable the
+  `federation-api` feature.
+  ([#5912](https://github.com/matrix-org/matrix-rust-sdk/pull/5912))
+- [**breaking**]: `Client::reset_server_info()` has been split into
+  `reset_supported_versions()` and `reset_well_known()`.
+  ([#5910](https://github.com/matrix-org/matrix-rust-sdk/pull/5910))
+
+## [0.15.0] - 2025-11-27
+
 ### Features
 
+- Add `QRCodeLoginError::NotFound` for non-existing / expired rendezvous sessions
+  ([#5898](https://github.com/matrix-org/matrix-rust-sdk/pull/5898))
+- Add `QRCodeGrantLoginError::NotFound` for non-existing / expired rendezvous sessions
+  ([#5898](https://github.com/matrix-org/matrix-rust-sdk/pull/5898))
+- Improve logging around key history bundles when joining a room.
+  ([#5866](https://github.com/matrix-org/matrix-rust-sdk/pull/5866))
 - Expose the power level required to modify `m.space.child` on
   `room::power_levels::RoomPowerLevelChanges`.
   ([#5857](https://github.com/matrix-org/matrix-rust-sdk/pull/5857))
@@ -107,6 +124,14 @@ All notable changes to this project will be documented in this file.
   ([#5560](https://github.com/matrix-org/matrix-rust-sdk/pull/5560))
 
 ### Bugfix
+
+- A new local `LatestEventValue` was always created as `LocalIsSending`. It
+  must be created as `LocalCannotBeSent` if a previous local `LatestEventValue`
+  exists and is `LocalCannotBeSent`.
+  ([#5908](https://github.com/matrix-org/matrix-rust-sdk/pull/5908))
+- Switch QR login implementation from `std::time::Instant` to `ruma::time::Instant` which
+  is compatible with Wasm.
+  ([#5889](https://github.com/matrix-org/matrix-rust-sdk/pull/5889))
 
 ## [0.14.0] - 2025-09-04
 

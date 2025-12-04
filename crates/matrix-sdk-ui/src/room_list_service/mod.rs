@@ -64,7 +64,7 @@ use eyeball::Subscriber;
 use futures_util::{Stream, StreamExt, pin_mut};
 use matrix_sdk::{
     Client, Error as SlidingSyncError, Room, SlidingSync, SlidingSyncList, SlidingSyncMode,
-    config::RequestConfig, event_cache::EventCacheError, timeout::timeout,
+    event_cache::EventCacheError, timeout::timeout,
 };
 pub use room_list::*;
 use ruma::{
@@ -167,14 +167,8 @@ impl RoomListService {
             {
                 cached.features
             } else {
-                // Our `/versions` calls don't support token refresh as of now (11.11.2025), so
-                // we're going to skip the sending of the authentication headers in case they
-                // might have expired.
-                //
-                // We only care about a feature which is advertised without being authenticaded
-                // anyways.
                 client
-                    .fetch_server_versions(Some(RequestConfig::new().skip_auth()))
+                    .fetch_server_versions(None)
                     .await
                     .map_err(|e| Error::SlidingSync(e.into()))?
                     .as_supported_versions()
@@ -205,6 +199,9 @@ impl RoomListService {
             builder = builder.share_pos();
         }
 
+        let state_machine = StateMachine::new();
+        let observable_state = state_machine.cloned_state();
+
         let sliding_sync = builder
             .add_cached_list(
                 SlidingSyncList::builder(ALL_ROOMS_LIST_NAME)
@@ -224,7 +221,23 @@ impl RoomListService {
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
                         // returned. If true, only invited rooms are returned.
                         is_invite: None,
-                    }))),
+                    })))
+                    .requires_timeout(move |request_generator| {
+                        // We want Sliding Sync to apply the poll + network timeout —i.e. to do the
+                        // long-polling— in some particular cases. Let's define them.
+                        match observable_state.get() {
+                            // These are the states where we want an immediate response from the
+                            // server, with no long-polling.
+                            State::Init
+                            | State::SettingUp
+                            | State::Recovering
+                            | State::Error { .. }
+                            | State::Terminated { .. } => false,
+
+                            // Otherwise we want long-polling if the list is fully-loaded.
+                            State::Running => request_generator.is_fully_loaded(),
+                        }
+                    }),
             )
             .await
             .map_err(Error::SlidingSync)?
@@ -236,7 +249,7 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state_machine: StateMachine::new() })
+        Ok(Self { client, sliding_sync, state_machine })
     }
 
     /// Start to sync the room list.

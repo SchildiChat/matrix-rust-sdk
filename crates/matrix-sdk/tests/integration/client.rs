@@ -1513,6 +1513,7 @@ async fn test_room_sync_state_after() {
     assert_eq!(*member.membership(), MembershipState::Leave);
 }
 
+#[cfg(feature = "federation-api")]
 #[async_test]
 async fn test_server_vendor_info() {
     let server = MatrixMockServer::new().await;
@@ -1534,25 +1535,11 @@ async fn test_server_version_without_auth() {
 
     // If we provide an access token, we encounter a failure, likely because the
     // token has expired.
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/versions"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(server.server())
-        .await;
+    server.mock_versions().expect_default_access_token().error_unknown_token(true).mount().await;
 
     // If we do not provide an access token, all is fine as the endpoint does not
     // require one.
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/versions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "versions": [
-                "r0.0.1",
-                "v1.1"
-            ]
-        })))
-        .mount(server.server())
-        .await;
+    server.mock_versions().expect_missing_access_token().ok_with_unstable_features().mount().await;
 
     let request_config = RequestConfig::new().disable_retry();
     client
@@ -1567,6 +1554,7 @@ async fn test_server_version_without_auth() {
         .expect("We should not fail here since we did not provide an auth token.");
 }
 
+#[cfg(feature = "federation-api")]
 #[async_test]
 async fn test_server_vendor_info_with_missing_fields() {
     let server = MatrixMockServer::new().await;

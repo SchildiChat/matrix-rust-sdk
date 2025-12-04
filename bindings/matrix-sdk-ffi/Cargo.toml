@@ -1,6 +1,6 @@
 [package]
 name = "matrix-sdk-ffi"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 homepage = "https://github.com/matrix-org/matrix-rust-sdk"
 keywords = ["matrix", "chat", "messaging", "ffi"]
@@ -45,11 +45,11 @@ experimental-element-recent-emojis = ["matrix-sdk/experimental-element-recent-em
 
 [dependencies]
 anyhow.workspace = true
-extension-trait = "1.0.1"
+extension-trait = "1.0.2"
 eyeball-im.workspace = true
 futures-util.workspace = true
 language-tags = "0.3.2"
-log-panics = { version = "2", features = ["with-backtrace"] }
+log-panics = { version = "2.1.0", features = ["with-backtrace"] }
 matrix-sdk = { workspace = true, features = [
     "anyhow",
     "e2e-encryption",
@@ -57,12 +57,13 @@ matrix-sdk = { workspace = true, features = [
     "markdown",
     "socks",
     "uniffi",
+    "federation-api",
 ] }
 matrix-sdk-base.workspace = true
 matrix-sdk-common.workspace = true
 matrix-sdk-ffi-macros.workspace = true
 matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
-mime = "0.3.16"
+mime = "0.3.17"
 once_cell.workspace = true
 ruma = { workspace = true, features = ["html", "unstable-msc3488", "compat-unset-avatar", "unstable-msc3245-v1-compat", "unstable-msc4278"] }
 serde.workspace = true
@@ -89,7 +90,8 @@ oauth2.workspace = true
 [target.'cfg(target_family = "wasm")'.dependencies]
 console_error_panic_hook = "0.1.7"
 tokio = { workspace = true, features = ["sync", "macros"] }
-uniffi.workspace = true
+uniffi = { workspace = true, features = ["wasm-unstable-single-threaded"] }
+futures-executor.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 async-compat.workspace = true
@@ -97,7 +99,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uniffi = { workspace = true, features = ["tokio"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-paranoid-android = "0.2.1"
+paranoid-android = "0.2.2"
 
 [dev-dependencies]
 similar-asserts.workspace = true

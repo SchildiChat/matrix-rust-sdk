@@ -8,7 +8,7 @@ name = "matrix-sdk-search"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version.workspace = true
-version = "0.14.0"
+version = "0.15.0"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -37,7 +37,6 @@ zeroize.workspace = true
 
 [dev-dependencies]
 matrix-sdk-test.workspace = true
-matrix-sdk = { workspace = true, features = ["native-tls", "e2e-encryption", "sqlite", "experimental-search"] }
 tempfile.workspace = true
 
 [lints]
