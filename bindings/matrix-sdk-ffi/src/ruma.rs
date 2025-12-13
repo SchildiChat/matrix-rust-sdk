@@ -205,6 +205,13 @@ pub fn message_event_content_from_markdown(
 }
 
 #[matrix_sdk_ffi_macros::export]
+pub fn message_event_content_from_markdown_as_notice(
+    md: String,
+) -> Arc<RoomMessageEventContentWithoutRelation> {
+    Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::notice_markdown(md)))
+}
+
+#[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_markdown_as_emote(
     md: String,
 ) -> Arc<RoomMessageEventContentWithoutRelation> {
@@ -217,6 +224,16 @@ pub fn message_event_content_from_html(
     html_body: String,
 ) -> Arc<RoomMessageEventContentWithoutRelation> {
     Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::text_html(
+        body, html_body,
+    )))
+}
+
+#[matrix_sdk_ffi_macros::export]
+pub fn message_event_content_from_html_as_notice(
+    body: String,
+    html_body: String,
+) -> Arc<RoomMessageEventContentWithoutRelation> {
+    Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::notice_html(
         body, html_body,
     )))
 }
