@@ -76,6 +76,7 @@ use crate::{
 
 // SC start
 use ruma::events::receipt::ReceiptThread;
+use ruma::UserId;
 // SC end
 
 pub mod configuration;
@@ -361,6 +362,13 @@ impl Timeline {
     /// SC: get fully_read marker event ID
     pub async fn fully_read_event_id(&self) -> Option<String> {
         self.inner.fully_read_event_id().await.map(Into::into)
+    }
+
+    /// SC: get latest read receipt by user
+    pub async fn latest_user_read_receipt_event_id(&self, user_id: String) -> Option<String> {
+        let user_id = UserId::parse(user_id).ok()?;
+        let (event_id, _) = self.inner.latest_user_read_receipt(&user_id).await?;
+        Some(event_id.into())
     }
 
     /// SC: same as send_read_receipt(), but with force_
