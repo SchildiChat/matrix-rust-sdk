@@ -250,6 +250,24 @@ impl Room {
                 // #nofilter.
             }
 
+            TimelineFilter::ScSettings { show_redactions, filter } => { // SC
+                // Like upstream EventTypeFilter
+                if let Some(event_type_filter) = filter {
+                    builder = builder.event_filter(move |event, room_version_id| {
+                        // Always perform the default filter first
+                        default_event_filter(event, room_version_id) &&
+                            event_type_filter.filter(event) &&
+                            (show_redactions || sc_event_not_redacted_filter(event))
+                    });
+                } else if !show_redactions {
+                    builder = builder.event_filter(move |event, _room_version_id| {
+                        sc_event_not_redacted_filter(event)
+                    });
+                } else {
+                    // #nofilter.
+                }
+            }
+
             TimelineFilter::OnlyMessage { types } => {
                 builder = builder.event_filter(move |event, room_version_id| {
                     default_event_filter(event, room_version_id)
@@ -2019,5 +2037,12 @@ impl TryFrom<SdkRoomSendQueueUpdate> for RoomSendQueueUpdate {
                 Self::SentEvent { transaction_id: transaction_id.into(), event_id: event_id.into() }
             }
         })
+    }
+}
+
+pub fn sc_event_not_redacted_filter(event: &AnySyncTimelineEvent) -> bool {
+    match event {
+        AnySyncTimelineEvent::MessageLike(msg) => !msg.is_redacted(),
+        AnySyncTimelineEvent::State(state) => !state.is_redacted(),
     }
 }
