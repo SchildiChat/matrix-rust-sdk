@@ -148,6 +148,11 @@ impl From<DateDividerMode> for matrix_sdk_ui::timeline::DateDividerMode {
 pub enum TimelineFilter {
     /// Show all the events in the timeline, independent of their type.
     All,
+    /// SC: custom settings, e.g. hide redacted messages
+    ScSettings {
+        show_redactions: bool,
+        filter: Option<Arc<TimelineEventTypeFilter>>,
+    },
     /// Show only `m.room.messages` of the given room message types.
     OnlyMessage {
         /// A list of [`RoomMessageEventMessageType`] that will be allowed to
