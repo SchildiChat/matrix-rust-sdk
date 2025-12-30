@@ -3365,6 +3365,16 @@ impl Room {
         ).await?;
         Ok(())
     }
+    /// Get all raw state events for a room via network query
+    pub async fn fetch_full_room_state(&self) -> Result<Vec<String>> {
+        let req = ruma::api::client::state::get_state_events::v3::Request::new(self.room_id().to_owned());
+        let resp = self.client().send(req).await?;
+        Ok(resp.room_state
+            .into_iter()
+            .map(|raw| serde_json::to_string(&raw))
+            .filter_map(Result::ok)
+            .collect())
+    }
     // SC end
 
     /// Get a `matrix:` permalink to an event in this room.
