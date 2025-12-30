@@ -802,7 +802,7 @@ impl Room {
         ).await?;
         Ok(())
     }
-    pub async fn send_raw_state(&self, event_type: String, state_key: String, content: String) -> Result<(), ClientError> {
+    pub async fn send_state_event_raw(&self, event_type: String, state_key: String, content: String) -> Result<(), ClientError> {
         let content_json: serde_json::Value =
             serde_json::from_str(&content).map_err(|e| ClientError::Generic {
                 msg: format!("Failed to parse JSON: {e}"),
@@ -810,6 +810,11 @@ impl Room {
             })?;
         self.inner.send_state_event_raw(&event_type, &state_key, content_json).await?;
         Ok(())
+    }
+    pub async fn get_state_event_raw(&self, event_type: String, state_key: String) -> Result<Option<String>, ClientError> {
+        let event_type = ruma::events::StateEventType::from(event_type);
+        let state_event = self.inner.get_state_event(event_type, &state_key).await?;
+        state_event.map(|s| serde_json::to_string(&s).map_err(ClientError::from_err)).transpose()
     }
     /// SC end
 
