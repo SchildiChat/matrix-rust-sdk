@@ -80,6 +80,7 @@ use tracing::{debug, error, warn};
 /// The default `required_state` constant value for sliding sync lists and
 /// sliding sync room subscriptions.
 const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
+    (StateEventType::Bridge, "*"), // SC
     (StateEventType::RoomName, ""),
     (StateEventType::RoomEncryption, ""),
     (StateEventType::RoomMember, "$LAZY"),
@@ -89,7 +90,6 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::RoomAvatar, ""),
     (StateEventType::RoomCanonicalAlias, ""),
     (StateEventType::RoomPowerLevels, ""),
-    (StateEventType::SpaceChild, "*"),
     (StateEventType::CallMember, "*"),
     (StateEventType::RoomJoinRules, ""),
     (StateEventType::RoomTombstone, ""),
