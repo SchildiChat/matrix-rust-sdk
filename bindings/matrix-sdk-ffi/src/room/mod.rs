@@ -816,6 +816,11 @@ impl Room {
         let state_event = self.inner.get_state_event(event_type, &state_key).await?;
         state_event.map(|s| serde_json::to_string(&s).map_err(ClientError::from_err)).transpose()
     }
+    pub async fn get_state_events_raw(&self, event_type: String) -> Result<Vec<String>, ClientError> {
+        let event_type = ruma::events::StateEventType::from(event_type);
+        let state_events = self.inner.get_state_events(event_type).await?;
+        Ok(state_events.into_iter().map(|s| serde_json::to_string(&s)).filter_map(Result::ok).collect())
+    }
     pub async fn fetch_full_room_state(&self) -> Result<Vec<String>, ClientError> {
         self.inner.fetch_full_room_state().await.map_err(ClientError::from_err)
     }
