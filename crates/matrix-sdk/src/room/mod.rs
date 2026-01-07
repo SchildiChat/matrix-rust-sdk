@@ -148,6 +148,11 @@ use thiserror::Error;
 use tokio::{join, sync::broadcast};
 use tracing::{debug, error, info, instrument, trace, warn};
 
+// SC
+use ruma::events::room::member::RoomMemberEventContent;
+use as_variant::as_variant;
+// SC end
+
 use self::futures::{SendAttachment, SendMessageLikeEvent, SendRawMessageLikeEvent};
 pub use self::{
     member::{RoomMember, RoomMemberRole},
@@ -3374,6 +3379,22 @@ impl Room {
             .map(|raw| serde_json::to_string(&raw))
             .filter_map(Result::ok)
             .collect())
+    }
+    /// Sets the user's display name in the current room.
+    pub async fn set_user_displayname(&self, displayname: Option<String>) -> Result<()> {
+        let user_id = self.own_user_id();
+        let mut content = self.get_state_event_static_for_key::<RoomMemberEventContent, _>(user_id).await?
+            .and_then(|event| {
+                event
+                    .deserialize()
+                    .inspect_err(|e| warn!("Couldn't deserialize the membership event: {e}"))
+                    .ok()
+            })
+            .and_then(|event| as_variant!(event, SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => e.content))
+            .ok_or(Error::InsufficientData)?;
+        content.displayname = displayname;
+        self.send_state_event_for_key(user_id, content).await?;
+        Ok(())
     }
     // SC end
 

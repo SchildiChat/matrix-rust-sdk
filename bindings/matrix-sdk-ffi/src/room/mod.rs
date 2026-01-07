@@ -824,6 +824,9 @@ impl Room {
     pub async fn fetch_full_room_state(&self) -> Result<Vec<String>, ClientError> {
         self.inner.fetch_full_room_state().await.map_err(ClientError::from_err)
     }
+    pub async fn set_user_displayname(&self, displayname: Option<String>) -> Result<(), ClientError> {
+        self.inner.set_user_displayname(displayname).await.map_err(ClientError::from)
+    }
     /// SC end
 
     /// Returns whether the send queue for that particular room is enabled or
