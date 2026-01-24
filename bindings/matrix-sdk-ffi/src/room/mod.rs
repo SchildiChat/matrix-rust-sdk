@@ -596,6 +596,24 @@ impl Room {
         Ok(())
     }
 
+    /// SC: Set avatar URL
+    pub async fn set_avatar_url(
+        &self,
+        url: String,
+        media_info: Option<ImageInfo>,
+    ) -> Result<(), ClientError> {
+        self.inner
+            .set_avatar_url(
+                &ruma::OwnedMxcUri::from(url),
+                media_info
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(|_| RoomError::InvalidMediaInfo)?,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Removes the current room avatar
     pub async fn remove_avatar(&self) -> Result<(), ClientError> {
         self.inner.remove_avatar().await?;
