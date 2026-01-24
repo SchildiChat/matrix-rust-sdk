@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Bug Fixes
+
+- [**breaking**] New `LatestEventValue::LocalHasBeenSent` variant to represent
+  a local event that has been sent successfully.
+  ([#5968](https://github.com/matrix-org/matrix-rust-sdk/pull/5968))
+
+### Features
+
+- Add `StateStore::upsert_thread_subscriptions()` method for bulk upserts.
+  ([#5848](https://github.com/matrix-org/matrix-rust-sdk/pull/5848))
+- The `LatestEventValue::LocalHasBeenSent` variant gains a new `event_id:
+  OwnedEventId` field.
+  ([#5977](https://github.com/matrix-org/matrix-rust-sdk/pull/5977))
+
+### Refactor
+
+- [**breaking**] The `message-ids` feature has been removed. It was already a no-op and has now
+  been eliminated entirely.
+  ([#5963](https://github.com/matrix-org/matrix-rust-sdk/pull/5963))
+
+## [0.16.0] - 2025-12-04
+
+### Security Fixes
+
+- Skip the serialization of custom join rules in the `RoomInfo` which prevented
+  the processing of sync responses containing events with custom join rules.
+  ([#5924](https://github.com/matrix-org/matrix-rust-sdk/pull/5924)) (Low, [CVE-2025-66622](https://www.cve.org/CVERecord?id=CVE-2025-66622), [GHSA-jj6p-3m75-g2p3](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-jj6p-3m75-g2p3)).
+
 ### Refactor
 
 - [**breaking**] `ServerInfo` has been renamed to `SupportedVersionsResponse`,
@@ -16,11 +44,6 @@ All notable changes to this project will be documented in this file.
   ([#5910](https://github.com/matrix-org/matrix-rust-sdk/pull/5910))
   - `StateStoreData(Key/Value)::ServerInfo` has been split into the
     `SupportedVersions` and `WellKnown` variants.
-
-## [0.15.0] - 2025-11-27
-
-### Refactor
-
 - [**breaking**] Upgrade Ruma to version 0.14.0.
   ([#5882](https://github.com/matrix-org/matrix-rust-sdk/pull/5882))
 - `Client::sync_lock` has been renamed `Client::state_store_lock`.

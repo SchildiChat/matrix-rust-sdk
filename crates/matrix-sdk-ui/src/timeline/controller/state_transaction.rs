@@ -210,7 +210,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         let event_id = deserialized.event_id().to_owned();
         let txn_id = deserialized.transaction_id().map(ToOwned::to_owned);
 
-        if let Some(action @ TimelineAction::HandleAggregation { .. }) = TimelineAction::from_event(
+        let timeline_action = TimelineAction::from_event(
             deserialized,
             raw_event,
             room_data_provider,
@@ -219,31 +219,58 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             None,
             None,
         )
-        .await
-        {
-            let encryption_info = event.kind.encryption_info().cloned();
+        .await;
 
-            let sender_profile = room_data_provider.profile_from_user_id(&sender).await;
+        match timeline_action {
+            Some(action @ TimelineAction::AddItem { .. })
+            | Some(action @ TimelineAction::HandleAggregation { .. }) => {
+                let encryption_info = event.kind.encryption_info().cloned();
+                let sender_profile = room_data_provider.profile_from_user_id(&sender).await;
 
-            let ctx = TimelineEventContext {
-                sender,
-                sender_profile,
-                timestamp,
-                // These are not used when handling an aggregation.
-                read_receipts: Default::default(),
-                is_highlighted: false,
-                flow: Flow::Remote {
-                    event_id: event_id.clone(),
-                    raw_event: event.raw().clone(),
-                    encryption_info,
-                    txn_id,
-                    position,
-                },
-                // This field is not used when handling an aggregation.
-                should_add_new_items: false,
-            };
+                let (forwarder, forwarder_profile) =
+                    get_forwarder_info(&event, room_data_provider).await;
 
-            TimelineEventHandler::new(self, ctx).handle_event(date_divider_adjuster, action).await;
+                let mut ctx = TimelineEventContext {
+                    sender,
+                    sender_profile,
+                    forwarder,
+                    forwarder_profile,
+                    timestamp,
+                    // These are not used when handling an aggregation.
+                    read_receipts: Default::default(),
+                    is_highlighted: false,
+                    flow: Flow::Remote {
+                        event_id: event_id.clone(),
+                        raw_event: event.raw().clone(),
+                        encryption_info,
+                        txn_id,
+                        position,
+                    },
+                    // This field is not used when handling an aggregation.
+                    should_add_new_items: false,
+                };
+
+                // FIXME: Continuation of the hackjob to get UTDs for focused timelines
+                // working from `handle_remote_aggregations()`.
+                if let TimelineAction::AddItem { .. } = action
+                    && let TimelineItemPosition::UpdateAt { timeline_item_index } = position
+                    && let Some(event) = self.items.get(timeline_item_index)
+                    && event
+                        .as_event()
+                        .map(|e| {
+                            e.content().is_unable_to_decrypt() && e.event_id() == Some(&event_id)
+                        })
+                        .unwrap_or_default()
+                {
+                    // Except when this is an UTD transitioning into a decrypted event.
+                    ctx.should_add_new_items = true;
+                }
+
+                TimelineEventHandler::new(self, ctx)
+                    .handle_event(date_divider_adjuster, action)
+                    .await;
+            }
+            None => {}
         }
     }
 
@@ -314,6 +341,40 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                         .get(event_index)
                         .and_then(|meta| meta.timeline_item_index)
                     {
+                        self.handle_remote_aggregation(
+                            event,
+                            TimelineItemPosition::UpdateAt { timeline_item_index },
+                            room_data_provider,
+                            &mut date_divider_adjuster,
+                        )
+                        .await;
+                    } else if let Some(event_id) = event.event_id()
+                        && let Some(meta) =
+                            self.items.all_remote_events().get_by_event_id(&event_id)
+                        && let Some(timeline_item_index) = meta.timeline_item_index
+                    {
+                        // FIXME: This branch is a complete hackjob.
+                        //
+                        // The reason being is that this branch is here to handle UTD -> Decrypted
+                        // event remplacements for focused timelines. But this transition should
+                        // naturally happen the same way it happens for unfocused timelines.
+                        //
+                        // Why it doesn't work here? Because the event cache fires out a
+                        // VectorDiff::Set with an index that matches to the cache's view of the
+                        // timeline, which is unfiltered, while the focused timeline will only show
+                        // i.e. pinned events.
+                        //
+                        // The `test_pinned_events_are_decrypted_after_recovering` integration test
+                        // showcases this. The event cache fires out the `Set` with an index of 7,
+                        // but the timeline with the PinnedEvents focus has only 4 items.
+                        //
+                        // This hackjob continues in the `handle_remote_aggregation()` method as we
+                        // can't just handle any `TimelineAction::AddItem` due to:
+                        //  https://github.com/matrix-org/matrix-rust-sdk/pull/4645
+                        //
+                        // Doing so breaks the `test_new_pinned_events_are_not_added_on_sync` test.
+                        //
+                        // Relevant issue: https://github.com/matrix-org/matrix-rust-sdk/issues/5954.
                         self.handle_remote_aggregation(
                             event,
                             TimelineItemPosition::UpdateAt { timeline_item_index },
@@ -625,9 +686,9 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         let is_highlighted =
             event.push_actions().is_some_and(|actions| actions.iter().any(Action::is_highlight));
 
-        let thread_summary = if let ThreadSummaryStatus::Some(summary) = event.thread_summary {
-            let latest_reply_item = if let Some(latest_reply) = summary.latest_reply {
-                self.fetch_latest_thread_reply(&latest_reply, room_data_provider).await
+        let thread_summary = if let ThreadSummaryStatus::Some(ref summary) = event.thread_summary {
+            let latest_reply_item = if let Some(ref latest_reply) = summary.latest_reply {
+                self.fetch_latest_thread_reply(latest_reply, room_data_provider).await
             } else {
                 None
             };
@@ -644,6 +705,8 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         let bundled_edit_encryption_info = event.kind.unsigned_encryption_map().and_then(|map| {
             map.get(&UnsignedEventLocation::RelationsReplace)?.encryption_info().cloned()
         });
+
+        let (forwarder, forwarder_profile) = get_forwarder_info(&event, room_data_provider).await;
 
         let (raw, utd_info) = match event.kind {
             TimelineEventKind::UnableToDecrypt { utd_info, event } => (event, Some(utd_info)),
@@ -739,6 +802,8 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             let ctx = TimelineEventContext {
                 sender,
                 sender_profile,
+                forwarder,
+                forwarder_profile,
                 timestamp,
                 read_receipts: if settings.track_read_receipts.is_enabled()
                     && should_add
@@ -973,4 +1038,35 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             }
         }
     }
+}
+
+/// Retrieves the forwarder information for a given timeline event.
+///
+/// # Parameters
+///
+/// - `event`: The timeline event to extract forwarder information from.
+/// - `room_data_provider`: A reference to the room data provider.
+///
+/// # Returns
+///
+/// A tuple containing:
+/// - `Option<OwnedUserId>`: The user ID of the forwarder, if available.
+/// - `Option<Profile>`: The profile of the forwarder, if available.
+async fn get_forwarder_info<P: RoomDataProvider>(
+    event: &TimelineEvent,
+    room_data_provider: &P,
+) -> (Option<OwnedUserId>, Option<Profile>) {
+    let forwarder = event
+        .kind
+        .encryption_info()
+        .and_then(|info| info.forwarder.as_ref())
+        .map(|info| info.user_id.clone());
+
+    let forwarder_profile = if let Some(ref forwarder_id) = forwarder {
+        Some(room_data_provider.profile_from_user_id(forwarder_id).await)
+    } else {
+        None
+    };
+
+    (forwarder, forwarder_profile.flatten())
 }

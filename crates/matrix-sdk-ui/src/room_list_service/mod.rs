@@ -388,11 +388,11 @@ impl RoomListService {
 
             loop {
                 let (sync_indicator, yield_delay) = match current_state {
-                    State::Init | State::SettingUp | State::Error { .. } => {
+                    State::SettingUp | State::Error { .. } => {
                         (SyncIndicator::Show, delay_before_showing)
                     }
 
-                    State::Recovering | State::Running | State::Terminated { .. } => {
+                    State::Init | State::Recovering | State::Running | State::Terminated { .. } => {
                         (SyncIndicator::Hide, delay_before_hiding)
                     }
                 };
@@ -458,6 +458,8 @@ impl RoomListService {
     /// room in `room_ids`, so that the [`LatestEventValue`] will automatically
     /// be calculated and updated for these rooms, for free.
     ///
+    /// All previous room subscriptions will be forgotten.
+    ///
     /// [listen_to_room]: matrix_sdk::latest_events::LatestEvents::listen_to_room
     /// [`LatestEventValue`]: matrix_sdk::latest_events::LatestEventValue
     pub async fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
@@ -498,7 +500,11 @@ impl RoomListService {
         }
 
         // Subscribe to the rooms.
-        self.sliding_sync.subscribe_to_rooms(room_ids, Some(settings), cancel_in_flight_request)
+        self.sliding_sync.clear_and_subscribe_to_rooms(
+            room_ids,
+            Some(settings),
+            cancel_in_flight_request,
+        )
     }
 
     #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Not, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
@@ -22,11 +22,10 @@ use matrix_sdk_ui::{
         ALL_ROOMS_LIST_NAME as ALL_ROOMS, Error, RoomListLoadingState, State, SyncIndicator,
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
     },
-    timeline::{RoomExt as _, TimelineItemKind, VirtualTimelineItem},
+    timeline::{LatestEventValue, RoomExt as _, TimelineItemKind, VirtualTimelineItem},
 };
 use ruma::{
     api::client::room::create_room::v3::Request as CreateRoomRequest,
-    event_id,
     events::room::message::RoomMessageEventContent,
     mxc_uri, room_id,
     time::{Duration, Instant},
@@ -418,7 +417,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
         assert pos Some("0"),
         // Still no long-polling because the list isn't fully-loaded.
         assert timeout None,
-        assert request = {
+        assert request >= {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
@@ -446,7 +445,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
         assert pos Some("1"),
         // Still no long-polling because the list isn't fully-loaded.
         assert timeout None,
-        assert request = {
+        assert request >= {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
@@ -475,7 +474,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
         // Still no long-polling because the list isn't fully-loaded,
         // but it's about to be!
         assert timeout None,
-        assert request = {
+        assert request >= {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
@@ -503,7 +502,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
         assert pos Some("3"),
         // The list is fully-loaded, we can start long-polling.
         assert timeout Some(30000),
-        assert request = {
+        assert request >= {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
@@ -1744,15 +1743,26 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
                 "!r0:bar.org": {
                     "initial": true,
                     "bump_stamp": 9,
-                    "required_state": [],
+                    "required_state": [
+                        {
+                            "content": {
+                                "name": "Look, a new name"
+                            },
+                            "sender": "@example:bar.org",
+                            "state_key": "",
+                            "type": "m.room.name",
+                            "event_id": "$s8",
+                            "origin_server_ts": 9,
+                        },
+                    ],
                 },
             },
         },
     };
 
     // Assert the dynamic entries.
-    // `!r0:bar.org` has a more recent message.
-    // The room must move in the room list.
+    // `!r0:bar.org` has a new state event. The room must move in the room list
+    // because it has the highest recency.
     assert_entries_batch! {
         [dynamic_entries_stream]
         pop back;
@@ -1866,7 +1876,7 @@ async fn test_room_sorting() -> Result<(), Error> {
     // Now, let's define a filter.
     dynamic_entries.set_filter(Box::new(new_filter_non_left()));
 
-    // Assert rooms are sorted by recency and by name!.
+    // Assert rooms are sorted by recency and by name!
     assert_entries_batch! {
         [stream]
         reset [
@@ -1910,14 +1920,44 @@ async fn test_room_sorting() -> Result<(), Error> {
                 },
             },
             "rooms": {
-                "!r0:bar.org": {
+              "!r0:bar.org": {
                     "bump_stamp": 7,
+                    "timeline": [{
+                        "content": {
+                              "body": "foo",
+                              "msgtype": "m.text",
+                          },
+                          "event_id": "$ev7",
+                          "origin_server_ts": 7,
+                          "sender": "@example:bar.org",
+                          "type": "m.room.message",
+                    }],
                 },
                 "!r1:bar.org": {
                     "bump_stamp": 6,
+                    "timeline": [{
+                        "content": {
+                              "body": "foo",
+                              "msgtype": "m.text"
+                          },
+                          "event_id": "$ev6",
+                          "origin_server_ts": 6,
+                          "sender": "@example:bar.org",
+                          "type": "m.room.message",
+                    }],
                 },
                 "!r2:bar.org": {
                     "bump_stamp": 9,
+                    "timeline": [{
+                        "content": {
+                              "body": "foo",
+                              "msgtype": "m.text"
+                          },
+                          "event_id": "$ev9",
+                          "origin_server_ts": 9,
+                          "sender": "@example:bar.org",
+                          "type": "m.room.message",
+                    }],
                 },
             },
         },
@@ -1975,6 +2015,23 @@ async fn test_room_sorting() -> Result<(), Error> {
     // | 3     | !r4     | 5       |      |
     // | 4     | !r3     | 4       |      |
 
+    // Rooms are individually updated.
+    assert_entries_batch! {
+        [stream]
+        set [ 1 ] [ "!r0:bar.org" ];
+        end;
+    };
+    assert_entries_batch! {
+        [stream]
+        set [ 2 ] [ "!r1:bar.org" ];
+        end;
+    };
+    assert_entries_batch! {
+        [stream]
+        set [ 0 ] [ "!r2:bar.org" ];
+        end;
+    };
+
     assert_pending!(stream);
 
     sync_then_assert_request_and_fake_response! {
@@ -1999,9 +2056,29 @@ async fn test_room_sorting() -> Result<(), Error> {
                 "!r6:bar.org": {
                     "initial": true,
                     "bump_stamp": 8,
+                    "timeline": [{
+                        "content": {
+                              "body": "foo",
+                              "msgtype": "m.text"
+                          },
+                          "event_id": "$ev8",
+                          "origin_server_ts": 8,
+                          "sender": "@example:bar.org",
+                          "type": "m.room.message",
+                    }],
                 },
                 "!r3:bar.org": {
                     "bump_stamp": 10,
+                    "timeline": [{
+                        "content": {
+                              "body": "foo",
+                              "msgtype": "m.text"
+                          },
+                          "event_id": "$ev10",
+                          "origin_server_ts": 10,
+                          "sender": "@example:bar.org",
+                          "type": "m.room.message",
+                    }],
                 },
             },
         },
@@ -2024,6 +2101,18 @@ async fn test_room_sorting() -> Result<(), Error> {
     // | 4     | !r4     | 5       |      |
     // | 5     | !r3     | 4       |      |
 
+    // Rooms are individually updated.
+    assert_entries_batch! {
+        [stream]
+        set [ 1 ] [ "!r6:bar.org" ];
+        end;
+    };
+    assert_entries_batch! {
+        [stream]
+        set [ 1 ] [ "!r6:bar.org" ];
+        end;
+    };
+
     assert_entries_batch! {
         [stream]
         remove [ 5 ];
@@ -2042,66 +2131,22 @@ async fn test_room_sorting() -> Result<(), Error> {
     // | 4     | !r1     | 6       | Aaa  |
     // | 5     | !r4     | 5       |      |
 
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
+    // Rooms are individually updated.
     assert_entries_batch! {
         [stream]
         set [ 2 ] [ "!r6:bar.org" ];
         end;
     };
-
-    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
-    // removed.
-    assert_entries_batch! {
-        [stream]
-        set [ 2 ] [ "!r6:bar.org" ];
-        end;
-    };
-
-    assert_pending!(stream);
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = Running => Running,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    "ranges": [[0, 5]],
-                    "timeline_limit": 1,
-                },
-            },
-        },
-        respond with = {
-            "pos": "3",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 6,
-                },
-            },
-            "rooms": {
-                "!r3:bar.org": {
-                    "bump_stamp": 11,
-                },
-            },
-        },
-    };
-
     assert_entries_batch! {
         [stream]
         set [ 0 ] [ "!r3:bar.org" ];
         end;
     };
-
-    // Now we have:
-    //
-    // | index | room ID | recency | name |
-    // |-------|---------|---------|------|
-    // | 0     | !r3     | 11      |      |
-    // | 1     | !r2     | 9       |      |
-    // | 2     | !r6     | 8       |      |
-    // | 3     | !r0     | 7       | Bbb  |
-    // | 4     | !r1     | 6       | Aaa  |
-    // | 5     | !r4     | 5       |      |
+    assert_entries_batch! {
+        [stream]
+        set [ 2 ] [ "!r6:bar.org" ];
+        end;
+    };
 
     assert_pending!(stream);
 
@@ -2267,7 +2312,6 @@ async fn test_room_subscription() -> Result<(), Error> {
     };
 
     // Subscribe.
-
     room_list.subscribe_to_rooms(&[room_id_1]).await;
 
     sync_then_assert_request_and_fake_response! {
@@ -2312,15 +2356,36 @@ async fn test_room_subscription() -> Result<(), Error> {
     };
 
     // Subscribe to another room.
-
     room_list.subscribe_to_rooms(&[room_id_2]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        assert request >= {
+        // strict comparison (with `=`) because we want to ensure
+        // the exact shape of `room_subscriptions`.
+        assert request = {
+            "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "required_state": [
+                        ["m.room.name", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
+                        ["m.room.member", "$ME"],
+                        ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
+                        ["m.room.canonical_alias", ""],
+                        ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
+                        ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
+                    ],
+                    "filters": {},
                     "timeline_limit": 1,
                 },
             },
@@ -2348,6 +2413,11 @@ async fn test_room_subscription() -> Result<(), Error> {
                     "timeline_limit": 20,
                 },
             },
+            "extensions": {
+                "account_data": { "enabled": true },
+                "receipts": { "enabled": true, "rooms": [ "*" ] },
+                "typing": { "enabled": true },
+            },
         },
         respond with = {
             "pos": "2",
@@ -2356,23 +2426,86 @@ async fn test_room_subscription() -> Result<(), Error> {
         },
     };
 
-    // Subscribe to an already subscribed room. Nothing happens.
-
-    room_list.subscribe_to_rooms(&[room_id_1]).await;
+    // Subscribe to an already subscribed room, plus a previously removed one.
+    room_list.subscribe_to_rooms(&[room_id_1, room_id_2]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         // strict comparison (with `=`) because we want to ensure
-        // the absence of `room_subscriptions`.
+        // the exact shape of `room_subscriptions`.
         assert request = {
             "conn_id": "room-list",
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "required_state": [
+                        ["m.room.name", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
+                        ["m.room.member", "$ME"],
+                        ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
+                        ["m.room.canonical_alias", ""],
+                        ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
+                        ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
+                    ],
+                    "filters": {},
                     "timeline_limit": 1,
                 },
             },
-            // NO `room_subscriptions`!
+            "room_subscriptions": {
+                room_id_1: {
+                    "required_state": [
+                        ["m.room.name", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
+                        ["m.room.member", "$ME"],
+                        ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
+                        ["m.room.canonical_alias", ""],
+                        ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
+                        ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
+                        ["m.room.pinned_events", ""],
+                    ],
+                    "timeline_limit": 20,
+                },
+                room_id_2: {
+                    "required_state": [
+                        ["m.room.name", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
+                        ["m.room.member", "$ME"],
+                        ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
+                        ["m.room.canonical_alias", ""],
+                        ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
+                        ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
+                        ["m.room.pinned_events", ""],
+                    ],
+                    "timeline_limit": 20,
+                },
+            },
             "extensions": {
                 "account_data": { "enabled": true },
                 "receipts": { "enabled": true, "rooms": [ "*" ] },
@@ -2568,7 +2701,7 @@ async fn test_room_empty_timeline() {
 
 #[async_test]
 async fn test_room_latest_event() -> Result<(), Error> {
-    let (_, server, room_list) = new_room_list_service().await?;
+    let (client, server, room_list) = new_room_list_service().await?;
     mock_encryption_state(&server, false).await;
 
     let sync = room_list.sync();
@@ -2597,8 +2730,14 @@ async fn test_room_latest_event() -> Result<(), Error> {
     let room = room_list.room(room_id)?;
     let timeline = room.timeline_builder().build().await.unwrap();
 
+    // We could subscribe to the room —with `RoomList::subscribe_to_rooms`— to
+    // automatically listen to the latest event updates, but we will do it
+    // manually here (so that we can ignore the subscription thingies).
+    let latest_events = client.latest_events().await;
+    latest_events.listen_to_room(room_id).await.unwrap();
+
     // The latest event does not exist.
-    assert!(room.latest_event_item().await.is_none());
+    assert_matches!(room.latest_event().await, LatestEventValue::None);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2616,58 +2755,19 @@ async fn test_room_latest_event() -> Result<(), Error> {
         },
     };
 
+    yield_now().await;
+
     // The latest event exists.
-    assert_matches!(
-        room.latest_event_item().await,
-        Some(event) => {
-            assert!(event.is_local_echo().not());
-            assert_eq!(event.event_id(), Some(event_id!("$x0:bar.org")));
-        }
-    );
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        assert request >= {},
-        respond with = {
-            "pos": "2",
-            "lists": {},
-            "rooms": {
-                room_id: {
-                    "timeline": [
-                        timeline_event!("$x1:bar.org" at 1 sec),
-                    ],
-                },
-            },
-        },
-    };
-
-    // The latest event has been updated.
-    let latest_event = room.latest_event_item().await.unwrap();
-    assert!(latest_event.is_local_echo().not());
-    assert_eq!(latest_event.event_id(), Some(event_id!("$x1:bar.org")));
-
-    // The latest event matches the latest event of the `Timeline`.
-    assert_matches!(
-        timeline.latest_event().await,
-        Some(timeline_event) => {
-            assert_eq!(timeline_event.event_id(), latest_event.event_id());
-        }
-    );
+    assert_matches!(room.latest_event().await, LatestEventValue::Remote { .. });
 
     // Insert a local event in the `Timeline`.
     timeline.send(RoomMessageEventContent::text_plain("Hello, World!").into()).await.unwrap();
 
-    // Let the send queue send the message, and the timeline process it.
+    // Let the latest event be computed.
     yield_now().await;
 
-    // The latest event of the `Timeline` is a local event.
-    assert_matches!(
-        timeline.latest_event().await,
-        Some(timeline_event) => {
-            assert!(timeline_event.is_local_echo());
-            assert_eq!(timeline_event.event_id(), None);
-        }
-    );
+    // The latest event has been updated.
+    assert_matches!(room.latest_event().await, LatestEventValue::Local { .. });
 
     Ok(())
 }
@@ -2714,10 +2814,11 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 1.
         {
-            // The state transitions into `Init`. The `SyncIndicator` must be `Show`.
+            // The state transitions into `Init`. The `SyncIndicator` stays in `Hide` as
+            // nothing is happening yet.
             assert_next_sync_indicator!(
                 sync_indicator,
-                SyncIndicator::Show,
+                SyncIndicator::Hide,
                 under DELAY_BEFORE_SHOWING + request_margin,
             );
         }
@@ -2726,7 +2827,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
 
         // Request 2.
         {
-            // The state transitions into `SettingUp`. The `SyncIndicator` stays in `Show`.
+            // The state transitions into `SettingUp`. The `SyncIndicator` must be `Show` as
+            // the service has now been started.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,

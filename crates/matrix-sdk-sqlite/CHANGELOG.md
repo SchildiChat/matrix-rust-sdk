@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
-## [0.15.0] - 2025-11-27
+## [0.16.0] - 2025-12-04
 
 ### Features
 
@@ -17,6 +17,8 @@ All notable changes to this project will be documented in this file.
 
 - Implement a new constructor that allows to open `SqliteCryptoStore` with a cryptographic key
   ([#5472](https://github.com/matrix-org/matrix-rust-sdk/pull/5472))
+- Implement `StateStore::upsert_thread_subscriptions()` method for bulk upserts.
+  ([#5848](https://github.com/matrix-org/matrix-rust-sdk/pull/5848))
 
 ### Refactor
 - [breaking] Change the logic for opening a store so as to use a `Secret` enum in the function `open_with_pool` instead of a `passphrase`

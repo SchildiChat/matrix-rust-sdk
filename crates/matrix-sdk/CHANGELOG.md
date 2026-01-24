@@ -6,19 +6,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
-### Refactor
+### Features
 
-- [**breaking**]: `Client::server_vendor_info()` requires to enable the
-  `federation-api` feature.
-  ([#5912](https://github.com/matrix-org/matrix-rust-sdk/pull/5912))
-- [**breaking**]: `Client::reset_server_info()` has been split into
-  `reset_supported_versions()` and `reset_well_known()`.
-  ([#5910](https://github.com/matrix-org/matrix-rust-sdk/pull/5910))
+- Sending `MessageLike` and `RawMessageLike` events through a `Room` now returns
+  the used `EncryptionInfo`, if any.
+  ([#5936](https://github.com/matrix-org/matrix-rust-sdk/pull/5936))
+- [**breaking**]: The new Latest Event API replaces the old API. All the
+  `new_` prefixes have been removed, thus `Room::new_latest_event` becomes
+  and overwrites the `Room::latest_event` value. The new Latest Event values
+  stored in `RoomInfo` are also erased once during the first update of the
+  SDK. The new values will be re-calculated. The following types or functions
+  are removed: `PossibleLatestEvent`, `is_suitable_for_latest_event`, and
+  `LatestEvent` (replaced by `LatestEventValue`). See the documentation of
+  `matrix_sdk::latest_event` to learn about the new API.
+  ([#5624](https://github.com/matrix-org/matrix-rust-sdk/pull/5624/))
+- Expose a new method `RoomEventCache::find_event_relations` for loading
+  events relating to a specific event ID from the cache.
+  ([#5930](https://github.com/matrix-org/matrix-rust-sdk/pull/5930/))
+- Replace in-memory stores with IndexedDB implementations when initializing
+  `Client` with `BuilderStoreConfig::IndexedDb`.
+  ([#5946](https://github.com/matrix-org/matrix-rust-sdk/pull/5946))
+- Call: Add support for the new Intents for voice only calls `Intent.StartCallDmVoice`
+  and `Intent.JoinExistingDmVoice`.
+  ([#6003](https://github.com/matrix-org/matrix-rust-sdk/pull/6003))
+- Add `SlidingSync::unsubscribe_to_rooms` and
+  `SlidingSync::clear_and_subscribe_to_rooms`.
+  ([#6012](https://github.com/matrix-org/matrix-rust-sdk/pull/6012))
 
-## [0.15.0] - 2025-11-27
+### Bugfix
+
+- Add manual WAL checkpoints when opening Sqlite DBs and when vacuuming them, since the WAL files aren't automatically shrinking. ([#6004](https://github.com/matrix-org/matrix-rust-sdk/pull/6004))
+- Use the server name extracted from the user id in `Client::fetch_client_well_known` as a fallback value. Otherwise, sometimes the server name is not available and we can't reload the well-known contents. ([#5996](https://github.com/matrix-org/matrix-rust-sdk/pull/5996))
+- Latest Event is lazier: a `RoomLatestEvents` can be registered even if its
+  associated `RoomEventCache` isn't created yet.
+  ([#5947](https://github.com/matrix-org/matrix-rust-sdk/pull/5947))
+- Allow granting of QR login to a new client whose device ID is not a base64
+  encoded Curve25519 public key.
+  ([#5940](https://github.com/matrix-org/matrix-rust-sdk/pull/5940))
+
+## [0.16.0] - 2025-12-04
 
 ### Features
 
+- Add `Client::get_store_sizes()` so to query the size of the existing stores, if available. ([#5911](https://github.com/matrix-org/matrix-rust-sdk/pull/5911))
 - Add `QRCodeLoginError::NotFound` for non-existing / expired rendezvous sessions
   ([#5898](https://github.com/matrix-org/matrix-rust-sdk/pull/5898))
 - Add `QRCodeGrantLoginError::NotFound` for non-existing / expired rendezvous sessions
@@ -63,9 +93,18 @@ All notable changes to this project will be documented in this file.
   ([#5678](https://github.com/matrix-org/matrix-rust-sdk/pull/5678).
 - Add new API to decline calls ([MSC4310](https://github.com/matrix-org/matrix-spec-proposals/pull/4310)): `Room::make_decline_call_event` and `Room::subscribe_to_call_decline_events`
   ([#5614](https://github.com/matrix-org/matrix-rust-sdk/pull/5614))
+- Use `StateStore::upsert_thread_subscriptions()` to bulk process thread subscription updates received
+  via the sync response or from the MSC4308 companion endpoint.
+  ([#5848](https://github.com/matrix-org/matrix-rust-sdk/pull/5848))
 
 ### Refactor
 
+- [**breaking**]: `Client::server_vendor_info()` requires to enable the
+  `federation-api` feature.
+  ([#5912](https://github.com/matrix-org/matrix-rust-sdk/pull/5912))
+- [**breaking**]: `Client::reset_server_info()` has been split into
+  `reset_supported_versions()` and `reset_well_known()`.
+  ([#5910](https://github.com/matrix-org/matrix-rust-sdk/pull/5910))
 - [**breaking**]: `Client::send()` has extra bounds where
   `Request::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>` and
   `Request::PathBuilder: SupportedPathBuilder`. This method should still work for any request to the

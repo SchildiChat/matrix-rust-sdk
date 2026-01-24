@@ -23,10 +23,10 @@ use matrix_sdk_store_encryption::StoreCipher;
 
 use crate::{
     event_cache_store::{
-        error::IndexeddbEventCacheStoreError, migrations::open_and_upgrade_db,
-        IndexeddbEventCacheStore,
+        IndexeddbEventCacheStore, error::IndexeddbEventCacheStoreError,
+        migrations::open_and_upgrade_db,
     },
-    serializer::{IndexedTypeSerializer, SafeEncodeSerializer},
+    serializer::{indexed_type::IndexedTypeSerializer, safe_encode::types::SafeEncodeSerializer},
 };
 
 /// A type for conveniently building an [`IndexeddbEventCacheStore`]
@@ -54,6 +54,16 @@ impl IndexeddbEventCacheStoreBuilder {
     pub fn database_name(mut self, name: String) -> Self {
         self.database_name = name;
         self
+    }
+
+    /// Create a new [`IndexeddbEventCacheStoreBuilder`] where the database name
+    /// is constructed by joining the given prefix with
+    /// [`Self::DEFAULT_DATABASE_NAME`] and separated by `::`.
+    pub fn with_prefix(prefix: &str) -> Self {
+        Self {
+            database_name: format!("{}::{}", prefix, Self::DEFAULT_DATABASE_NAME),
+            store_cipher: None,
+        }
     }
 
     /// Sets the store cipher to use when encrypting data before it is persisted

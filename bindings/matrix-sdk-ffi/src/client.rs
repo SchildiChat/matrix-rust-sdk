@@ -59,6 +59,7 @@ use ruma::{
         alias::get_alias,
         error::ErrorKind,
         profile::{AvatarUrl, DisplayName},
+        room::create_room::v3::CreationContent,
         uiaa::UserIdentifier,
     },
     events::{
@@ -86,6 +87,7 @@ use ruma::{
         RoomAccountDataEvent as RumaRoomAccountDataEvent,
     },
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
+    room::RoomType,
     room_version_rules::AuthorizationRules,
     OwnedDeviceId, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
 };
@@ -359,6 +361,17 @@ impl Client {
 
 #[matrix_sdk_ffi_macros::export]
 impl Client {
+    /// Perform database optimizations if any are available, i.e. vacuuming in
+    /// SQLite.
+    pub async fn optimize_stores(&self) -> Result<(), ClientError> {
+        Ok(self.inner.optimize_stores().await?)
+    }
+
+    /// Returns the sizes of the existing stores, if known.
+    pub async fn get_store_sizes(&self) -> Result<StoreSizes, ClientError> {
+        Ok(self.inner.get_store_sizes().await?.into())
+    }
+
     /// Information about login options for the client's homeserver.
     pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
         let oauth = self.inner.oauth();
@@ -1507,8 +1520,8 @@ impl Client {
         SyncServiceBuilder::new((*self.inner).clone(), self.utd_hook_manager.get().cloned())
     }
 
-    pub fn space_service(&self) -> Arc<SpaceService> {
-        let inner = UISpaceService::new((*self.inner).clone());
+    pub async fn space_service(&self) -> Arc<SpaceService> {
+        let inner = UISpaceService::new((*self.inner).clone()).await;
         Arc::new(SpaceService::new(inner))
     }
 
@@ -1870,6 +1883,12 @@ impl Client {
             .await?
             .iter()
             .any(|focus| matches!(focus, RtcFocusInfo::LiveKit(_))))
+    }
+
+    /// Checks if the server supports login using a QR code.
+    pub async fn is_login_with_qr_code_supported(&self) -> Result<bool, ClientError> {
+        Ok(matches!(self.inner.auth_api(), Some(AuthApi::OAuth(_)))
+            && self.inner.unstable_features().await?.contains(&ruma::api::FeatureFlag::Msc4108))
     }
 
     /// Get server vendor information from the federation API.
@@ -2301,6 +2320,8 @@ pub struct CreateRoomParameters {
     pub history_visibility_override: Option<RoomHistoryVisibility>,
     #[uniffi(default = None)]
     pub canonical_alias: Option<String>,
+    #[uniffi(default = false)]
+    pub is_space: bool,
 }
 
 impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
@@ -2354,6 +2375,12 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         }
 
         request.initial_state = initial_state;
+
+        if value.is_space {
+            let mut creation_content = CreationContent::new();
+            creation_content.room_type = Some(RoomType::Space);
+            request.creation_content = Some(Raw::new(&creation_content)?);
+        }
 
         if let Some(power_levels) = value.power_level_content_override {
             match Raw::new(&power_levels.into()) {
@@ -2862,5 +2889,93 @@ impl TryFrom<RumaAllowRule> for AllowRule {
             }
             _ => Err(format!("Invalid AllowRule: {value:?}")),
         }
+    }
+}
+
+/// Contains the disk size of the different stores, if known. It won't be
+/// available for in-memory stores.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StoreSizes {
+    /// The size of the CryptoStore.
+    crypto_store: Option<u64>,
+    /// The size of the StateStore.
+    state_store: Option<u64>,
+    /// The size of the EventCacheStore.
+    event_cache_store: Option<u64>,
+    /// The size of the MediaStore.
+    media_store: Option<u64>,
+}
+
+impl From<matrix_sdk::StoreSizes> for StoreSizes {
+    fn from(value: matrix_sdk::StoreSizes) -> Self {
+        Self {
+            crypto_store: value.crypto_store.map(|v| v as u64),
+            state_store: value.state_store.map(|v| v as u64),
+            event_cache_store: value.event_cache_store.map(|v| v as u64),
+            media_store: value.media_store.map(|v| v as u64),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruma::{
+        api::client::room::{create_room, Visibility},
+        events::StateEventType,
+        room::RoomType,
+    };
+
+    use crate::{
+        client::{CreateRoomParameters, JoinRule, RoomPreset, RoomVisibility},
+        room::RoomHistoryVisibility,
+    };
+
+    #[test]
+    fn test_create_room_parameters_mapping() {
+        let params = CreateRoomParameters {
+            name: Some("A room".to_owned()),
+            topic: Some("A topic".to_owned()),
+            is_encrypted: true,
+            is_direct: true,
+            visibility: RoomVisibility::Public,
+            preset: RoomPreset::PublicChat,
+            invite: Some(vec!["@user:example.com".to_owned()]),
+            avatar: Some("http://example.com/avatar.jpg".to_owned()),
+            power_level_content_override: None,
+            join_rule_override: Some(JoinRule::Knock),
+            history_visibility_override: Some(RoomHistoryVisibility::Shared),
+            canonical_alias: Some("#a-room:example.com".to_owned()),
+            is_space: true,
+        };
+
+        let request: create_room::v3::Request =
+            params.try_into().expect("CreateRoomParameters couldn't be transformed into a Request");
+        let initial_state = request
+            .initial_state
+            .iter()
+            .map(|raw| raw.deserialize().expect("Initial state event failed to deserialize"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(request.name, Some("A room".to_owned()));
+        assert_eq!(request.topic, Some("A topic".to_owned()));
+        assert!(initial_state.iter().any(|e| e.event_type() == StateEventType::RoomEncryption));
+        assert!(request.is_direct);
+        assert_eq!(request.visibility, Visibility::Public);
+        assert_eq!(request.preset, Some(create_room::v3::RoomPreset::PublicChat));
+        assert_eq!(request.invite.len(), 1);
+        assert!(initial_state.iter().any(|e| e.event_type() == StateEventType::RoomAvatar));
+        assert!(initial_state.iter().any(|e| e.event_type() == StateEventType::RoomJoinRules));
+        assert!(initial_state
+            .iter()
+            .any(|e| e.event_type() == StateEventType::RoomHistoryVisibility));
+        assert_eq!(request.room_alias_name, Some("#a-room:example.com".to_owned()));
+
+        let room_type = request
+            .creation_content
+            .expect("Creation content is missing")
+            .deserialize()
+            .expect("Creation content can't be deserialized")
+            .room_type;
+        assert_eq!(room_type, Some(RoomType::Space));
     }
 }

@@ -25,12 +25,12 @@ pub mod traits;
 use gloo_utils::format::JsValueSerdeExt;
 use indexed_db_futures::KeyRange;
 use range::IndexedKeyRange;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use traits::{Indexed, IndexedKey};
 use wasm_bindgen::JsValue;
 
-use crate::serializer::SafeEncodeSerializer;
+use crate::serializer::safe_encode::types::SafeEncodeSerializer;
 
 #[derive(Debug, Error)]
 pub enum IndexedTypeSerializerError<IndexingError> {

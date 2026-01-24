@@ -250,6 +250,14 @@ impl EventCacheStore for MemoryStore {
         self.inner.write().unwrap().events.save_item(room_id.to_owned(), event);
         Ok(())
     }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -263,5 +271,6 @@ mod tests {
     }
 
     event_cache_store_integration_tests!();
+    #[cfg(not(target_family = "wasm"))]
     event_cache_store_integration_tests_time!();
 }

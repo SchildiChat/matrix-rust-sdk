@@ -9,7 +9,7 @@ name = "matrix-sdk-base"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version.workspace = true
-version = "0.15.0"
+version = "0.16.0"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -49,9 +49,6 @@ test-send-sync = [
     "matrix-sdk-common/test-send-sync",
     "matrix-sdk-crypto?/test-send-sync",
 ]
-
-# "message-ids" feature doesn't do anything and is deprecated.
-message-ids = []
 
 # helpers for testing features build upon this
 testing = [

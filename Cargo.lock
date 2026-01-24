@@ -317,6 +317,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-once-cell"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288f83726785267c6f2ef073a3d83dc3f9b81464e9f99898240cced85fce35a"
+
+[[package]]
 name = "async-rx"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2698,43 +2704,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce23b50ad8242c51a442f3ff322d56b02f08852c77e4c0b4d3fd684abc89c683"
 
 [[package]]
-name = "indexed_db_futures"
-version = "0.6.4"
-source = "git+https://github.com/matrix-org/rust-indexed-db?rev=201caac274e38756c6e523ba7cf84ffb625b7c48#201caac274e38756c6e523ba7cf84ffb625b7c48"
-dependencies = [
- "accessory",
- "cfg-if",
- "delegate-display",
- "derive_more 2.0.1",
- "fancy_constructor",
- "futures-core",
- "indexed_db_futures_macros_internal",
- "js-sys",
- "sealed",
- "serde",
- "serde-wasm-bindgen",
- "smallvec",
- "thiserror 2.0.17",
- "tokio",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm_evt_listener",
- "web-sys",
- "web-time",
-]
-
-[[package]]
-name = "indexed_db_futures_macros_internal"
-version = "1.0.0"
-source = "git+https://github.com/matrix-org/rust-indexed-db?rev=201caac274e38756c6e523ba7cf84ffb625b7c48#201caac274e38756c6e523ba7cf84ffb625b7c48"
-dependencies = [
- "macroific",
- "proc-macro2",
- "quote",
- "syn 2.0.101",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2937,6 +2906,9 @@ name = "language-tags"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4345964bb142484797b161f473a503a434de77149dd8c7427788c6e13379388"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "lazy_static"
@@ -3177,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "anymap2",
@@ -3187,6 +3159,7 @@ dependencies = [
  "assert_matches",
  "assert_matches2",
  "async-channel",
+ "async-once-cell",
  "async-stream",
  "async-trait",
  "axum",
@@ -3256,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-base"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "as_variant",
@@ -3296,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-common"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "assert_matches",
  "assert_matches2",
@@ -3328,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-crypto"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -3411,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-ffi"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -3461,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-indexeddb"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "assert_matches",
  "assert_matches2",
@@ -3473,13 +3446,13 @@ dependencies = [
  "gloo-utils",
  "growable-bloom-filter",
  "hkdf",
- "indexed_db_futures",
  "js-sys",
  "matrix-sdk-base",
  "matrix-sdk-common",
  "matrix-sdk-crypto",
  "matrix-sdk-store-encryption",
  "matrix-sdk-test",
+ "matrix_indexed_db_futures",
  "rand 0.8.5",
  "rmp-serde",
  "ruma",
@@ -3533,7 +3506,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-qrcode"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "byteorder",
  "image",
@@ -3545,7 +3518,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-search"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "aes",
  "byteorder",
@@ -3566,7 +3539,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-sqlite"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "as_variant",
  "assert_matches",
@@ -3600,7 +3573,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-store-encryption"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3620,7 +3593,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-test"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "as_variant",
  "ctor",
@@ -3642,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-test-macros"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "quote",
  "syn 2.0.101",
@@ -3650,7 +3623,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-test-utils"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "ctor",
  "tracing-subscriber",
@@ -3658,7 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-ui"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "as_variant",
@@ -3704,6 +3677,45 @@ dependencies = [
  "uniffi",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "matrix_indexed_db_futures"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "245ff6a224b4df7b0c90dda2dd5a6eb46112708d49e8bdd8b007fccb09fea8e4"
+dependencies = [
+ "accessory",
+ "cfg-if",
+ "delegate-display",
+ "derive_more 2.0.1",
+ "fancy_constructor",
+ "futures-core",
+ "js-sys",
+ "matrix_indexed_db_futures_macros_internal",
+ "sealed",
+ "serde",
+ "serde-wasm-bindgen",
+ "smallvec",
+ "thiserror 2.0.17",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm_evt_listener",
+ "web-sys",
+ "web-time",
+]
+
+[[package]]
+name = "matrix_indexed_db_futures_macros_internal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b428aee5c0fe9e5babd29e99d289b7f64718c444989aac0442d1fd6d3e3f66d1"
+dependencies = [
+ "macroific",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.101",
 ]
 
 [[package]]
@@ -4797,12 +4809,13 @@ dependencies = [
 
 [[package]]
 name = "ruma"
-version = "0.14.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+version = "0.14.1"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "assign",
  "js_int",
  "js_option",
+ "language-tags",
  "ruma-client-api",
  "ruma-common",
  "ruma-events",
@@ -4814,8 +4827,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-client-api"
-version = "0.22.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+version = "0.22.1"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "as_variant",
  "assign",
@@ -4837,8 +4850,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-common"
-version = "0.17.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+version = "0.17.1"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "as_variant",
  "base64",
@@ -4870,13 +4883,14 @@ dependencies = [
 
 [[package]]
 name = "ruma-events"
-version = "0.32.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+version = "0.32.1"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "as_variant",
  "indexmap",
  "js_int",
  "js_option",
+ "language-tags",
  "percent-encoding",
  "pulldown-cmark",
  "regex",
@@ -4896,8 +4910,8 @@ dependencies = [
 
 [[package]]
 name = "ruma-federation-api"
-version = "0.13.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+version = "0.13.1"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "headers",
  "http",
@@ -4918,7 +4932,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.6.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -4929,7 +4943,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.12.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "js_int",
  "thiserror 2.0.17",
@@ -4937,9 +4951,10 @@ dependencies = [
 
 [[package]]
 name = "ruma-macros"
-version = "0.17.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+version = "0.17.1"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
+ "as_variant",
  "cfg-if",
  "proc-macro-crate",
  "proc-macro2",
@@ -4953,7 +4968,7 @@ dependencies = [
 [[package]]
 name = "ruma-signatures"
 version = "0.19.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=58b8490fc#58b8490fceeb553af902883748de25a52eb5d4ab"
+source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -6474,8 +6489,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 [[package]]
 name = "uniffi"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c866f627c3f04c3df068b68bb2d725492caaa539dd313e2a9d26bb85b1a32f4e"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "camino",
@@ -6498,8 +6512,7 @@ dependencies = [
 [[package]]
 name = "uniffi_bindgen"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c8ca600167641ebe7c8ba9254af40492dda3397c528cc3b2f511bd23e8541a5"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "askama",
@@ -6524,8 +6537,7 @@ dependencies = [
 [[package]]
 name = "uniffi_build"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e55c05228f4858bb258f651d21d743fcc1fe5a2ec20d3c0f9daefddb105ee4d"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "camino",
@@ -6535,8 +6547,7 @@ dependencies = [
 [[package]]
 name = "uniffi_core"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e7a5a038ebffe8f4cf91416b154ef3c2468b18e828b7009e01b1b99938089f9"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -6548,8 +6559,7 @@ dependencies = [
 [[package]]
 name = "uniffi_internal_macros"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c2a6f93e7b73726e2015696ece25ca0ac5a5f1cf8d6a7ab5214dd0a01d2edf"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -6561,8 +6571,7 @@ dependencies = [
 [[package]]
 name = "uniffi_macros"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64c6309fc36c7992afc03bc0c5b059c656bccbef3f2a4bc362980017f8936141"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "camino",
  "fs-err",
@@ -6578,11 +6587,10 @@ dependencies = [
 [[package]]
 name = "uniffi_meta"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a138823392dba19b0aa494872689f97d0ee157de5852e2bec157ce6de9cdc22"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
- "siphasher 0.3.11",
+ "siphasher 1.0.1",
  "uniffi_internal_macros",
  "uniffi_pipeline",
 ]
@@ -6590,8 +6598,7 @@ dependencies = [
 [[package]]
 name = "uniffi_pipeline"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c27c4b515d25f8e53cc918e238c39a79c3144a40eaf2e51c4a7958973422c29"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "heck",
@@ -6603,8 +6610,7 @@ dependencies = [
 [[package]]
 name = "uniffi_udl"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0adacdd848aeed7af4f5af7d2f621d5e82531325d405e29463482becfdeafca"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "anyhow",
  "textwrap",
@@ -7016,8 +7022,7 @@ dependencies = [
 [[package]]
 name = "weedle2"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998d2c24ec099a87daf9467808859f9d82b61f1d9c9701251aea037f514eae0e"
+source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
 dependencies = [
  "nom",
 ]
@@ -7436,7 +7441,6 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "camino",
- "cargo_metadata",
  "clap",
  "fs_extra",
  "regex",

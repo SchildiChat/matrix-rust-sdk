@@ -20,39 +20,39 @@ use std::{
 };
 
 use async_trait::async_trait;
-use matrix_sdk_base::{cross_process_lock::CrossProcessLockGeneration, timer};
+use matrix_sdk_base::cross_process_lock::CrossProcessLockGeneration;
 use matrix_sdk_crypto::{
+    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
     olm::{
         InboundGroupSession, OutboundGroupSession, PickledInboundGroupSession,
         PrivateCrossSigningIdentity, SenderDataType, Session, StaticAccountData,
     },
     store::{
+        CryptoStore,
         types::{
             BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
             RoomKeyWithheldEntry, RoomSettings, StoredRoomKeyBundleData,
         },
-        CryptoStore,
     },
-    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
-    events::secret::request::SecretName, DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
-    RoomId, TransactionId, UserId,
+    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, RoomId, TransactionId, UserId,
+    events::secret::request::SecretName,
 };
-use rusqlite::{named_params, params_from_iter, OptionalExtension};
+use rusqlite::{OptionalExtension, named_params, params_from_iter};
 use tokio::{fs, sync::Mutex};
 use tracing::{debug, instrument, warn};
 use vodozemac::Curve25519PublicKey;
 
 use crate::{
+    OpenStoreError, Secret, SqliteStoreConfig,
     connection::{Connection as SqliteAsyncConn, Pool as SqlitePool},
     error::{Error, Result},
     utils::{
-        repeat_vars, EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
-        SqliteKeyValueStoreConnExt,
+        EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        SqliteKeyValueStoreConnExt, repeat_vars,
     },
-    OpenStoreError, Secret, SqliteStoreConfig,
 };
 
 /// The database name.
@@ -124,6 +124,8 @@ impl SqliteCryptoStore {
         let version = conn.db_version().await?;
         debug!("Opened sqlite store with version {}", version);
         run_migrations(&conn, version).await?;
+
+        conn.wal_checkpoint().await;
 
         let store_cipher = match secret {
             Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s).await?)),
@@ -1066,11 +1068,7 @@ impl CryptoStore for SqliteCryptoStore {
             })
             .collect::<Result<_>>()?;
 
-        if sessions.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(sessions))
-        }
+        if sessions.is_empty() { Ok(None) } else { Ok(Some(sessions)) }
     }
 
     #[instrument(skip(self))]
@@ -1501,8 +1499,6 @@ impl CryptoStore for SqliteCryptoStore {
         key: &str,
         holder: &str,
     ) -> Result<Option<CrossProcessLockGeneration>> {
-        let _timer = timer!("method");
-
         let key = key.to_owned();
         let holder = holder.to_owned();
 
@@ -1551,6 +1547,10 @@ impl CryptoStore for SqliteCryptoStore {
             Ok(None)
         }
     }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        Ok(Some(self.pool.get().await?.get_db_size().await?))
+    }
 }
 
 #[cfg(test)]
@@ -1566,7 +1566,7 @@ mod tests {
     use once_cell::sync::Lazy;
     use ruma::{device_id, room_id, user_id};
     use similar_asserts::assert_eq;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use tokio::fs;
 
     use super::SqliteCryptoStore;
@@ -1978,7 +1978,7 @@ mod tests {
 mod encrypted_tests {
     use matrix_sdk_crypto::{cryptostore_integration_tests, cryptostore_integration_tests_time};
     use once_cell::sync::Lazy;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use tokio::fs;
 
     use super::SqliteCryptoStore;

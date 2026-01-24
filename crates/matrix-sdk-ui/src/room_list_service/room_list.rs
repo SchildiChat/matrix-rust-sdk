@@ -28,7 +28,7 @@ use matrix_sdk::{
     Client, Room, RoomRecencyStamp, RoomState, SlidingSync, SlidingSyncList,
     executor::{JoinHandle, spawn},
 };
-use matrix_sdk_base::RoomInfoNotableUpdate;
+use matrix_sdk_base::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons};
 use ruma::MilliSecondsSinceUnixEpoch;
 use tokio::{
     select,
@@ -280,6 +280,22 @@ fn merge_stream_and_receiver(
                 update = room_info_notable_update_receiver.recv() => {
                     match update {
                         Ok(update) => {
+                            // Filter which _reason_ can trigger an update of
+                            // the room list.
+                            //
+                            // If the update is strictly about the
+                            // `RECENCY_STAMP`, let's ignore it, because the
+                            // Latest Event type is used to sort the room list
+                            // by recency already. We don't want to trigger an
+                            // update because of `RECENCY_STAMP`.
+                            //
+                            // If the update contains more reasons than
+                            // `RECENCY_STAMP`, then it's fine. That's why we
+                            // are using `==` instead of `contains`.
+                            if update.reasons == RoomInfoNotableUpdateReasons::RECENCY_STAMP {
+                                continue;
+                            }
+
                             // Emit a `VectorDiff::Set` for the specific rooms.
                             if let Some(index) = current_values.iter().position(|room| room.room_id() == update.room_id) {
                                 let mut room = current_values[index].clone();
@@ -448,11 +464,11 @@ pub struct RoomListItem {
     /// The inner room.
     inner: Room,
 
-    /// Cache of `Room::new_latest_event_timestamp`.
+    /// Cache of `Room::latest_event_timestamp`.
     pub(super) cached_latest_event_timestamp: Option<MilliSecondsSinceUnixEpoch>,
 
-    /// Cache of `Room::new_latest_event_is_local`.
-    pub(super) cached_latest_event_is_local: bool,
+    /// Cache of `Room::latest_event_is_unsent`.
+    pub(super) cached_latest_event_is_unsent: bool,
 
     /// Cache of `Room::recency_stamp`.
     pub(super) cached_recency_stamp: Option<RoomRecencyStamp>,
@@ -475,8 +491,8 @@ impl RoomListItem {
 
     /// Refresh the cached data.
     pub(super) fn refresh_cached_data(&mut self) {
-        self.cached_latest_event_timestamp = self.inner.new_latest_event_timestamp();
-        self.cached_latest_event_is_local = self.inner.new_latest_event_is_local();
+        self.cached_latest_event_timestamp = self.inner.latest_event_timestamp();
+        self.cached_latest_event_is_unsent = self.inner.latest_event_is_unsent();
         self.cached_recency_stamp = self.inner.recency_stamp();
         self.cached_display_name = self.inner.cached_display_name().map(|name| name.to_string());
         self.cached_is_space = self.inner.is_space();
@@ -486,8 +502,8 @@ impl RoomListItem {
 
 impl From<Room> for RoomListItem {
     fn from(inner: Room) -> Self {
-        let cached_latest_event_timestamp = inner.new_latest_event_timestamp();
-        let cached_latest_event_is_local = inner.new_latest_event_is_local();
+        let cached_latest_event_timestamp = inner.latest_event_timestamp();
+        let cached_latest_event_is_unsent = inner.latest_event_is_unsent();
         let cached_recency_stamp = inner.recency_stamp();
         let cached_display_name = inner.cached_display_name().map(|name| name.to_string());
         let cached_is_space = inner.is_space();
@@ -496,7 +512,7 @@ impl From<Room> for RoomListItem {
         Self {
             inner,
             cached_latest_event_timestamp,
-            cached_latest_event_is_local,
+            cached_latest_event_is_unsent,
             cached_recency_stamp,
             cached_display_name,
             cached_is_space,

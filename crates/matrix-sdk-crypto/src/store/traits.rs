@@ -15,28 +15,28 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
-use matrix_sdk_common::{cross_process_lock::CrossProcessLockGeneration, AsyncTraitDeps};
+use matrix_sdk_common::{AsyncTraitDeps, cross_process_lock::CrossProcessLockGeneration};
 use ruma::{
-    events::secret::request::SecretName, DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId,
+    DeviceId, OwnedDeviceId, RoomId, TransactionId, UserId, events::secret::request::SecretName,
 };
 use vodozemac::Curve25519PublicKey;
 
 use super::{
+    CryptoStoreError, Result,
     types::{
         BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
         StoredRoomKeyBundleData, TrackedUser,
     },
-    CryptoStoreError, Result,
 };
 #[cfg(doc)]
 use crate::olm::SenderData;
 use crate::{
+    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, UserIdentityData,
     olm::{
         InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
         SenderDataType, Session,
     },
     store::types::RoomKeyWithheldEntry,
-    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, UserIdentityData,
 };
 
 /// Represents a store that the `OlmMachine` uses to store E2EE data (such as
@@ -399,6 +399,9 @@ pub trait CryptoStore: AsyncTraitDeps {
 
     /// Load the next-batch token for a to-device query, if any.
     async fn next_batch_token(&self) -> Result<Option<String>, Self::Error>;
+
+    /// Returns the size of the store in bytes, if known.
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -647,6 +650,10 @@ impl<T: CryptoStore> CryptoStore for EraseCryptoStoreError<T> {
 
     async fn next_batch_token(&self) -> Result<Option<String>, Self::Error> {
         self.0.next_batch_token().await.map_err(Into::into)
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        self.0.get_size().await.map_err(Into::into)
     }
 }
 
