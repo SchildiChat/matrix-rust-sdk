@@ -30,8 +30,8 @@ use matrix_sdk_ui::{
     Timeline,
     timeline::{
         AnyOtherFullStateEventContent, Error, EventSendState, MsgLikeKind, OtherMessageLike,
-        RedactError, RoomExt, TimelineBuilder, TimelineEventItemId, TimelineFocus,
-        TimelineItemContent, VirtualTimelineItem, default_event_filter,
+        RedactError, RoomExt, TimelineBuilder, TimelineEventItemId, TimelineEventShieldState,
+        TimelineFocus, TimelineItemContent, VirtualTimelineItem, default_event_filter,
     },
 };
 use ruma::{
@@ -386,7 +386,8 @@ async fn test_redact_local_sent_message() {
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     // Mock event sending.
-    server.mock_room_send().ok(event_id!("$wWgymRfo7ri1uQx0NXO40vLJ")).mock_once().mount().await;
+    let event_id = event_id!("$ev0");
+    server.mock_room_send().ok(event_id).mock_once().mount().await;
 
     // Send the event so it's added to the send queue as a local event.
     timeline
@@ -408,18 +409,26 @@ async fn test_redact_local_sent_message() {
     assert!(date_divider.is_date_divider());
 
     assert_let!(Some(timeline_updates) = timeline_stream.next().await);
-    assert_eq!(timeline_updates.len(), 1);
+    assert_eq!(timeline_updates.len(), 5);
 
     // We receive an update in the timeline from the send queue.
-    assert_let!(VectorDiff::Set { index, value: item } = &timeline_updates[0]);
-    assert_eq!(*index, 1);
-
-    assert_pending!(timeline_stream);
-
-    // Check the event is sent but still considered local.
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
     let event = item.as_event().unwrap();
     assert!(event.is_local_echo());
     assert_matches!(event.send_state(), Some(EventSendState::Sent { .. }));
+
+    // And then it's inserted in the Event Cache, and considered remote.
+    assert_matches!(&timeline_updates[1], VectorDiff::Remove { index: 1 });
+    assert_let!(VectorDiff::PushFront { value: remote_event } = &timeline_updates[2]);
+    assert_eq!(remote_event.as_event().unwrap().event_id(), Some(event_id));
+
+    // The date divider is adjusted.
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[3]);
+    assert!(date_divider.is_date_divider());
+
+    assert_matches!(&timeline_updates[4], VectorDiff::Remove { index: 2 });
+
+    assert_pending!(timeline_stream);
 
     // Mock the redaction response for the event we just sent. Ensure it's called
     // once.
@@ -748,7 +757,7 @@ async fn test_timeline_without_encryption_info() {
     assert_eq!(items.len(), 2);
     assert!(items[0].as_virtual().is_some());
     // No encryption, no shields.
-    assert!(items[1].as_event().unwrap().get_shield(false).is_none());
+    assert_eq!(items[1].as_event().unwrap().get_shield(false), TimelineEventShieldState::None);
 }
 
 #[async_test]
@@ -778,7 +787,7 @@ async fn test_timeline_without_encryption_can_update() {
     assert_eq!(items.len(), 2);
     assert!(items[0].as_virtual().is_some());
     // No encryption, no shields
-    assert!(items[1].as_event().unwrap().get_shield(false).is_none());
+    assert_eq!(items[1].as_event().unwrap().get_shield(false), TimelineEventShieldState::None);
 
     let encryption_event_content = RoomEncryptionEventContent::with_recommended_defaults();
     server
@@ -796,17 +805,17 @@ async fn test_timeline_without_encryption_can_update() {
     // Previous timeline event now has a shield.
     assert_let!(VectorDiff::Set { index, value } = &timeline_updates[0]);
     assert_eq!(*index, 1);
-    assert!(value.as_event().unwrap().get_shield(false).is_some());
+    assert_ne!(value.as_event().unwrap().get_shield(false), TimelineEventShieldState::None);
 
     // Room encryption event is received.
     assert_let!(VectorDiff::PushBack { value } = &timeline_updates[1]);
     assert_let!(TimelineItemContent::OtherState(other_state) = value.as_event().unwrap().content());
     assert_let!(AnyOtherFullStateEventContent::RoomEncryption(_) = other_state.content());
-    assert!(value.as_event().unwrap().get_shield(false).is_some());
+    assert_ne!(value.as_event().unwrap().get_shield(false), TimelineEventShieldState::None);
 
     // New message event is received and has a shield.
     assert_let!(VectorDiff::PushBack { value } = &timeline_updates[2]);
-    assert!(value.as_event().unwrap().get_shield(false).is_some());
+    assert_ne!(value.as_event().unwrap().get_shield(false), TimelineEventShieldState::None);
 
     assert_pending!(stream);
 }

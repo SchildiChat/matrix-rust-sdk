@@ -29,7 +29,7 @@ use std::{rc::Rc, time::Duration};
 pub use builder::IndexeddbMediaStoreBuilder;
 pub use error::IndexeddbMediaStoreError;
 use indexed_db_futures::{
-    cursor::CursorDirection, database::Database, transaction::TransactionMode, Build,
+    Build, cursor::CursorDirection, database::Database, transaction::TransactionMode,
 };
 #[cfg(target_family = "wasm")]
 use matrix_sdk_base::cross_process_lock::{
@@ -37,15 +37,15 @@ use matrix_sdk_base::cross_process_lock::{
 };
 use matrix_sdk_base::{
     media::{
+        MediaRequestParameters,
         store::{
             IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaService, MediaStore,
             MediaStoreInner,
         },
-        MediaRequestParameters,
     },
     timer,
 };
-use ruma::{time::SystemTime, MilliSecondsSinceUnixEpoch, MxcUri};
+use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, time::SystemTime};
 use tracing::instrument;
 
 use crate::{
@@ -53,7 +53,7 @@ use crate::{
         transaction::IndexeddbMediaStoreTransaction,
         types::{Lease, Media, MediaCleanupTime, MediaContent, MediaMetadata, UnixTime},
     },
-    serializer::{Indexed, IndexedTypeSerializer},
+    serializer::indexed_type::{IndexedTypeSerializer, traits::Indexed},
     transaction::TransactionError,
 };
 
@@ -111,8 +111,6 @@ impl MediaStore for IndexeddbMediaStore {
         key: &str,
         holder: &str,
     ) -> Result<Option<CrossProcessLockGeneration>, IndexeddbMediaStoreError> {
-        let _timer = timer!("method");
-
         let transaction = self.transaction(&[Lease::OBJECT_STORE], TransactionMode::Readwrite)?;
 
         let now = Duration::from_millis(MilliSecondsSinceUnixEpoch::now().get().into());
@@ -271,6 +269,14 @@ impl MediaStore for IndexeddbMediaStore {
         let _timer = timer!("method");
         self.media_service.clean(self).await
     }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -339,12 +345,12 @@ impl MediaStoreInner for IndexeddbMediaStore {
 
         let transaction =
             self.transaction(&[MediaMetadata::OBJECT_STORE], TransactionMode::Readwrite)?;
-        if let Some(mut metadata) = transaction.get_media_metadata_by_id(request).await? {
-            if metadata.ignore_policy != ignore_policy {
-                metadata.ignore_policy = ignore_policy;
-                transaction.put_media_metadata(&metadata).await?;
-                transaction.commit().await?;
-            }
+        if let Some(mut metadata) = transaction.get_media_metadata_by_id(request).await?
+            && metadata.ignore_policy != ignore_policy
+        {
+            metadata.ignore_policy = ignore_policy;
+            transaction.put_media_metadata(&metadata).await?;
+            transaction.commit().await?;
         }
         Ok(())
     }
@@ -497,13 +503,21 @@ mod tests {
     }
 
     mod encrypted {
+        use std::sync::Arc;
+
+        use matrix_sdk_store_encryption::StoreCipher;
+
         use super::*;
 
         wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
         async fn get_media_store() -> Result<IndexeddbMediaStore, MediaStoreError> {
             let name = format!("test-media-store-{}", Uuid::new_v4().as_hyphenated());
-            Ok(IndexeddbMediaStore::builder().database_name(name).build().await?)
+            Ok(IndexeddbMediaStore::builder()
+                .database_name(name)
+                .store_cipher(Arc::new(StoreCipher::new().expect("store cipher")))
+                .build()
+                .await?)
         }
 
         #[cfg(target_family = "wasm")]

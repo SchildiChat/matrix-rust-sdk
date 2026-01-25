@@ -6,7 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
-## [0.15.0] - 2025-11-27
+### Features
+
+- [**breaking**] `ShieldStateCode` no longer includes
+  `SentInClear`. `VerificationState::to_shield_state_{lax,strict}` never
+  returned that code, and so having it in the enum was somewhat misleading.
+  ([#5959](https://github.com/matrix-org/matrix-rust-sdk/pull/5959))
+- Add field `forwarder` of type `ForwarderInfo` to `EncryptionInfo`, which
+  exposes information about the forwarder of the keys with which an event was
+  encrypted if they were shared as part of an [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268)
+  room key bundle.
+  ([#5945](https://github.com/matrix-org/matrix-rust-sdk/pull/5945)).
+
+### Bug Fixes
+
+- Fix `TimelineEvent::from_bundled_latest_event` sometimes removing the `session_id` of UTDs. This broken event could later be saved to the event cache and become an unresolvable UTD. ([#5970](https://github.com/matrix-org/matrix-rust-sdk/pull/5970)).
+
+## [0.16.0] - 2025-12-04
 
 ### Features
 

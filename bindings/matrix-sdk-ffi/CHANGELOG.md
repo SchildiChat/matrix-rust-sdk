@@ -6,6 +6,53 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Bug Fixes
+
+- [**breaking**] `LatestEventValue::Local { is_sending: bool }` is replaced
+  by [`state: LatestEventValueLocalState`] to represent 3 states: `IsSending`,
+  `HasBeenSent` and `CannotBeSent`.
+  ([#5968](https://github.com/matrix-org/matrix-rust-sdk/pull/5968/))
+
+### Features
+
+- Add `RoomCreationParameters::is_space` parameter to be able to create spaces. ([#6010](https://github.com/matrix-org/matrix-rust-sdk/pull/6010/))
+- [**breaking**] `LazyTimelineItemProvider::get_shields` no longer returns an
+  an `Option`: the `ShieldState` type contains a `None` variant, so the
+  `Option` was redundant. The `message` field has also been removed: since there
+  was no way to localise the returned string, applications should not be using it.
+  ([#5959](https://github.com/matrix-org/matrix-rust-sdk/pull/5959))
+- Add `SpaceService::get_space_room` to get a space given its id from the space graph if available.
+[#5944](https://github.com/matrix-org/matrix-rust-sdk/pull/5944)
+- Add `QrCodeData::to_bytes()` to allow generation of a QR code.
+  ([#5939](https://github.com/matrix-org/matrix-rust-sdk/pull/5939))
+- [**breaking**]: The new Latest Event API replaces the old API.
+  `Room::new_latest_event` overwrites the `Room::latest_event` method. See the
+  documentation of `matrix_sdk::latest_event` to learn about the new API.
+  [#5624](https://github.com/matrix-org/matrix-rust-sdk/pull/5624/)
+- Created `RoomPowerLevels::events` function which returns a `HashMap<TimelineEventType, i64>` with all the power 
+  levels per event type. ([#5937](https://github.com/matrix-org/matrix-rust-sdk/pull/5937))
+- Expose `EventTimelineItem::forwarder` and `forwarder_profile`, which, if present, provide the ID and profile of
+  the user who forwarded the keys used to decrypt the event as part of an [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268)
+  key bundle.
+  ([#6000](https://github.com/matrix-org/matrix-rust-sdk/pull/6000))
+  
+### Refactor
+
+- [**breaking**] The existing `TimelineEventType` was renamed to `TimelineEventContent`, because it contained the 
+  actual contents of the event. Then, we created a new `TimelineEventType` enum that actually contains *just* the 
+  event type. ([#5937](https://github.com/matrix-org/matrix-rust-sdk/pull/5937))
+- [**breaking**] The function `TimelineEvent::event_type` is now `TimelineEvent::content`. 
+  ([#5937](https://github.com/matrix-org/matrix-rust-sdk/pull/5937))
+- [**breaking**] The `SpaceService` will no longer auto-subscribe to required
+  client events when invoking the `subscribe_to_joined_spaces` but instead do it
+  through its, now async, constructor.
+  ([#5972](https://github.com/matrix-org/matrix-rust-sdk/pull/5972))
+- [**breaking**] The `SpaceService`'s `joined_spaces` method has been renamed
+  `top_level_joined_spaces` and `subscribe_to_joined_spaces` to `space_service.subscribe_to_top_level_joined_spaces`
+  ([#5972](https://github.com/matrix-org/matrix-rust-sdk/pull/5972))
+
+## [0.16.0] - 2025-12-04
+
 ### Breaking changes
 
 - `TimelineConfiguration::track_read_receipts`'s type is now an enum to allow tracking to be enabled for all events
@@ -14,11 +61,6 @@ All notable changes to this project will be documented in this file.
 - `Client::reset_server_info()` has been split into `reset_supported_versions()`
   and `reset_well_known()`.
   ([#5910](https://github.com/matrix-org/matrix-rust-sdk/pull/5910))
-
-## [0.15.0] - 2025-11-27
-
-### Breaking changes
-
 - Add `HumanQrLoginError::NotFound` for non-existing / expired rendezvous sessions
   ([#5898](https://github.com/matrix-org/matrix-rust-sdk/pull/5898))
 - Add `HumanQrGrantLoginError::NotFound` for non-existing / expired rendezvous sessions
@@ -87,6 +129,7 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `Client::get_store_sizes()` so to query the size of the existing stores, if available. ([#5911](https://github.com/matrix-org/matrix-rust-sdk/pull/5911))
 - Expose `is_space` in `NotificationRoomInfo`, allowing clients to determine if the room that triggered the notification is a space.
 - Add push actions to `NotificationItem` and replace `SyncNotification` with `NotificationItem`.
   ([#5835](https://github.com/matrix-org/matrix-rust-sdk/pull/5835))

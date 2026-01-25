@@ -257,16 +257,25 @@ async fn test_edit_local_echo() {
     timeline.room().send_queue().set_enabled(true);
 
     assert_let!(Some(timeline_updates) = timeline_stream.next().await);
-    assert_eq!(timeline_updates.len(), 1);
+    assert_eq!(timeline_updates.len(), 5);
 
     // Observe the event being sent, and replacing the local echo.
     assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
-
     let item = item.as_event().unwrap();
     assert!(item.is_local_echo());
-
     let edit_message = item.content().as_message().unwrap();
     assert_eq!(edit_message.body(), "hello, world");
+
+    // Since the event is sent, it's inserted in the Event Cache, which
+    // transforms it as a remote event.
+    assert_matches!(&timeline_updates[1], VectorDiff::Remove { index: 1 });
+    assert_let!(VectorDiff::PushFront { value: remote_event } = &timeline_updates[2]);
+    assert_eq!(remote_event.as_event().unwrap().event_id().unwrap(), "$1");
+
+    // The date divider is adjusted.
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[3]);
+    assert!(date_divider.is_date_divider());
+    assert_matches!(&timeline_updates[4], VectorDiff::Remove { index: 2 });
 
     // No new updates.
     assert_pending!(timeline_stream);
@@ -303,16 +312,14 @@ async fn test_send_edit() {
     let hello_world_message = hello_world_item.content().as_message().unwrap();
     assert!(!hello_world_message.is_edited());
     assert!(hello_world_item.is_editable());
+    assert_matches!(hello_world_item.original_json(), Some(_));
+    assert_matches!(hello_world_item.latest_edit_json(), None);
 
     server.mock_room_send().ok(event_id!("$edit_event")).mock_once().mount().await;
 
+    let edit = RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!");
     timeline
-        .edit(
-            &hello_world_item.identifier(),
-            EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::text_plain(
-                "Hello, Room!",
-            )),
-        )
+        .edit(&hello_world_item.identifier(), EditedContent::RoomMessage(edit.clone()))
         .await
         .unwrap();
 
@@ -328,6 +335,31 @@ async fn test_send_edit() {
     let edit_message = edit_item.content().as_message().unwrap();
     assert_eq!(edit_message.body(), "Hello, Room!");
     assert!(edit_message.is_edited());
+    assert_matches!(edit_item.original_json(), Some(_));
+    // The local echo doesn't have the edit's JSON yet.
+    assert_matches!(edit_item.latest_edit_json(), None);
+
+    // We receive the remote echo for the edit.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("*Hello, Room!")
+                    .sender(client.user_id().unwrap())
+                    .event_id(event_id!("$edit_event"))
+                    .edit(hello_world_item.event_id().unwrap(), edit),
+            ),
+        )
+        .await;
+
+    let edit_item =
+        assert_next_matches!(timeline_stream, VectorDiff::Set { index: 0, value } => value);
+    let edit_message = edit_item.content().as_message().unwrap();
+    assert_eq!(edit_message.body(), "Hello, Room!");
+    assert!(edit_message.is_edited());
+    assert_matches!(edit_item.original_json(), Some(_));
+    // The remote echo populated the edit's JSON.
+    assert_matches!(edit_item.latest_edit_json(), Some(_));
 
     // The response to the mocked endpoint does not generate further timeline
     // updates, so just wait for a bit before verifying that the endpoint was

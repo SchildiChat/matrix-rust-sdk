@@ -20,31 +20,31 @@ use async_trait::async_trait;
 use matrix_sdk_base::{
     cross_process_lock::CrossProcessLockGeneration,
     media::{
+        MediaRequestParameters, UniqueKey,
         store::{
             IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaService, MediaStore,
             MediaStoreInner,
         },
-        MediaRequestParameters, UniqueKey,
     },
     timer,
 };
 use matrix_sdk_store_encryption::StoreCipher;
-use ruma::{time::SystemTime, MilliSecondsSinceUnixEpoch, MxcUri};
-use rusqlite::{params_from_iter, OptionalExtension};
+use ruma::{MilliSecondsSinceUnixEpoch, MxcUri, time::SystemTime};
+use rusqlite::{OptionalExtension, params_from_iter};
 use tokio::{
     fs,
     sync::{Mutex, OwnedMutexGuard},
 };
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument};
 
 use crate::{
+    OpenStoreError, Secret, SqliteStoreConfig,
     connection::{Connection as SqliteAsyncConn, Pool as SqlitePool},
     error::{Error, Result},
     utils::{
-        repeat_vars, time_to_timestamp, EncryptableStore, SqliteAsyncConnExt,
-        SqliteKeyValueStoreAsyncConnExt, SqliteKeyValueStoreConnExt, SqliteTransactionExt,
+        EncryptableStore, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        SqliteKeyValueStoreConnExt, SqliteTransactionExt, repeat_vars, time_to_timestamp,
     },
-    OpenStoreError, Secret, SqliteStoreConfig,
 };
 
 mod keys {
@@ -143,6 +143,8 @@ impl SqliteMediaStore {
         let version = conn.db_version().await?;
         run_migrations(&conn, version).await?;
 
+        conn.wal_checkpoint().await;
+
         let store_cipher = match secret {
             Some(s) => Some(Arc::new(conn.get_or_create_store_cipher(s).await?)),
             None => None,
@@ -165,9 +167,6 @@ impl SqliteMediaStore {
     // Acquire a connection for executing read operations.
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
-        trace!("Taking a `read` connection");
-        let _timer = timer!("connection");
-
         let connection = self.pool.get().await?;
 
         // Per https://www.sqlite.org/foreignkeys.html#fk_enable, foreign key
@@ -182,9 +181,6 @@ impl SqliteMediaStore {
     // Acquire a connection for executing write operations.
     #[instrument(skip_all)]
     async fn write(&self) -> Result<OwnedMutexGuard<SqliteAsyncConn>> {
-        trace!("Taking a `write` connection");
-        let _timer = timer!("connection");
-
         let connection = self.write_connection.clone().lock_owned().await;
 
         // Per https://www.sqlite.org/foreignkeys.html#fk_enable, foreign key
@@ -194,6 +190,14 @@ impl SqliteMediaStore {
         connection.execute_batch("PRAGMA foreign_keys = ON;").await?;
 
         Ok(connection)
+    }
+
+    pub async fn vacuum(&self) -> Result<()> {
+        self.write_connection.lock().await.vacuum().await
+    }
+
+    async fn get_db_size(&self) -> Result<Option<usize>> {
+        Ok(Some(self.pool.get().await?.get_db_size().await?))
     }
 }
 
@@ -245,8 +249,6 @@ impl MediaStore for SqliteMediaStore {
         key: &str,
         holder: &str,
     ) -> Result<Option<CrossProcessLockGeneration>> {
-        let _timer = timer!("method");
-
         let key = key.to_owned();
         let holder = holder.to_owned();
 
@@ -396,6 +398,14 @@ impl MediaStore for SqliteMediaStore {
         let _timer = timer!("method");
 
         self.media_service.clean(self).await
+    }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        Ok(self.vacuum().await?)
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        self.get_db_size().await
     }
 }
 
@@ -672,8 +682,8 @@ mod tests {
 
     use matrix_sdk_base::{
         media::{
-            store::{IgnoreMediaRetentionPolicy, MediaStore, MediaStoreError},
             MediaFormat, MediaRequestParameters, MediaThumbnailSettings,
+            store::{IgnoreMediaRetentionPolicy, MediaStore, MediaStoreError},
         },
         media_store_inner_integration_tests, media_store_integration_tests,
         media_store_integration_tests_time,
@@ -681,10 +691,10 @@ mod tests {
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use ruma::{events::room::MediaSource, media::Method, mxc_uri, uint};
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     use super::SqliteMediaStore;
-    use crate::{utils::SqliteAsyncConnExt, SqliteStoreConfig};
+    use crate::{SqliteStoreConfig, utils::SqliteAsyncConnExt};
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
@@ -803,7 +813,7 @@ mod encrypted_tests {
         media_store_integration_tests, media_store_integration_tests_time,
     };
     use once_cell::sync::Lazy;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     use super::SqliteMediaStore;
 

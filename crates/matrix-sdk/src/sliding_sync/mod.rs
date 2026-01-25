@@ -20,13 +20,12 @@ mod cache;
 mod client;
 mod error;
 mod list;
-mod sticky_parameters;
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     fmt::Debug,
     future::Future,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::{Arc, RwLock as StdRwLock, RwLockWriteGuard as StdRwLockWriteGuard},
     time::Duration,
 };
 
@@ -49,11 +48,7 @@ use tokio::{
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
 pub use self::{builder::*, client::VersionBuilderError, error::*, list::*};
-use self::{
-    cache::restore_sliding_sync_state,
-    client::SlidingSyncResponseProcessor,
-    sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager, StickyData},
-};
+use self::{cache::restore_sliding_sync_state, client::SlidingSyncResponseProcessor};
 use crate::{Client, Result, config::RequestConfig};
 
 /// The Sliding Sync instance.
@@ -110,8 +105,13 @@ pub(super) struct SlidingSyncInner {
     /// The lists of this Sliding Sync instance.
     lists: AsyncRwLock<BTreeMap<String, SlidingSyncList>>,
 
-    /// Request parameters that are sticky.
-    sticky: StdRwLock<SlidingSyncStickyManager<SlidingSyncStickyParameters>>,
+    /// Room subscriptions, i.e. rooms that may be out-of-scope of all lists
+    /// but one wants to receive updates.
+    room_subscriptions: StdRwLock<BTreeMap<OwnedRoomId, http::request::RoomSubscription>>,
+
+    /// The intended state of the extensions being supplied to sliding /sync
+    /// calls.
+    extensions: http::request::Extensions,
 
     /// Internal channel used to pass messages between Sliding Sync and other
     /// types.
@@ -132,10 +132,10 @@ impl SlidingSync {
         SlidingSyncBuilder::new(id, client)
     }
 
-    /// Subscribe to many rooms.
+    /// Add subscriptions to many rooms.
     ///
-    /// If the associated `Room`s exist, it will be marked as
-    /// members are missing, so that it ensures to re-fetch all members.
+    /// If the associated `Room`s exist, they will be marked as members are
+    /// missing, so that it ensures to re-fetch all members.
     ///
     /// A subscription to an already subscribed room is ignored.
     pub fn subscribe_to_rooms(
@@ -144,31 +144,57 @@ impl SlidingSync {
         settings: Option<http::request::RoomSubscription>,
         cancel_in_flight_request: bool,
     ) {
-        let settings = settings.unwrap_or_default();
-        let mut sticky = self.inner.sticky.write().unwrap();
-        let room_subscriptions = &mut sticky.data_mut().room_subscriptions;
+        if subscribe_to_rooms(
+            self.inner.room_subscriptions.write().unwrap(),
+            &self.inner.client,
+            room_ids,
+            settings,
+            cancel_in_flight_request,
+        ) {
+            self.inner.internal_channel_send_if_possible(
+                SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
+            );
+        }
+    }
 
+    /// Remove subscriptions to many rooms.
+    pub fn unsubscribe_to_rooms(&self, room_ids: &[&RoomId], cancel_in_flight_request: bool) {
+        let mut room_subscriptions = self.inner.room_subscriptions.write().unwrap();
         let mut skip_over_current_sync_loop_iteration = false;
 
         for room_id in room_ids {
-            // If the room subscription already exists, let's not
-            // override it with a new one. First, it would reset its
-            // state (`RoomSubscriptionState`), and second it would try to
-            // re-subscribe with the next request. We don't want that. A room
-            // subscription should happen once, and next subscriptions should
-            // be ignored.
-            if let Entry::Vacant(entry) = room_subscriptions.entry((*room_id).to_owned()) {
-                if let Some(room) = self.inner.client.get_room(room_id) {
-                    room.mark_members_missing();
-                }
-
-                entry.insert((RoomSubscriptionState::default(), settings.clone()));
-
+            if room_subscriptions.remove(*room_id).is_some() {
                 skip_over_current_sync_loop_iteration = true;
             }
         }
 
         if cancel_in_flight_request && skip_over_current_sync_loop_iteration {
+            self.inner.internal_channel_send_if_possible(
+                SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
+            );
+        }
+    }
+
+    /// Replace all subscriptions to rooms by other ones.
+    ///
+    /// If the associated `Room`s exist, they will be marked as members are
+    /// missing, so that it ensures to re-fetch all members.
+    pub fn clear_and_subscribe_to_rooms(
+        &self,
+        room_ids: &[&RoomId],
+        settings: Option<http::request::RoomSubscription>,
+        cancel_in_flight_request: bool,
+    ) {
+        let mut room_subscriptions = self.inner.room_subscriptions.write().unwrap();
+        room_subscriptions.clear();
+
+        if subscribe_to_rooms(
+            room_subscriptions,
+            &self.inner.client,
+            room_ids,
+            settings,
+            cancel_in_flight_request,
+        ) {
             self.inner.internal_channel_send_if_possible(
                 SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
             );
@@ -305,14 +331,6 @@ impl SlidingSync {
         debug!("Sliding Sync response has been handled by the client");
         trace!(?sync_response);
 
-        // Commit sticky parameters, if needed.
-        if let Some(ref txn_id) = sliding_sync_response.txn_id {
-            let txn_id = txn_id.as_str().into();
-            self.inner.sticky.write().unwrap().maybe_commit(txn_id);
-            let mut lists = self.inner.lists.write().await;
-            lists.values_mut().for_each(|list| list.maybe_commit_sticky(txn_id));
-        }
-
         let update_summary = {
             // Update the rooms.
             let updated_rooms = {
@@ -385,7 +403,6 @@ impl SlidingSync {
     #[instrument(skip_all)]
     async fn generate_sync_request(
         &self,
-        txn_id: &mut LazyTransactionId,
     ) -> Result<(http::Request, RequestConfig, OwnedMutexGuard<SlidingSyncPositionMarkers>)> {
         // Collect requests for lists.
         let mut requests_lists = BTreeMap::new();
@@ -397,7 +414,7 @@ impl SlidingSync {
             let mut require_timeout = true;
 
             for (name, list) in lists.iter() {
-                requests_lists.insert(name.clone(), list.next_request(txn_id)?);
+                requests_lists.insert(name.clone(), list.next_request()?);
                 require_timeout = require_timeout && list.requires_timeout();
             }
 
@@ -421,8 +438,7 @@ impl SlidingSync {
 
         debug!(pos = ?position_guard.pos, "Got a position");
 
-        let to_device_enabled =
-            self.inner.sticky.read().unwrap().data().extensions.to_device.enabled == Some(true);
+        let to_device_enabled = self.inner.extensions.to_device.enabled == Some(true);
 
         let restored_fields = if self.inner.share_pos || to_device_enabled {
             restore_sliding_sync_state(&self.inner.client, &self.inner.storage_key).await?
@@ -483,20 +499,16 @@ impl SlidingSync {
             lists: requests_lists,
         });
 
-        // Apply sticky parameters, if needs be.
-        self.inner.sticky.write().unwrap().maybe_apply(&mut request, txn_id);
+        // Add room subscriptions.
+        request.room_subscriptions = self.inner.room_subscriptions.read().unwrap().clone();
 
-        // Extensions are now applied (via sticky parameters).
-        //
+        // Add extensions.
+        request.extensions = self.inner.extensions.clone();
+
         // Override the to-device token if the extension is enabled.
         if to_device_enabled {
             request.extensions.to_device.since =
                 restored_fields.and_then(|fields| fields.to_device_token);
-        }
-
-        // Apply the transaction id if one was generated.
-        if let Some(txn_id) = txn_id.get() {
-            request.txn_id = Some(txn_id.to_string());
         }
 
         Ok((
@@ -630,14 +642,13 @@ impl SlidingSync {
     /// Is the e2ee extension enabled for this sliding sync instance?
     #[cfg(feature = "e2e-encryption")]
     fn is_e2ee_enabled(&self) -> bool {
-        self.inner.sticky.read().unwrap().data().extensions.e2ee.enabled == Some(true)
+        self.inner.extensions.e2ee.enabled == Some(true)
     }
 
     /// Is the thread subscriptions extension enabled for this sliding sync
     /// instance?
     fn is_thread_subscriptions_enabled(&self) -> bool {
-        self.inner.sticky.read().unwrap().data().extensions.thread_subscriptions.enabled
-            == Some(true)
+        self.inner.extensions.thread_subscriptions.enabled == Some(true)
     }
 
     #[cfg(not(feature = "e2e-encryption"))]
@@ -649,7 +660,7 @@ impl SlidingSync {
     async fn must_process_rooms_response(&self) -> bool {
         // We consider that we must, if there's any room subscription or there's any
         // list.
-        !self.inner.sticky.read().unwrap().data().room_subscriptions.is_empty()
+        !self.inner.room_subscriptions.read().unwrap().is_empty()
             || !self.inner.lists.read().await.is_empty()
     }
 
@@ -659,8 +670,7 @@ impl SlidingSync {
     #[doc(hidden)]
     #[instrument(skip_all, fields(pos, conn_id = self.inner.id))]
     pub async fn sync_once(&self) -> Result<UpdateSummary> {
-        let (request, request_config, position_guard) =
-            self.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, request_config, position_guard) = self.generate_sync_request().await?;
 
         // Send the request.
         let summaries = self.send_sync_request(request, request_config, position_guard).await?;
@@ -718,7 +728,7 @@ impl SlidingSync {
                             // Here, errors we **cannot** ignore, and that must stop the sync loop.
                             Err(error) => {
                                 if error.client_api_error_kind() == Some(&ErrorKind::UnknownPos) {
-                                    // The Sliding Sync session has expired. Let's reset `pos` and sticky parameters.
+                                    // The Sliding Sync session has expired. Let's reset `pos`.
                                     self.expire_session().await;
                                 }
 
@@ -750,8 +760,7 @@ impl SlidingSync {
 
     /// Expire the current Sliding Sync session on the client-side.
     ///
-    /// Expiring a Sliding Sync session means: resetting `pos`. It also resets
-    /// sticky parameters.
+    /// Expiring a Sliding Sync session means: resetting `pos`.
     ///
     /// This should only be used when it's clear that this session was about to
     /// expire anyways, and should be used only in very specific cases (e.g.
@@ -761,16 +770,14 @@ impl SlidingSync {
     /// This method **MUST** be called when the sync loop is stopped.
     #[doc(hidden)]
     pub async fn expire_session(&self) {
-        info!("Session expired; resetting `pos` and sticky parameters");
+        info!("Session expired; resetting `pos`");
 
         {
             let lists = self.inner.lists.read().await;
+
             for list in lists.values() {
                 // Invalidate in-memory data that would be persisted on disk.
                 list.set_maximum_number_of_rooms(None);
-
-                // Invalidate the sticky data for this list.
-                list.invalidate_sticky_data();
             }
         }
 
@@ -790,13 +797,41 @@ impl SlidingSync {
         }
 
         {
-            let mut sticky = self.inner.sticky.write().unwrap();
-
             // Clear all room subscriptions: we don't want to resend all room subscriptions
             // when the session will restart.
-            sticky.data_mut().room_subscriptions.clear();
+            self.inner.room_subscriptions.write().unwrap().clear();
         }
     }
+}
+
+/// Private implementation for [`SlidingSync::subscribe_to_rooms`] and
+/// [`SlidingSync::clear_and_subscribe_to_rooms`].
+fn subscribe_to_rooms(
+    mut room_subscriptions: StdRwLockWriteGuard<
+        '_,
+        BTreeMap<OwnedRoomId, http::request::RoomSubscription>,
+    >,
+    client: &Client,
+    room_ids: &[&RoomId],
+    settings: Option<http::request::RoomSubscription>,
+    cancel_in_flight_request: bool,
+) -> bool {
+    let settings = settings.unwrap_or_default();
+    let mut skip_over_current_sync_loop_iteration = false;
+
+    for room_id in room_ids {
+        if let Entry::Vacant(entry) = room_subscriptions.entry((*room_id).to_owned()) {
+            if let Some(room) = client.get_room(room_id) {
+                room.mark_members_missing();
+            }
+
+            entry.insert(settings.clone());
+
+            skip_over_current_sync_loop_iteration = true;
+        }
+    }
+
+    cancel_in_flight_request && skip_over_current_sync_loop_iteration
 }
 
 impl SlidingSyncInner {
@@ -832,16 +867,6 @@ impl SlidingSync {
         let mut position_lock = self.inner.position.lock().await;
         position_lock.pos = Some(new_pos);
     }
-
-    /// Read the static extension configuration for this Sliding Sync.
-    ///
-    /// Note: this is not the next content of the sticky parameters, but rightly
-    /// the static configuration that was set during creation of this
-    /// Sliding Sync.
-    pub fn extensions_config(&self) -> http::request::Extensions {
-        let sticky = self.inner.sticky.read().unwrap();
-        sticky.data().extensions.clone()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -859,77 +884,6 @@ pub struct UpdateSummary {
     pub lists: Vec<String>,
     /// The rooms that have seen updates
     pub rooms: Vec<OwnedRoomId>,
-}
-
-/// A very basic bool-ish enum to represent the state of a
-/// [`http::request::RoomSubscription`]. A `RoomSubscription` that has been sent
-/// once should ideally not being sent again, to mostly save bandwidth.
-#[derive(Debug, Default)]
-enum RoomSubscriptionState {
-    /// The `RoomSubscription` has not been sent or received correctly from the
-    /// server, i.e. the `RoomSubscription` —which is part of the sticky
-    /// parameters— has not been committed.
-    #[default]
-    Pending,
-
-    /// The `RoomSubscription` has been sent and received correctly by the
-    /// server.
-    Applied,
-}
-
-/// The set of sticky parameters owned by the `SlidingSyncInner` instance, and
-/// sent in the request.
-#[derive(Debug)]
-pub(super) struct SlidingSyncStickyParameters {
-    /// Room subscriptions, i.e. rooms that may be out-of-scope of all lists
-    /// but one wants to receive updates.
-    room_subscriptions:
-        BTreeMap<OwnedRoomId, (RoomSubscriptionState, http::request::RoomSubscription)>,
-
-    /// The intended state of the extensions being supplied to sliding /sync
-    /// calls.
-    extensions: http::request::Extensions,
-}
-
-impl SlidingSyncStickyParameters {
-    /// Create a new set of sticky parameters.
-    pub fn new(
-        room_subscriptions: BTreeMap<OwnedRoomId, http::request::RoomSubscription>,
-        extensions: http::request::Extensions,
-    ) -> Self {
-        Self {
-            room_subscriptions: room_subscriptions
-                .into_iter()
-                .map(|(room_id, room_subscription)| {
-                    (room_id, (RoomSubscriptionState::Pending, room_subscription))
-                })
-                .collect(),
-            extensions,
-        }
-    }
-}
-
-impl StickyData for SlidingSyncStickyParameters {
-    type Request = http::Request;
-
-    fn apply(&self, request: &mut Self::Request) {
-        request.room_subscriptions = self
-            .room_subscriptions
-            .iter()
-            .filter(|(_, (state, _))| matches!(state, RoomSubscriptionState::Pending))
-            .map(|(room_id, (_, room_subscription))| (room_id.clone(), room_subscription.clone()))
-            .collect();
-        request.extensions = self.extensions.clone();
-    }
-
-    fn on_commit(&mut self) {
-        // All room subscriptions are marked as `Applied`.
-        for (state, _room_subscription) in self.room_subscriptions.values_mut() {
-            if matches!(state, RoomSubscriptionState::Pending) {
-                *state = RoomSubscriptionState::Applied;
-            }
-        }
-    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -950,9 +904,7 @@ mod tests {
     use matrix_sdk_common::executor::spawn;
     use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
     use ruma::{
-        OwnedRoomId, TransactionId,
-        api::client::error::ErrorKind,
-        assign,
+        OwnedRoomId, assign,
         events::{direct::DirectEvent, room::member::MembershipState},
         owned_room_id, room_id,
         serde::Raw,
@@ -965,13 +917,11 @@ mod tests {
     };
 
     use super::{
-        SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
-        SlidingSyncStickyParameters, http,
-        sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
+        SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
+        cache::restore_sliding_sync_state, http,
     };
     use crate::{
         Client, Result,
-        sliding_sync::cache::restore_sliding_sync_state,
         test_utils::{logged_in_client, mocks::MatrixMockServer},
     };
 
@@ -1081,8 +1031,7 @@ mod tests {
         assert!(room0.are_members_synced().not());
 
         {
-            let sticky = sliding_sync.inner.sticky.read().unwrap();
-            let room_subscriptions = &sticky.data().room_subscriptions;
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
 
             assert!(room_subscriptions.contains_key(room_id_0));
             assert!(room_subscriptions.contains_key(room_id_1));
@@ -1125,6 +1074,76 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_subscribe_unsubscribe_and_clear_and_subscribe_to_rooms() -> Result<()> {
+        let (_server, sliding_sync) = new_sliding_sync(vec![
+            SlidingSyncList::builder("foo")
+                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10)),
+        ])
+        .await?;
+
+        let room_id_0 = room_id!("!r0:bar.org");
+        let room_id_1 = room_id!("!r1:bar.org");
+        let room_id_2 = room_id!("!r2:bar.org");
+        let room_id_3 = room_id!("!r3:bar.org");
+
+        // Initially empty.
+        {
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
+
+            assert!(room_subscriptions.is_empty());
+        }
+
+        // Add 2 rooms.
+        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], Default::default(), false);
+
+        {
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
+
+            assert_eq!(room_subscriptions.len(), 2);
+            assert!(room_subscriptions.contains_key(room_id_0));
+            assert!(room_subscriptions.contains_key(room_id_1));
+        }
+
+        // Remove 1 room.
+        sliding_sync.unsubscribe_to_rooms(&[room_id_0], false);
+
+        {
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
+
+            assert_eq!(room_subscriptions.len(), 1);
+            assert!(room_subscriptions.contains_key(room_id_1));
+        }
+
+        // Add 2 rooms, but one already exists.
+        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], Default::default(), false);
+
+        {
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
+
+            assert_eq!(room_subscriptions.len(), 2);
+            assert!(room_subscriptions.contains_key(room_id_0));
+            assert!(room_subscriptions.contains_key(room_id_1));
+        }
+
+        // Replace all rooms with 2 other rooms.
+        sliding_sync.clear_and_subscribe_to_rooms(
+            &[room_id_2, room_id_3],
+            Default::default(),
+            false,
+        );
+
+        {
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
+
+            assert_eq!(room_subscriptions.len(), 2);
+            assert!(room_subscriptions.contains_key(room_id_2));
+            assert!(room_subscriptions.contains_key(room_id_3));
+        }
+
+        Ok(())
+    }
+
+    #[async_test]
     async fn test_room_subscriptions_are_reset_when_session_expires() -> Result<()> {
         let (_server, sliding_sync) = new_sliding_sync(vec![
             SlidingSyncList::builder("foo")
@@ -1140,8 +1159,7 @@ mod tests {
         sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None, false);
 
         {
-            let sticky = sliding_sync.inner.sticky.read().unwrap();
-            let room_subscriptions = &sticky.data().room_subscriptions;
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
 
             assert!(room_subscriptions.contains_key(room_id_0));
             assert!(room_subscriptions.contains_key(room_id_1));
@@ -1152,8 +1170,7 @@ mod tests {
         sliding_sync.subscribe_to_rooms(&[room_id_2], None, false);
 
         {
-            let sticky = sliding_sync.inner.sticky.read().unwrap();
-            let room_subscriptions = &sticky.data().room_subscriptions;
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
 
             assert!(room_subscriptions.contains_key(room_id_0));
             assert!(room_subscriptions.contains_key(room_id_1));
@@ -1164,8 +1181,7 @@ mod tests {
         sliding_sync.expire_session().await;
 
         {
-            let sticky = sliding_sync.inner.sticky.read().unwrap();
-            let room_subscriptions = &sticky.data().room_subscriptions;
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
 
             assert!(room_subscriptions.is_empty());
         }
@@ -1174,8 +1190,7 @@ mod tests {
         sliding_sync.subscribe_to_rooms(&[room_id_2], None, false);
 
         {
-            let sticky = sliding_sync.inner.sticky.read().unwrap();
-            let room_subscriptions = &sticky.data().room_subscriptions;
+            let room_subscriptions = sliding_sync.inner.room_subscriptions.read().unwrap();
 
             assert!(room_subscriptions.contains_key(room_id_0).not());
             assert!(room_subscriptions.contains_key(room_id_1).not());
@@ -1213,320 +1228,69 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_sticky_parameters_api_invalidated_flow() {
-        let r0 = room_id!("!r0.matrix.org");
-        let r1 = room_id!("!r1:matrix.org");
-
-        let mut room_subscriptions = BTreeMap::new();
-        room_subscriptions.insert(r0.to_owned(), Default::default());
-
-        // At first it's invalidated.
-        let mut sticky = SlidingSyncStickyManager::new(SlidingSyncStickyParameters::new(
-            room_subscriptions,
-            Default::default(),
-        ));
-        assert!(sticky.is_invalidated());
-
-        // Then when we create a request, the sticky parameters are applied.
-        let txn_id: &TransactionId = "tid123".into();
-
-        let mut request = http::Request::default();
-        request.txn_id = Some(txn_id.to_string());
-
-        sticky.maybe_apply(&mut request, &mut LazyTransactionId::from_owned(txn_id.to_owned()));
-
-        assert!(request.txn_id.is_some());
-        assert_eq!(request.room_subscriptions.len(), 1);
-        assert!(request.room_subscriptions.contains_key(r0));
-
-        let tid = request.txn_id.unwrap();
-
-        sticky.maybe_commit(tid.as_str().into());
-        assert!(!sticky.is_invalidated());
-
-        // Applying new parameters will invalidate again.
-        sticky
-            .data_mut()
-            .room_subscriptions
-            .insert(r1.to_owned(), (Default::default(), Default::default()));
-        assert!(sticky.is_invalidated());
-
-        // Committing with the wrong transaction id will keep it invalidated.
-        sticky.maybe_commit("wrong tid today, my love has gone away 🎵".into());
-        assert!(sticky.is_invalidated());
-
-        // Restarting a request will only remember the last generated transaction id.
-        let txn_id1: &TransactionId = "tid456".into();
-        let mut request1 = http::Request::default();
-        request1.txn_id = Some(txn_id1.to_string());
-        sticky.maybe_apply(&mut request1, &mut LazyTransactionId::from_owned(txn_id1.to_owned()));
-
-        assert!(sticky.is_invalidated());
-        // The first room subscription has been applied to `request`, so it's not
-        // reapplied here. It's a particular logic of `room_subscriptions`, it's not
-        // related to the sticky design.
-        assert_eq!(request1.room_subscriptions.len(), 1);
-        assert!(request1.room_subscriptions.contains_key(r1));
-
-        let txn_id2: &TransactionId = "tid789".into();
-        let mut request2 = http::Request::default();
-        request2.txn_id = Some(txn_id2.to_string());
-
-        sticky.maybe_apply(&mut request2, &mut LazyTransactionId::from_owned(txn_id2.to_owned()));
-        assert!(sticky.is_invalidated());
-        // `request2` contains `r1` because the sticky parameters have not been
-        // committed, so it's still marked as pending.
-        assert_eq!(request2.room_subscriptions.len(), 1);
-        assert!(request2.room_subscriptions.contains_key(r1));
-
-        // Here we commit with the not most-recent TID, so it keeps the invalidated
-        // status.
-        sticky.maybe_commit(txn_id1);
-        assert!(sticky.is_invalidated());
-
-        // But here we use the latest TID, so the commit is effective.
-        sticky.maybe_commit(txn_id2);
-        assert!(!sticky.is_invalidated());
-    }
-
-    #[test]
-    fn test_room_subscriptions_are_sticky() {
-        let r0 = room_id!("!r0.matrix.org");
-        let r1 = room_id!("!r1:matrix.org");
-
-        let mut sticky = SlidingSyncStickyManager::new(SlidingSyncStickyParameters::new(
-            BTreeMap::new(),
-            Default::default(),
-        ));
-
-        // A room subscription is added, applied, and committed.
-        {
-            // Insert `r0`.
-            sticky
-                .data_mut()
-                .room_subscriptions
-                .insert(r0.to_owned(), (Default::default(), Default::default()));
-
-            // Then the sticky parameters are applied.
-            let txn_id: &TransactionId = "tid0".into();
-            let mut request = http::Request::default();
-            request.txn_id = Some(txn_id.to_string());
-
-            sticky.maybe_apply(&mut request, &mut LazyTransactionId::from_owned(txn_id.to_owned()));
-
-            assert!(request.txn_id.is_some());
-            assert_eq!(request.room_subscriptions.len(), 1);
-            assert!(request.room_subscriptions.contains_key(r0));
-
-            // Then the sticky parameters are committed.
-            let tid = request.txn_id.unwrap();
-
-            sticky.maybe_commit(tid.as_str().into());
-        }
-
-        // A room subscription is added, applied, but NOT committed.
-        {
-            // Insert `r1`.
-            sticky
-                .data_mut()
-                .room_subscriptions
-                .insert(r1.to_owned(), (Default::default(), Default::default()));
-
-            // Then the sticky parameters are applied.
-            let txn_id: &TransactionId = "tid1".into();
-            let mut request = http::Request::default();
-            request.txn_id = Some(txn_id.to_string());
-
-            sticky.maybe_apply(&mut request, &mut LazyTransactionId::from_owned(txn_id.to_owned()));
-
-            assert!(request.txn_id.is_some());
-            assert_eq!(request.room_subscriptions.len(), 1);
-            // `r0` is not present, it's only `r1`.
-            assert!(request.room_subscriptions.contains_key(r1));
-
-            // Then the sticky parameters are NOT committed.
-            // It can happen if the request has failed to be sent for example,
-            // or if the response didn't match.
-        }
-
-        // A previously added room subscription is re-added, applied, and committed.
-        {
-            // Then the sticky parameters are applied.
-            let txn_id: &TransactionId = "tid2".into();
-            let mut request = http::Request::default();
-            request.txn_id = Some(txn_id.to_string());
-
-            sticky.maybe_apply(&mut request, &mut LazyTransactionId::from_owned(txn_id.to_owned()));
-
-            assert!(request.txn_id.is_some());
-            assert_eq!(request.room_subscriptions.len(), 1);
-            // `r0` is not present, it's only `r1`.
-            assert!(request.room_subscriptions.contains_key(r1));
-
-            // Then the sticky parameters are committed.
-            let tid = request.txn_id.unwrap();
-
-            sticky.maybe_commit(tid.as_str().into());
-        }
-
-        // All room subscriptions have been committed.
-        {
-            // Then the sticky parameters are applied.
-            let txn_id: &TransactionId = "tid3".into();
-            let mut request = http::Request::default();
-            request.txn_id = Some(txn_id.to_string());
-
-            sticky.maybe_apply(&mut request, &mut LazyTransactionId::from_owned(txn_id.to_owned()));
-
-            assert!(request.txn_id.is_some());
-            // All room subscriptions have been sent.
-            assert!(request.room_subscriptions.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_extensions_are_sticky() {
-        let mut extensions = http::request::Extensions::default();
-        extensions.account_data.enabled = Some(true);
-
-        // At first it's invalidated.
-        let mut sticky = SlidingSyncStickyManager::new(SlidingSyncStickyParameters::new(
-            Default::default(),
-            extensions,
-        ));
-
-        assert!(sticky.is_invalidated(), "invalidated because of non default parameters");
-
-        // `StickyParameters::new` follows its caller's intent when it comes to e2ee and
-        // to-device.
-        let extensions = &sticky.data().extensions;
-        assert_eq!(extensions.e2ee.enabled, None);
-        assert_eq!(extensions.to_device.enabled, None);
-        assert_eq!(extensions.to_device.since, None);
-
-        // What the user explicitly enabled is… enabled.
-        assert_eq!(extensions.account_data.enabled, Some(true));
-
-        let txn_id: &TransactionId = "tid123".into();
-        let mut request = http::Request::default();
-        request.txn_id = Some(txn_id.to_string());
-        sticky.maybe_apply(&mut request, &mut LazyTransactionId::from_owned(txn_id.to_owned()));
-        assert!(sticky.is_invalidated());
-        assert_eq!(request.extensions.to_device.enabled, None);
-        assert_eq!(request.extensions.to_device.since, None);
-        assert_eq!(request.extensions.e2ee.enabled, None);
-        assert_eq!(request.extensions.account_data.enabled, Some(true));
-    }
-
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
-    async fn test_sticky_extensions_plus_since() -> Result<()> {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+    async fn test_extensions_to_device_since_is_set() {
+        use matrix_sdk_base::crypto::store::types::Changes;
 
-        let sync = client
-            .sliding_sync("test-slidingsync")?
-            .add_list(SlidingSyncList::builder("new_list"))
+        let client = logged_in_client(None).await;
+        let sliding_sync = SlidingSyncBuilder::new("foo".to_owned(), client.clone())
+            .unwrap()
+            .with_to_device_extension(assign!(
+                http::request::ToDevice::default(),
+                {
+                    enabled: Some(true),
+                }
+            ))
             .build()
-            .await?;
+            .await
+            .unwrap();
 
-        // No extensions have been explicitly enabled here.
-        assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.to_device.enabled, None);
-        assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.e2ee.enabled, None);
-        assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.account_data.enabled, None);
-
-        // Now enable e2ee and to-device.
-        let sync = client
-            .sliding_sync("test-slidingsync")?
-            .add_list(SlidingSyncList::builder("new_list"))
-            .with_to_device_extension(
-                assign!(http::request::ToDevice::default(), { enabled: Some(true)}),
-            )
-            .with_e2ee_extension(assign!(http::request::E2EE::default(), { enabled: Some(true)}))
-            .build()
-            .await?;
-
-        // Even without a since token, the first request will contain the extensions
-        // configuration, at least.
-        let txn_id = TransactionId::new();
-        let (request, _, _) = sync
-            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
-            .await?;
-
-        assert_eq!(request.extensions.e2ee.enabled, Some(true));
-        assert_eq!(request.extensions.to_device.enabled, Some(true));
-        assert!(request.extensions.to_device.since.is_none());
-
+        // Test `SlidingSyncInner::extensions`.
         {
-            // Committing with another transaction id doesn't validate anything.
-            let mut sticky = sync.inner.sticky.write().unwrap();
-            assert!(sticky.is_invalidated());
-            sticky.maybe_commit(
-                "hopefully the rng won't generate this very specific transaction id".into(),
-            );
-            assert!(sticky.is_invalidated());
+            let to_device = &sliding_sync.inner.extensions.to_device;
+
+            assert_eq!(to_device.enabled, Some(true));
+            assert!(to_device.since.is_none());
         }
 
-        // Regenerating a request will yield the same one.
-        let txn_id2 = TransactionId::new();
-        let (request, _, _) = sync
-            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id2.to_owned()))
-            .await?;
-
-        assert_eq!(request.extensions.e2ee.enabled, Some(true));
-        assert_eq!(request.extensions.to_device.enabled, Some(true));
-        assert!(request.extensions.to_device.since.is_none());
-
-        assert!(txn_id != txn_id2, "the two requests must not share the same transaction id");
-
+        // Test `Request::extensions`.
         {
-            // Committing with the expected transaction id will validate it.
-            let mut sticky = sync.inner.sticky.write().unwrap();
-            assert!(sticky.is_invalidated());
-            sticky.maybe_commit(txn_id2.as_str().into());
-            assert!(!sticky.is_invalidated());
+            let (request, _, _) = sliding_sync.generate_sync_request().await.unwrap();
+
+            let to_device = &request.extensions.to_device;
+
+            assert_eq!(to_device.enabled, Some(true));
+            assert!(to_device.since.is_none());
         }
 
-        // The next request should contain no sticky parameters.
-        let txn_id = TransactionId::new();
-        let (request, _, _) = sync
-            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
-            .await?;
-        assert!(request.extensions.e2ee.enabled.is_none());
-        assert!(request.extensions.to_device.enabled.is_none());
-        assert!(request.extensions.to_device.since.is_none());
+        // Define a `since` token.
+        let since_token = "depuis".to_owned();
 
-        // If there's a to-device `since` token, we make sure we put the token
-        // into the extension config. The rest doesn't need to be re-enabled due to
-        // stickiness.
-        let _since_token = "since";
-
-        #[cfg(feature = "e2e-encryption")]
         {
-            use matrix_sdk_base::crypto::store::types::Changes;
             if let Some(olm_machine) = &*client.olm_machine().await {
                 olm_machine
                     .store()
                     .save_changes(Changes {
-                        next_batch_token: Some(_since_token.to_owned()),
+                        next_batch_token: Some(since_token.clone()),
                         ..Default::default()
                     })
-                    .await?;
+                    .await
+                    .unwrap();
+            } else {
+                panic!("Where is the Olm machine?");
             }
         }
 
-        let txn_id = TransactionId::new();
-        let (request, _, _) = sync
-            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
-            .await?;
+        // Test `Request::extensions` again.
+        {
+            let (request, _, _) = sliding_sync.generate_sync_request().await.unwrap();
 
-        assert!(request.extensions.e2ee.enabled.is_none());
-        assert!(request.extensions.to_device.enabled.is_none());
+            let to_device = &request.extensions.to_device;
 
-        #[cfg(feature = "e2e-encryption")]
-        assert_eq!(request.extensions.to_device.since.as_deref(), Some(_since_token));
-
-        Ok(())
+            assert_eq!(to_device.enabled, Some(true));
+            assert_eq!(to_device.since, Some(since_token));
+        }
     }
 
     // With MSC4186, with the `e2ee` extension enabled, if a request has no `pos`,
@@ -1616,10 +1380,7 @@ mod tests {
             .await?;
 
         // First request: no `pos`.
-        let txn_id = TransactionId::new();
-        let (_request, _, _) = sync
-            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
-            .await?;
+        let (_request, _, _) = sync.generate_sync_request().await?;
 
         // Now, tracked users must be dirty.
         {
@@ -1657,10 +1418,7 @@ mod tests {
         // Second request: with a `pos` this time.
         sync.set_pos("chocolat".to_owned()).await;
 
-        let txn_id = TransactionId::new();
-        let (_request, _, _) = sync
-            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
-            .await?;
+        let (_request, _, _) = sync.generate_sync_request().await?;
 
         // Tracked users are not marked as dirty.
         {
@@ -1671,141 +1429,6 @@ mod tests {
             let outgoing_requests = olm_machine.outgoing_requests().await?;
 
             assert!(outgoing_requests.is_empty());
-        }
-
-        Ok(())
-    }
-
-    #[async_test]
-    async fn test_unknown_pos_resets_pos_and_sticky_parameters() -> Result<()> {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-
-        let sliding_sync = client
-            .sliding_sync("test-slidingsync")?
-            .with_to_device_extension(
-                assign!(http::request::ToDevice::default(), { enabled: Some(true) }),
-            )
-            .build()
-            .await?;
-
-        // First request asks to enable the extension.
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
-        assert!(request.extensions.to_device.enabled.is_some());
-
-        let sync = sliding_sync.sync();
-        pin_mut!(sync);
-
-        // `pos` is `None` to start with.
-        assert!(sliding_sync.inner.position.lock().await.pos.is_none());
-
-        #[derive(Deserialize)]
-        struct PartialRequest {
-            txn_id: Option<String>,
-        }
-
-        {
-            let _mock_guard = Mock::given(SlidingSyncMatcher)
-                .respond_with(|request: &Request| {
-                    // Repeat the txn_id in the response, if set.
-                    let request: PartialRequest = request.body_json().unwrap();
-
-                    ResponseTemplate::new(200).set_body_json(json!({
-                        "txn_id": request.txn_id,
-                        "pos": "0",
-                    }))
-                })
-                .mount_as_scoped(&server)
-                .await;
-
-            let next = sync.next().await;
-            assert_matches!(next, Some(Ok(_update_summary)));
-
-            // `pos` has been updated.
-            assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("0".to_owned()));
-        }
-
-        // Next request doesn't ask to enable the extension.
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
-        assert!(request.extensions.to_device.enabled.is_none());
-
-        // Next request is successful.
-        {
-            let _mock_guard = Mock::given(SlidingSyncMatcher)
-                .respond_with(|request: &Request| {
-                    // Repeat the txn_id in the response, if set.
-                    let request: PartialRequest = request.body_json().unwrap();
-
-                    ResponseTemplate::new(200).set_body_json(json!({
-                        "txn_id": request.txn_id,
-                        "pos": "1",
-                    }))
-                })
-                .mount_as_scoped(&server)
-                .await;
-
-            let next = sync.next().await;
-            assert_matches!(next, Some(Ok(_update_summary)));
-
-            // `pos` has been updated.
-            assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("1".to_owned()));
-        }
-
-        // Next request is successful despite it receives an already
-        // received `pos` from the server.
-        {
-            let _mock_guard = Mock::given(SlidingSyncMatcher)
-                .respond_with(|request: &Request| {
-                    // Repeat the txn_id in the response, if set.
-                    let request: PartialRequest = request.body_json().unwrap();
-
-                    ResponseTemplate::new(200).set_body_json(json!({
-                        "txn_id": request.txn_id,
-                        "pos": "0", // <- already received!
-                    }))
-                })
-                .up_to_n_times(1) // run this mock only once.
-                .mount_as_scoped(&server)
-                .await;
-
-            let next = sync.next().await;
-            assert_matches!(next, Some(Ok(_update_summary)));
-
-            // `pos` has been updated.
-            assert_eq!(sliding_sync.inner.position.lock().await.pos, Some("0".to_owned()));
-        }
-
-        // Stop responding with successful requests!
-        //
-        // When responding with `M_UNKNOWN_POS`, that regenerates the sticky parameters,
-        // so they're reset. It also resets the `pos`.
-        {
-            let _mock_guard = Mock::given(SlidingSyncMatcher)
-                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-                    "error": "foo",
-                    "errcode": "M_UNKNOWN_POS",
-                })))
-                .mount_as_scoped(&server)
-                .await;
-
-            let next = sync.next().await;
-
-            // The expected error is returned.
-            assert_matches!(next, Some(Err(err)) if err.client_api_error_kind() == Some(&ErrorKind::UnknownPos));
-
-            // `pos` has been reset.
-            assert!(sliding_sync.inner.position.lock().await.pos.is_none());
-
-            // Next request asks to enable the extension again.
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
-
-            assert!(request.extensions.to_device.enabled.is_some());
-
-            // `sync` has been stopped.
-            assert!(sync.next().await.is_none());
         }
 
         Ok(())
@@ -1849,8 +1472,7 @@ mod tests {
         {
             assert!(sliding_sync.inner.position.lock().await.pos.is_none());
 
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
             assert!(request.pos.is_none());
         }
 
@@ -1887,8 +1509,7 @@ mod tests {
         // It's still 0, not "yolo".
         {
             assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("0"));
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
             assert_eq!(request.pos.as_deref(), Some("0"));
         }
 
@@ -1938,8 +1559,7 @@ mod tests {
 
         // `pos` is `None` to start with.
         {
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
             assert!(request.pos.is_none());
             assert!(sliding_sync.inner.position.lock().await.pos.is_none());
@@ -1975,8 +1595,7 @@ mod tests {
 
         // It's alright, the next request will load it from the database.
         {
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
             assert_eq!(request.pos.as_deref(), Some("42"));
             assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("42"));
         }
@@ -1986,8 +1605,7 @@ mod tests {
             let sliding_sync = client.sliding_sync("elephant-sync")?.share_pos().build().await?;
             assert_eq!(sliding_sync.inner.position.lock().await.pos.as_deref(), Some("42"));
 
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
             assert_eq!(request.pos.as_deref(), Some("42"));
         }
 
@@ -1998,8 +1616,7 @@ mod tests {
         {
             assert!(sliding_sync.inner.position.lock().await.pos.is_none());
 
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
             assert!(request.pos.is_none());
         }
 
@@ -2008,8 +1625,7 @@ mod tests {
             let sliding_sync = client.sliding_sync("elephant-sync")?.share_pos().build().await?;
             assert!(sliding_sync.inner.position.lock().await.pos.is_none());
 
-            let (request, _, _) =
-                sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+            let (request, _, _) = sliding_sync.generate_sync_request().await?;
             assert!(request.pos.is_none());
         }
 
@@ -2638,8 +2254,7 @@ mod tests {
     async fn test_timeout_zero_list() -> Result<()> {
         let (_server, sliding_sync) = new_sliding_sync(vec![]).await?;
 
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
         // Zero list means sliding sync is fully loaded, so there is a timeout to wait
         // on new update to pop.
@@ -2655,8 +2270,7 @@ mod tests {
         ])
         .await?;
 
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
         // The list does not require a timeout.
         assert!(request.timeout.is_none());
@@ -2684,8 +2298,7 @@ mod tests {
             };
         }
 
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
         // The list is now fully loaded, so it requires a timeout.
         assert!(request.timeout.is_some());
@@ -2703,8 +2316,7 @@ mod tests {
         ])
         .await?;
 
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
         // Two lists don't require a timeout.
         assert!(request.timeout.is_none());
@@ -2732,8 +2344,7 @@ mod tests {
             };
         }
 
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
         // One don't require a timeout.
         assert!(request.timeout.is_none());
@@ -2761,8 +2372,7 @@ mod tests {
             };
         }
 
-        let (request, _, _) =
-            sliding_sync.generate_sync_request(&mut LazyTransactionId::new()).await?;
+        let (request, _, _) = sliding_sync.generate_sync_request().await?;
 
         // All lists require a timeout.
         assert!(request.timeout.is_some());

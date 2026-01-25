@@ -9,32 +9,32 @@ use std::{
 
 use async_trait::async_trait;
 use matrix_sdk_base::{
+    MinimalRoomMemberEvent, ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK, RoomInfo,
+    RoomMemberships, RoomState, StateChanges, StateStore, StateStoreDataKey, StateStoreDataValue,
     deserialized_responses::{DisplayName, RawAnySyncOrStrippedState, SyncOrStrippedState},
     store::{
-        compare_thread_subscription_bump_stamps, migration_helpers::RoomInfoV1, ChildTransactionId,
-        DependentQueuedRequest, DependentQueuedRequestKind, QueueWedgeError, QueuedRequest,
-        QueuedRequestKind, RoomLoadSettings, SentRequestKey, StoredThreadSubscription,
-        ThreadSubscriptionStatus,
+        ChildTransactionId, DependentQueuedRequest, DependentQueuedRequestKind, QueueWedgeError,
+        QueuedRequest, QueuedRequestKind, RoomLoadSettings, SentRequestKey,
+        StoredThreadSubscription, ThreadSubscriptionStatus,
+        compare_thread_subscription_bump_stamps, migration_helpers::RoomInfoV1,
     },
-    timer, MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
-    StateStoreDataKey, StateStoreDataValue, ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
-    canonical_json::{redact, RedactedBecause},
+    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
+    canonical_json::{RedactedBecause, redact},
     events::{
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent,
+        GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
             create::RoomCreateEventContent,
             member::{StrippedRoomMemberEvent, SyncRoomMemberEvent},
         },
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncStateEvent,
-        GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -45,13 +45,13 @@ use tokio::{
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{
+    OpenStoreError, Secret, SqliteStoreConfig,
     connection::{Connection as SqliteAsyncConn, Pool as SqlitePool},
     error::{Error, Result},
     utils::{
-        repeat_vars, EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
-        SqliteKeyValueStoreConnExt,
+        EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
+        SqliteKeyValueStoreConnExt, repeat_vars,
     },
-    OpenStoreError, Secret, SqliteStoreConfig,
 };
 
 mod keys {
@@ -159,6 +159,8 @@ impl SqliteStateStore {
             write_connection: Arc::new(Mutex::new(conn)),
         };
         this.run_migrations(version, None).await?;
+
+        this.read().await?.wal_checkpoint().await;
 
         Ok(this)
     }
@@ -403,6 +405,17 @@ impl SqliteStateStore {
             .await?;
         }
 
+        if from < 15 && to >= 15 {
+            conn.with_transaction(move |txn| {
+                // Run the migration.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/013_send_queue_new_parent_key_format.sql"
+                ))?;
+                txn.set_db_version(15)
+            })
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -462,18 +475,12 @@ impl SqliteStateStore {
     /// Acquire a connection for executing read operations.
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
-        trace!("Taking a `read` connection");
-        let _timer = timer!("connection");
-
         Ok(self.pool.get().await?)
     }
 
     /// Acquire a connection for executing write operations.
     #[instrument(skip_all)]
     async fn write(&self) -> OwnedMutexGuard<SqliteAsyncConn> {
-        trace!("Taking a `write` connection");
-        let _timer = timer!("connection");
-
         self.write_connection.clone().lock_owned().await
     }
 
@@ -488,6 +495,15 @@ impl SqliteStateStore {
 
         let member_room_id = self.encode_key(keys::MEMBER, room_id);
         txn.remove_room_members(&member_room_id, Some(stripped))
+    }
+
+    pub async fn vacuum(&self) -> Result<()> {
+        self.write_connection.lock().await.vacuum().await
+    }
+
+    pub async fn get_db_size(&self) -> Result<Option<usize>> {
+        let read_conn = self.pool.get().await?;
+        Ok(Some(read_conn.get_db_size().await?))
     }
 }
 
@@ -1897,7 +1913,7 @@ impl StateStore for SqliteStateStore {
         let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
 
         let content = self.serialize_json(&content)?;
-        // See comment in [`Self::save_send_queue_event`] to understand why the
+        // See comment in [`Self::save_send_queue_request`] to understand why the
         // transaction id is neither encrypted or hashed.
         let transaction_id = transaction_id.to_string();
 
@@ -1918,7 +1934,7 @@ impl StateStore for SqliteStateStore {
     ) -> Result<bool, Self::Error> {
         let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
 
-        // See comment in `save_send_queue_event`.
+        // See comment in `save_send_queue_request`.
         let transaction_id = transaction_id.to_string();
 
         let num_deleted = self
@@ -1943,7 +1959,7 @@ impl StateStore for SqliteStateStore {
 
         // Note: ROWID is always present and is an auto-incremented integer counter. We
         // want to maintain the insertion order, so we can sort using it.
-        // Note 2: transaction_id is not encoded, see why in `save_send_queue_event`.
+        // Note 2: transaction_id is not encoded, see why in `save_send_queue_request`.
         let res: Vec<(String, Vec<u8>, Option<Vec<u8>>, usize, Option<u64>)> = self
             .read()
             .await?
@@ -1985,7 +2001,7 @@ impl StateStore for SqliteStateStore {
     ) -> Result<(), Self::Error> {
         let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
 
-        // See comment in `save_send_queue_event`.
+        // See comment in `save_send_queue_request`.
         let transaction_id = transaction_id.to_string();
 
         // Serialize the error to json bytes (encrypted if option is enabled) if set.
@@ -2034,7 +2050,7 @@ impl StateStore for SqliteStateStore {
         let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
         let content = self.serialize_json(&content)?;
 
-        // See comment in `save_send_queue_event`.
+        // See comment in `save_send_queue_request`.
         let parent_txn_id = parent_txn_id.to_string();
         let own_txn_id = own_txn_id.to_string();
 
@@ -2068,7 +2084,7 @@ impl StateStore for SqliteStateStore {
         let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
         let content = self.serialize_json(&new_content)?;
 
-        // See comment in `save_send_queue_event`.
+        // See comment in `save_send_queue_request`.
         let own_txn_id = own_transaction_id.to_string();
 
         let num_updated = self
@@ -2099,9 +2115,9 @@ impl StateStore for SqliteStateStore {
         parent_key: SentRequestKey,
     ) -> Result<usize> {
         let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
-        let parent_key = self.serialize_value(&parent_key)?;
+        let parent_key = self.serialize_json(&parent_key)?;
 
-        // See comment in `save_send_queue_event`.
+        // See comment in `save_send_queue_request`.
         let parent_txn_id = parent_txn_id.to_string();
 
         self.write()
@@ -2122,7 +2138,7 @@ impl StateStore for SqliteStateStore {
     ) -> Result<bool> {
         let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
 
-        // See comment in `save_send_queue_event`.
+        // See comment in `save_send_queue_request`.
         let txn_id = txn_id.to_string();
 
         let num_deleted = self
@@ -2145,7 +2161,7 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Vec<DependentQueuedRequest>> {
         let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
 
-        // Note: transaction_id is not encoded, see why in `save_send_queue_event`.
+        // Note: transaction_id is not encoded, see why in `save_send_queue_request`.
         let res: Vec<(String, String, Option<Vec<u8>>, Vec<u8>, Option<u64>)> = self
             .read()
             .await?
@@ -2170,7 +2186,7 @@ impl StateStore for SqliteStateStore {
             dependent_events.push(DependentQueuedRequest {
                 own_transaction_id: entry.0.into(),
                 parent_transaction_id: entry.1.into(),
-                parent_key: entry.2.map(|bytes| self.deserialize_value(&bytes)).transpose()?,
+                parent_key: entry.2.map(|json| self.deserialize_json(&json)).transpose()?,
                 kind: self.deserialize_json(&entry.3)?,
                 created_at,
             });
@@ -2213,6 +2229,57 @@ impl StateStore for SqliteStateStore {
                 .execute((room_id, thread_id, status, new.bump_stamp))
             })
             .await?;
+        Ok(())
+    }
+
+    async fn upsert_thread_subscriptions(
+        &self,
+        updates: Vec<(&RoomId, &EventId, StoredThreadSubscription)>,
+    ) -> Result<(), Self::Error> {
+        let values: Vec<_> = updates
+            .into_iter()
+            .map(|(room_id, thread_id, subscription)| {
+                (
+                    self.encode_key(keys::THREAD_SUBSCRIPTIONS, room_id),
+                    self.encode_key(keys::THREAD_SUBSCRIPTIONS, thread_id),
+                    subscription.status.as_str(),
+                    subscription.bump_stamp,
+                )
+            })
+            .collect();
+
+        self.write()
+            .await
+            .with_transaction(move |txn| {
+                let mut txn = txn.prepare_cached(
+                    "INSERT INTO thread_subscriptions (room_id, event_id, status, bump_stamp) 
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (room_id, event_id) DO UPDATE 
+                    SET 
+                        status = 
+                            CASE
+                                WHEN thread_subscriptions.bump_stamp IS NULL THEN EXCLUDED.status
+                                WHEN EXCLUDED.bump_stamp IS NULL THEN EXCLUDED.status
+                                WHEN thread_subscriptions.bump_stamp < EXCLUDED.bump_stamp THEN EXCLUDED.status
+                                ELSE thread_subscriptions.status
+                            END, 
+                        bump_stamp = 
+                            CASE
+                                WHEN thread_subscriptions.bump_stamp IS NULL THEN EXCLUDED.bump_stamp
+                                WHEN EXCLUDED.bump_stamp IS NULL THEN thread_subscriptions.bump_stamp
+                                WHEN thread_subscriptions.bump_stamp < EXCLUDED.bump_stamp THEN EXCLUDED.bump_stamp
+                                ELSE thread_subscriptions.bump_stamp
+                            END",
+                )?;
+
+                for value in values {
+                    txn.execute(value)?;
+                }
+
+                Result::<_, Error>::Ok(())
+            })
+            .await?;
+
         Ok(())
     }
 
@@ -2261,6 +2328,14 @@ impl StateStore for SqliteStateStore {
 
         Ok(())
     }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        Ok(self.vacuum().await?)
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        self.get_db_size().await
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2274,9 +2349,9 @@ struct ReceiptData {
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
-    use matrix_sdk_base::{statestore_integration_tests, StateStore, StoreError};
+    use matrix_sdk_base::{StateStore, StoreError, statestore_integration_tests};
     use once_cell::sync::Lazy;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     use super::SqliteStateStore;
 
@@ -2302,13 +2377,13 @@ mod encrypted_tests {
         sync::atomic::{AtomicU32, Ordering::SeqCst},
     };
 
-    use matrix_sdk_base::{statestore_integration_tests, StateStore, StoreError};
+    use matrix_sdk_base::{StateStore, StoreError, statestore_integration_tests};
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     use super::SqliteStateStore;
-    use crate::{utils::SqliteAsyncConnExt, SqliteStoreConfig};
+    use crate::{SqliteStoreConfig, utils::SqliteAsyncConnExt};
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
@@ -2381,43 +2456,43 @@ mod migration_tests {
     use std::{
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicU32, Ordering::SeqCst},
             Arc,
+            atomic::{AtomicU32, Ordering::SeqCst},
         },
     };
 
     use as_variant::as_variant;
     use matrix_sdk_base::{
+        RoomState, StateStore,
         media::{MediaFormat, MediaRequestParameters},
         store::{
             ChildTransactionId, DependentQueuedRequestKind, RoomLoadSettings,
             SerializableEventContent,
         },
         sync::UnreadNotificationsCount,
-        RoomState, StateStore,
     };
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use ruma::{
+        EventId, MilliSecondsSinceUnixEpoch, OwnedTransactionId, RoomId, TransactionId, UserId,
         events::{
-            room::{create::RoomCreateEventContent, message::RoomMessageEventContent, MediaSource},
             StateEventType,
+            room::{MediaSource, create::RoomCreateEventContent, message::RoomMessageEventContent},
         },
-        room_id, server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedTransactionId,
-        RoomId, TransactionId, UserId,
+        room_id, server_name, user_id,
     };
     use rusqlite::Transaction;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
     use tokio::{fs, sync::Mutex};
     use zeroize::Zeroizing;
 
-    use super::{init, keys, SqliteStateStore, DATABASE_NAME};
+    use super::{DATABASE_NAME, SqliteStateStore, init, keys};
     use crate::{
+        OpenStoreError, Secret, SqliteStoreConfig,
         error::{Error, Result},
         utils::{EncryptableStore as _, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt},
-        OpenStoreError, Secret, SqliteStoreConfig,
     };
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());

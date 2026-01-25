@@ -30,8 +30,8 @@
 use std::ops::Deref;
 
 use matrix_sdk_base::media::{
-    store::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
     MediaRequestParameters, UniqueKey,
+    store::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
 };
 use matrix_sdk_crypto::CryptoStoreError;
 use ruma::MxcUri;
@@ -53,8 +53,13 @@ use crate::{
         types::{Lease, MediaCleanupTime, MediaContent, MediaMetadata, UnixTime},
     },
     serializer::{
-        Indexed, IndexedKey, IndexedKeyComponentBounds, IndexedPrefixKeyComponentBounds,
-        MaybeEncrypted, SafeEncodeSerializer, INDEXED_KEY_LOWER_STRING, INDEXED_KEY_UPPER_STRING,
+        indexed_type::{
+            constants::{INDEXED_KEY_LOWER_STRING, INDEXED_KEY_UPPER_STRING},
+            traits::{
+                Indexed, IndexedKey, IndexedKeyComponentBounds, IndexedPrefixKeyComponentBounds,
+            },
+        },
+        safe_encode::types::{MaybeEncrypted, SafeEncodeSerializer},
     },
 };
 

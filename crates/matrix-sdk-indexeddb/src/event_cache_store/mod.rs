@@ -16,13 +16,13 @@
 
 use std::{rc::Rc, time::Duration};
 
-use indexed_db_futures::{database::Database, Build};
+use indexed_db_futures::{Build, database::Database};
 #[cfg(target_family = "wasm")]
 use matrix_sdk_base::cross_process_lock::{
     CrossProcessLockGeneration, FIRST_CROSS_PROCESS_LOCK_GENERATION,
 };
 use matrix_sdk_base::{
-    event_cache::{store::EventCacheStore, Event, Gap},
+    event_cache::{Event, Gap, store::EventCacheStore},
     linked_chunk::{
         ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
         RawChunk, Update,
@@ -30,7 +30,7 @@ use matrix_sdk_base::{
     timer,
 };
 use ruma::{
-    events::relation::RelationType, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, events::relation::RelationType,
 };
 use tracing::{error, instrument, trace};
 use web_sys::IdbTransactionMode;
@@ -41,7 +41,7 @@ use crate::{
         transaction::IndexeddbEventCacheStoreTransaction,
         types::{ChunkType, InBandEvent, Lease, OutOfBandEvent},
     },
-    serializer::{Indexed, IndexedTypeSerializer},
+    serializer::indexed_type::{IndexedTypeSerializer, traits::Indexed},
     transaction::TransactionError,
 };
 
@@ -108,8 +108,6 @@ impl EventCacheStore for IndexeddbEventCacheStore {
         key: &str,
         holder: &str,
     ) -> Result<Option<CrossProcessLockGeneration>, IndexeddbEventCacheStoreError> {
-        let _timer = timer!("method");
-
         let transaction =
             self.transaction(&[Lease::OBJECT_STORE], IdbTransactionMode::Readwrite)?;
 
@@ -408,15 +406,13 @@ impl EventCacheStore for IndexeddbEventCacheStore {
         )?;
         if let Some(chunk) =
             transaction.get_chunk_by_id(linked_chunk_id, before_chunk_identifier).await?
+            && let Some(previous_identifier) = chunk.previous
         {
-            if let Some(previous_identifier) = chunk.previous {
-                let previous_identifier = ChunkIdentifier::new(previous_identifier);
-                return Ok(transaction
-                    .load_chunk_by_id(linked_chunk_id, previous_identifier)
-                    .await?);
-            }
+            let previous_identifier = ChunkIdentifier::new(previous_identifier);
+            Ok(transaction.load_chunk_by_id(linked_chunk_id, previous_identifier).await?)
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     #[instrument(skip(self))]
@@ -562,6 +558,14 @@ impl EventCacheStore for IndexeddbEventCacheStore {
         transaction.commit().await?;
         Ok(())
     }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        Ok(None)
+    }
 }
 
 #[cfg(all(test, target_family = "wasm"))]
@@ -593,13 +597,21 @@ mod tests {
     }
 
     mod encrypted {
+        use std::sync::Arc;
+
+        use matrix_sdk_store_encryption::StoreCipher;
+
         use super::*;
 
         wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
         async fn get_event_cache_store() -> Result<IndexeddbEventCacheStore, EventCacheStoreError> {
             let name = format!("test-event-cache-store-{}", Uuid::new_v4().as_hyphenated());
-            Ok(IndexeddbEventCacheStore::builder().database_name(name).build().await?)
+            Ok(IndexeddbEventCacheStore::builder()
+                .database_name(name)
+                .store_cipher(Arc::new(StoreCipher::new().expect("store cipher")))
+                .build()
+                .await?)
         }
 
         event_cache_store_integration_tests!();

@@ -175,6 +175,17 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// If the event was already stored with the same id, it must be replaced,
     /// without causing an error.
     async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error>;
+
+    /// Perform database optimizations if any are available, i.e. vacuuming in
+    /// SQLite.
+    ///
+    /// **Warning:** this was added to check if SQLite fragmentation was the
+    /// source of performance issues, **DO NOT use in production**.
+    #[doc(hidden)]
+    async fn optimize(&self) -> Result<(), Self::Error>;
+
+    /// Returns the size of the store in bytes, if known.
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -281,6 +292,15 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
 
     async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error> {
         self.0.save_event(room_id, event).await.map_err(Into::into)
+    }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        self.0.optimize().await.map_err(Into::into)?;
+        Ok(())
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        Ok(self.0.get_size().await.map_err(Into::into)?)
     }
 }
 

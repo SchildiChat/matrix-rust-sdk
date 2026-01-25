@@ -19,8 +19,8 @@ use matrix_sdk_base::{
     event_cache::{Event as RawEvent, Gap as RawGap},
     linked_chunk::{ChunkContent, ChunkIdentifier, LinkedChunkId, RawChunk},
 };
-use ruma::{events::relation::RelationType, EventId, RoomId};
-use serde::{de::DeserializeOwned, Serialize};
+use ruma::{EventId, RoomId, events::relation::RelationType};
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     error::AsyncErrorDeps,
@@ -32,9 +32,10 @@ use crate::{
         },
         types::{Chunk, ChunkType, Event, Gap, Lease, Position},
     },
-    serializer::{
-        Indexed, IndexedKeyRange, IndexedPrefixKeyBounds, IndexedPrefixKeyComponentBounds,
+    serializer::indexed_type::{
         IndexedTypeSerializer,
+        range::IndexedKeyRange,
+        traits::{Indexed, IndexedPrefixKeyBounds, IndexedPrefixKeyComponentBounds},
     },
     transaction::{Transaction, TransactionError},
 };

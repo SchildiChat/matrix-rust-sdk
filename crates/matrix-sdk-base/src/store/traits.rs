@@ -487,13 +487,27 @@ pub trait StateStore: AsyncTraitDeps {
     /// bumpstamp is kept.
     ///
     /// If the new thread subscription has a bumpstamp that's lower than or
-    /// equal to a previously one, the existing subscription is kept, i.e.
+    /// equal to a previous one, the existing subscription is kept, i.e.
     /// this method must have no effect.
     async fn upsert_thread_subscription(
         &self,
         room: &RoomId,
         thread_id: &EventId,
         subscription: StoredThreadSubscription,
+    ) -> Result<(), Self::Error>;
+
+    /// Inserts or updates multiple thread subscriptions.
+    ///
+    /// If the new thread subscription hasn't set a bumpstamp, and there was a
+    /// previous subscription in the database with a bumpstamp, the existing
+    /// bumpstamp is kept.
+    ///
+    /// If the new thread subscription has a bumpstamp that's lower than or
+    /// equal to a previous one, the existing subscription is kept, i.e.
+    /// this method must have no effect.
+    async fn upsert_thread_subscriptions(
+        &self,
+        updates: Vec<(&RoomId, &EventId, StoredThreadSubscription)>,
     ) -> Result<(), Self::Error>;
 
     /// Remove a previous thread subscription for a given room and thread.
@@ -513,6 +527,17 @@ pub trait StateStore: AsyncTraitDeps {
         room: &RoomId,
         thread_id: &EventId,
     ) -> Result<Option<StoredThreadSubscription>, Self::Error>;
+
+    /// Perform database optimizations if any are available, i.e. vacuuming in
+    /// SQLite.
+    ///
+    /// /// **Warning:** this was added to check if SQLite fragmentation was the
+    /// source of performance issues, **DO NOT use in production**.
+    #[doc(hidden)]
+    async fn optimize(&self) -> Result<(), Self::Error>;
+
+    /// Returns the size of the store in bytes, if known.
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -817,6 +842,13 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         self.0.upsert_thread_subscription(room, thread_id, subscription).await.map_err(Into::into)
     }
 
+    async fn upsert_thread_subscriptions(
+        &self,
+        updates: Vec<(&RoomId, &EventId, StoredThreadSubscription)>,
+    ) -> Result<(), Self::Error> {
+        self.0.upsert_thread_subscriptions(updates).await.map_err(Into::into)
+    }
+
     async fn load_thread_subscription(
         &self,
         room: &RoomId,
@@ -831,6 +863,14 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         thread_id: &EventId,
     ) -> Result<(), Self::Error> {
         self.0.remove_thread_subscription(room, thread_id).await.map_err(Into::into)
+    }
+
+    async fn optimize(&self) -> Result<(), Self::Error> {
+        self.0.optimize().await.map_err(Into::into)
+    }
+
+    async fn get_size(&self) -> Result<Option<usize>, Self::Error> {
+        self.0.get_size().await.map_err(Into::into)
     }
 }
 

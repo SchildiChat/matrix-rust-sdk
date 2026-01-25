@@ -1,7 +1,7 @@
 [package]
 name = "matrix-sdk-ui"
 description = "GUI-centric utilities on top of matrix-rust-sdk (experimental)."
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 license = "Apache-2.0"
@@ -36,7 +36,7 @@ experimental-encrypted-state-events = [
 as_variant.workspace = true
 async-rx.workspace = true
 async-stream.workspace = true
-async_cell = "0.2.3"
+async_cell.workspace = true
 bitflags.workspace = true
 chrono.workspace = true
 eyeball.workspace = true

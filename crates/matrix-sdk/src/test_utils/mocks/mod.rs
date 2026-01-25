@@ -142,11 +142,11 @@ struct Keys {
 ///     .await;
 ///
 /// // And we send it out.
-/// let response = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
+/// let result = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
 ///
 /// assert_eq!(
 ///     event_id,
-///     response.event_id,
+///     result.response.event_id,
 ///     "The event ID we mocked should match the one we received when we sent the event"
 /// );
 /// # anyhow::Ok(()) });
@@ -422,11 +422,11 @@ impl MatrixMockServer {
     ///     .mount()
     ///     .await;
     ///
-    /// let response = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
+    /// let result = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
     ///
     /// assert_eq!(
     ///     event_id,
-    ///     response.event_id,
+    ///     result.response.event_id,
     ///     "The event ID we mocked should match the one we received when we sent the event"
     /// );
     /// # anyhow::Ok(()) });
@@ -2140,11 +2140,11 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     ///     .await;
     ///
     /// let content = RoomMessageEventContent::text_plain("Hello world");
-    /// let response = room.send(content).await?;
+    /// let result = room.send(content).await?;
     ///
     /// assert_eq!(
     ///     event_id,
-    ///     response.event_id,
+    ///     result.response.event_id,
     ///     "The event ID we mocked should match the one we received when we sent the event"
     /// );
     /// # anyhow::Ok(()) });
@@ -2186,11 +2186,11 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     /// // The `m.room.reaction` event type should not be mocked by the server.
     /// assert!(response_not_mocked.is_err());
     ///
-    /// let response = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
+    /// let result = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
     /// // The `m.room.message` event type should be mocked by the server.
     /// assert_eq!(
     ///     event_id,
-    ///     response.event_id,
+    ///     result.response.event_id,
     ///     "The event ID we mocked should match the one we received when we sent the event"
     /// );
     /// # anyhow::Ok(()) });
@@ -2300,11 +2300,11 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     ///     .mount_as_scoped()
     ///     .await;
     ///
-    /// let response = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
+    /// let result = room.send_raw("m.room.message", json!({ "body": "Hello world" })).await?;
     ///
     /// assert_eq!(
     ///     event_id,
-    ///     response.event_id,
+    ///     result.response.event_id,
     ///     "The event ID we mocked should match the one we received when we sent the event"
     /// );
     /// # anyhow::Ok(()) });
@@ -2360,6 +2360,7 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     ///     .send(RoomMessageEventContent::text_plain("It's a secret to everybody"))
     ///     .await
     ///     .expect("We should be able to send an initial message")
+    ///     .response
     ///     .event_id;
     ///
     /// let event = receiver.await?;
@@ -3629,8 +3630,8 @@ impl<'a> MockEndpoint<'a, UploadCrossSigningKeysEndpoint> {
         })))
     }
 
-    /// Returns an error response with an OAuth 2.0 UIAA stage.
-    pub fn uiaa_oauth(self) -> MatrixMock<'a> {
+    /// Returns an error response with an unstable OAuth 2.0 UIAA stage.
+    pub fn uiaa_unstable_oauth(self) -> MatrixMock<'a> {
         let server_uri = self.server.uri();
         self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
             "session": "dummy",
@@ -3639,6 +3640,23 @@ impl<'a> MockEndpoint<'a, UploadCrossSigningKeysEndpoint> {
             }],
             "params": {
                 "org.matrix.cross_signing_reset": {
+                    "url": format!("{server_uri}/account/?action=org.matrix.cross_signing_reset"),
+                }
+            },
+            "msg": "To reset your end-to-end encryption cross-signing identity, you first need to approve it and then try again."
+        })))
+    }
+
+    /// Returns an error response with a stable OAuth 2.0 UIAA stage.
+    pub fn uiaa_stable_oauth(self) -> MatrixMock<'a> {
+        let server_uri = self.server.uri();
+        self.respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "session": "dummy",
+            "flows": [{
+                "stages": [ "m.oauth" ]
+            }],
+            "params": {
+                "m.oauth": {
                     "url": format!("{server_uri}/account/?action=org.matrix.cross_signing_reset"),
                 }
             },

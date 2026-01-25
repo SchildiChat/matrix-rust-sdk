@@ -20,23 +20,19 @@ use std::{
 use as_variant::as_variant;
 use indexmap::IndexMap;
 use matrix_sdk::{
-    Client, Error,
+    Error,
     deserialized_responses::{EncryptionInfo, ShieldState},
     send_queue::{SendHandle, SendReactionHandle},
 };
-use matrix_sdk_base::{
-    deserialized_responses::{SENT_IN_CLEAR, ShieldStateCode},
-    latest_event::LatestEvent,
-};
+use matrix_sdk_base::deserialized_responses::ShieldStateCode;
 use once_cell::sync::Lazy;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedTransactionId,
-    OwnedUserId, RoomId, TransactionId, UserId,
+    OwnedUserId, TransactionId, UserId,
     events::{AnySyncTimelineEvent, receipt::Receipt, room::message::MessageType},
     room_version_rules::RedactionRules,
     serde::Raw,
 };
-use tracing::warn;
 use unicode_segmentation::UnicodeSegmentation;
 
 mod content;
@@ -71,6 +67,16 @@ pub struct EventTimelineItem {
     pub(super) sender: OwnedUserId,
     /// The sender's profile of the event.
     pub(super) sender_profile: TimelineDetails<Profile>,
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, the user ID of the forwarder.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub(super) forwarder: Option<OwnedUserId>,
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, the forwarder's profile, if present.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub(super) forwarder_profile: Option<TimelineDetails<Profile>>,
     /// The timestamp of the event.
     pub(super) timestamp: MilliSecondsSinceUnixEpoch,
     /// The content of the event.
@@ -112,105 +118,27 @@ pub(crate) enum TimelineItemHandle<'a> {
 }
 
 impl EventTimelineItem {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         sender: OwnedUserId,
         sender_profile: TimelineDetails<Profile>,
+        forwarder: Option<OwnedUserId>,
+        forwarder_profile: Option<TimelineDetails<Profile>>,
         timestamp: MilliSecondsSinceUnixEpoch,
         content: TimelineItemContent,
         kind: EventTimelineItemKind,
         is_room_encrypted: bool,
     ) -> Self {
-        Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted }
-    }
-
-    /// If the supplied low-level [`TimelineEvent`] is suitable for use as the
-    /// `latest_event` in a message preview, wrap it as an
-    /// `EventTimelineItem`.
-    ///
-    /// **Note:** Timeline items created via this constructor do **not** produce
-    /// the correct ShieldState when calling
-    /// [`get_shield`][EventTimelineItem::get_shield]. This is because they are
-    /// intended for display in the room list which a) is unlikely to show
-    /// shields and b) would incur a significant performance overhead.
-    ///
-    /// [`TimelineEvent`]: matrix_sdk::deserialized_responses::TimelineEvent
-    pub async fn from_latest_event(
-        client: Client,
-        room_id: &RoomId,
-        latest_event: LatestEvent,
-    ) -> Option<EventTimelineItem> {
-        // TODO: We shouldn't be returning an EventTimelineItem here because we're
-        // starting to diverge on what kind of data we need. The note above is a
-        // potential footgun which could one day turn into a security issue.
-        use super::traits::RoomDataProvider;
-
-        let raw_sync_event = latest_event.event().raw().clone();
-        let encryption_info = latest_event.event().encryption_info().cloned();
-
-        let Ok(event) = raw_sync_event.deserialize() else {
-            warn!("Unable to deserialize latest_event as an AnySyncTimelineEvent!");
-            return None;
-        };
-
-        let timestamp = event.origin_server_ts();
-        let sender = event.sender().to_owned();
-        let event_id = event.event_id().to_owned();
-        let is_own = client.user_id().map(|uid| uid == sender).unwrap_or(false);
-
-        // Get the room's power levels for calculating the latest event
-        let power_levels = if let Some(room) = client.get_room(room_id) {
-            room.power_levels().await.ok()
-        } else {
-            None
-        };
-        let room_power_levels_info = client.user_id().zip(power_levels.as_ref());
-
-        // If we don't (yet) know how to handle this type of message, return `None`
-        // here. If we do, convert it into a `TimelineItemContent`.
-        let content =
-            TimelineItemContent::from_latest_event_content(event, room_power_levels_info)?;
-
-        // The message preview probably never needs read receipts.
-        let read_receipts = IndexMap::new();
-
-        // Being highlighted is _probably_ not relevant to the message preview.
-        let is_highlighted = false;
-
-        // We may need this, depending on how we are going to display edited messages in
-        // previews.
-        let latest_edit_json = None;
-
-        // Probably the origin of the event doesn't matter for the preview.
-        let origin = RemoteEventOrigin::Sync;
-
-        let kind = RemoteEventTimelineItem {
-            event_id,
-            transaction_id: None,
-            read_receipts,
-            is_own,
-            is_highlighted,
-            encryption_info,
-            original_json: Some(raw_sync_event),
-            latest_edit_json,
-            origin,
+        Self {
+            sender,
+            sender_profile,
+            forwarder,
+            forwarder_profile,
+            timestamp,
+            content,
+            kind,
+            is_room_encrypted,
         }
-        .into();
-
-        let room = client.get_room(room_id);
-        let sender_profile = if let Some(room) = room {
-            let mut profile = room.profile_from_latest_event(&latest_event);
-
-            // Fallback to the slow path.
-            if profile.is_none() {
-                profile = room.profile_from_user_id(&sender).await;
-            }
-
-            profile.map(TimelineDetails::Ready).unwrap_or(TimelineDetails::Unavailable)
-        } else {
-            TimelineDetails::Unavailable
-        };
-
-        Some(Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted: false })
     }
 
     /// Check whether this item is a local echo.
@@ -310,6 +238,22 @@ impl EventTimelineItem {
         &self.sender_profile
     }
 
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, returns the user ID of the forwarder.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub fn forwarder(&self) -> Option<&UserId> {
+        self.forwarder.as_deref()
+    }
+
+    /// If the keys used to decrypt this event were shared-on-invite as part of
+    /// an [MSC4268] key bundle, returns the profile of the forwarder.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub fn forwarder_profile(&self) -> Option<&TimelineDetails<Profile>> {
+        self.forwarder_profile.as_ref()
+    }
+
     /// Get the content of this item.
     pub fn content(&self) -> &TimelineItemContent {
         &self.content
@@ -403,30 +347,29 @@ impl EventTimelineItem {
         }
     }
 
-    /// Gets the [`ShieldState`] which can be used to decorate messages in the
-    /// recommended way.
-    pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
+    /// Gets the [`TimelineEventShieldState`] which can be used to decorate
+    /// messages in the recommended way.
+    pub fn get_shield(&self, strict: bool) -> TimelineEventShieldState {
         if !self.is_room_encrypted || self.is_local_echo() {
-            return None;
+            return TimelineEventShieldState::None;
         }
 
         // An unable-to-decrypt message has no authenticity shield.
         if self.content().is_unable_to_decrypt() {
-            return None;
+            return TimelineEventShieldState::None;
         }
 
         match self.encryption_info() {
             Some(info) => {
                 if strict {
-                    Some(info.verification_state.to_shield_state_strict())
+                    info.verification_state.to_shield_state_strict().into()
                 } else {
-                    Some(info.verification_state.to_shield_state_lax())
+                    info.verification_state.to_shield_state_lax().into()
                 }
             }
-            None => Some(ShieldState::Red {
-                code: ShieldStateCode::SentInClear,
-                message: SENT_IN_CLEAR,
-            }),
+            None => {
+                TimelineEventShieldState::Red { code: TimelineEventShieldStateCode::SentInClear }
+            }
         }
     }
 
@@ -544,6 +487,8 @@ impl EventTimelineItem {
         Self {
             sender: self.sender.clone(),
             sender_profile: self.sender_profile.clone(),
+            forwarder: self.forwarder.clone(),
+            forwarder_profile: self.forwarder_profile.clone(),
             timestamp: self.timestamp,
             content,
             kind,
@@ -788,415 +733,70 @@ impl ReactionsByKeyBySender {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use assert_matches::assert_matches;
-    use assert_matches2::assert_let;
-    use matrix_sdk::test_utils::logged_in_client;
-    use matrix_sdk_base::{
-        MinimalStateEvent, OriginalMinimalStateEvent, RequestedRequiredStates,
-        deserialized_responses::TimelineEvent, latest_event::LatestEvent,
-    };
-    use matrix_sdk_test::{async_test, event_factory::EventFactory, sync_state_event};
-    use ruma::{
-        RoomId, UInt, UserId,
-        api::client::sync::sync_events::v5 as http,
-        event_id,
-        events::{
-            AnySyncStateEvent,
-            room::{
-                member::RoomMemberEventContent,
-                message::{MessageFormat, MessageType},
-            },
-        },
-        room_id,
-        serde::Raw,
-        user_id,
-    };
+/// Extends [`ShieldState`] to allow for a `SentInClear` code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimelineEventShieldState {
+    /// A red shield with a tooltip containing a message appropriate to the
+    /// associated code should be presented.
+    Red {
+        /// A machine-readable representation.
+        code: TimelineEventShieldStateCode,
+    },
+    /// A grey shield with a tooltip containing a message appropriate to the
+    /// associated code should be presented.
+    Grey {
+        /// A machine-readable representation.
+        code: TimelineEventShieldStateCode,
+    },
+    /// No shield should be presented.
+    None,
+}
 
-    use super::{EventTimelineItem, Profile};
-    use crate::timeline::{MembershipChange, TimelineDetails, TimelineItemContent};
-
-    #[async_test]
-    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item() {
-        // Given a sync event that is suitable to be used as a latest_event
-
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-        let event = EventFactory::new()
-            .room(room_id)
-            .text_html("**My M**", "<b>My M</b>")
-            .sender(user_id)
-            .server_ts(122344)
-            .into_event();
-        let client = logged_in_client(None).await;
-
-        // When we construct a timeline event from it
-        let timeline_item =
-            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        // Then its properties correctly translate
-        assert_eq!(timeline_item.sender, user_id);
-        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
-        assert_eq!(timeline_item.timestamp.0, UInt::new(122344).unwrap());
-        if let MessageType::Text(txt) = timeline_item.content.as_message().unwrap().msgtype() {
-            assert_eq!(txt.body, "**My M**");
-            let formatted = txt.formatted.as_ref().unwrap();
-            assert_eq!(formatted.format, MessageFormat::Html);
-            assert_eq!(formatted.body, "<b>My M</b>");
-        } else {
-            panic!("Unexpected message type");
+impl From<ShieldState> for TimelineEventShieldState {
+    fn from(value: ShieldState) -> Self {
+        match value {
+            ShieldState::Red { code, message: _ } => {
+                TimelineEventShieldState::Red { code: code.into() }
+            }
+            ShieldState::Grey { code, message: _ } => {
+                TimelineEventShieldState::Grey { code: code.into() }
+            }
+            ShieldState::None => TimelineEventShieldState::None,
         }
     }
+}
 
-    #[async_test]
-    async fn test_latest_knock_member_state_event_can_be_wrapped_as_a_timeline_item() {
-        // Given a sync knock member state event that is suitable to be used as a
-        // latest_event
+/// Extends [`ShieldStateCode`] to allow for a `SentInClear` code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum TimelineEventShieldStateCode {
+    /// Not enough information available to check the authenticity.
+    AuthenticityNotGuaranteed,
+    /// The sending device isn't yet known by the Client.
+    UnknownDevice,
+    /// The sending device hasn't been verified by the sender.
+    UnsignedDevice,
+    /// The sender hasn't been verified by the Client's user.
+    UnverifiedIdentity,
+    /// The sender was previously verified but changed their identity.
+    VerificationViolation,
+    /// The `sender` field on the event does not match the owner of the device
+    /// that established the Megolm session.
+    MismatchedSender,
+    /// An unencrypted event in an encrypted room.
+    SentInClear,
+}
 
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-        let raw_event = member_event_as_state_event(
-            room_id,
-            user_id,
-            "knock",
-            "Alice Margatroid",
-            "mxc://e.org/SEs",
-        );
-        let client = logged_in_client(None).await;
-
-        // Add create and power levels state event, otherwise the knock state event
-        // can't be used as the latest event
-        let create_event = sync_state_event!({
-            "type": "m.room.create",
-            "content": { "room_version": "11" },
-            "event_id": "$143278582443PhrSm:example.org",
-            "origin_server_ts": 143273580,
-            "room_id": room_id,
-            "sender": user_id,
-            "state_key": "",
-            "unsigned": {
-              "age": 1235
-            }
-        });
-        let power_level_event = sync_state_event!({
-            "type": "m.room.power_levels",
-            "content": {},
-            "event_id": "$143278582443PhrSn:example.org",
-            "origin_server_ts": 143273581,
-            "room_id": room_id,
-            "sender": user_id,
-            "state_key": "",
-            "unsigned": {
-              "age": 1234
-            }
-        });
-        let mut room = http::response::Room::new();
-        room.required_state.extend([create_event, power_level_event]);
-
-        // And the room is stored in the client so it can be extracted when needed
-        let response = response_with_room(room_id, room);
-        client
-            .process_sliding_sync_test_helper(&response, &RequestedRequiredStates::default())
-            .await
-            .unwrap();
-
-        // When we construct a timeline event from it
-        let event = TimelineEvent::from_plaintext(raw_event.cast());
-        let timeline_item =
-            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        // Then its properties correctly translate
-        assert_eq!(timeline_item.sender, user_id);
-        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
-        assert_eq!(timeline_item.timestamp.0, UInt::new(143273583).unwrap());
-        if let TimelineItemContent::MembershipChange(change) = timeline_item.content {
-            assert_eq!(change.user_id, user_id);
-            assert_matches!(change.change, Some(MembershipChange::Knocked));
-        } else {
-            panic!("Unexpected state event type");
+impl From<ShieldStateCode> for TimelineEventShieldStateCode {
+    fn from(value: ShieldStateCode) -> Self {
+        use TimelineEventShieldStateCode::*;
+        match value {
+            ShieldStateCode::AuthenticityNotGuaranteed => AuthenticityNotGuaranteed,
+            ShieldStateCode::UnknownDevice => UnknownDevice,
+            ShieldStateCode::UnsignedDevice => UnsignedDevice,
+            ShieldStateCode::UnverifiedIdentity => UnverifiedIdentity,
+            ShieldStateCode::VerificationViolation => VerificationViolation,
+            ShieldStateCode::MismatchedSender => MismatchedSender,
         }
-    }
-
-    #[async_test]
-    async fn test_latest_message_includes_bundled_edit() {
-        // Given a sync event that is suitable to be used as a latest_event, and
-        // contains a bundled edit,
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-
-        let f = EventFactory::new();
-
-        let original_event_id = event_id!("$original");
-
-        let event = f
-            .text_html("**My M**", "<b>My M</b>")
-            .sender(user_id)
-            .event_id(original_event_id)
-            .with_bundled_edit(
-                f.text_html(" * Updated!", " * <b>Updated!</b>")
-                    .edit(
-                        original_event_id,
-                        MessageType::text_html("Updated!", "<b>Updated!</b>").into(),
-                    )
-                    .event_id(event_id!("$edit"))
-                    .sender(user_id),
-            )
-            .server_ts(42)
-            .into_event();
-
-        let client = logged_in_client(None).await;
-
-        // When we construct a timeline event from it,
-        let timeline_item =
-            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        // Then its properties correctly translate.
-        assert_eq!(timeline_item.sender, user_id);
-        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
-        assert_eq!(timeline_item.timestamp.0, UInt::new(42).unwrap());
-        if let MessageType::Text(txt) = timeline_item.content.as_message().unwrap().msgtype() {
-            assert_eq!(txt.body, "Updated!");
-            let formatted = txt.formatted.as_ref().unwrap();
-            assert_eq!(formatted.format, MessageFormat::Html);
-            assert_eq!(formatted.body, "<b>Updated!</b>");
-        } else {
-            panic!("Unexpected message type");
-        }
-    }
-
-    #[async_test]
-    async fn test_latest_poll_includes_bundled_edit() {
-        // Given a sync event that is suitable to be used as a latest_event, and
-        // contains a bundled edit,
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-
-        let f = EventFactory::new();
-
-        let original_event_id = event_id!("$original");
-
-        let event = f
-            .poll_start(
-                "It's one avocado, Michael, how much could it cost? 10 dollars?",
-                "It's one avocado, Michael, how much could it cost?",
-                vec!["1 dollar", "10 dollars", "100 dollars"],
-            )
-            .event_id(original_event_id)
-            .with_bundled_edit(
-                f.poll_edit(
-                    original_event_id,
-                    "It's one banana, Michael, how much could it cost?",
-                    vec!["1 dollar", "10 dollars", "100 dollars"],
-                )
-                .event_id(event_id!("$edit"))
-                .sender(user_id),
-            )
-            .sender(user_id)
-            .into_event();
-
-        let client = logged_in_client(None).await;
-
-        // When we construct a timeline event from it,
-        let timeline_item =
-            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        // Then its properties correctly translate.
-        assert_eq!(timeline_item.sender, user_id);
-
-        let poll = timeline_item.content().as_poll().unwrap();
-        assert!(poll.has_been_edited);
-        assert_eq!(
-            poll.poll_start.question.text,
-            "It's one banana, Michael, how much could it cost?"
-        );
-    }
-
-    #[async_test]
-    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_storage()
-     {
-        // Given a sync event that is suitable to be used as a latest_event, and a room
-        // with a member event for the sender
-
-        use ruma::owned_mxc_uri;
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-        let event = EventFactory::new()
-            .room(room_id)
-            .text_html("**My M**", "<b>My M</b>")
-            .sender(user_id)
-            .into_event();
-        let client = logged_in_client(None).await;
-        let mut room = http::response::Room::new();
-        room.required_state.push(member_event_as_state_event(
-            room_id,
-            user_id,
-            "join",
-            "Alice Margatroid",
-            "mxc://e.org/SEs",
-        ));
-
-        // And the room is stored in the client so it can be extracted when needed
-        let response = response_with_room(room_id, room);
-        client
-            .process_sliding_sync_test_helper(&response, &RequestedRequiredStates::default())
-            .await
-            .unwrap();
-
-        // When we construct a timeline event from it
-        let timeline_item =
-            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        // Then its sender is properly populated
-        assert_let!(TimelineDetails::Ready(profile) = timeline_item.sender_profile);
-        assert_eq!(
-            profile,
-            Profile {
-                display_name: Some("Alice Margatroid".to_owned()),
-                display_name_ambiguous: false,
-                avatar_url: Some(owned_mxc_uri!("mxc://e.org/SEs"))
-            }
-        );
-    }
-
-    #[async_test]
-    async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_cache()
-     {
-        // Given a sync event that is suitable to be used as a latest_event, a room, and
-        // a member event for the sender (which isn't part of the room yet).
-
-        use ruma::owned_mxc_uri;
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-        let f = EventFactory::new().room(room_id);
-        let event = f.text_html("**My M**", "<b>My M</b>").sender(user_id).into_event();
-        let client = logged_in_client(None).await;
-
-        let member_event = MinimalStateEvent::Original(
-            f.member(user_id)
-                .sender(user_id!("@example:example.org"))
-                .avatar_url("mxc://e.org/SEs".into())
-                .display_name("Alice Margatroid")
-                .reason("")
-                .into_raw_sync()
-                .deserialize_as_unchecked::<OriginalMinimalStateEvent<RoomMemberEventContent>>()
-                .unwrap(),
-        );
-
-        let room = http::response::Room::new();
-        // Do not push the `member_event` inside the room. Let's say it's flying in the
-        // `StateChanges`.
-
-        // And the room is stored in the client so it can be extracted when needed
-        let response = response_with_room(room_id, room);
-        client
-            .process_sliding_sync_test_helper(&response, &RequestedRequiredStates::default())
-            .await
-            .unwrap();
-
-        // When we construct a timeline event from it
-        let timeline_item = EventTimelineItem::from_latest_event(
-            client,
-            room_id,
-            LatestEvent::new_with_sender_details(event, Some(member_event), None),
-        )
-        .await
-        .unwrap();
-
-        // Then its sender is properly populated
-        assert_let!(TimelineDetails::Ready(profile) = timeline_item.sender_profile);
-        assert_eq!(
-            profile,
-            Profile {
-                display_name: Some("Alice Margatroid".to_owned()),
-                display_name_ambiguous: false,
-                avatar_url: Some(owned_mxc_uri!("mxc://e.org/SEs"))
-            }
-        );
-    }
-
-    #[async_test]
-    async fn test_emoji_detection() {
-        let room_id = room_id!("!q:x.uk");
-        let user_id = user_id!("@t:o.uk");
-        let client = logged_in_client(None).await;
-        let f = EventFactory::new().room(room_id).sender(user_id);
-
-        let mut event = f.text_html("🤷‍♂️ No boost 🤷‍♂️", "").into_event();
-        let mut timeline_item =
-            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        assert!(!timeline_item.contains_only_emojis());
-
-        // Ignores leading and trailing white spaces
-        event = f.text_html(" 🚀 ", "").into_event();
-        timeline_item =
-            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        assert!(timeline_item.contains_only_emojis());
-
-        // Too many
-        event = f.text_html("👨‍👩‍👦1️⃣🚀👳🏾‍♂️🪩👍👍🏻🫱🏼‍🫲🏾🙂👋", "").into_event();
-        timeline_item =
-            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        assert!(!timeline_item.contains_only_emojis());
-
-        // Works with combined emojis
-        event = f.text_html("👨‍👩‍👦1️⃣👳🏾‍♂️👍🏻🫱🏼‍🫲🏾", "").into_event();
-        timeline_item =
-            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
-                .await
-                .unwrap();
-
-        assert!(timeline_item.contains_only_emojis());
-    }
-
-    fn member_event_as_state_event(
-        room_id: &RoomId,
-        user_id: &UserId,
-        membership: &str,
-        display_name: &str,
-        avatar_url: &str,
-    ) -> Raw<AnySyncStateEvent> {
-        sync_state_event!({
-            "type": "m.room.member",
-            "content": {
-                "avatar_url": avatar_url,
-                "displayname": display_name,
-                "membership": membership,
-                "reason": ""
-            },
-            "event_id": "$143273582443PhrSn:example.org",
-            "origin_server_ts": 143273583,
-            "room_id": room_id,
-            "sender": user_id,
-            "state_key": user_id,
-            "unsigned": {
-              "age": 1234
-            }
-        })
-    }
-
-    fn response_with_room(room_id: &RoomId, room: http::response::Room) -> http::Response {
-        let mut response = http::Response::new("6".to_owned());
-        response.rooms.insert(room_id.to_owned(), room);
-        response
     }
 }
