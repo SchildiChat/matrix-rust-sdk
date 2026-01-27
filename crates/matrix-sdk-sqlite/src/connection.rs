@@ -105,7 +105,12 @@ impl managed::Manager for Manager {
 
     async fn create(&self) -> Result<Self::Type, Self::Error> {
         let path = self.database_path.clone();
-        SyncWrapper::new(RUNTIME, move || rusqlite::Connection::open(path)).await
+        SyncWrapper::new(RUNTIME, move || {
+            let conn = rusqlite::Connection::open(path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(30))?;
+            Ok(conn)
+        })
+        .await
     }
 
     async fn recycle(
