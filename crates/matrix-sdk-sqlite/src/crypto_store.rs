@@ -173,7 +173,7 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 13;
+const DATABASE_VERSION: u8 = 14;
 
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
@@ -309,6 +309,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         .await?;
     }
 
+    if version < 14 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/014_room_key_backups_fully_downloaded.sql"
+            ))?;
+            txn.set_db_version(14)
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -363,6 +373,8 @@ trait SqliteConnectionExt {
         user_id: &[u8],
         data: &[u8],
     ) -> rusqlite::Result<()>;
+
+    fn set_has_downloaded_all_room_keys(&self, room_id: &[u8]) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionExt for rusqlite::Connection {
@@ -503,6 +515,16 @@ impl SqliteConnectionExt for rusqlite::Connection {
             VALUES (?1, ?2, ?3)
             ON CONFLICT (room_id, sender_user_id) DO UPDATE SET bundle_data = ?3",
             (room_id, sender_user_id, data),
+        )?;
+        Ok(())
+    }
+
+    fn set_has_downloaded_all_room_keys(&self, room_id: &[u8]) -> rusqlite::Result<()> {
+        self.execute(
+            "INSERT INTO room_key_backups_fully_downloaded(room_id)
+             VALUES (?1)
+             ON CONFLICT(room_id) DO NOTHING",
+            (room_id,),
         )?;
         Ok(())
     }
@@ -813,6 +835,16 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             .await
             .optional()?)
     }
+
+    async fn has_downloaded_all_room_keys(&self, room_id: Key) -> Result<bool> {
+        Ok(self
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM room_key_backups_fully_downloaded WHERE room_id = ?)",
+                (room_id,),
+                |row| row.get(0),
+            )
+            .await?)
+    }
 }
 
 #[async_trait]
@@ -1022,6 +1054,11 @@ impl CryptoStore for SqliteCryptoStore {
                     let user_id = this.encode_key("received_room_key_bundle", &bundle.sender_user);
                     let value = this.serialize_value(&bundle)?;
                     txn.set_received_room_key_bundle(&room_id, &user_id, &value)?;
+                }
+
+                for room in changes.room_key_backups_fully_downloaded {
+                    let room_id = this.encode_key("room_key_backups_fully_downloaded", &room);
+                    txn.set_has_downloaded_all_room_keys(&room_id)?;
                 }
 
                 Ok::<_, Error>(())
@@ -1454,6 +1491,11 @@ impl CryptoStore for SqliteCryptoStore {
             .await?
             .map(|value| self.deserialize_value(&value))
             .transpose()
+    }
+
+    async fn has_downloaded_all_room_keys(&self, room_id: &RoomId) -> Result<bool> {
+        let room_id = self.encode_key("room_key_backups_fully_downloaded", room_id);
+        self.acquire().await?.has_downloaded_all_room_keys(room_id).await
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {

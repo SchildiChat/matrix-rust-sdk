@@ -111,6 +111,7 @@ pub struct MemoryStore {
     room_settings: StdRwLock<HashMap<OwnedRoomId, RoomSettings>>,
     room_key_bundles:
         StdRwLock<HashMap<OwnedRoomId, HashMap<OwnedUserId, StoredRoomKeyBundleData>>>,
+    room_key_backups_fully_downloaded: StdRwLock<HashSet<OwnedRoomId>>,
 
     save_changes_lock: Arc<Mutex<()>>,
 }
@@ -336,6 +337,14 @@ impl CryptoStore for MemoryStore {
                     .entry(bundle.bundle_data.room_id.clone())
                     .or_default()
                     .insert(bundle.sender_user.clone(), bundle);
+            }
+        }
+
+        if !changes.room_key_backups_fully_downloaded.is_empty() {
+            let mut room_key_backups_fully_downloaded =
+                self.room_key_backups_fully_downloaded.write();
+            for room in changes.room_key_backups_fully_downloaded {
+                room_key_backups_fully_downloaded.insert(room);
             }
         }
 
@@ -752,6 +761,11 @@ impl CryptoStore for MemoryStore {
         let result = guard.get(room_id).and_then(|bundles| bundles.get(user_id).cloned());
 
         Ok(result)
+    }
+
+    async fn has_downloaded_all_room_keys(&self, room_id: &RoomId) -> Result<bool> {
+        let guard = self.room_key_backups_fully_downloaded.read();
+        Ok(guard.contains(room_id))
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -1579,6 +1593,13 @@ mod integration_tests {
             user_id: &UserId,
         ) -> crate::store::Result<Option<StoredRoomKeyBundleData>, Self::Error> {
             self.0.get_received_room_key_bundle_data(room_id, user_id).await
+        }
+
+        async fn has_downloaded_all_room_keys(
+            &self,
+            room_id: &RoomId,
+        ) -> Result<bool, Self::Error> {
+            self.0.has_downloaded_all_room_keys(room_id).await
         }
 
         async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {

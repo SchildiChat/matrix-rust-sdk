@@ -12,6 +12,7 @@ mod client;
 #[cfg(feature = "e2e-encryption")]
 mod encryption;
 mod event_cache;
+mod latest_event;
 mod matrix_auth;
 mod media;
 mod notification;
@@ -19,6 +20,7 @@ mod refresh_token;
 mod room;
 mod room_preview;
 mod send_queue;
+mod sync;
 #[cfg(feature = "experimental-widgets")]
 mod widget;
 

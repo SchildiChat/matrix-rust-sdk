@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `Room::set_own_member_display_name` to set the current user's display name
+  within only the one single room (can be used for /myroomnick functionality).
+  [#5981](https://github.com/matrix-org/matrix-rust-sdk/pull/5981)
 - Sending `MessageLike` and `RawMessageLike` events through a `Room` now returns
   the used `EncryptionInfo`, if any.
   ([#5936](https://github.com/matrix-org/matrix-rust-sdk/pull/5936))
@@ -32,6 +35,13 @@ All notable changes to this project will be documented in this file.
 - Add `SlidingSync::unsubscribe_to_rooms` and
   `SlidingSync::clear_and_subscribe_to_rooms`.
   ([#6012](https://github.com/matrix-org/matrix-rust-sdk/pull/6012))
+- [**breaking**] Sliding Sync has a new `PollTimeout` type, used by
+  `SlidingSyncBuilder::requires_timeout`.
+  ([#6005](https://github.com/matrix-org/matrix-rust-sdk/pull/6005))
+- Inviting a user to a room with `Client::enable_share_history_on_invite` set
+  to true will now trigger a download of all historical keys for the room in
+  question from the client's key backup.
+  ([#6017](https://github.com/matrix-org/matrix-rust-sdk/pull/6017))
 
 ### Bugfix
 

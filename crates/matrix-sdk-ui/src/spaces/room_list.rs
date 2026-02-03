@@ -354,7 +354,25 @@ impl SpaceRoomList {
         }
     }
 
-    /// Sorts spare rooms by various criteria as defined in
+    /// Clears the room list back to its initial state so that any new changes
+    /// to the hierarchy will be included the next time [`Self::paginate`] is
+    /// called.
+    ///
+    /// This is useful when you've added or removed children from the space as
+    /// the list is based on a cached state that lives server-side, meaning
+    /// the /hierarchy request needs to be restarted from scratch to pick up
+    /// the changes.
+    pub async fn reset(&self) {
+        let mut pagination_token = self.token.lock().await;
+        *pagination_token = None.into();
+
+        self.rooms.lock().clear();
+        self.children_state.lock().take();
+
+        self.pagination_state.set(SpaceRoomListPaginationState::Idle { end_reached: false });
+    }
+
+    /// Sorts space rooms by various criteria as defined in
     /// https://spec.matrix.org/latest/client-server-api/#ordering-of-children-within-a-space
     fn compare_rooms(
         a: &SpaceRoom,
@@ -364,23 +382,7 @@ impl SpaceRoomList {
         let a_state = children_state.get(&a.room_id);
         let b_state = children_state.get(&b.room_id);
 
-        match (a_state, b_state) {
-            (Some(a_state), Some(b_state)) => {
-                match (&a_state.content.order, &b_state.content.order) {
-                    (Some(a_order), Some(b_order)) => a_order
-                        .cmp(b_order)
-                        .then(a_state.origin_server_ts.cmp(&b_state.origin_server_ts))
-                        .then(a.room_id.cmp(&b.room_id)),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => a_state
-                        .origin_server_ts
-                        .cmp(&b_state.origin_server_ts)
-                        .then(a.room_id.to_string().cmp(&b.room_id.to_string())),
-                }
-            }
-            _ => a.room_id.to_string().cmp(&b.room_id.to_string()),
-        }
+        SpaceRoom::compare_rooms(a, b, a_state.map(Into::into), b_state.map(Into::into))
     }
 }
 
@@ -886,6 +888,44 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[async_test]
+    async fn test_reset() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let space_service = SpaceService::new(client.clone()).await;
+
+        let parent_space_id = room_id!("!parent_space:example.org");
+        let child_space_id_1 = room_id!("!1:example.org");
+
+        server
+            .mock_get_hierarchy()
+            .ok_with_room_ids(vec![child_space_id_1])
+            .expect(2)
+            .mount()
+            .await;
+
+        let room_list = space_service.space_room_list(parent_space_id.to_owned()).await;
+
+        room_list.paginate().await.unwrap();
+
+        // This space contains 1 room
+        assert_eq!(room_list.rooms().len(), 1);
+
+        // Resetting the room list
+        room_list.reset().await;
+
+        // Clears the rooms and pagination token
+        assert_eq!(room_list.rooms().len(), 0);
+        assert_matches!(
+            room_list.pagination_state(),
+            SpaceRoomListPaginationState::Idle { end_reached: false }
+        );
+
+        // Allows paginating again
+        room_list.paginate().await.unwrap();
+        assert_eq!(room_list.rooms().len(), 1);
     }
 
     fn make_space_room(

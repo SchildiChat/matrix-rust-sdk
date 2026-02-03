@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Fix the `is_last_admin` check in `LeaveSpaceRoom` since it was not
+  accounting for the membership state.
+  [#6032](https://github.com/matrix-org/matrix-rust-sdk/pull/6032)
 - [**breaking**] `LatestEventValue::Local { is_sending: bool }` is replaced
   by [`state: LatestEventValueLocalState`] to represent 3 states: `IsSending`,
   `HasBeenSent` and `CannotBeSent`.
@@ -18,6 +21,15 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `TimelineEventFilter` for filtering events based on their type or
+  content. For content filtering, only membership and profile change filters
+  are available as of now.
+  ([#6048](https://github.com/matrix-org/matrix-rust-sdk/pull/6048/))
+- Introduce `SpaceFilter`s as a mechanism for narrowing down what's displayed in
+  the room list ([#6025](https://github.com/matrix-org/matrix-rust-sdk/pull/6025))
+- Utilize the cache and include common relations when focusing a timeline on an event without
+  requestion context.
+  ([#5858](https://github.com/matrix-org/matrix-rust-sdk/pull/5858))
 - [**breaking**] `EventTimelineItem::get_shield` now returns a new type,
   `TimelineEventShieldState`, which extends the old `ShieldState` with a code
   for `SentInClear`, now that the latter has been removed from `ShieldState`.
@@ -40,6 +52,9 @@ All notable changes to this project will be documented in this file.
   
 ### Refactor
 
+- [**breaking**] Refactored `is_last_admin` to `is_last_owner` the check will now
+  account also for v12 rooms, where creators and users with PL 150 matter.
+  ([#6036](https://github.com/matrix-org/matrix-rust-sdk/pull/6036))
 - [**breaking**] The `SpaceService` will no longer auto-subscribe to required
   client events when invoking the `subscribe_to_joined_spaces` but instead do it
   through its, now async, constructor.
