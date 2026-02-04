@@ -72,6 +72,7 @@ mod builder;
 mod controller;
 mod date_dividers;
 mod error;
+pub mod event_filter;
 mod event_handler;
 mod event_item;
 pub mod event_type_filter;
@@ -91,6 +92,7 @@ pub use self::{
     builder::TimelineBuilder,
     controller::default_event_filter,
     error::*,
+    event_filter::{TimelineEventCondition, TimelineEventFilter},
     event_item::{
         AnyOtherFullStateEventContent, EmbeddedEvent, EncryptedMessage, EventItemOrigin,
         EventSendState, EventTimelineItem, InReplyToDetails, MediaUploadProgress,
@@ -1133,8 +1135,8 @@ impl TimelineReadReceiptTracking {
     /// Whether or not read receipt tracking is enabled.
     pub fn is_enabled(&self) -> bool {
         match self {
-            TimelineReadReceiptTracking::AllEvents => true,
-            TimelineReadReceiptTracking::MessageLikeEvents => true,
+            TimelineReadReceiptTracking::AllEvents
+            | TimelineReadReceiptTracking::MessageLikeEvents => true,
             TimelineReadReceiptTracking::Disabled => false,
         }
     }

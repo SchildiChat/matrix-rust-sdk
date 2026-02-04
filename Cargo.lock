@@ -211,9 +211,9 @@ checksum = "9dbc3a507a82b17ba0d98f6ce8fd6954ea0c8152e98009d36a40d8dcc8ce078a"
 
 [[package]]
 name = "askama"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d4744ed2eef2645831b441d8f5459689ade2ab27c854488fbab1fbe94fce1a7"
+checksum = "f75363874b771be265f4ffe307ca705ef6f3baa19011c149da8674a87f1b75c4"
 dependencies = [
  "askama_derive",
  "itoa",
@@ -224,9 +224,9 @@ dependencies = [
 
 [[package]]
 name = "askama_derive"
-version = "0.13.1"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d661e0f57be36a5c14c48f78d09011e67e0cb618f269cca9f2fd8d15b68c46ac"
+checksum = "129397200fe83088e8a68407a8e2b1f826cf0086b21ccdb866a722c8bcd3a94f"
 dependencies = [
  "askama_parser",
  "basic-toml",
@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "askama_parser"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf315ce6524c857bb129ff794935cf6d42c82a6cff60526fe2a63593de4d0d4f"
+checksum = "d6ab5630b3d5eaf232620167977f95eb51f3432fc76852328774afbd242d4358"
 dependencies = [
  "memchr",
  "serde",
@@ -334,9 +334,9 @@ dependencies = [
 
 [[package]]
 name = "async-stream"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd56dd203fef61ac097dd65721a419ddccb106b2d2b70ba60a6b529f03961a51"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
 dependencies = [
  "async-stream-impl",
  "futures-core",
@@ -345,9 +345,9 @@ dependencies = [
 
 [[package]]
 name = "async-stream-impl"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16e62a023e7c117e27523144c5d2459f4397fcc3cab0085af8e2224f643a0193"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -507,15 +507,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "wiremock",
-]
-
-[[package]]
-name = "bincode"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -863,40 +854,42 @@ checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 
 [[package]]
 name = "codspeed"
-version = "3.0.5"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35584c5fcba8059780748866387fb97c5a203bcfc563fc3d0790af406727a117"
+checksum = "5f0d98d97fd75ca4489a1a0997820a6521531085e7c8a98941bd0e1264d567dd"
 dependencies = [
  "anyhow",
- "bincode",
+ "cc",
  "colored",
+ "getrandom 0.2.15",
  "glob",
  "libc",
  "nix",
  "serde",
  "serde_json",
  "statrs",
- "uuid",
 ]
 
 [[package]]
 name = "codspeed-criterion-compat"
-version = "3.0.5"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78f6c1c6bed5fd84d319e8b0889da051daa361c79b7709c9394dfe1a882bba67"
+checksum = "d16fe2db207123f7b3a3b5cfff0c22f99469f7534145f3573f57f4c8a5653c2c"
 dependencies = [
+ "clap",
  "codspeed",
  "codspeed-criterion-compat-walltime",
  "colored",
  "futures",
+ "regex",
  "tokio",
 ]
 
 [[package]]
 name = "codspeed-criterion-compat-walltime"
-version = "3.0.5"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c989289ce6b1cbde72ed560496cb8fbf5aa14d5ef5666f168e7f87751038352e"
+checksum = "b035c7f9846b143aeabb3833f5b584023eb97b43ecbff3d997db74c4372df2bd"
 dependencies = [
  "anes",
  "cast",
@@ -3873,9 +3866,9 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nix"
-version = "0.29.0"
+version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -3974,9 +3967,9 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "oneshot"
-version = "0.1.11"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ce411919553d3f9fa53a0880544cda985a112117a0444d5ff1e870a893d6ea"
+checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 
 [[package]]
 name = "oorandom"
@@ -4810,7 +4803,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.14.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "assign",
  "js_int",
@@ -4828,7 +4821,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.22.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "as_variant",
  "assign",
@@ -4851,7 +4844,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.17.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "as_variant",
  "base64",
@@ -4884,7 +4877,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.32.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -4911,7 +4904,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.13.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "headers",
  "http",
@@ -4932,7 +4925,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.6.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -4943,7 +4936,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.12.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "js_int",
  "thiserror 2.0.17",
@@ -4952,7 +4945,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.17.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "as_variant",
  "cfg-if",
@@ -4968,7 +4961,7 @@ dependencies = [
 [[package]]
 name = "ruma-signatures"
 version = "0.19.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=5509cb598#5509cb598312ee5b71e366ae31f4e744a19a7e79"
+source = "git+https://github.com/SchildiChat/ruma?rev=4b033f77b#4b033f77bfeee102e05c7f5e43c24128a3f464eb"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -6488,8 +6481,9 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "uniffi"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c6dec3fc6645f71a16a3fa9ff57991028153bd194ca97f4b55e610c73ce66a"
 dependencies = [
  "anyhow",
  "camino",
@@ -6511,8 +6505,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_bindgen"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ed0150801958d4825da56a41c71f000a457ac3a4613fa9647df78ac4b6b6881"
 dependencies = [
  "anyhow",
  "askama",
@@ -6536,8 +6531,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_build"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b78fd9271a4c2e85bd2c266c5a9ede1fac676eb39fd77f636c27eaf67426fd5f"
 dependencies = [
  "anyhow",
  "camino",
@@ -6546,8 +6542,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_core"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0ef62e69762fbb9386dcb6c87cd3dd05d525fa8a3a579a290892e60ddbda47e"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -6558,8 +6555,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_internal_macros"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98f51ebca0d9a4b2aa6c644d5ede45c56f73906b96403c08a1985e75ccb64a01"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -6570,8 +6568,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_macros"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db9d12529f1223d014fd501e5f29ca0884d15d6ed5ddddd9f506e55350327dc3"
 dependencies = [
  "camino",
  "fs-err",
@@ -6586,8 +6585,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_meta"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df6d413db2827c68588f8149d30d49b71d540d46539e435b23a7f7dbd4d4f86"
 dependencies = [
  "anyhow",
  "siphasher 1.0.1",
@@ -6597,8 +6597,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_pipeline"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a806dddc8208f22efd7e95a5cdf88ed43d0f3271e8f63b47e757a8bbdb43b63a"
 dependencies = [
  "anyhow",
  "heck",
@@ -6609,8 +6610,9 @@ dependencies = [
 
 [[package]]
 name = "uniffi_udl"
-version = "0.30.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d1a7339539bf6f6fa3e9b534dece13f778bda2d54b1a6d4e40b4d6090ac26e7"
 dependencies = [
  "anyhow",
  "textwrap",
@@ -7022,7 +7024,8 @@ dependencies = [
 [[package]]
 name = "weedle2"
 version = "5.0.0"
-source = "git+https://github.com/mozilla/uniffi-rs?rev=870b814#870b81499a58009c1741292ac7208198fb9e9a1f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "998d2c24ec099a87daf9467808859f9d82b61f1d9c9701251aea037f514eae0e"
 dependencies = [
  "nom",
 ]

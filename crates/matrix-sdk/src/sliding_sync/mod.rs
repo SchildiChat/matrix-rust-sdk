@@ -407,18 +407,18 @@ impl SlidingSync {
         // Collect requests for lists.
         let mut requests_lists = BTreeMap::new();
 
-        let require_timeout = {
+        let timeout = {
             let lists = self.inner.lists.read().await;
 
-            // Start at `true` in case there is zero list.
-            let mut require_timeout = true;
+            // Start at `Default` in case there is zero list.
+            let mut timeout = PollTimeout::Default;
 
             for (name, list) in lists.iter() {
                 requests_lists.insert(name.clone(), list.next_request()?);
-                require_timeout = require_timeout && list.requires_timeout();
+                timeout = timeout.min(list.requires_timeout());
             }
 
-            require_timeout
+            timeout
         };
 
         // Collect the `pos`.
@@ -490,7 +490,11 @@ impl SlidingSync {
         //
         // The `timeout` query is necessary when all lists require it. Please see
         // [`SlidingSyncList::requires_timeout`].
-        let timeout = require_timeout.then(|| self.inner.poll_timeout);
+        let timeout = match timeout {
+            PollTimeout::None => None,
+            PollTimeout::Some(timeout) => Some(Duration::from_secs(timeout.into())),
+            PollTimeout::Default => Some(self.inner.poll_timeout),
+        };
 
         let mut request = assign!(http::Request::new(), {
             conn_id: Some(self.inner.id.clone()),
@@ -884,6 +888,54 @@ pub struct UpdateSummary {
     pub lists: Vec<String>,
     /// The rooms that have seen updates
     pub rooms: Vec<OwnedRoomId>,
+}
+
+/// Define what kind of poll timeout [`SlidingSync`] must use.
+///
+/// [The spec says about `timeout`][spec]:
+///
+/// > How long to wait for new events […] If omitted the response is always
+/// > returned immediately, even if there are no changes.
+///
+/// [spec]: https://github.com/matrix-org/matrix-spec-proposals/blob/erikj/sss/proposals/4186-simplified-sliding-sync.md#top-level
+#[derive(Debug)]
+pub enum PollTimeout {
+    /// No `timeout` must be present.
+    None,
+
+    /// A `timeout=X` must be present, where `X` is in seconds and
+    /// represents how long to wait for new events.
+    Some(u32),
+
+    /// A `timeout=X` must be present, where `X` is the default value passed to
+    /// [`SlidingSyncBuilder::poll_timeout`].
+    Default,
+}
+
+impl PollTimeout {
+    /// Computes the smallest `PollTimeout` between two of them.
+    ///
+    /// The rules are the following:
+    ///
+    /// * `None` < `Some`,
+    /// * `Some(x) < Some(y)` if and only if `x < y`,
+    /// * `Some < Default`.
+    ///
+    /// The `Default` value is unknown at this step but is assumed to be the
+    /// largest.
+    fn min(self, left: Self) -> Self {
+        match (self, left) {
+            (Self::None, _) => Self::None,
+
+            (Self::Some(_), Self::None) => Self::None,
+            (Self::Some(right), Self::Some(left)) => Self::Some(right.min(left)),
+            (Self::Some(right), Self::Default) => Self::Some(right),
+
+            (Self::Default, Self::None) => Self::None,
+            (Self::Default, Self::Some(left)) => Self::Some(left),
+            (Self::Default, Self::Default) => Self::Default,
+        }
+    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]

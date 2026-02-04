@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- `Client::create_room` now uses `RoomPowerLevelsContentOverride` under the hood instead of 
+  `RoomPowerLevelsEventContent` to be able to explicitly set values which would previously be 
+  ignored if they matched the default power level values specified by the spec: these may not be 
+  the same in the homeserver and result in rooms with incorrect power levels being created.
+  ([#6034](https://github.com/matrix-org/matrix-rust-sdk/pull/6034))
+- Fix the `is_last_admin` check in `LeaveSpaceRoom` since it was not
+  accounting for the membership state.
+  [#6032](https://github.com/matrix-org/matrix-rust-sdk/pull/6032)
 - [**breaking**] `LatestEventValue::Local { is_sending: bool }` is replaced
   by [`state: LatestEventValueLocalState`] to represent 3 states: `IsSending`,
   `HasBeenSent` and `CannotBeSent`.
@@ -15,12 +23,23 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `TimelineFilter::EventFilter` for filtering events based on their type or
+  content. For content filtering, only membership and profile change filters
+  are available as of now.
+  ([#6048](https://github.com/matrix-org/matrix-rust-sdk/pull/6048/))
+- Introduce `SpaceFilter`s as a mechanism for narrowing down what's displayed in
+  the room list ([#6025](https://github.com/matrix-org/matrix-rust-sdk/pull/6025))
+- Expose room power level thresholds in `OtherState::RoomPowerLevels` (ban, kick, invite, redact, state &
+  events defaults, per-event overrides, notifications), so clients can compute the required power level
+  for actions and compare with previous values. ([#5931](https://github.com/matrix-org/matrix-rust-sdk/pull/5931))
 - Add `RoomCreationParameters::is_space` parameter to be able to create spaces. ([#6010](https://github.com/matrix-org/matrix-rust-sdk/pull/6010/))
 - [**breaking**] `LazyTimelineItemProvider::get_shields` no longer returns an
   an `Option`: the `ShieldState` type contains a `None` variant, so the
   `Option` was redundant. The `message` field has also been removed: since there
   was no way to localise the returned string, applications should not be using it.
   ([#5959](https://github.com/matrix-org/matrix-rust-sdk/pull/5959))
+- Add `Room::list_threads` to list all the threads in a room.
+  ([#5953](https://github.com/matrix-org/matrix-rust-sdk/pull/5953))
 - Add `SpaceService::get_space_room` to get a space given its id from the space graph if available.
 [#5944](https://github.com/matrix-org/matrix-rust-sdk/pull/5944)
 - Add `QrCodeData::to_bytes()` to allow generation of a QR code.
@@ -35,9 +54,13 @@ All notable changes to this project will be documented in this file.
   the user who forwarded the keys used to decrypt the event as part of an [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268)
   key bundle.
   ([#6000](https://github.com/matrix-org/matrix-rust-sdk/pull/6000))
+- Add `NonFavorite` filter to the Room List API. ([#5991](https://github.com/matrix-org/matrix-rust-sdk/pull/5991))
   
 ### Refactor
 
+- [**breaking**] Refactored `is_last_admin` to `is_last_owner` the check will now
+  account also for v12 rooms, where creators and users with PL 150 matter.
+  ([#6036](https://github.com/matrix-org/matrix-rust-sdk/pull/6036))
 - [**breaking**] The existing `TimelineEventType` was renamed to `TimelineEventContent`, because it contained the 
   actual contents of the event. Then, we created a new `TimelineEventType` enum that actually contains *just* the 
   event type. ([#5937](https://github.com/matrix-org/matrix-rust-sdk/pull/5937))

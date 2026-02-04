@@ -12,8 +12,9 @@
 // See the License for that specific language governing permissions and
 // limitations under the License.
 
-use matrix_sdk::{Client, RoomState, room::RoomMemberRole};
-use ruma::{Int, OwnedRoomId};
+use matrix_sdk::{Client, ROOM_VERSION_RULES_FALLBACK, RoomState, room::RoomMemberRole};
+use ruma::{Int, OwnedRoomId, events::room::member::MembershipState};
+use tracing::info;
 
 use crate::spaces::{Error, SpaceRoom};
 
@@ -23,15 +24,17 @@ use crate::spaces::{Error, SpaceRoom};
 pub struct LeaveSpaceRoom {
     /// The underlying [`SpaceRoom`]
     pub space_room: SpaceRoom,
-    /// Whether the user is the last admin in the room. This helps clients
+    /// Whether the user is the last owner in the room. This helps clients
     /// better inform the user about the consequences of leaving the room.
-    pub is_last_admin: bool,
+    pub is_last_owner: bool,
+    /// If the room creators have infinite PL.
+    pub are_creators_privileged: bool,
 }
 
 /// The `LeaveSpaceHandle` processes rooms to be left in the order they were
 /// provided by the [`crate::spaces::SpaceService`] and annotates them with
 /// extra data to inform the leave process e.g. if the current user is the last
-/// room admin.
+/// room owner.
 ///
 /// Once the upstream client decides what rooms should actually be left, the
 /// handle provides a method to execute that too.
@@ -53,25 +56,55 @@ impl LeaveSpaceHandle {
                 continue;
             }
 
-            let users_to_power_levels = room.users_with_power_levels().await;
+            if !room.are_members_synced() {
+                info!("Syncing members for room {} to check if can leave", room.room_id());
+                _ = room.sync_members().await.ok();
+            }
 
-            let is_last_admin = users_to_power_levels
-                .iter()
+            let mut privileged_creator_ids = Vec::new();
+            let mut are_creators_privileged = false;
+            if let Some(mut create) = room.create_content() {
+                let rules = create.room_version.rules().unwrap_or(ROOM_VERSION_RULES_FALLBACK);
+                if rules.authorization.explicitly_privilege_room_creators {
+                    are_creators_privileged = true;
+                    privileged_creator_ids.push(create.creator);
+                    privileged_creator_ids.append(&mut create.additional_creators);
+                }
+            }
+
+            let owner_ids = room
+                .users_with_power_levels()
+                .await
+                .into_iter()
                 .filter(|(_, power_level)| {
-                    let Some(power_level) = Int::new(**power_level) else {
+                    let Some(power_level) = Int::new(*power_level) else {
                         return false;
                     };
 
-                    RoomMemberRole::suggested_role_for_power_level(power_level.into())
-                        == RoomMemberRole::Administrator
+                    if are_creators_privileged {
+                        power_level >= ruma::int!(150)
+                    } else {
+                        RoomMemberRole::suggested_role_for_power_level(power_level.into())
+                            == RoomMemberRole::Administrator
+                    }
                 })
-                .map(|p| p.0)
-                .collect::<Vec<_>>()
-                == vec![room.own_user_id()];
+                .map(|p: (ruma::OwnedUserId, i64)| p.0)
+                .chain(privileged_creator_ids.into_iter());
+
+            let mut joined_owner_ids = Vec::new();
+            for owner_id in owner_ids {
+                if let Ok(Some(member)) = room.get_member_no_sync(&owner_id).await
+                    && *member.membership() == MembershipState::Join
+                {
+                    joined_owner_ids.push(owner_id);
+                }
+            }
+            let is_last_owner = joined_owner_ids == [room.own_user_id()];
 
             rooms.push(LeaveSpaceRoom {
                 space_room: SpaceRoom::new_from_known(&room, 0),
-                is_last_admin,
+                is_last_owner,
+                are_creators_privileged,
             });
         }
 
@@ -126,12 +159,15 @@ mod tests {
         let parent_space_id = room_id!("!parent_space:example.org");
         let child_space_id_1 = room_id!("!child_space_1:example.org");
         let child_space_id_2 = room_id!("!child_space_2:example.org");
+        let child_space_v12_id_1 = room_id!("!child_space_v12_1:example.org");
+        let child_space_v12_id_2 = room_id!("!child_space_v12_2:example.org");
         let left_room_id = room_id!("!left_room:example.org");
         let invited_room_id = room_id!("!invited_room:example.org");
 
+        let some_non_admin_id = owned_user_id!("@some_non_admin:a.b");
         let mut power_levels = BTreeMap::from([
             (user_id.to_owned(), 100.into()),
-            (owned_user_id!("@some_non_admin:a.b"), 50.into()),
+            (some_non_admin_id.clone(), 50.into()),
         ]);
 
         server
@@ -145,11 +181,17 @@ mod tests {
                     )
                     .add_state_event(
                         factory.power_levels(&mut power_levels).state_key("").sender(user_id),
-                    ),
+                    )
+                    .add_state_event(factory.member(user_id).state_key(user_id.to_string()))
+                    .add_state_event(
+                        factory.member(&some_non_admin_id).state_key(some_non_admin_id.to_string()),
+                    )
+                    .set_joined_members_count(2),
             )
             .await;
 
-        power_levels.insert(owned_user_id!("@some_other_admin:a.b"), 100.into());
+        let other_admin_user_id = owned_user_id!("@some_other_admin:a.b");
+        power_levels.insert(other_admin_user_id.clone(), 100.into());
 
         server
             .sync_room(
@@ -162,7 +204,83 @@ mod tests {
                     )
                     .add_state_event(
                         factory.power_levels(&mut power_levels).state_key("").sender(user_id),
-                    ),
+                    )
+                    .add_state_event(factory.member(user_id).state_key(user_id.to_string()))
+                    .add_state_event(
+                        factory.member(&some_non_admin_id).state_key(some_non_admin_id.to_string()),
+                    )
+                    .add_state_event(
+                        factory
+                            .member(&other_admin_user_id)
+                            .state_key(other_admin_user_id.to_string()),
+                    )
+                    .set_joined_members_count(3),
+            )
+            .await;
+
+        // The creator is not supposed to be in the power levels on v12
+        let mut power_levels = BTreeMap::from([
+            (some_non_admin_id.clone(), 50.into()),
+            (other_admin_user_id.clone(), 100.into()),
+        ]);
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(child_space_v12_id_1)
+                    .add_state_event(factory.create(user_id, RoomVersionId::V12).with_space_type())
+                    .add_state_event(
+                        factory.space_parent(
+                            parent_space_id.to_owned(),
+                            child_space_v12_id_1.to_owned(),
+                        ),
+                    )
+                    .add_state_event(factory.member(user_id).state_key(user_id.to_string()))
+                    .add_state_event(
+                        factory.member(&some_non_admin_id).state_key(some_non_admin_id.to_string()),
+                    )
+                    .add_state_event(
+                        factory
+                            .member(&other_admin_user_id)
+                            .state_key(other_admin_user_id.to_string()),
+                    )
+                    .add_state_event(
+                        factory.power_levels(&mut power_levels).state_key("").sender(user_id),
+                    )
+                    .set_joined_members_count(3),
+            )
+            .await;
+
+        let other_owner_user_id = owned_user_id!("@some_other_owner:a.b");
+        power_levels.insert(other_owner_user_id.clone(), 150.into());
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(child_space_v12_id_2)
+                    .add_state_event(factory.create(user_id, RoomVersionId::V12).with_space_type())
+                    .add_state_event(
+                        factory.space_parent(
+                            parent_space_id.to_owned(),
+                            child_space_v12_id_2.to_owned(),
+                        ),
+                    )
+                    .add_state_event(factory.member(user_id).state_key(user_id.to_string()))
+                    .add_state_event(
+                        factory.member(&some_non_admin_id).state_key(some_non_admin_id.to_string()),
+                    )
+                    .add_state_event(
+                        factory
+                            .member(&other_admin_user_id)
+                            .state_key(other_admin_user_id.to_string()),
+                    )
+                    .add_state_event(
+                        factory
+                            .member(&other_owner_user_id)
+                            .state_key(other_owner_user_id.to_string()),
+                    )
+                    .add_state_event(
+                        factory.power_levels(&mut power_levels).state_key("").sender(user_id),
+                    )
+                    .set_joined_members_count(4),
             )
             .await;
 
@@ -183,6 +301,18 @@ mod tests {
                             .space_child(parent_space_id.to_owned(), child_space_id_2.to_owned()),
                     )
                     .add_state_event(
+                        factory.space_child(
+                            parent_space_id.to_owned(),
+                            child_space_v12_id_1.to_owned(),
+                        ),
+                    )
+                    .add_state_event(
+                        factory.space_child(
+                            parent_space_id.to_owned(),
+                            child_space_v12_id_2.to_owned(),
+                        ),
+                    )
+                    .add_state_event(
                         factory.space_child(parent_space_id.to_owned(), left_room_id.to_owned()),
                     )
                     .add_state_event(
@@ -200,13 +330,36 @@ mod tests {
         let rooms = handle.rooms();
 
         let child_room_1 = &rooms[0];
-        assert!(child_room_1.is_last_admin);
+        assert!(child_room_1.is_last_owner);
+        assert_eq!(child_room_1.space_room.num_joined_members, 2);
+        assert!(!child_room_1.are_creators_privileged);
 
         let child_room_2 = &rooms[1];
-        assert!(!child_room_2.is_last_admin);
+        assert!(!child_room_2.is_last_owner);
+        assert_eq!(child_room_2.space_room.num_joined_members, 3);
+        assert!(!child_room_2.are_creators_privileged);
+
+        let child_room_3 = &rooms[2];
+        assert!(child_room_3.is_last_owner);
+        assert_eq!(child_room_3.space_room.num_joined_members, 3);
+        assert!(child_room_3.are_creators_privileged);
+
+        let child_room_4 = &rooms[3];
+        assert!(!child_room_4.is_last_owner);
+        assert_eq!(child_room_4.space_room.num_joined_members, 4);
+        assert!(child_room_4.are_creators_privileged);
 
         let room_ids = rooms.iter().map(|r| r.space_room.room_id.clone()).collect::<Vec<_>>();
-        assert_eq!(room_ids, vec![child_space_id_1, child_space_id_2, parent_space_id]);
+        assert_eq!(
+            room_ids,
+            vec![
+                child_space_id_1,
+                child_space_id_2,
+                child_space_v12_id_1,
+                child_space_v12_id_2,
+                parent_space_id
+            ]
+        );
 
         handle.leave(|room| room_ids.contains(&room.space_room.room_id)).await.unwrap();
 
