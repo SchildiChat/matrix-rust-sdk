@@ -95,6 +95,74 @@ fn log_sql_trace(event: TraceEvent<'_>) {
     }
 }
 
+fn log_sql_trace_crypto(event: TraceEvent<'_>) {
+    match event {
+        TraceEvent::Stmt(_, sql) => {
+            debug!(db = "crypto", sql, "SQL query start");
+        }
+        TraceEvent::Profile(stmt, duration) => {
+            debug!(
+                db = "crypto",
+                sql = stmt.sql().as_ref(),
+                elapsed_ms = duration.as_millis(),
+                "SQL query end"
+            );
+        }
+        _ => {}
+    }
+}
+
+fn log_sql_trace_state(event: TraceEvent<'_>) {
+    match event {
+        TraceEvent::Stmt(_, sql) => {
+            debug!(db = "state", sql, "SQL query start");
+        }
+        TraceEvent::Profile(stmt, duration) => {
+            debug!(
+                db = "state",
+                sql = stmt.sql().as_ref(),
+                elapsed_ms = duration.as_millis(),
+                "SQL query end"
+            );
+        }
+        _ => {}
+    }
+}
+
+fn log_sql_trace_event_cache(event: TraceEvent<'_>) {
+    match event {
+        TraceEvent::Stmt(_, sql) => {
+            debug!(db = "event_cache", sql, "SQL query start");
+        }
+        TraceEvent::Profile(stmt, duration) => {
+            debug!(
+                db = "event_cache",
+                sql = stmt.sql().as_ref(),
+                elapsed_ms = duration.as_millis(),
+                "SQL query end"
+            );
+        }
+        _ => {}
+    }
+}
+
+fn log_sql_trace_media(event: TraceEvent<'_>) {
+    match event {
+        TraceEvent::Stmt(_, sql) => {
+            debug!(db = "media", sql, "SQL query start");
+        }
+        TraceEvent::Profile(stmt, duration) => {
+            debug!(
+                db = "media",
+                sql = stmt.sql().as_ref(),
+                elapsed_ms = duration.as_millis(),
+                "SQL query end"
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Type representing a connection to SQLite from the [`Pool`].
 pub type Connection = Object;
 
@@ -120,11 +188,19 @@ impl managed::Manager for Manager {
     async fn create(&self) -> Result<Self::Type, Self::Error> {
         let path = self.database_path.clone();
         SyncWrapper::new(RUNTIME, move || {
+            let trace_cb = match path.file_name().and_then(|name| name.to_str()) {
+                Some("matrix-sdk-crypto.sqlite3") => log_sql_trace_crypto,
+                Some("matrix-sdk-state.sqlite3") => log_sql_trace_state,
+                Some("matrix-sdk-event-cache.sqlite3") => log_sql_trace_event_cache,
+                Some("matrix-sdk-media.sqlite3") => log_sql_trace_media,
+                _ => log_sql_trace,
+            };
+
             let conn = rusqlite::Connection::open(path)?;
             //conn.busy_timeout(std::time::Duration::from_secs(30))?;
             conn.trace_v2(
                 TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_PROFILE,
-                Some(log_sql_trace),
+                Some(trace_cb),
             );
             Ok(conn)
         })
