@@ -69,6 +69,8 @@ use std::{convert::Infallible, path::PathBuf};
 pub use deadpool::managed::reexports::*;
 use deadpool::managed::{self, Metrics, RecycleError};
 use deadpool_sync::SyncWrapper;
+use rusqlite::trace::{TraceEvent, TraceEventCodes};
+use tracing::debug;
 
 /// The default runtime used by `matrix-sdk-sqlite` for `deadpool`.
 pub const RUNTIME: Runtime = Runtime::Tokio1;
@@ -80,6 +82,18 @@ deadpool::managed_reexports!(
     rusqlite::Error,
     Infallible
 );
+
+fn log_sql_trace(event: TraceEvent<'_>) {
+    match event {
+        TraceEvent::Stmt(_, sql) => {
+            debug!(sql, "SQL query start");
+        }
+        TraceEvent::Profile(stmt, duration) => {
+            debug!(sql = stmt.sql().as_ref(), elapsed_ms = duration.as_millis(), "SQL query end");
+        }
+        _ => {}
+    }
+}
 
 /// Type representing a connection to SQLite from the [`Pool`].
 pub type Connection = Object;
@@ -107,7 +121,11 @@ impl managed::Manager for Manager {
         let path = self.database_path.clone();
         SyncWrapper::new(RUNTIME, move || {
             let conn = rusqlite::Connection::open(path)?;
-            conn.busy_timeout(std::time::Duration::from_secs(30))?;
+            //conn.busy_timeout(std::time::Duration::from_secs(30))?;
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_PROFILE,
+                Some(log_sql_trace),
+            );
             Ok(conn)
         })
         .await
