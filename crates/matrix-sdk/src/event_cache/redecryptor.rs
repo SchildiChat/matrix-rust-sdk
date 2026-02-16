@@ -14,9 +14,9 @@
 
 //! The Redecryptor (affectionately known as R2D2) is a layer and long-running
 //! background task which handles redecryption of events in case we couldn't
-//! decrypt them imediatelly.
+//! decrypt them immediately.
 //!
-//! There are various reasons why a room key might not be available imediatelly
+//! There are various reasons why a room key might not be available immediately
 //! when the event becomes available:
 //!     - The to-device message containing the room key just arrives late, i.e.
 //!       after the room event.
@@ -25,33 +25,34 @@
 //!     - The event is a historic event in a previously unjoined room, we need
 //!       to receive historic room keys as defined in [MSC3061].
 //!
-//! R2D2 listens to the OlmMachine for received room keys and new
+//! R2D2 listens to the [`OlmMachine`] for received room keys and new
 //! m.room_key.withheld events.
 //!
-//! If a new room key has been received it attempts to find any UTDs in the
-//! [`EventCache`]. If R2D2 decrypts any UTDs from the event cache it will
-//! replace the events in the cache and send out new [`RoomEventCacheUpdates`]
+//! If a new room key has been received, it attempts to find any UTDs in the
+//! [`EventCache`]. If R2D2 decrypts any UTDs from the event cache, it will
+//! replace the events in the cache and send out new [`RoomEventCacheUpdate`]s
 //! to any of its listeners.
 //!
-//! If a new withheld info has been received it attempts to find any relevant
+//! If a new withheld info has been received, it attempts to find any relevant
 //! events and updates the [`EncryptionInfo`] of an event.
 //!
-//! There's an additional gotcha, the [`OlmMachine`] might get recreated by
-//! calls to [`BaseClient::regenerate_olm()`]. When this happens we will receive
-//! a `None` on the room keys stream and we need to re-listen to it.
+//! There's an additional gotcha: the [`OlmMachine`] might get recreated by
+//! calls to [`BaseClient::regenerate_olm()`]. When this happens, we will
+//! receive a `None` on the room keys stream and we need to re-listen to it.
 //!
 //! Another gotcha is that room keys might be received on another process if the
-//! Client is operating on a Apple device. A separate process is used in this
-//! case to receive push notifications. In this case the room key will be
-//! received and R2D2 won't get notified about it. To work around this
+//! [`Client`] is operating on a Apple iOS device. A separate process is used
+//! in this case to receive push notifications. In this case, the room key will
+//! be received and R2D2 won't get notified about it. To work around this,
 //! decryption requests can be explicitly sent to R2D2.
 //!
 //! The final gotcha is that a room key might be received just in between the
 //! time the event was initially tried to be decrypted and the time it took to
-//! persist it in the event cache. To handle this race condition R2D2 listens to
-//! the event cache and attempts to decrypt any UTDs the event cache persists.
+//! persist it in the event cache. To handle this race condition, R2D2 listens
+//! to the event cache and attempts to decrypt any UTDs the event cache
+//! persists.
 //!
-//! In the graph bellow the Timeline block is meant to be the `Timeline` from
+//! In the graph below, the Timeline block is meant to be the `Timeline` from
 //! the `matrix-sdk-ui` crate, but it could be any other listener that
 //! subscribes to [`RedecryptorReport`] stream.
 //!
@@ -87,7 +88,7 @@
 //!                  │                  │                    │
 //!              Decryption             │                Redecryptor
 //!                request              │                  report
-//!                  │        RoomEventCacheUpdates          │         
+//!                  │        RoomEventCacheUpdates          │
 //!                  │                  │                    │
 //!                  │                  │                    │
 //!                  │      ┌───────────┴───────────┐        │
@@ -131,11 +132,11 @@ use matrix_sdk_base::{
     deserialized_responses::{DecryptedRoomEvent, TimelineEvent, TimelineEventKind},
     event_cache::store::EventCacheStoreLockState,
     locks::Mutex,
+    task_monitor::BackgroundTaskHandle,
     timer,
 };
 #[cfg(doc)]
 use matrix_sdk_common::deserialized_responses::EncryptionInfo;
-use matrix_sdk_common::executor::{AbortOnDrop, JoinHandleExt, spawn};
 use ruma::{
     OwnedEventId, OwnedRoomId, RoomId,
     events::{AnySyncTimelineEvent, room::encrypted::OriginalSyncRoomEncryptedEvent},
@@ -166,7 +167,8 @@ type OwnedSessionId = String;
 
 type EventIdAndUtd = (OwnedEventId, Raw<AnySyncTimelineEvent>);
 type EventIdAndEvent = (OwnedEventId, DecryptedRoomEvent);
-type ResolvedUtd = (OwnedEventId, DecryptedRoomEvent, Option<Vec<Action>>);
+pub(in crate::event_cache) type ResolvedUtd =
+    (OwnedEventId, DecryptedRoomEvent, Option<Vec<Action>>);
 
 /// The information sent across the channel to the long-running task requesting
 /// that the supplied set of sessions be retried.
@@ -371,6 +373,12 @@ impl EventCache {
             events.iter().cloned().map(|(event_id, _, _)| event_id).collect();
         let mut new_events = Vec::with_capacity(events.len());
 
+        // Consider the pinned event linked chunk, if it's been initialized.
+        if let Some(pinned_cache) = state.pinned_event_cache() {
+            pinned_cache.replace_utds(&events).await?;
+        }
+
+        // Consider the room linked chunk.
         for (event_id, decrypted, actions) in events {
             // The event isn't in the cache, nothing to replace. Realistically this can't
             // happen since we retrieved the list of events from the cache itself and
@@ -783,7 +791,7 @@ async fn send_report_and_retry_memory_events(
 ///
 /// For more info see the [module level docs](self).
 pub(crate) struct Redecryptor {
-    _task: AbortOnDrop<()>,
+    _task: BackgroundTaskHandle,
 }
 
 impl Redecryptor {
@@ -800,18 +808,20 @@ impl Redecryptor {
         let linked_chunk_stream = BroadcastStream::new(linked_chunk_update_sender.subscribe());
         let backup_state_stream = client.encryption().backups().state_stream();
 
-        let task = spawn(async {
-            let request_redecryption_stream = UnboundedReceiverStream::new(receiver);
+        let task = client
+            .task_monitor()
+            .spawn_background_task("event_cache::redecryptor", async {
+                let request_redecryption_stream = UnboundedReceiverStream::new(receiver);
 
-            Self::listen_for_room_keys_task(
-                cache,
-                request_redecryption_stream,
-                linked_chunk_stream,
-                backup_state_stream,
-            )
-            .await;
-        })
-        .abort_on_drop();
+                Self::listen_for_room_keys_task(
+                    cache,
+                    request_redecryption_stream,
+                    linked_chunk_stream,
+                    backup_state_stream,
+                )
+                .await;
+            })
+            .abort_on_drop();
 
         Self { _task: task }
     }
@@ -927,7 +937,7 @@ impl Redecryptor {
                         // The stream got closed, this could mean that our OlmMachine got
                         // regenerated, let's return true and try to recreate the stream.
                         None => {
-                            break true
+                            break true;
                         }
                     }
                 }
@@ -951,7 +961,7 @@ impl Redecryptor {
                         }
                         // The stream got closed, same as for the room key stream, we'll try to
                         // recreate the streams.
-                        None => break true
+                        None => break true,
                     }
                 }
                 // Events that the event cache handled. If the event cache received any UTDs, let's
