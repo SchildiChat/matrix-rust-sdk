@@ -2,14 +2,14 @@ use std::{ops::Not as _, sync::Arc};
 
 use matrix_sdk::{
     Room,
-    event_cache::RoomEventCacheUpdate,
     room::IncludeRelations,
     store::StoreConfig,
     test_utils::mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     timeout::timeout,
 };
 use matrix_sdk_base::event_cache::store::MemoryStore;
-use matrix_sdk_test::{JoinedRoomBuilder, StateTestEvent, async_test, event_factory::EventFactory};
+use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
+use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{EventId, event_id, owned_event_id, room_id, user_id};
 use serde_json::json;
 use tokio::time::Duration;
@@ -50,14 +50,15 @@ impl PinningTestSetup<'_> {
     }
 
     async fn mock_sync(&mut self, include_pinned_state_event: bool) {
-        let f = EventFactory::new().sender(user_id!("@a:b.c"));
+        let f = EventFactory::new().room(self.room_id).sender(user_id!("@a:b.c"));
 
         let mut joined_room_builder = JoinedRoomBuilder::new(self.room_id)
             .add_timeline_event(f.text_msg("A").event_id(self.event_id).into_raw_sync());
 
         if include_pinned_state_event {
-            joined_room_builder =
-                joined_room_builder.add_state_event(StateTestEvent::RoomPinnedEvents);
+            let pinned_events =
+                f.room_pinned_events(vec![owned_event_id!("$a"), owned_event_id!("$b")]);
+            joined_room_builder = joined_room_builder.add_state_bulk(vec![pinned_events.into()]);
         }
 
         self.server.sync_room(&self.client, joined_room_builder).await;
@@ -161,7 +162,7 @@ async fn test_pinned_events_are_reloaded_from_storage() {
             .client_builder()
             .on_builder(|builder| {
                 builder.store_config(
-                    StoreConfig::new("test_store".to_owned())
+                    StoreConfig::new(CrossProcessLockConfig::multi_process("test_store"))
                         .event_cache_store(event_cache_store.clone())
                         .state_store(state_store.clone()),
                 )
@@ -177,21 +178,12 @@ async fn test_pinned_events_are_reloaded_from_storage() {
         // This is important: the pinned events list must include our event ID,
         // otherwise the initial reload from network will clear the storage-loaded
         // events.
-        let pinned_events_state = StateTestEvent::Custom(json!({
-            "content": {
-                "pinned": [pinned_event_id]
-            },
-            "event_id": "$pinned_events_state",
-            "origin_server_ts": 151393755,
-            "sender": "@example:localhost",
-            "state_key": "",
-            "type": "m.room.pinned_events",
-        }));
+        let pinned_events_state = f.room_pinned_events(vec![pinned_event_id.to_owned()]);
 
         let room = server
             .sync_room(
                 &client,
-                JoinedRoomBuilder::new(room_id).add_state_event(pinned_events_state),
+                JoinedRoomBuilder::new(room_id).add_state_bulk(vec![pinned_events_state.into()]),
             )
             .await;
 
@@ -205,10 +197,8 @@ async fn test_pinned_events_are_reloaded_from_storage() {
 
         // Wait for the background task to reload the events.
         while let Ok(Ok(up)) = timeout(subscriber.recv(), Duration::from_millis(300)).await {
-            if let RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. } = up {
-                for diff in diffs {
-                    diff.apply(&mut events);
-                }
+            for diff in up.diffs {
+                diff.apply(&mut events);
             }
             if !events.is_empty() {
                 break;
@@ -230,7 +220,7 @@ async fn test_pinned_events_are_reloaded_from_storage() {
         .client_builder()
         .on_builder(|builder| {
             builder.store_config(
-                StoreConfig::new("test_store".to_owned())
+                StoreConfig::new(CrossProcessLockConfig::multi_process("test_store"))
                     .event_cache_store(event_cache_store)
                     .state_store(state_store),
             )
@@ -253,10 +243,8 @@ async fn test_pinned_events_are_reloaded_from_storage() {
 
     // Wait for the background task to reload the events from storage.
     while let Ok(Ok(up)) = timeout(subscriber.recv(), Duration::from_millis(300)).await {
-        if let RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. } = up {
-            for diff in diffs {
-                diff.apply(&mut events);
-            }
+        for diff in up.diffs {
+            diff.apply(&mut events);
         }
         if !events.is_empty() {
             break;
@@ -314,19 +302,13 @@ async fn test_pinned_events_dont_include_thread_responses() {
     // This is important: the pinned events list must include our event ID,
     // otherwise the initial reload from network will clear the storage-loaded
     // events.
-    let pinned_events_state = StateTestEvent::Custom(json!({
-        "content": {
-            "pinned": [pinned_event_id]
-        },
-        "event_id": "$pinned_events_state",
-        "origin_server_ts": 151393755,
-        "sender": "@example:localhost",
-        "state_key": "",
-        "type": "m.room.pinned_events",
-    }));
+    let pinned_events_state = f.room_pinned_events(vec![pinned_event_id.to_owned()]);
 
     let room = server
-        .sync_room(&client, JoinedRoomBuilder::new(room_id).add_state_event(pinned_events_state))
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![pinned_events_state.into()]),
+        )
         .await;
 
     // Get the room event cache and subscribe to pinned events.
@@ -339,10 +321,8 @@ async fn test_pinned_events_dont_include_thread_responses() {
 
     // Wait for the background task to reload the events.
     while let Ok(Ok(up)) = timeout(subscriber.recv(), Duration::from_millis(300)).await {
-        if let RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. } = up {
-            for diff in diffs {
-                diff.apply(&mut events);
-            }
+        for diff in up.diffs {
+            diff.apply(&mut events);
         }
         if !events.is_empty() {
             break;

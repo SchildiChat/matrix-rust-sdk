@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Ensure that the display name of a `Room` in a `NotificationStatus` coming 
+  from a `NotificationClient` excludes service members.
+  ([#6136](https://github.com/matrix-org/matrix-rust-sdk/pull/6136))
 - Fix the `is_last_admin` check in `LeaveSpaceRoom` since it was not
   accounting for the membership state.
   [#6032](https://github.com/matrix-org/matrix-rust-sdk/pull/6032)
@@ -58,6 +61,8 @@ All notable changes to this project will be documented in this file.
   
 ### Refactor
 
+- [**breaking**] Remove `WithLocking` from `EncryptionSyncService`, the locking mechanism will be taken from the parent 
+  `Client` with `Client::cross_process_store_config`. ([#6160](https://github.com/matrix-org/matrix-rust-sdk/pull/6160))
 - [**breaking**] The [`Timeline::pin_event`] and [`Timeline::unpin_event`] methods have been
   moved to the SDK crate, in the `Room` object. Users can replace previous uses with
   `timeline.room().pin_event()` etc.

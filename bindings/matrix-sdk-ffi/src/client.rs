@@ -1,3 +1,17 @@
+// Copyright 2025 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for that specific language governing permissions and
+// limitations under the License.
+
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -45,7 +59,9 @@ use matrix_sdk::{
     task_monitor::BackgroundTaskFailureReason,
     Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
 };
-use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{
+    cross_process_lock::CrossProcessLockConfig, stream::StreamExt, SendOutsideWasm, SyncOutsideWasm,
+};
 use matrix_sdk_ui::{
     notification_client::{
         NotificationClient as MatrixNotificationClient,
@@ -237,6 +253,32 @@ pub trait AccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_change(&self, event: AccountDataEvent);
 }
 
+/// A listener for duplicate key upload errors triggered by requests to
+/// /keys/upload.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait DuplicateKeyUploadErrorListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called once when uploading keys fails.
+    fn on_duplicate_key_upload_error(&self, message: Option<DuplicateOneTimeKeyErrorMessage>);
+}
+
+/// Information about the old and new key that caused a duplicate key upload
+/// error in /keys/upload.
+#[derive(uniffi::Record)]
+pub struct DuplicateOneTimeKeyErrorMessage {
+    /// The previously uploaded one-time key, encoded as unpadded base64.
+    pub old_key: String,
+    /// The one-time key we attempted to upload, encoded as unpadded base64
+    pub new_key: String,
+}
+
+impl From<matrix_sdk::encryption::DuplicateOneTimeKeyErrorMessage>
+    for DuplicateOneTimeKeyErrorMessage
+{
+    fn from(value: matrix_sdk::encryption::DuplicateOneTimeKeyErrorMessage) -> Self {
+        Self { old_key: value.old_key.to_base64(), new_key: value.new_key.to_base64() }
+    }
+}
+
 /// A listener for changes of room account data events.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
@@ -331,8 +373,7 @@ impl Client {
             }
         });
 
-        let cross_process_store_locks_holder_name =
-            sdk_client.cross_process_store_locks_holder_name().to_owned();
+        let store_mode = sdk_client.cross_process_lock_config();
 
         let client = Client {
             inner: AsyncRuntimeDropped::new(sdk_client.clone()),
@@ -349,11 +390,18 @@ impl Client {
                 ))?;
             }
 
-            client
-                .inner
-                .oauth()
-                .enable_cross_process_refresh_lock(cross_process_store_locks_holder_name)
-                .await?;
+            match store_mode {
+                CrossProcessLockConfig::MultiProcess { holder_name } => {
+                    client
+                        .inner
+                        .oauth()
+                        .enable_cross_process_refresh_lock(holder_name.clone())
+                        .await?;
+                }
+                CrossProcessLockConfig::SingleProcess => {
+                    client.inner.oauth();
+                }
+            }
         }
 
         if let Some(session_delegate) = session_delegate {
@@ -742,6 +790,28 @@ impl Client {
                         .on_error(report.room_id.to_string(), ClientError::from_err(report.error)),
                     Err(err) => {
                         error!("error when listening to the send queue error reporter: {err}");
+                    }
+                }
+            }
+        })))
+    }
+
+    /// Subscribe to duplicate key upload errors triggered by requests to
+    /// /keys/upload.
+    pub fn subscribe_to_duplicate_key_upload_errors(
+        &self,
+        listener: Box<dyn DuplicateKeyUploadErrorListener>,
+    ) -> Arc<TaskHandle> {
+        let mut subscriber = self.inner.subscribe_to_duplicate_key_upload_errors();
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            loop {
+                match subscriber.recv().await {
+                    Ok(message) => {
+                        listener.on_duplicate_key_upload_error(message.map(|m| m.into()))
+                    }
+                    Err(err) => {
+                        error!("error when listening to key upload errors: {err}");
                     }
                 }
             }

@@ -158,7 +158,10 @@ use super::{EventCache, EventCacheError, EventCacheInner, EventsOrigin, RoomEven
 use crate::{
     Client, Result, Room,
     encryption::backups::BackupState,
-    event_cache::{RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate},
+    event_cache::{
+        RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate, TimelineVectorDiffs,
+        room::PostProcessingOrigin,
+    },
     room::PushContext,
 };
 
@@ -397,16 +400,15 @@ impl EventCache {
             }
         }
 
-        state.post_process_new_events(new_events, false).await?;
+        state.post_process_new_events(new_events, PostProcessingOrigin::Redecryption).await?;
 
         // We replaced a bunch of events, reactive updates for those replacements have
         // been queued up. We need to send them out to our subscribers now.
         let diffs = state.room_linked_chunk().updates_as_vector_diffs();
 
-        let _ = room_cache.inner.update_sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
-            diffs,
-            origin: EventsOrigin::Cache,
-        });
+        let _ = room_cache.inner.update_sender.send(RoomEventCacheUpdate::UpdateTimelineEvents(
+            TimelineVectorDiffs { diffs, origin: EventsOrigin::Cache },
+        ));
 
         let _ = room_cache
             .inner
@@ -1094,11 +1096,10 @@ mod tests {
         sleep::sleep,
         store::StoreConfig,
     };
-    use matrix_sdk_test::{
-        JoinedRoomBuilder, StateTestEvent, async_test, event_factory::EventFactory,
-    };
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
+    use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
     use ruma::{
-        EventId, OwnedEventId, RoomId, device_id, event_id,
+        EventId, OwnedEventId, RoomId, RoomVersionId, device_id, event_id,
         events::{AnySyncTimelineEvent, relation::RelationType},
         room_id,
         serde::Raw,
@@ -1111,7 +1112,10 @@ mod tests {
     use crate::{
         Client, assert_let_timeout,
         encryption::EncryptionSettings,
-        event_cache::{DecryptionRetryRequest, RoomEventCacheGenericUpdate, RoomEventCacheUpdate},
+        event_cache::{
+            DecryptionRetryRequest, RoomEventCacheGenericUpdate, RoomEventCacheUpdate,
+            TimelineVectorDiffs,
+        },
         test_utils::mocks::MatrixMockServer,
     };
 
@@ -1307,12 +1311,19 @@ mod tests {
             let store = DelayingStore::new();
 
             (
-                StoreConfig::new("delayed_store_event_cache_test".into())
-                    .event_cache_store(store.clone()),
+                StoreConfig::new(CrossProcessLockConfig::multi_process(
+                    "delayed_store_event_cache_test",
+                ))
+                .event_cache_store(store.clone()),
                 Some(store),
             )
         } else {
-            (StoreConfig::new("normal_store_event_cache_test".into()), None)
+            (
+                StoreConfig::new(CrossProcessLockConfig::multi_process(
+                    "normal_store_event_cache_test",
+                )),
+                None,
+            )
         };
 
         let bob = matrix_mock_server
@@ -1332,10 +1343,12 @@ mod tests {
         // Ensure that Alice and Bob are aware of their devices and identities.
         matrix_mock_server.exchange_e2ee_identities(&alice, &bob).await;
 
+        let event_factory = EventFactory::new().room(room_id).sender(alice_user_id);
+
         // Let us now create a room for them.
         let room_builder = JoinedRoomBuilder::new(room_id)
-            .add_state_event(StateTestEvent::Create)
-            .add_state_event(StateTestEvent::Encryption);
+            .add_state_event(event_factory.create(alice_user_id, RoomVersionId::V1))
+            .add_state_event(event_factory.room_encryption());
 
         matrix_mock_server
             .mock_sync()
@@ -1447,7 +1460,8 @@ mod tests {
         // Alright, Bob has received an update from the cache.
 
         assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         // There should be a single new event, and it should be a UTD as we did not
@@ -1477,7 +1491,8 @@ mod tests {
         // Bob should receive a new update from the cache.
         assert_let_timeout!(
             Duration::from_secs(1),
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         // It should replace the UTD with a decrypted event.
@@ -1529,7 +1544,8 @@ mod tests {
         // Alright, Bob has received an update from the cache.
 
         assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         // There should be a single new event, and it should be a UTD as we did not
@@ -1560,7 +1576,8 @@ mod tests {
         // Bob should receive a new update from the cache.
         assert_let_timeout!(
             Duration::from_secs(1),
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         // It should replace the UTD with a decrypted event.
@@ -1606,7 +1623,8 @@ mod tests {
         // encryption info.
         assert_let_timeout!(
             Duration::from_secs(1),
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         assert_eq!(diffs.len(), 1);
@@ -1681,7 +1699,8 @@ mod tests {
 
         // Alright, Bob has received an update from the cache.
         assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         // There should be a single new event, and it should be a UTD as we did not
@@ -1698,7 +1717,8 @@ mod tests {
         // Bob should receive a new update from the cache.
         assert_let_timeout!(
             Duration::from_secs(1),
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = subscriber.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                subscriber.recv()
         );
 
         // It should replace the UTD with a decrypted event.

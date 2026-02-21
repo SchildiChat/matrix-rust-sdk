@@ -31,7 +31,6 @@ mod store;
 mod sync_service;
 mod task_handle;
 mod timeline;
-mod tracing;
 mod utd;
 mod utils;
 mod widget;

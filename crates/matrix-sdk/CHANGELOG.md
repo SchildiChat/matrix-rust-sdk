@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `Client::subscribe_to_duplicate_key_upload_errors` for listening to duplicate key
+  upload errors from `/keys/upload`.
+  ([#6135](https://github.com/matrix-org/matrix-rust-sdk/pull/6135/))
 - Add `Room::pin_event` and `Room::unpin_event`, which allow pinning and unpinning events from a
   room. These were extracted from the `matrix_sdk_ui` crate, with no changes in functionality.
   ([#6106](https://github.com/matrix-org/matrix-rust-sdk/pull/6106))
@@ -50,6 +53,8 @@ All notable changes to this project will be documented in this file.
 
 ### Bugfix
 
+- Latest Event is correctly computed when multiple edits exist for the same event candidate.
+  ([#6096](https://github.com/matrix-org/matrix-rust-sdk/pull/6096))
 - Restrict which `m.room.member` can be a `LatestEventValue` candidate by relying on `MembershipChange` for more control.
   ([#6143](https://github.com/matrix-org/matrix-rust-sdk/pull/6143))
 - Add manual WAL checkpoints when opening Sqlite DBs and when vacuuming them, since the WAL files aren't automatically shrinking. ([#6004](https://github.com/matrix-org/matrix-rust-sdk/pull/6004))
@@ -60,6 +65,13 @@ All notable changes to this project will be documented in this file.
 - Allow granting of QR login to a new client whose device ID is not a base64
   encoded Curve25519 public key.
   ([#5940](https://github.com/matrix-org/matrix-rust-sdk/pull/5940))
+
+### Refactor
+
+- [**breaking**] Replaced `ClientBuilder::cross_process_store_locks_holder_name` with 
+  `ClientBuilder::cross_process_store_config` to allow specifying the configuration for the cross-process lock and 
+  whether it should act as a no-op (client used in a single process) or we should keep the previous behavior (client 
+  used in multiple processes). ([#6160](https://github.com/matrix-org/matrix-rust-sdk/pull/6160))
 
 ## [0.16.0] - 2025-12-04
 

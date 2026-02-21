@@ -4948,8 +4948,7 @@ mod tests {
 
     use matrix_sdk_base::{ComposerDraft, DraftAttachment, store::ComposerDraftType};
     use matrix_sdk_test::{
-        JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
-        event_factory::EventFactory, test_json,
+        JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
     };
     use ruma::{
         RoomVersionId, event_id,
@@ -5005,16 +5004,19 @@ mod tests {
                 .and(header("authorization", "Bearer 1234"))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .set_body_json(&*test_json::sync_events::ENCRYPTION_CONTENT),
+                        .set_body_json(EventFactory::new().room_encryption().into_content()),
                 )
                 .mount(&server)
                 .await;
+            let f = EventFactory::new().sender(user_id!("@example:localhost"));
             let response = SyncResponseBuilder::default()
                 .add_joined_room(
                     JoinedRoomBuilder::default()
-                        .add_state_event(StateTestEvent::Member)
-                        .add_state_event(StateTestEvent::PowerLevels)
-                        .add_state_event(StateTestEvent::Encryption),
+                        .add_state_event(
+                            f.member(user_id!("@example:localhost")).display_name("example"),
+                        )
+                        .add_state_event(f.default_power_levels())
+                        .add_state_event(f.room_encryption()),
                 )
                 .build_sync_response();
             client.base_client().receive_sync_response(response).await.unwrap();

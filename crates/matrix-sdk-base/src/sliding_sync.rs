@@ -358,6 +358,7 @@ mod tests {
         assert!(sync_resp.rooms.invited.contains_key(room_id));
     }
 
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use ruma::events::AnyStrippedStateEvent;
 
     fn invite_state_for(
@@ -1274,7 +1275,7 @@ mod tests {
 
         {
             let client = {
-                let store = StoreConfig::new("cross-process-foo".to_owned());
+                let store = StoreConfig::new(CrossProcessLockConfig::SingleProcess);
                 state_store = store.state_store.clone();
 
                 let client = BaseClient::new(store, ThreadingSupport::Disabled);
@@ -1306,7 +1307,7 @@ mod tests {
 
         {
             let client = {
-                let mut store = StoreConfig::new("cross-process-foo".to_owned());
+                let mut store = StoreConfig::new(CrossProcessLockConfig::SingleProcess);
                 store.state_store = state_store;
                 let client = BaseClient::new(store, ThreadingSupport::Disabled);
                 client
