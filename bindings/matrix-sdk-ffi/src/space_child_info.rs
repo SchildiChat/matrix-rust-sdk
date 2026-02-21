@@ -25,20 +25,17 @@ pub fn space_children_info(room: &matrix_sdk::Room) -> Vec<SpaceChildInfo> {
     if !room.is_space() {
         return space_children;
     }
-    for (r, s) in room.space_children().iter() {
-        // Has room been removed from space again?
-        if let Some(ev) = s.as_original() {
-            // Hasn't been replaced by empty state event?
-            // The spec tells us to ignore children without `via`
-            if !ev.content.via.is_empty() {
-                space_children.push(
-                    SpaceChildInfo::new(
-                        r.to_string(),
-                        ev.content.order.as_ref().map(|order| order.0.into()),
-                        ev.content.suggested,
-                    )
-                );
-            }
+    for (r, ev) in room.space_children().iter() {
+        // Hasn't been replaced by empty state event?
+        // The spec tells us to ignore children without `via`
+        if !ev.content.via.is_empty() {
+            space_children.push(
+                SpaceChildInfo::new(
+                    r.to_string(),
+                    ev.content.order.as_ref().map(|order| order.0.into()),
+                    ev.content.suggested,
+                )
+            );
         }
     }
     return space_children;

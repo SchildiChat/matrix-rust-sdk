@@ -44,7 +44,7 @@ impl Room {
     /// If you need a variant that's sync (but with the drawback that it returns
     /// an `Option`), consider using [`Room::cached_display_name`].
     ///
-    /// [spec]: <https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room>
+    /// [spec]: <https://spec.matrix.org/latest/client-server-api/#calculating-the-display-name-for-a-room>
     pub async fn display_name(&self) -> StoreResult<RoomDisplayName> {
         if let Some(name) = self.cached_display_name() {
             Ok(name)
@@ -109,7 +109,7 @@ impl Room {
     /// or [`Room::display_name`] (async, always returns a value), which should
     /// be preferred in general.
     ///
-    /// [spec]: <https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room>
+    /// [spec]: <https://spec.matrix.org/latest/client-server-api/#calculating-the-display-name-for-a-room>
     pub(crate) async fn compute_display_name(&self) -> StoreResult<UpdatedRoomDisplayName> {
         enum DisplayNameOrSummary {
             Summary(RoomSummary),
@@ -434,7 +434,7 @@ pub struct RoomHero {
 const NUM_HEROES: usize = 5;
 
 /// The name of the room, either from the metadata or calculated
-/// according to [matrix specification](https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room)
+/// according to [matrix specification](https://spec.matrix.org/latest/client-server-api/#calculating-the-display-name-for-a-room)
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RoomDisplayName {
     /// The room has been named explicitly as
@@ -571,9 +571,11 @@ mod tests {
         events::{
             StateEventType,
             room::{
-                canonical_alias::RoomCanonicalAliasEventContent,
+                canonical_alias::{
+                    PossiblyRedactedRoomCanonicalAliasEventContent, RoomCanonicalAliasEventContent,
+                },
                 member::{MembershipState, RoomMemberEventContent, StrippedRoomMemberEvent},
-                name::RoomNameEventContent,
+                name::{PossiblyRedactedRoomNameEventContent, RoomNameEventContent},
             },
         },
         room_alias_id, room_id,
@@ -584,8 +586,7 @@ mod tests {
 
     use super::{Room, RoomDisplayName, compute_display_name_from_heroes};
     use crate::{
-        MinimalStateEvent, OriginalMinimalStateEvent, RoomHero, RoomState, StateChanges,
-        StateStore, store::MemoryStore,
+        MinimalStateEvent, RoomHero, RoomState, StateChanges, StateStore, store::MemoryStore,
     };
 
     fn make_room_test_helper(room_type: RoomState) -> (Arc<MemoryStore>, Room) {
@@ -611,22 +612,22 @@ mod tests {
     }
 
     fn make_canonical_alias_event() -> MinimalStateEvent<RoomCanonicalAliasEventContent> {
-        MinimalStateEvent::Original(OriginalMinimalStateEvent {
-            content: assign!(RoomCanonicalAliasEventContent::new(), {
+        MinimalStateEvent {
+            content: assign!(PossiblyRedactedRoomCanonicalAliasEventContent::new(), {
                 alias: Some(room_alias_id!("#test:example.com").to_owned()),
             }),
             event_id: None,
-        })
+        }
     }
 
-    fn make_name_event_with(name: &str) -> MinimalStateEvent<RoomNameEventContent> {
-        MinimalStateEvent::Original(OriginalMinimalStateEvent {
-            content: RoomNameEventContent::new(name.to_owned()),
+    fn make_name_event_with(name: &str) -> MinimalStateEvent<PossiblyRedactedRoomNameEventContent> {
+        MinimalStateEvent {
+            content: RoomNameEventContent::new(name.to_owned()).into(),
             event_id: None,
-        })
+        }
     }
 
-    fn make_name_event() -> MinimalStateEvent<RoomNameEventContent> {
+    fn make_name_event() -> MinimalStateEvent<PossiblyRedactedRoomNameEventContent> {
         make_name_event_with("Test Room")
     }
 
@@ -724,10 +725,7 @@ mod tests {
     async fn test_display_name_for_invited_room_is_empty_if_room_name_empty() {
         let (_, room) = make_room_test_helper(RoomState::Invited);
 
-        let room_name = MinimalStateEvent::Original(OriginalMinimalStateEvent {
-            content: RoomNameEventContent::new(String::new()),
-            event_id: None,
-        });
+        let room_name = make_name_event_with("");
         room.info.update(|info| info.base_info.name = Some(room_name));
 
         assert_eq!(room.compute_display_name().await.unwrap().into_inner(), RoomDisplayName::Empty);

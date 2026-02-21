@@ -57,6 +57,7 @@ use crate::{
 };
 
 pub(super) mod events;
+mod pinned_events;
 mod threads;
 
 pub use threads::ThreadEventCacheUpdate;
@@ -233,6 +234,24 @@ impl RoomEventCache {
     ) -> Result<(Vec<Event>, Receiver<ThreadEventCacheUpdate>)> {
         let mut state = self.inner.state.write().await?;
         Ok(state.subscribe_to_thread(thread_root))
+    }
+
+    /// Subscribe to the pinned event cache for this room.
+    ///
+    /// This is a persisted view over the pinned events of a room.
+    ///
+    /// The pinned events will be initially reloaded from storage, and/or loaded
+    /// from a network request to fetch the latest pinned events and their
+    /// relations, to update it as needed. The list of pinned events will
+    /// also be kept up-to-date as new events are pinned, and new
+    /// related events show up from other sources.
+    pub async fn subscribe_to_pinned_events(
+        &self,
+    ) -> Result<(Vec<Event>, Receiver<RoomEventCacheUpdate>)> {
+        let room = self.inner.weak_room.get().ok_or(EventCacheError::ClientDropped)?;
+        let state = self.inner.state.read().await?;
+
+        state.subscribe_to_pinned_events(room).await
     }
 
     /// Paginate backwards in a thread, given its root event ID.
@@ -664,8 +683,8 @@ mod private {
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
         sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, OnceLock,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 
@@ -674,7 +693,7 @@ mod private {
     use itertools::Itertools;
     use matrix_sdk_base::{
         apply_redaction,
-        deserialized_responses::{ThreadSummary, ThreadSummaryStatus, TimelineEventKind},
+        deserialized_responses::{ThreadSummary, ThreadSummaryStatus},
         event_cache::{
             Event, Gap,
             store::{EventCacheStoreLock, EventCacheStoreLockGuard, EventCacheStoreLockState},
@@ -694,7 +713,6 @@ mod private {
             relation::RelationType, room::redaction::SyncRoomRedactionEvent,
         },
         room_version_rules::RoomVersionRules,
-        serde::Raw,
     };
     use tokio::sync::{
         Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -714,6 +732,10 @@ mod private {
         events::EventLinkedChunk,
         sort_positions_descending,
     };
+    use crate::{
+        Room,
+        event_cache::{persistence::send_updates_to_store, room::pinned_events::PinnedEventCache},
+    };
 
     /// State for a single room's event cache.
     ///
@@ -721,14 +743,17 @@ mod private {
     /// the same time.
     pub struct RoomEventCacheStateLock {
         /// The per-thread lock around the real state.
-        locked_state: RwLock<RoomEventCacheStateLockInner>,
+        locked_state: RwLock<RoomEventCacheState>,
 
+        /// A lock taken to avoid multiple attempts to upgrade from a read lock
+        /// to a write lock.
+        ///
         /// Please see inline comment of [`Self::read`] to understand why it
         /// exists.
-        read_lock_acquisition: Mutex<()>,
+        state_lock_upgrade_mutex: Mutex<()>,
     }
 
-    struct RoomEventCacheStateLockInner {
+    struct RoomEventCacheState {
         /// Whether thread support has been enabled for the event cache.
         enabled_thread_support: bool,
 
@@ -746,6 +771,9 @@ mod private {
         ///
         /// Keyed by the thread root event ID.
         threads: HashMap<OwnedEventId, ThreadEventCache>,
+
+        /// Cache for pinned events in this room, initialized on-demand.
+        pinned_event_cache: OnceLock<PinnedEventCache>,
 
         pagination_status: SharedObservable<RoomPaginationStatus>,
 
@@ -772,7 +800,7 @@ mod private {
         /// the context of pagination? We do this at most once per room,
         /// the first time we try to run backward pagination. We reset
         /// that upon clearing the timeline events.
-        waited_for_initial_prev_token: Arc<AtomicBool>,
+        waited_for_initial_prev_token: bool,
 
         /// An atomic count of the current number of subscriber of the
         /// [`super::RoomEventCache`].
@@ -861,10 +889,8 @@ mod private {
                 }
             };
 
-            let waited_for_initial_prev_token = Arc::new(AtomicBool::new(false));
-
             Ok(Self {
-                locked_state: RwLock::new(RoomEventCacheStateLockInner {
+                locked_state: RwLock::new(RoomEventCacheState {
                     enabled_thread_support,
                     room_id,
                     store,
@@ -882,10 +908,11 @@ mod private {
                     generic_update_sender,
                     linked_chunk_update_sender,
                     room_version_rules,
-                    waited_for_initial_prev_token,
+                    waited_for_initial_prev_token: false,
                     subscriber_count: Default::default(),
+                    pinned_event_cache: OnceLock::new(),
                 }),
-                read_lock_acquisition: Mutex::new(()),
+                state_lock_upgrade_mutex: Mutex::new(()),
             })
         }
 
@@ -945,7 +972,7 @@ mod private {
             //
             // [^1]: https://docs.rs/lock_api/0.4.14/lock_api/struct.RwLock.html#method.upgradable_read
             // [^2]: https://docs.rs/async-lock/3.4.1/async_lock/struct.RwLock.html#method.upgradable_read
-            let _one_reader_guard = self.read_lock_acquisition.lock().await;
+            let _state_lock_upgrade_guard = self.state_lock_upgrade_mutex.lock().await;
 
             // Obtain a read lock.
             let state_guard = self.locked_state.read().await;
@@ -957,7 +984,7 @@ mod private {
                 EventCacheStoreLockState::Dirty(store_guard) => {
                     // Drop the read lock, and take a write lock to modify the state.
                     // This is safe because only one reader at a time (see
-                    // `Self::read_lock_acquisition`) is allowed.
+                    // `Self::state_lock_upgrade_mutex`) is allowed.
                     drop(state_guard);
                     let state_guard = self.locked_state.write().await;
 
@@ -1053,9 +1080,8 @@ mod private {
 
     /// The read lock guard returned by [`RoomEventCacheStateLock::read`].
     pub struct RoomEventCacheStateLockReadGuard<'a> {
-        /// The per-thread read lock guard over the
-        /// [`RoomEventCacheStateLockInner`].
-        state: RwLockReadGuard<'a, RoomEventCacheStateLockInner>,
+        /// The per-thread read lock guard over the [`RoomEventCacheState`].
+        state: RwLockReadGuard<'a, RoomEventCacheState>,
 
         /// The cross-process lock guard over the store.
         store: EventCacheStoreLockGuard,
@@ -1063,9 +1089,8 @@ mod private {
 
     /// The write lock guard return by [`RoomEventCacheStateLock::write`].
     pub struct RoomEventCacheStateLockWriteGuard<'a> {
-        /// The per-thread write lock guard over the
-        /// [`RoomEventCacheStateLockInner`].
-        state: RwLockWriteGuard<'a, RoomEventCacheStateLockInner>,
+        /// The per-thread write lock guard over the [`RoomEventCacheState`].
+        state: RwLockWriteGuard<'a, RoomEventCacheState>,
 
         /// The cross-process lock guard over the store.
         store: EventCacheStoreLockGuard,
@@ -1190,6 +1215,32 @@ mod private {
         pub fn is_dirty(&self) -> bool {
             EventCacheStoreLockGuard::is_dirty(&self.store)
         }
+
+        /// Subscribe to the lazily initialized pinned event cache for this
+        /// room.
+        ///
+        /// This is a persisted view over the pinned events of a room. The
+        /// pinned events will be initially loaded from a network
+        /// request to fetch the latest pinned events will be performed,
+        /// to update it as needed. The list of pinned events will also
+        /// be kept up-to-date as new events are pinned, and new related
+        /// events show up from sync or backpagination.
+        ///
+        /// This requires the room's event cache to be initialized.
+        pub async fn subscribe_to_pinned_events(
+            &self,
+            room: Room,
+        ) -> Result<(Vec<Event>, Receiver<RoomEventCacheUpdate>), EventCacheError> {
+            let pinned_event_cache = self.state.pinned_event_cache.get_or_init(|| {
+                PinnedEventCache::new(
+                    room,
+                    self.state.linked_chunk_update_sender.clone(),
+                    self.state.store.clone(),
+                )
+            });
+
+            pinned_event_cache.subscribe().await
+        }
     }
 
     impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
@@ -1199,9 +1250,16 @@ mod private {
             &mut self.state.room_linked_chunk
         }
 
-        /// Get a reference to the `waited_for_initial_prev_token` atomic bool.
-        pub fn waited_for_initial_prev_token(&self) -> &Arc<AtomicBool> {
-            &self.state.waited_for_initial_prev_token
+        /// Get a reference to the [`pinned_event_cache`] if it has been
+        /// initialized.
+        #[cfg(any(feature = "e2e-encryption", test))]
+        pub fn pinned_event_cache(&self) -> Option<&PinnedEventCache> {
+            self.state.pinned_event_cache.get()
+        }
+
+        /// Get the `waited_for_initial_prev_token` value.
+        pub fn waited_for_initial_prev_token(&mut self) -> &mut bool {
+            &mut self.state.waited_for_initial_prev_token
         }
 
         /// Find a single event in this room.
@@ -1504,57 +1562,16 @@ mod private {
 
         async fn send_updates_to_store(
             &mut self,
-            mut updates: Vec<Update<Event, Gap>>,
+            updates: Vec<Update<Event, Gap>>,
         ) -> Result<(), EventCacheError> {
-            if updates.is_empty() {
-                return Ok(());
-            }
-
-            // Strip relations from updates which insert or replace items.
-            for update in updates.iter_mut() {
-                match update {
-                    Update::PushItems { items, .. } => strip_relations_from_events(items),
-                    Update::ReplaceItem { item, .. } => strip_relations_from_event(item),
-                    // Other update kinds don't involve adding new events.
-                    Update::NewItemsChunk { .. }
-                    | Update::NewGapChunk { .. }
-                    | Update::RemoveChunk(_)
-                    | Update::RemoveItem { .. }
-                    | Update::DetachLastItems { .. }
-                    | Update::StartReattachItems
-                    | Update::EndReattachItems
-                    | Update::Clear => {}
-                }
-            }
-
-            // Spawn a task to make sure that all the changes are effectively forwarded to
-            // the store, even if the call to this method gets aborted.
-            //
-            // The store cross-process locking involves an actual mutex, which ensures that
-            // storing updates happens in the expected order.
-
-            let store = self.store.clone();
-            let room_id = self.state.room_id.clone();
-            let cloned_updates = updates.clone();
-
-            spawn(async move {
-                trace!(updates = ?cloned_updates, "sending linked chunk updates to the store");
-                let linked_chunk_id = LinkedChunkId::Room(&room_id);
-                store.handle_linked_chunk_updates(linked_chunk_id, cloned_updates).await?;
-                trace!("linked chunk updates applied");
-
-                super::Result::Ok(())
-            })
-            .await
-            .expect("joining failed")?;
-
-            // Forward that the store got updated to observers.
-            let _ = self.state.linked_chunk_update_sender.send(RoomEventCacheLinkedChunkUpdate {
-                linked_chunk_id: OwnedLinkedChunkId::Room(self.state.room_id.clone()),
+            let linked_chunk_id = OwnedLinkedChunkId::Room(self.state.room_id.clone());
+            send_updates_to_store(
+                &self.store,
+                linked_chunk_id,
+                &self.state.linked_chunk_update_sender,
                 updates,
-            });
-
-            Ok(())
+            )
+            .await
         }
 
         /// Reset this data structure as if it were brand new.
@@ -1590,7 +1607,8 @@ mod private {
             // Reset the pagination state too: pretend we never waited for the initial
             // prev-batch token, and indicate that we're not at the start of the
             // timeline, since we don't know about that anymore.
-            self.state.waited_for_initial_prev_token.store(false, Ordering::SeqCst);
+            self.state.waited_for_initial_prev_token = false;
+
             // TODO: likely must cancel any ongoing back-paginations too
             self.state
                 .pagination_status
@@ -1688,8 +1706,8 @@ mod private {
 
             // If we've never waited for an initial previous-batch token, and we've now
             // inserted a gap, no need to wait for a previous-batch token later.
-            if !self.state.waited_for_initial_prev_token.load(Ordering::SeqCst) && has_new_gap {
-                self.state.waited_for_initial_prev_token.store(true, Ordering::SeqCst);
+            if !self.state.waited_for_initial_prev_token && has_new_gap {
+                self.state.waited_for_initial_prev_token = true;
             }
 
             // Remove the old duplicated events.
@@ -1858,6 +1876,16 @@ mod private {
         ) -> Result<(), EventCacheError> {
             // Update the store before doing the post-processing.
             self.propagate_changes().await?;
+
+            // Need an explicit re-borrow to avoid a deref vs deref-mut borrowck conflict
+            // below.
+            let state = &mut *self.state;
+
+            if let Some(pinned_event_cache) = state.pinned_event_cache.get_mut() {
+                pinned_event_cache
+                    .maybe_add_live_related_events(&events, &state.room_version_rules.redaction)
+                    .await?;
+            }
 
             let mut new_events_by_thread: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
@@ -2284,50 +2312,6 @@ mod private {
         }
 
         Ok(Some(all_chunks))
-    }
-
-    /// Removes the bundled relations from an event, if they were present.
-    ///
-    /// Only replaces the present if it contained bundled relations.
-    fn strip_relations_if_present<T>(event: &mut Raw<T>) {
-        // We're going to get rid of the `unsigned`/`m.relations` field, if it's
-        // present.
-        // Use a closure that returns an option so we can quickly short-circuit.
-        let mut closure = || -> Option<()> {
-            let mut val: serde_json::Value = event.deserialize_as().ok()?;
-            let unsigned = val.get_mut("unsigned")?;
-            let unsigned_obj = unsigned.as_object_mut()?;
-            if unsigned_obj.remove("m.relations").is_some() {
-                *event = Raw::new(&val).ok()?.cast_unchecked();
-            }
-            None
-        };
-        let _ = closure();
-    }
-
-    fn strip_relations_from_event(ev: &mut Event) {
-        match &mut ev.kind {
-            TimelineEventKind::Decrypted(decrypted) => {
-                // Remove all information about encryption info for
-                // the bundled events.
-                decrypted.unsigned_encryption_info = None;
-
-                // Remove the `unsigned`/`m.relations` field, if needs be.
-                strip_relations_if_present(&mut decrypted.event);
-            }
-
-            TimelineEventKind::UnableToDecrypt { event, .. }
-            | TimelineEventKind::PlainText { event } => {
-                strip_relations_if_present(event);
-            }
-        }
-    }
-
-    /// Strips the bundled relations from a collection of events.
-    fn strip_relations_from_events(items: &mut [Event]) {
-        for ev in items.iter_mut() {
-            strip_relations_from_event(ev);
-        }
     }
 
     /// Implementation of [`RoomEventCacheStateLockReadGuard::find_event`] and
