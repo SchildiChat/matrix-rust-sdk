@@ -156,6 +156,24 @@ impl LatestEvent {
                 // If the room' state is `Invited`, it means the current user has been recently
                 // invited to this room.
                 RoomState::Invited => {
+                    // Short: Let's not update a `RemoteInvite` to another `RemoteInvite`.
+                    //
+                    // Long: An invite room is only constituted of stripped-state events. These
+                    // events do not have an `origin_server_ts` field. It means we cannot compute
+                    // the timestamp of the `LatestEventValue`. To workaround this, we set the
+                    // timestamp to `now()`. See `Builder::new_remote_for_invite` to learn more.
+                    // If an invite room receives a new event, its `LatestEventValue`'s timestamp
+                    // will be updated to `now()`, which will make the room bumps to the top of the
+                    // room list for example. This is not an acceptable behaviour because it can be
+                    // an “attack vector”, i.e. a way to annoy people with spammy invites. That's
+                    // why, once a `RemoteInvite` has been computed, we do not refresh it.
+                    if matches!(
+                        self.current_value.read().await.deref(),
+                        LatestEventValue::RemoteInvite { .. }
+                    ) {
+                        return;
+                    }
+
                     let new_value = Builder::new_remote_for_invite(&room).await;
 
                     trace!(value = ?new_value, "Computed a remote `LatestEventValue` for invite");
@@ -293,11 +311,12 @@ mod tests_latest_event {
         linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
         store::{SerializableEventContent, StoreConfig},
     };
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
         MilliSecondsSinceUnixEpoch, OwnedTransactionId, event_id,
         events::{AnyMessageLikeEventContent, room::message::RoomMessageEventContent},
-        room_id, user_id,
+        owned_event_id, owned_room_id, room_id, user_id,
     };
     use stream_assert::{assert_next_matches, assert_pending};
 
@@ -453,7 +472,7 @@ mod tests_latest_event {
 
     #[async_test]
     async fn test_local_has_priority_over_remote() {
-        let room_id = room_id!("!r0").to_owned();
+        let room_id = owned_room_id!("!r0");
         let user_id = user_id!("@mnt_io:matrix.org");
         let event_factory = EventFactory::new().sender(user_id).room(&room_id);
 
@@ -542,7 +561,7 @@ mod tests_latest_event {
         {
             let update = RoomSendQueueUpdate::SentEvent {
                 transaction_id,
-                event_id: event_id!("$ev1").to_owned(),
+                event_id: owned_event_id!("$ev1"),
             };
 
             latest_event.update_with_send_queue(&update, &room_event_cache, user_id, None).await;
@@ -564,13 +583,14 @@ mod tests_latest_event {
 
     #[async_test]
     async fn test_store_latest_event_value() {
-        let room_id = room_id!("!r0").to_owned();
+        let room_id = owned_room_id!("!r0");
         let user_id = user_id!("@mnt_io:matrix.org");
         let event_factory = EventFactory::new().sender(user_id).room(&room_id);
 
         let server = MatrixMockServer::new().await;
 
-        let store_config = StoreConfig::new("cross-process-lock-holder".to_owned());
+        let store_config =
+            StoreConfig::new(CrossProcessLockConfig::multi_process("cross-process-lock-holder"));
 
         // Load the client for the first time, and run some operations.
         {

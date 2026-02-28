@@ -29,19 +29,21 @@ use ruma::{
     OwnedRoomAliasId, OwnedRoomId, OwnedTransactionId, OwnedUserId, OwnedVoipId, RoomId,
     RoomVersionId, TransactionId, UInt, UserId, VoipVersionId,
     events::{
-        AnyGlobalAccountDataEvent, AnyMessageLikeEvent, AnyStateEvent, AnyStrippedStateEvent,
-        AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
-        AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations,
+        AnyGlobalAccountDataEvent, AnyMessageLikeEvent, AnyRoomAccountDataEvent, AnyStateEvent,
+        AnyStrippedStateEvent, AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent,
+        AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations,
         EphemeralRoomEventContent, EventContentFromType, False, GlobalAccountDataEventContent,
         Mentions, MessageLikeEvent, MessageLikeEventContent, PossiblyRedactedStateEventContent,
-        RedactContent, RedactedMessageLikeEventContent, RedactedStateEventContent, StateEvent,
-        StateEventContent, StaticEventContent, StaticStateEventContent, StrippedStateEvent,
-        SyncMessageLikeEvent, SyncStateEvent,
+        RedactContent, RedactedMessageLikeEventContent, RedactedStateEventContent,
+        RoomAccountDataEventContent, StateEvent, StateEventContent, StaticEventContent,
+        StaticStateEventContent, StrippedStateEvent, SyncMessageLikeEvent, SyncStateEvent,
         beacon::BeaconEventContent,
         call::{SessionDescription, invite::CallInviteEventContent},
         direct::{DirectEventContent, OwnedDirectUserIdentifier},
+        fully_read::FullyReadEventContent,
         ignored_user_list::IgnoredUserListEventContent,
         macros::EventContent,
+        marked_unread::MarkedUnreadEventContent,
         member_hints::MemberHintsEventContent,
         poll::{
             unstable_end::UnstablePollEndEventContent,
@@ -51,6 +53,7 @@ use ruma::{
                 UnstablePollAnswer, UnstablePollStartContentBlock, UnstablePollStartEventContent,
             },
         },
+        presence::{PresenceEvent, PresenceEventContent},
         push_rules::PushRulesEventContent,
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
@@ -63,6 +66,9 @@ use ruma::{
             encrypted::{
                 EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
             },
+            encryption::RoomEncryptionEventContent,
+            history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
+            join_rules::{JoinRule, RoomJoinRulesEventContent},
             member::{MembershipState, RoomMemberEventContent},
             message::{
                 FormattedBody, GalleryItemType, GalleryMessageEventContent,
@@ -71,6 +77,7 @@ use ruma::{
                 RoomMessageEventContentWithoutRelation,
             },
             name::RoomNameEventContent,
+            pinned_events::RoomPinnedEventsEventContent,
             power_levels::RoomPowerLevelsEventContent,
             redaction::RoomRedactionEventContent,
             server_acl::RoomServerAclEventContent,
@@ -82,9 +89,12 @@ use ruma::{
             notification::{NotificationType, RtcNotificationEventContent},
         },
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
+        space_order::SpaceOrderEventContent,
         sticker::StickerEventContent,
+        tag::{TagEventContent, Tags},
         typing::TypingEventContent,
     },
+    presence::PresenceState,
     push::Ruleset,
     room::RoomType,
     room_version_rules::AuthorizationRules,
@@ -143,6 +153,9 @@ struct Unsigned<C: StaticEventContent> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     age: Option<Int>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invite_room_state: Option<Vec<Raw<AnyStrippedStateEvent>>>,
 }
 
 // rustc can't derive Default because C isn't marked as `Default` 🤔 oh well.
@@ -154,6 +167,7 @@ impl<C: StaticEventContent> Default for Unsigned<C> {
             relations: None,
             redacted_because: None,
             age: None,
+            invite_room_state: None,
         }
     }
 }
@@ -172,6 +186,8 @@ enum EventFormat {
     Ephemeral,
     /// A global account data.
     GlobalAccountData,
+    /// A room account data.
+    RoomAccountData,
 }
 
 impl EventFormat {
@@ -185,7 +201,7 @@ impl EventFormat {
         matches!(self, Self::Timeline | Self::SyncTimeline)
     }
 
-    /// Whether this format ha an `room_id` field.
+    /// Whether this format has an `room_id` field.
     fn has_room_id(self) -> bool {
         matches!(self, Self::Timeline)
     }
@@ -251,6 +267,12 @@ impl<E: StaticEventContent<IsPrefix = False>> EventBuilder<E> {
     /// Add age to unsigned data in this event.
     pub fn age(mut self, age: impl Into<Int>) -> Self {
         self.unsigned.get_or_insert_with(Default::default).age = Some(age.into());
+        self
+    }
+
+    /// Set the previous content for this state event (in the unsigned section).
+    pub fn prev_content(mut self, prev: E) -> Self {
+        self.unsigned.get_or_insert_with(Default::default).prev_content = Some(prev);
         self
     }
 
@@ -390,6 +412,14 @@ where
 
     pub fn into_event(self) -> TimelineEvent {
         TimelineEvent::from_plaintext(self.into_raw_sync())
+    }
+
+    /// Returns just the event content as a JSON value.
+    ///
+    /// This is useful when you need only the content portion of an event,
+    /// for example when mocking HTTP responses that return event content.
+    pub fn into_content(self) -> serde_json::Value {
+        json!(self.content)
     }
 }
 
@@ -590,6 +620,24 @@ where
         Raw::<AnyGlobalAccountDataEvent>::from(val)
             .deserialize()
             .expect("expected global account data")
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for Raw<AnyRoomAccountDataEvent>
+where
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.format(EventFormat::RoomAccountData).into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for AnyRoomAccountDataEvent
+where
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::<AnyRoomAccountDataEvent>::from(val).deserialize().expect("expected room account data")
     }
 }
 
@@ -975,6 +1023,60 @@ impl EventFactory {
         event
     }
 
+    /// Create a state event for room encryption with recommended defaults.
+    ///
+    /// This creates an `m.room.encryption` event with the
+    /// `m.megolm.v1.aes-sha2` algorithm and recommended rotation settings.
+    pub fn room_encryption(&self) -> EventBuilder<RoomEncryptionEventContent> {
+        let mut event = self.event(RoomEncryptionEventContent::with_recommended_defaults());
+        // The state key is empty for a room encryption state event.
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a state event for room encryption with state event encryption
+    /// enabled.
+    #[cfg(feature = "experimental-encrypted-state-events")]
+    pub fn room_encryption_with_state_encryption(
+        &self,
+    ) -> EventBuilder<RoomEncryptionEventContent> {
+        let mut content = RoomEncryptionEventContent::with_recommended_defaults();
+        content.encrypt_state_events = true;
+        let mut event = self.event(content);
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a room history visibility state event.
+    ///
+    /// This creates an `m.room.history_visibility` event with the given
+    /// visibility setting.
+    pub fn room_history_visibility(
+        &self,
+        visibility: HistoryVisibility,
+    ) -> EventBuilder<RoomHistoryVisibilityEventContent> {
+        let mut event = self.event(RoomHistoryVisibilityEventContent::new(visibility));
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a room join rules state event.
+    ///
+    /// This creates an `m.room.join_rules` event with the given join rule.
+    pub fn room_join_rules(&self, join_rule: JoinRule) -> EventBuilder<RoomJoinRulesEventContent> {
+        let mut event = self.event(RoomJoinRulesEventContent::new(join_rule));
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a state event for the room's pinned events.
+    pub fn room_pinned_events(
+        &self,
+        pinned: Vec<OwnedEventId>,
+    ) -> EventBuilder<RoomPinnedEventsEventContent> {
+        self.event(RoomPinnedEventsEventContent::new(pinned)).state_key("")
+    }
+
     /// Create a new `m.member_hints` event with the given service members.
     ///
     /// ```
@@ -1214,9 +1316,16 @@ impl EventFactory {
         &self,
         map: &mut BTreeMap<OwnedUserId, Int>,
     ) -> EventBuilder<RoomPowerLevelsEventContent> {
-        let mut event = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
-        event.users.append(map);
-        self.event(event)
+        let mut content = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
+        content.users.append(map);
+        let mut event = self.event(content);
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a new `m.room.power_levels` event with default values.
+    pub fn default_power_levels(&self) -> EventBuilder<RoomPowerLevelsEventContent> {
+        self.power_levels(&mut BTreeMap::new())
     }
 
     /// Create a new `m.room.server_acl` event.
@@ -1235,10 +1344,13 @@ impl EventFactory {
         alias: Option<OwnedRoomAliasId>,
         alt_aliases: Vec<OwnedRoomAliasId>,
     ) -> EventBuilder<RoomCanonicalAliasEventContent> {
-        let mut event = RoomCanonicalAliasEventContent::new();
-        event.alias = alias;
-        event.alt_aliases = alt_aliases;
-        self.event(event)
+        let mut content = RoomCanonicalAliasEventContent::new();
+        content.alias = alias;
+        content.alt_aliases = alt_aliases;
+        let mut event = self.event(content);
+        // The state key is empty for a canonical alias state event.
+        event.state_key = Some("".to_owned());
+        event
     }
 
     /// Create a new `org.matrix.msc3672.beacon` event.
@@ -1380,6 +1492,97 @@ impl EventFactory {
     {
         self.event(content).format(EventFormat::GlobalAccountData)
     }
+
+    /// Create a new room account data event of the given `C` content type.
+    pub fn room_account_data<C>(&self, content: C) -> EventBuilder<C>
+    where
+        C: RoomAccountDataEventContent + StaticEventContent<IsPrefix = False>,
+    {
+        self.event(content).format(EventFormat::RoomAccountData)
+    }
+
+    /// Create a new `m.fully_read` room account data event.
+    pub fn fully_read(&self, event_id: &EventId) -> EventBuilder<FullyReadEventContent> {
+        self.room_account_data(FullyReadEventContent::new(event_id.to_owned()))
+    }
+
+    /// Create a new `m.marked_unread` room account data event.
+    pub fn marked_unread(&self, unread: bool) -> EventBuilder<MarkedUnreadEventContent> {
+        self.room_account_data(MarkedUnreadEventContent::new(unread))
+    }
+
+    /// Create a new `m.tag` room account data event with the given tags.
+    pub fn tag(&self, tags: Tags) -> EventBuilder<TagEventContent> {
+        self.room_account_data(tags.into())
+    }
+
+    /// Create a new `m.space_order` room account data event with the given
+    /// order.
+    pub fn space_order(&self, order: &str) -> EventBuilder<SpaceOrderEventContent> {
+        let order = ruma::SpaceChildOrder::parse(order).expect("order should be valid");
+        self.room_account_data(SpaceOrderEventContent::new(order))
+    }
+
+    /// Create a new `m.presence` event.
+    ///
+    /// This is a special event type that has its own structure different from
+    /// regular Matrix events.
+    pub fn presence(&self, state: PresenceState) -> PresenceBuilder {
+        PresenceBuilder { sender: self.sender.clone(), content: PresenceEventContent::new(state) }
+    }
+}
+
+/// Builder for presence events.
+#[derive(Debug)]
+pub struct PresenceBuilder {
+    sender: Option<OwnedUserId>,
+    content: PresenceEventContent,
+}
+
+impl PresenceBuilder {
+    /// Set the sender of the presence event.
+    pub fn sender(mut self, sender: &UserId) -> Self {
+        self.sender = Some(sender.to_owned());
+        self
+    }
+
+    /// Set the avatar URL.
+    pub fn avatar_url(mut self, url: &MxcUri) -> Self {
+        self.content.avatar_url = Some(url.to_owned());
+        self
+    }
+
+    /// Set whether the user is currently active.
+    pub fn currently_active(mut self, active: bool) -> Self {
+        self.content.currently_active = Some(active);
+        self
+    }
+
+    /// Set the last active time in milliseconds.
+    pub fn last_active_ago(mut self, ms: u64) -> Self {
+        self.content.last_active_ago = Some(UInt::try_from(ms).unwrap());
+        self
+    }
+
+    /// Set the status message.
+    pub fn status_msg(mut self, msg: impl Into<String>) -> Self {
+        self.content.status_msg = Some(msg.into());
+        self
+    }
+
+    /// Set the display name.
+    pub fn display_name(mut self, name: impl Into<String>) -> Self {
+        self.content.displayname = Some(name.into());
+        self
+    }
+}
+
+impl From<PresenceBuilder> for Raw<PresenceEvent> {
+    fn from(builder: PresenceBuilder) -> Self {
+        let sender = builder.sender.expect("sender must be set for presence events");
+        let event = PresenceEvent { content: builder.content, sender };
+        Raw::new(&event).unwrap().cast_unchecked()
+    }
 }
 
 impl EventBuilder<DirectEventContent> {
@@ -1410,6 +1613,15 @@ impl EventBuilder<RoomMemberEventContent> {
         );
         self.content.membership = MembershipState::Invite;
         self.state_key = Some(invited_user.to_string());
+        self
+    }
+
+    /// Set that the sender of this event left the room (self-leave).
+    ///
+    /// This sets the membership to Leave and uses the sender as the state_key.
+    pub fn leave(mut self) -> Self {
+        self.content.membership = MembershipState::Leave;
+        self.state_key = Some(self.sender.as_ref().expect("sender must be set").to_string());
         self
     }
 
@@ -1470,6 +1682,20 @@ impl EventBuilder<RoomMemberEventContent> {
         }
 
         self.unsigned.get_or_insert_with(Default::default).prev_content = Some(prev_content);
+        self
+    }
+
+    /// Set the invite room state (in the unsigned section).
+    ///
+    /// This is used to provide context about the room when a user is invited,
+    /// such as the room name and join rules.
+    pub fn invite_room_state<I, E>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = E>,
+        E: Into<Raw<AnyStrippedStateEvent>>,
+    {
+        self.unsigned.get_or_insert_with(Default::default).invite_room_state =
+            Some(events.into_iter().map(Into::into).collect());
         self
     }
 }

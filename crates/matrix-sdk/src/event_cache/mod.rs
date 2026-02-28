@@ -35,7 +35,6 @@ use std::{
 };
 
 use eyeball::{SharedObservable, Subscriber};
-use eyeball_im::VectorDiff;
 use futures_util::future::{join_all, try_join_all};
 use matrix_sdk_base::{
     ThreadingSupport,
@@ -72,6 +71,7 @@ use crate::{
     send_queue::{LocalEchoContent, RoomSendQueueUpdate, SendQueueUpdate},
 };
 
+mod caches;
 mod deduplicator;
 mod pagination;
 mod persistence;
@@ -79,10 +79,11 @@ mod persistence;
 mod redecryptor;
 mod room;
 
+pub use caches::TimelineVectorDiffs;
 pub use pagination::{RoomPagination, RoomPaginationStatus};
 #[cfg(feature = "e2e-encryption")]
 pub use redecryptor::{DecryptionRetryRequest, RedecryptorReport};
-pub use room::{RoomEventCache, RoomEventCacheSubscriber, ThreadEventCacheUpdate};
+pub use room::{RoomEventCache, RoomEventCacheSubscriber};
 
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Debug)]
@@ -454,10 +455,10 @@ impl EventCache {
                         // so let's do it!
                         if !diffs.is_empty() {
                             let _ = room.inner.update_sender.send(
-                                RoomEventCacheUpdate::UpdateTimelineEvents {
+                                RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
                                     diffs,
                                     origin: EventsOrigin::Cache,
-                                },
+                                }),
                             );
                         }
                     } else {
@@ -1014,10 +1015,9 @@ impl EventCacheInner {
             let mut state_guard = state_guard?;
             let updates_as_vector_diffs = state_guard.reset().await?;
 
-            let _ = room.inner.update_sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
-                diffs: updates_as_vector_diffs,
-                origin: EventsOrigin::Cache,
-            });
+            let _ = room.inner.update_sender.send(RoomEventCacheUpdate::UpdateTimelineEvents(
+                TimelineVectorDiffs { diffs: updates_as_vector_diffs, origin: EventsOrigin::Cache },
+            ));
 
             let _ = room
                 .inner
@@ -1119,7 +1119,10 @@ impl EventCacheInner {
 
                 let update_sender = Sender::new(32);
 
+                let own_user_id =
+                    client.user_id().expect("the user must be logged in, at this point").to_owned();
                 let room_state = RoomEventCacheStateLock::new(
+                    own_user_id,
                     room_id.to_owned(),
                     room_version_rules,
                     enabled_thread_support,
@@ -1251,13 +1254,7 @@ pub enum RoomEventCacheUpdate {
     },
 
     /// The room has received updates for the timeline as _diffs_.
-    UpdateTimelineEvents {
-        /// Diffs to apply to the timeline.
-        diffs: Vec<VectorDiff<TimelineEvent>>,
-
-        /// Where the diffs are coming from.
-        origin: EventsOrigin,
-    },
+    UpdateTimelineEvents(TimelineVectorDiffs),
 
     /// The room has received new ephemeral events.
     AddEphemeralEvents {

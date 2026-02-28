@@ -3,14 +3,14 @@ use std::{
     ops::Deref,
     option_env,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, LazyLock, Mutex as StdMutex},
     time::Duration,
 };
 
 use anyhow::Result;
 use assign::assign;
 use matrix_sdk::{
-    Client, ClientBuilder, Room,
+    Client, ClientBuilder, Room, ThreadingSupport,
     config::{RequestConfig, SyncSettings},
     encryption::EncryptionSettings,
     ruma::{
@@ -23,14 +23,14 @@ use matrix_sdk::{
     timeout::ElapsedError,
 };
 use matrix_sdk_base::crypto::{CollectStrategy, DecryptionSettings, TrustRequirement};
-use once_cell::sync::Lazy;
+use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use rand::Rng as _;
 use tempfile::{TempDir, tempdir};
 use tokio::{sync::Mutex, time::sleep};
 
 /// This global maintains temp directories alive for the whole lifetime of the
 /// process.
-static TMP_DIRS: Lazy<Mutex<Vec<TempDir>>> = Lazy::new(Mutex::default);
+static TMP_DIRS: LazyLock<Mutex<Vec<TempDir>>> = LazyLock::new(Mutex::default);
 
 enum SqlitePath {
     Random,
@@ -44,8 +44,9 @@ pub struct TestClientBuilder {
     room_key_recipient_strategy: CollectStrategy,
     encryption_settings: EncryptionSettings,
     enable_share_history_on_invite: bool,
+    threading_support: ThreadingSupport,
     http_proxy: Option<String>,
-    cross_process_store_locks_holder_name: Option<String>,
+    cross_process_lock_config: CrossProcessLockConfig,
 }
 
 impl TestClientBuilder {
@@ -63,8 +64,9 @@ impl TestClientBuilder {
             encryption_settings: Default::default(),
             room_key_recipient_strategy: Default::default(),
             enable_share_history_on_invite: false,
+            threading_support: ThreadingSupport::Disabled,
             http_proxy: None,
-            cross_process_store_locks_holder_name: None,
+            cross_process_lock_config: CrossProcessLockConfig::SingleProcess,
         }
     }
 
@@ -92,6 +94,11 @@ impl TestClientBuilder {
         self
     }
 
+    pub fn enable_threading_support(mut self, thread_support: ThreadingSupport) -> Self {
+        self.threading_support = thread_support;
+        self
+    }
+
     /// Simulate the behaviour of the clients when the "exclude insecure
     /// devices" (MSC4153) labs flag is enabled.
     pub fn exclude_insecure_devices(mut self, exclude_insecure_devices: bool) -> Self {
@@ -107,8 +114,11 @@ impl TestClientBuilder {
         self
     }
 
-    pub fn cross_process_store_locks_holder_name(mut self, holder_name: String) -> Self {
-        self.cross_process_store_locks_holder_name = Some(holder_name);
+    pub fn cross_process_lock_config(
+        mut self,
+        cross_process_lock_config: CrossProcessLockConfig,
+    ) -> Self {
+        self.cross_process_lock_config = cross_process_lock_config;
         self
     }
 
@@ -123,15 +133,12 @@ impl TestClientBuilder {
             .with_encryption_settings(self.encryption_settings)
             .with_room_key_recipient_strategy(self.room_key_recipient_strategy.clone())
             .with_enable_share_history_on_invite(self.enable_share_history_on_invite)
-            .request_config(RequestConfig::short_retry());
+            .with_threading_support(self.threading_support)
+            .request_config(RequestConfig::short_retry())
+            .cross_process_store_config(self.cross_process_lock_config.clone());
 
         if let Some(decryption_settings) = &self.decryption_settings {
             client_builder = client_builder.with_decryption_settings(decryption_settings.clone())
-        }
-
-        if let Some(holder_name) = &self.cross_process_store_locks_holder_name {
-            client_builder =
-                client_builder.cross_process_store_locks_holder_name(holder_name.clone());
         }
 
         if let Some(proxy) = &self.http_proxy {

@@ -24,10 +24,7 @@ use matrix_sdk::{
         MatrixMockServer, RoomContextResponseTemplate, RoomRelationsResponseTemplate,
     },
 };
-use matrix_sdk_test::{
-    ALICE, BOB, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent, async_test,
-    event_factory::EventFactory,
-};
+use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{
     AnyOtherFullStateEventContent, Error, EventSendState, MsgLikeKind, OtherMessageLike,
     RedactError, RoomExt, TimelineBuilder, TimelineEventFocusThreadMode, TimelineEventItemId,
@@ -615,10 +612,12 @@ async fn test_read_marker() {
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
     assert!(date_divider.is_date_divider());
 
+    let f = EventFactory::new();
     server
         .sync_room(
             &client,
-            JoinedRoomBuilder::new(room_id).add_account_data(RoomAccountDataTestEvent::FullyRead),
+            JoinedRoomBuilder::new(room_id)
+                .add_account_data(f.fully_read(event_id!("$someplace:example.org"))),
         )
         .await;
 
@@ -656,13 +655,14 @@ async fn test_sync_highlighted() {
     server.mock_room_state_encryption().plain().mount().await;
 
     let room_id = room_id!("!a98sd12bjh:example.org");
+    let f = EventFactory::new().sender(user_id!("@example:localhost"));
     let room = server
         .sync_room(
             &client,
             // We need the member event and power levels locally so the push rules processor works.
             JoinedRoomBuilder::new(room_id)
-                .add_state_event(StateTestEvent::Member)
-                .add_state_event(StateTestEvent::PowerLevels),
+                .add_state_event(f.member(user_id!("@example:localhost")).display_name("example"))
+                .add_state_event(f.default_power_levels()),
         )
         .await;
 

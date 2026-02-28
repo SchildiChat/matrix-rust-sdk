@@ -24,7 +24,7 @@ use std::{
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::Stream;
-use matrix_sdk_common::timer;
+use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, timer};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSettings, OlmError, OlmMachine,
@@ -79,9 +79,12 @@ use crate::{
 ///
 /// ```rust
 /// use matrix_sdk_base::{BaseClient, ThreadingSupport, store::StoreConfig};
+/// use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 ///
 /// let client = BaseClient::new(
-///     StoreConfig::new("cross-process-holder-name".to_owned()),
+///     StoreConfig::new(CrossProcessLockConfig::multi_process(
+///         "cross-process-holder-name".to_owned(),
+///     )),
 ///     ThreadingSupport::Disabled,
 /// );
 /// ```
@@ -201,11 +204,10 @@ impl BaseClient {
     #[cfg(feature = "e2e-encryption")]
     pub async fn clone_with_in_memory_state_store(
         &self,
-        cross_process_store_locks_holder_name: &str,
+        cross_process_mode: CrossProcessLockConfig,
         handle_verification_events: bool,
     ) -> Result<Self> {
-        let config = StoreConfig::new(cross_process_store_locks_holder_name.to_owned())
-            .state_store(MemoryStore::new());
+        let config = StoreConfig::new(cross_process_mode).state_store(MemoryStore::new());
         let config = config.crypto_store(self.crypto_store.clone());
 
         let copy = Self {
@@ -238,11 +240,10 @@ impl BaseClient {
     #[allow(clippy::unused_async)]
     pub async fn clone_with_in_memory_state_store(
         &self,
-        cross_process_store_locks_holder: &str,
+        cross_process_store_config: CrossProcessLockConfig,
         _handle_verification_events: bool,
     ) -> Result<Self> {
-        let config = StoreConfig::new(cross_process_store_locks_holder.to_owned())
-            .state_store(MemoryStore::new());
+        let config = StoreConfig::new(cross_process_store_config).state_store(MemoryStore::new());
         Ok(Self::new(config, ThreadingSupport::Disabled))
     }
 
@@ -432,8 +433,9 @@ impl BaseClient {
     /// ```rust
     /// # use matrix_sdk_base::{BaseClient, store::StoreConfig, RoomState, ThreadingSupport};
     /// # use ruma::{OwnedRoomId, OwnedUserId, RoomId};
+    /// use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     /// # async {
-    /// # let client = BaseClient::new(StoreConfig::new("example".to_owned()), ThreadingSupport::Disabled);
+    /// # let client = BaseClient::new(StoreConfig::new(CrossProcessLockConfig::multi_process("example")), ThreadingSupport::Disabled);
     /// # async fn send_join_request() -> anyhow::Result<OwnedRoomId> { todo!() }
     /// # async fn maybe_get_inviter(room_id: &RoomId) -> anyhow::Result<Option<OwnedUserId>> { todo!() }
     /// # let room_id: &RoomId = todo!();
@@ -1149,9 +1151,10 @@ mod tests {
 
     use assert_matches2::{assert_let, assert_matches};
     use futures_util::FutureExt as _;
+    use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
     use matrix_sdk_test::{
-        BOB, InvitedRoomBuilder, LeftRoomBuilder, StateTestEvent, StrippedStateTestEvent,
-        SyncResponseBuilder, async_test, event_factory::EventFactory, ruma_response_from_json,
+        BOB, InvitedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, async_test,
+        event_factory::EventFactory, ruma_response_from_json,
     };
     use ruma::{
         api::client::{self as api, sync::sync_events::v5},
@@ -1331,6 +1334,7 @@ mod tests {
         let room_id = room_id!("!test:example.org");
 
         let client = logged_in_base_client(Some(user_id)).await;
+        let f = EventFactory::new();
 
         let mut sync_builder = SyncResponseBuilder::new();
 
@@ -1349,19 +1353,14 @@ mod tests {
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
 
         let response = sync_builder
-            .add_invited_room(InvitedRoomBuilder::new(room_id).add_state_event(
-                StrippedStateTestEvent::Custom(json!({
-                    "content": {
-                        "displayname": "Alice",
-                        "membership": "invite",
-                    },
-                    "event_id": "$143273582443PhrSn:example.org",
-                    "origin_server_ts": 1432735824653u64,
-                    "sender": "@example:example.org",
-                    "state_key": user_id,
-                    "type": "m.room.member",
-                })),
-            ))
+            .add_invited_room(
+                InvitedRoomBuilder::new(room_id).add_state_event(
+                    f.member(user_id)
+                        .sender(user_id!("@example:example.org"))
+                        .membership(MembershipState::Invite)
+                        .display_name("Alice"),
+                ),
+            )
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Invited);
@@ -1461,7 +1460,7 @@ mod tests {
         let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
 
         let client = BaseClient::new(
-            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            StoreConfig::new(CrossProcessLockConfig::SingleProcess),
             ThreadingSupport::Disabled,
         );
         client
@@ -1523,7 +1522,7 @@ mod tests {
         let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
 
         let client = BaseClient::new(
-            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            StoreConfig::new(CrossProcessLockConfig::SingleProcess),
             ThreadingSupport::Disabled,
         );
         client
@@ -1587,7 +1586,7 @@ mod tests {
         let room_id = room_id!("!ithpyNKDtmhneaTQja:example.org");
 
         let client = BaseClient::new(
-            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            StoreConfig::new(CrossProcessLockConfig::SingleProcess),
             ThreadingSupport::Disabled,
         );
         client
@@ -1601,23 +1600,13 @@ mod tests {
             .unwrap();
 
         // Preamble: let the SDK know about the room, and that the invited user left it.
+        let f = EventFactory::new().sender(user_id);
         let mut sync_builder = SyncResponseBuilder::new();
         let response = sync_builder
-            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_state_event(
-                StateTestEvent::Custom(json!({
-                    "content": {
-                        "avatar_url": null,
-                        "displayname": null,
-                        "membership": "leave"
-                    },
-                    "event_id": "$151803140217rkvjc:localhost",
-                    "origin_server_ts": 151800139,
-                    "room_id": room_id,
-                    "sender": user_id,
-                    "state_key": user_id,
-                    "type": "m.room.member",
-                })),
-            ))
+            .add_joined_room(
+                matrix_sdk_test::JoinedRoomBuilder::new(room_id)
+                    .add_state_event(f.member(user_id).leave()),
+            )
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
 
@@ -1661,7 +1650,7 @@ mod tests {
     async fn test_ignored_user_list_changes() {
         let user_id = user_id!("@alice:example.org");
         let client = BaseClient::new(
-            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            StoreConfig::new(CrossProcessLockConfig::SingleProcess),
             ThreadingSupport::Disabled,
         );
 
