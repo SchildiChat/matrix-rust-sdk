@@ -31,7 +31,8 @@ use matrix_sdk_crypto::{
         CryptoStore,
         types::{
             BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-            RoomKeyWithheldEntry, RoomSettings, StoredRoomKeyBundleData,
+            RoomKeyWithheldEntry, RoomPendingKeyBundleDetails, RoomSettings,
+            StoredRoomKeyBundleData,
         },
     },
 };
@@ -194,22 +195,13 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 14;
-
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
 
 /// Run migrations for the given version of the database.
 async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
-    if version == 0 {
-        debug!("Creating database");
-    } else if version < DATABASE_VERSION {
-        debug!(version, new_version = DATABASE_VERSION, "Upgrading database");
-    } else {
-        return Ok(());
-    }
-
     if version < 1 {
+        debug!("Creating database");
         // First turn on WAL mode, this can't be done in the transaction, it fails with
         // the error message: "cannot change into wal mode from within a transaction".
         conn.execute_batch("PRAGMA journal_mode = wal;").await?;
@@ -221,6 +213,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 2 {
+        debug!("Upgrading database to version 2");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/002_reset_olm_hash.sql"))?;
             txn.set_db_version(2)
@@ -229,6 +222,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 3 {
+        debug!("Upgrading database to version 3");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/003_room_settings.sql"))?;
             txn.set_db_version(3)
@@ -237,6 +231,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 4 {
+        debug!("Upgrading database to version 4");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/004_drop_outbound_group_sessions.sql"
@@ -247,6 +242,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 5 {
+        debug!("Upgrading database to version 5");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/005_withheld_code.sql"))?;
             txn.set_db_version(5)
@@ -255,6 +251,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 6 {
+        debug!("Upgrading database to version 6");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/006_drop_outbound_group_sessions.sql"
@@ -265,6 +262,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 7 {
+        debug!("Upgrading database to version 7");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/007_lock_leases.sql"))?;
             txn.set_db_version(7)
@@ -273,6 +271,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 8 {
+        debug!("Upgrading database to version 8");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/008_secret_inbox.sql"))?;
             txn.set_db_version(8)
@@ -281,6 +280,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 9 {
+        debug!("Upgrading database to version 9");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/009_inbound_group_session_sender_key_sender_data_type.sql"
@@ -291,6 +291,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 10 {
+        debug!("Upgrading database to version 10");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/010_received_room_key_bundles.sql"
@@ -301,6 +302,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 11 {
+        debug!("Upgrading database to version 11");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/011_received_room_key_bundles_with_curve_key.sql"
@@ -311,6 +313,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 12 {
+        debug!("Upgrading database to version 12");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/012_withheld_code_by_room.sql"
@@ -321,6 +324,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 13 {
+        debug!("Upgrading database to version 13");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/013_lease_locks_with_generation.sql"
@@ -331,11 +335,23 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 14 {
+        debug!("Upgrading database to version 14");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/014_room_key_backups_fully_downloaded.sql"
             ))?;
             txn.set_db_version(14)
+        })
+        .await?;
+    }
+
+    if version < 15 {
+        debug!("Upgrading database to version 15");
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/015_rooms_pending_key_bundle.sql"
+            ))?;
+            txn.set_db_version(15)
         })
         .await?;
     }
@@ -396,6 +412,12 @@ trait SqliteConnectionExt {
     ) -> rusqlite::Result<()>;
 
     fn set_has_downloaded_all_room_keys(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+
+    fn set_room_pending_key_bundle(
+        &self,
+        room_id: &[u8],
+        details: Option<&[u8]>,
+    ) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionExt for rusqlite::Connection {
@@ -537,6 +559,24 @@ impl SqliteConnectionExt for rusqlite::Connection {
             ON CONFLICT (room_id, sender_user_id) DO UPDATE SET bundle_data = ?3",
             (room_id, sender_user_id, data),
         )?;
+        Ok(())
+    }
+
+    fn set_room_pending_key_bundle(
+        &self,
+        room_id: &[u8],
+        data: Option<&[u8]>,
+    ) -> rusqlite::Result<()> {
+        if let Some(data) = data {
+            self.execute(
+                "INSERT INTO rooms_pending_key_bundle (room_id, data)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (room_id) DO UPDATE SET data = ?2",
+                (room_id, data),
+            )?;
+        } else {
+            self.execute("DELETE FROM rooms_pending_key_bundle WHERE room_id = ?1", (room_id,))?;
+        }
         Ok(())
     }
 
@@ -857,6 +897,23 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             .optional()?)
     }
 
+    async fn get_room_pending_key_bundle(&self, room_id: Key) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .query_row(
+                "SELECT data FROM rooms_pending_key_bundle WHERE room_id = ?",
+                (room_id,),
+                |row| row.get(0),
+            )
+            .await
+            .optional()?)
+    }
+
+    async fn get_all_rooms_pending_key_bundle(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .query_many("SELECT data FROM rooms_pending_key_bundle", (), |row| row.get(0))
+            .await?)
+    }
+
     async fn has_downloaded_all_room_keys(&self, room_id: Key) -> Result<bool> {
         Ok(self
             .query_row(
@@ -1080,6 +1137,12 @@ impl CryptoStore for SqliteCryptoStore {
                 for room in changes.room_key_backups_fully_downloaded {
                     let room_id = this.encode_key("room_key_backups_fully_downloaded", &room);
                     txn.set_has_downloaded_all_room_keys(&room_id)?;
+                }
+
+                for (room, details) in changes.rooms_pending_key_bundle {
+                    let room_id = this.encode_key("rooms_pending_key_bundle", &room);
+                    let value = details.as_ref().map(|d| this.serialize_value(d)).transpose()?;
+                    txn.set_room_pending_key_bundle(&room_id, value.as_deref())?;
                 }
 
                 Ok::<_, Error>(())
@@ -1514,6 +1577,28 @@ impl CryptoStore for SqliteCryptoStore {
     async fn has_downloaded_all_room_keys(&self, room_id: &RoomId) -> Result<bool> {
         let room_id = self.encode_key("room_key_backups_fully_downloaded", room_id);
         self.read().await?.has_downloaded_all_room_keys(room_id).await
+    }
+
+    async fn get_pending_key_bundle_details_for_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<RoomPendingKeyBundleDetails>> {
+        let room_id = self.encode_key("rooms_pending_key_bundle", room_id.as_bytes());
+        let Some(value) = self.read().await?.get_room_pending_key_bundle(room_id).await? else {
+            return Ok(None);
+        };
+
+        let details = self.deserialize_value(&value)?;
+        Ok(Some(details))
+    }
+
+    async fn get_all_rooms_pending_key_bundles(&self) -> Result<Vec<RoomPendingKeyBundleDetails>> {
+        let details = self.read().await?.get_all_rooms_pending_key_bundle().await?;
+        let room_ids = details
+            .into_iter()
+            .map(|value| self.deserialize_value(&value))
+            .collect::<Result<_, _>>()?;
+        Ok(room_ids)
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {

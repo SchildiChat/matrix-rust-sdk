@@ -24,7 +24,7 @@ use ruma::{
         room::{
             avatar::PossiblyRedactedRoomAvatarEventContent,
             canonical_alias::PossiblyRedactedRoomCanonicalAliasEventContent,
-            create::RoomCreateEventContent, encryption::RoomEncryptionEventContent,
+            create::RoomCreateEventContent, encryption::PossiblyRedactedRoomEncryptionEventContent,
             guest_access::PossiblyRedactedRoomGuestAccessEventContent,
             history_visibility::PossiblyRedactedRoomHistoryVisibilityEventContent,
             join_rules::PossiblyRedactedRoomJoinRulesEventContent,
@@ -118,7 +118,6 @@ impl RoomInfoV1 {
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,
-            invite_acceptance_details: None,
         }
     }
 }
@@ -145,7 +144,7 @@ struct BaseRoomInfoV1 {
     avatar: Option<MinimalStateEvent<PossiblyRedactedRoomAvatarEventContent>>,
     canonical_alias: Option<MinimalStateEvent<PossiblyRedactedRoomCanonicalAliasEventContent>>,
     dm_targets: HashSet<OwnedUserId>,
-    encryption: Option<RoomEncryptionEventContent>,
+    encryption: Option<PossiblyRedactedRoomEncryptionEventContent>,
     guest_access: Option<MinimalStateEvent<PossiblyRedactedRoomGuestAccessEventContent>>,
     history_visibility:
         Option<MinimalStateEvent<PossiblyRedactedRoomHistoryVisibilityEventContent>>,

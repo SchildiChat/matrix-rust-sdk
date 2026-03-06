@@ -85,7 +85,10 @@ use ruma::{
         filter::LazyLoadOptions,
         membership::{
             Invite3pid, ban_user, forget_room, get_member_events,
-            invite_user::{self, v3::InvitationRecipient},
+            invite_user::{
+                self,
+                v3::{InvitationRecipient, InviteUserId},
+            },
             kick_user, leave_room, unban_user,
         },
         message::send_message_event,
@@ -114,7 +117,7 @@ use ruma::{
         room::{
             ImageInfo, MediaSource, ThumbnailInfo,
             avatar::{self, RoomAvatarEventContent},
-            encryption::RoomEncryptionEventContent,
+            encryption::PossiblyRedactedRoomEncryptionEventContent,
             history_visibility::HistoryVisibility,
             member::{MembershipChange, RoomMemberEventContent, SyncRoomMemberEvent},
             message::{
@@ -619,6 +622,11 @@ impl Room {
         )
         .await;
 
+        // Save the loaded events into the event cache, if it's set up.
+        if let Ok((cache, _handles)) = self.event_cache().await {
+            cache.save_events(chunk.clone()).await;
+        }
+
         Ok(Messages {
             start: http_response.start,
             end: http_response.end,
@@ -1079,7 +1087,8 @@ impl Room {
                     Ok(response) => Some(
                         response
                             .into_content()
-                            .deserialize_as_unchecked::<RoomEncryptionEventContent>()?,
+                            .deserialize_as_unchecked::<PossiblyRedactedRoomEncryptionEventContent>(
+                            )?,
                     ),
                     Err(err) if err.client_api_error_kind() == Some(&ErrorKind::NotFound) => None,
                     Err(err) => return Err(err.into()),
@@ -1091,7 +1100,7 @@ impl Room {
                 // `RoomInfo`.
                 let mut room_info = self.clone_info();
                 room_info.mark_encryption_state_synced();
-                room_info.set_encryption_event(response.clone());
+                room_info.set_encryption_event(response);
                 let mut changes = StateChanges::default();
                 changes.add_room(room_info.clone());
 
@@ -2005,7 +2014,7 @@ impl Room {
             shared_room_history::share_room_history(self, user_id.to_owned()).await?;
         }
 
-        let recipient = InvitationRecipient::UserId { user_id: user_id.to_owned() };
+        let recipient = InvitationRecipient::UserId(InviteUserId::new(user_id.to_owned()));
         let request = invite_user::v3::Request::new(self.room_id().to_owned(), recipient);
         self.client.send(request).await?;
 
@@ -3623,7 +3632,8 @@ impl Room {
     /// Returns `None` if some data couldn't be found. This should only happen
     /// in brand new rooms, while we process its state.
     pub async fn push_condition_room_ctx(&self) -> Result<Option<PushConditionRoomCtx>> {
-        self.push_condition_room_ctx_internal(self.client.enabled_thread_subscriptions()).await
+        self.push_condition_room_ctx_internal(self.client.enabled_thread_subscriptions().await?)
+            .await
     }
 
     /// Get the push-condition context for this room, with a choice to include
@@ -3689,7 +3699,7 @@ impl Room {
     /// Retrieves a [`PushContext`] that can be used to compute the push
     /// actions for events.
     pub async fn push_context(&self) -> Result<Option<PushContext>> {
-        self.push_context_internal(self.client.enabled_thread_subscriptions()).await
+        self.push_context_internal(self.client.enabled_thread_subscriptions().await?).await
     }
 
     /// Retrieves a [`PushContext`] that can be used to compute the push actions

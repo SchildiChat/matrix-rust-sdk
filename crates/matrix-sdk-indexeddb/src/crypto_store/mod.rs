@@ -44,7 +44,8 @@ use matrix_sdk_crypto::{
         CryptoStore, CryptoStoreError,
         types::{
             BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-            RoomKeyWithheldEntry, RoomSettings, StoredRoomKeyBundleData,
+            RoomKeyWithheldEntry, RoomPendingKeyBundleDetails, RoomSettings,
+            StoredRoomKeyBundleData,
         },
     },
     vodozemac::base64_encode,
@@ -103,6 +104,7 @@ mod keys {
     pub const LEASE_LOCKS: &str = "lease_locks";
 
     pub const ROOM_KEY_BACKUPS_FULLY_DOWNLOADED: &str = "room_key_backups_fully_downloaded";
+    pub const ROOMS_PENDING_KEY_BUNDLE: &str = "rooms_pending_key_bundle";
 
     // keys
     pub const STORE_CIPHER: &str = "store_cipher";
@@ -747,6 +749,19 @@ impl IndexeddbCryptoStore {
                     self.serializer.encode_key(keys::ROOM_KEY_BACKUPS_FULLY_DOWNLOADED, room_id),
                     JsValue::TRUE,
                 );
+            }
+        }
+
+        if !changes.rooms_pending_key_bundle.is_empty() {
+            let mut room_store = indexeddb_changes.get(keys::ROOMS_PENDING_KEY_BUNDLE);
+            for (room_id, details) in &changes.rooms_pending_key_bundle {
+                let key = self.serializer.encode_key(keys::ROOMS_PENDING_KEY_BUNDLE, room_id);
+                if let Some(details) = details {
+                    let value = self.serializer.serialize_value(details)?;
+                    room_store.put(key, value);
+                } else {
+                    room_store.delete(key);
+                }
             }
         }
 
@@ -1575,6 +1590,39 @@ impl_crypto_store! {
             .await?
             .is_some();
 
+        Ok(result)
+    }
+
+    async fn get_pending_key_bundle_details_for_room(&self, room_id: &RoomId) -> Result<Option<RoomPendingKeyBundleDetails >> {
+        let key = self.serializer.encode_key(keys::ROOMS_PENDING_KEY_BUNDLE, room_id);
+        let result = self
+            .inner
+            .transaction(keys::ROOMS_PENDING_KEY_BUNDLE)
+            .with_mode(TransactionMode::Readonly)
+            .build()?
+            .object_store(keys::ROOMS_PENDING_KEY_BUNDLE)?
+            .get(&key)
+            .await?
+            .map(|v| self.serializer.deserialize_value(v))
+            .transpose()?;
+        Ok(result)
+    }
+
+    async fn get_all_rooms_pending_key_bundles(&self) -> Result<Vec<RoomPendingKeyBundleDetails>> {
+        let result = self
+            .inner
+            .transaction(keys::ROOMS_PENDING_KEY_BUNDLE)
+            .with_mode(TransactionMode::Readonly)
+            .build()?
+            .object_store(keys::ROOMS_PENDING_KEY_BUNDLE)?
+            .get_all()
+            .await?
+            .map(|result| {
+                result
+                    .map_err(Into::into)
+                    .and_then(|v| self.serializer.deserialize_value(v).map_err(Into::into))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(result)
     }
 

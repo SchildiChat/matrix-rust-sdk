@@ -1272,9 +1272,6 @@ async fn test_pinned_events_are_decrypted_after_recovering_with_event_not_in_tim
 /// variant even if the focused UTD event isn't part of the main timeline and
 /// thus wasn't put into the event cache by the main timeline backpaginating.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-// FIXME: This test is ignored because R2D2 can't decrypt this event as
-// it's never put into the event cache.
-#[ignore]
 async fn test_permalink_timelines_redecrypt() -> TestResult {
     const RECOVERY_PASSPHRASE: &str = "I am error";
 
@@ -1539,8 +1536,7 @@ async fn test_latest_thread_event_is_redecrypted_and_updated() -> TestResult {
     {
         // Her timeline sees a new item for the thread reply, because we don't know yet
         // that the thread reply is part of the thread, as it's encrypted.
-        // TODO(bnjbvr): we should know it, since an encrypted event includes the
-        // relationship?
+        // TODO: we should know it, since an encrypted event includes the relationship?
         let next_item = assert_next_with_timeout!(stream, 5000);
         assert_let!(VectorDiff::PushBack { value } = next_item);
         assert!(value.content().is_unable_to_decrypt());

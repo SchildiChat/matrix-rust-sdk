@@ -57,17 +57,17 @@ pub use http;
 #[cfg(feature = "e2e-encryption")]
 pub use matrix_sdk_crypto as crypto;
 pub use room::{
-    EncryptionState, InviteAcceptanceDetails, PredecessorRoom, Room,
-    RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo, RoomInfoNotableUpdate,
-    RoomInfoNotableUpdateReasons, RoomMember, RoomMembersUpdate, RoomMemberships, RoomRecencyStamp,
-    RoomState, RoomStateFilter, SuccessorRoom, apply_redaction,
+    EncryptionState, PredecessorRoom, Room, RoomCreateWithCreatorEventContent, RoomDisplayName,
+    RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMember,
+    RoomMembersUpdate, RoomMemberships, RoomRecencyStamp, RoomState, RoomStateFilter,
+    SuccessorRoom, apply_redaction,
 };
 pub use store::{
     ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent, DraftThumbnail,
     QueueWedgeError, StateChanges, StateStore, StateStoreDataKey, StateStoreDataValue, StoreError,
     ThreadSubscriptionCatchupToken,
 };
-pub use utils::{MinimalRoomMemberEvent, MinimalStateEvent, RawSyncStateEventWithKeys};
+pub use utils::{MinimalRoomMemberEvent, MinimalStateEvent, RawStateEventWithKeys};
 
 #[cfg(test)]
 matrix_sdk_test_utils::init_tracing_for_tests!();

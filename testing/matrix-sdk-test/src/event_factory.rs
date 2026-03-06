@@ -57,7 +57,7 @@ use ruma::{
         push_rules::PushRulesEventContent,
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
-        relation::{Annotation, BundledThread, InReplyTo, Reference, Replacement, Thread},
+        relation::{Annotation, BundledThread, Reference, Replacement, Reply, Thread},
         room::{
             ImageInfo,
             avatar::{self, RoomAvatarEventContent},
@@ -86,7 +86,7 @@ use ruma::{
         },
         rtc::{
             decline::RtcDeclineEventContent,
-            notification::{NotificationType, RtcNotificationEventContent},
+            notification::{CallIntent, NotificationType, RtcNotificationEventContent},
         },
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         space_order::SpaceOrderEventContent,
@@ -349,7 +349,7 @@ where
                     .and_then(|room_id| room_id.server_name())
                     .unwrap_or(server_name!("dummy.org"));
 
-                EventId::new(server_name)
+                EventId::new_v1(server_name)
             });
 
             map.insert("event_id".to_owned(), json!(event_id));
@@ -443,8 +443,7 @@ impl EventBuilder<RoomEncryptedEventContent> {
 impl EventBuilder<RoomMessageEventContent> {
     /// Adds a reply relation to the current event.
     pub fn reply_to(mut self, event_id: &EventId) -> Self {
-        self.content.relates_to =
-            Some(Relation::Reply { in_reply_to: InReplyTo::new(event_id.to_owned()) });
+        self.content.relates_to = Some(Relation::Reply(Reply::with_event_id(event_id.to_owned())));
         self
     }
 
@@ -518,9 +517,8 @@ impl EventBuilder<UnstablePollStartEventContent> {
     /// Adds a reply relation to the current event.
     pub fn reply_to(mut self, event_id: &EventId) -> Self {
         if let UnstablePollStartEventContent::New(content) = &mut self.content {
-            content.relates_to = Some(RelationWithoutReplacement::Reply {
-                in_reply_to: InReplyTo::new(event_id.to_owned()),
-            });
+            content.relates_to =
+                Some(RelationWithoutReplacement::Reply(Reply::with_event_id(event_id.to_owned())));
         }
         self
     }
@@ -1152,7 +1150,7 @@ impl EventFactory {
 
         let redacted_because = RedactedBecause {
             content: RoomRedactionEventContent::default(),
-            event_id: EventId::new(server_name!("dummy.server")),
+            event_id: EventId::new_v1(server_name!("dummy.server")),
             sender: redacter.to_owned(),
             origin_server_ts: self.next_server_ts(),
         };
@@ -1174,7 +1172,7 @@ impl EventFactory {
 
         let redacted_because = RedactedBecause {
             content: RoomRedactionEventContent::default(),
-            event_id: EventId::new(server_name!("dummy.server")),
+            event_id: EventId::new_v1(server_name!("dummy.server")),
             sender: redacter.to_owned(),
             origin_server_ts: self.next_server_ts(),
         };
@@ -1717,6 +1715,11 @@ impl EventBuilder<RoomAvatarEventContent> {
 impl EventBuilder<RtcNotificationEventContent> {
     pub fn mentions(mut self, users: impl IntoIterator<Item = OwnedUserId>) -> Self {
         self.content.mentions = Some(Mentions::with_user_ids(users));
+        self
+    }
+
+    pub fn call_intent(mut self, call_intent: CallIntent) -> Self {
+        self.content.call_intent = Some(call_intent);
         self
     }
 

@@ -28,7 +28,9 @@ use eyeball_im::{Vector, VectorDiff};
 use futures_core::Stream;
 use futures_util::StreamExt;
 #[cfg(feature = "e2e-encryption")]
-use matrix_sdk_base::crypto::{DecryptionSettings, store::LockableCryptoStore};
+use matrix_sdk_base::crypto::{
+    DecryptionSettings, store::LockableCryptoStore, store::types::RoomPendingKeyBundleDetails,
+};
 use matrix_sdk_base::{
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, StoreError, SyncOutsideWasm, ThreadingSupport,
@@ -61,7 +63,7 @@ use ruma::{
                 get_capabilities::{self, v3::Capabilities},
                 get_supported_versions,
             },
-            error::ErrorKind,
+            error::{ErrorKind, UnknownTokenErrorData},
             filter::{FilterDefinition, create_filter::v3::Request as FilterUploadRequest},
             knock::knock_room,
             media,
@@ -163,10 +165,7 @@ pub enum LoopCtrl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionChange {
     /// The session's token is no longer valid.
-    UnknownToken {
-        /// Whether or not the session was soft logged out
-        soft_logout: bool,
-    },
+    UnknownToken(UnknownTokenErrorData),
     /// The session's tokens have been refreshed.
     TokensRefreshed,
 }
@@ -1637,6 +1636,12 @@ impl Client {
             room.set_is_direct(true).await?;
         }
 
+        // If we joined following an invite, check if we had previously received a key
+        // bundle from the inviter, and import it if so.
+        //
+        // It's important that we only do this once `BaseClient::room_joined` has
+        // completed: see the notes on `BundleReceiverTask::handle_bundle` on avoiding a
+        // race.
         #[cfg(feature = "e2e-encryption")]
         if self.inner.enable_share_history_on_invite
             && let Some(inviter) =
@@ -1984,12 +1989,12 @@ impl Client {
         result
     }
 
-    fn broadcast_unknown_token(&self, soft_logout: &bool) {
+    fn broadcast_unknown_token(&self, unknown_token_data: &UnknownTokenErrorData) {
         _ = self
             .inner
             .auth_ctx
             .session_change_sender
-            .send(SessionChange::UnknownToken { soft_logout: *soft_logout });
+            .send(SessionChange::UnknownToken(unknown_token_data.clone()));
     }
 
     /// Fetches server versions from network; no caching.
@@ -3245,16 +3250,31 @@ impl Client {
     }
 
     /// Whether the client is configured to take thread subscriptions (MSC4306
-    /// and MSC4308) into account.
+    /// and MSC4308) into account, and the server enabled the experimental
+    /// feature flag for it.
     ///
     /// This may cause filtering out of thread subscriptions, and loading the
     /// thread subscriptions via the sliding sync extension, when the room
     /// list service is being used.
-    pub fn enabled_thread_subscriptions(&self) -> bool {
+    ///
+    /// This is async and fallible as it may use the network to retrieve the
+    /// server supported features, if they aren't cached already.
+    pub async fn enabled_thread_subscriptions(&self) -> Result<bool> {
+        // Check if the client is configured to support thread subscriptions first.
         match self.base_client().threading_support {
-            ThreadingSupport::Enabled { with_subscriptions } => with_subscriptions,
-            ThreadingSupport::Disabled => false,
+            ThreadingSupport::Enabled { with_subscriptions: false }
+            | ThreadingSupport::Disabled => return Ok(false),
+            ThreadingSupport::Enabled { with_subscriptions: true } => {}
         }
+
+        // Now, let's check that the server supports it.
+        let server_enabled = self
+            .supported_versions()
+            .await?
+            .features
+            .contains(&FeatureFlag::from("org.matrix.msc4306"));
+
+        Ok(server_enabled)
     }
 
     /// Fetch thread subscriptions changes between `from` and up to `to`.
@@ -3348,6 +3368,18 @@ impl Client {
         &self,
     ) -> broadcast::Receiver<Option<DuplicateOneTimeKeyErrorMessage>> {
         self.inner.duplicate_key_upload_error_sender.subscribe()
+    }
+
+    /// Check the record of whether we are waiting for an [MSC4268] key bundle
+    /// for the given room.
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn get_pending_key_bundle_details_for_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<RoomPendingKeyBundleDetails>> {
+        Ok(self.base_client().get_pending_key_bundle_details_for_room(room_id).await?)
     }
 }
 
