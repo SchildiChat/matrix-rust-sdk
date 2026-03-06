@@ -1,4 +1,4 @@
-// Copyright 2025 The Matrix.org Foundation C.I.C.
+// Copyright 2026 The Matrix.org Foundation C.I.C.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,10 @@
 
 //! Threads-related data structures.
 
+pub mod pagination;
+
 use std::collections::BTreeSet;
 
-use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
     event_cache::{Event, Gap},
     linked_chunk::{ChunkContent, OwnedLinkedChunkId, Position},
@@ -25,20 +26,13 @@ use ruma::{EventId, OwnedEventId, OwnedRoomId};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{error, trace};
 
-use crate::event_cache::{
-    BackPaginationOutcome, EventsOrigin, RoomEventCacheLinkedChunkUpdate,
-    deduplicator::DeduplicationOutcome,
-    room::{LoadMoreEventsBackwardsOutcome, events::EventLinkedChunk},
+use super::{
+    super::deduplicator::DeduplicationOutcome,
+    EventsOrigin, TimelineVectorDiffs,
+    event_linked_chunk::EventLinkedChunk,
+    pagination::{BackPaginationOutcome, LoadMoreEventsBackwardsOutcome},
+    room::RoomEventCacheLinkedChunkUpdate,
 };
-
-/// An update coming from a thread event cache.
-#[derive(Clone, Debug)]
-pub struct ThreadEventCacheUpdate {
-    /// New vector diff for the thread timeline.
-    pub diffs: Vec<VectorDiff<Event>>,
-    /// The origin that triggered this update.
-    pub origin: EventsOrigin,
-}
 
 /// All the information related to a single thread.
 pub(crate) struct ThreadEventCache {
@@ -53,7 +47,7 @@ pub(crate) struct ThreadEventCache {
     chunk: EventLinkedChunk,
 
     /// A sender for live events updates in this thread.
-    sender: Sender<ThreadEventCacheUpdate>,
+    sender: Sender<TimelineVectorDiffs>,
 
     /// A sender for the globally observable linked chunk updates that happened
     /// during a sync or a back-pagination.
@@ -79,7 +73,7 @@ impl ThreadEventCache {
     }
 
     /// Subscribe to live events from this thread.
-    pub fn subscribe(&self) -> (Vec<Event>, Receiver<ThreadEventCacheUpdate>) {
+    pub fn subscribe(&self) -> (Vec<Event>, Receiver<TimelineVectorDiffs>) {
         let events = self.chunk.events().map(|(_position, item)| item.clone()).collect();
 
         let recv = self.sender.subscribe();
@@ -93,12 +87,12 @@ impl ThreadEventCache {
 
         let diffs = self.chunk.updates_as_vector_diffs();
         if !diffs.is_empty() {
-            let _ = self.sender.send(ThreadEventCacheUpdate { diffs, origin: EventsOrigin::Cache });
+            let _ = self.sender.send(TimelineVectorDiffs { diffs, origin: EventsOrigin::Cache });
         }
     }
 
-    // TODO(bnjbvr): share more code with `RoomEventCacheState` to avoid the
-    // duplication here too.
+    // TODO: share more code with `RoomEventCacheState` to avoid the duplication
+    // here too.
     fn propagate_changes(&mut self) {
         // This is a lie, at the moment! We're not persisting threads yet, so we're just
         // forwarding all updates to the linked chunk update sender.
@@ -143,7 +137,7 @@ impl ThreadEventCache {
 
         let diffs = self.chunk.updates_as_vector_diffs();
         if !diffs.is_empty() {
-            let _ = self.sender.send(ThreadEventCacheUpdate { diffs, origin: EventsOrigin::Sync });
+            let _ = self.sender.send(TimelineVectorDiffs { diffs, origin: EventsOrigin::Sync });
         }
     }
 
@@ -169,7 +163,7 @@ impl ThreadEventCache {
 
         let diffs = self.chunk.updates_as_vector_diffs();
         if !diffs.is_empty() {
-            let _ = self.sender.send(ThreadEventCacheUpdate { diffs, origin: EventsOrigin::Sync });
+            let _ = self.sender.send(TimelineVectorDiffs { diffs, origin: EventsOrigin::Sync });
         }
     }
 
@@ -180,9 +174,14 @@ impl ThreadEventCache {
     pub fn load_more_events_backwards(&self) -> LoadMoreEventsBackwardsOutcome {
         // If any in-memory chunk is a gap, don't load more events, and let the caller
         // resolve the gap.
-        if let Some(prev_token) = self.chunk.rgap().map(|gap| gap.prev_token) {
+        if let Some(prev_token) = self.chunk.rgap().map(|gap| gap.token) {
             trace!(%prev_token, "thread chunk has at least a gap");
-            return LoadMoreEventsBackwardsOutcome::Gap { prev_token: Some(prev_token) };
+            return LoadMoreEventsBackwardsOutcome::Gap {
+                prev_token: Some(prev_token),
+                // Since there is `Some(prev_token)` already, we assume we've
+                // waited for it already.
+                waited_for_initial_prev_token: true,
+            };
         }
 
         // If we don't have a gap, then the first event should be the the thread's root;
@@ -199,7 +198,11 @@ impl ThreadEventCache {
 
         // Otherwise, we don't have a gap nor events. We don't have anything. Poor us.
         // Well, is ok: start a pagination from the end.
-        LoadMoreEventsBackwardsOutcome::Gap { prev_token: None }
+        LoadMoreEventsBackwardsOutcome::Gap {
+            prev_token: None,
+            // No `prev_token` for threads, let's assume it's been waited.
+            waited_for_initial_prev_token: true,
+        }
     }
 
     /// Find duplicates in a thread, until there's persistent storage for
@@ -273,13 +276,12 @@ impl ThreadEventCache {
         new_token: Option<String>,
         events: Vec<Event>,
     ) -> Option<BackPaginationOutcome> {
-        // TODO(bnjbvr): consider deduplicating this code (~same for room) at some
-        // point.
+        // TODO: consider deduplicating this code (~same for room) at some point.
         let prev_gap_id = if let Some(token) = prev_token {
             // If the gap id is missing, it means that the gap disappeared during
             // pagination; in this case, early return to the caller.
             let gap_id = self.chunk.chunk_identifier(|chunk| {
-                    matches!(chunk.content(), ChunkContent::Gap(Gap { prev_token }) if *prev_token == token)
+                    matches!(chunk.content(), ChunkContent::Gap(Gap { token: prev_token }) if *prev_token == token)
                 })?;
 
             Some(gap_id)
@@ -290,7 +292,7 @@ impl ThreadEventCache {
         // This is a backwards pagination, so the events were returned in the reverse
         // topological order.
         let topo_ordered_events = events.iter().cloned().rev().collect::<Vec<_>>();
-        let new_gap = new_token.map(|token| Gap { prev_token: token });
+        let new_gap = new_token.map(|token| Gap { token });
 
         let deduplication = self.filter_duplicate_events(topo_ordered_events);
 
@@ -310,7 +312,8 @@ impl ThreadEventCache {
         };
 
         // Add the paginated events to the thread chunk.
-        let reached_start = self.chunk.finish_back_pagination(prev_gap_id, new_gap, &events);
+        let reached_start =
+            self.chunk.push_backwards_pagination_events(prev_gap_id, new_gap, &events);
 
         self.propagate_changes();
 
@@ -320,7 +323,7 @@ impl ThreadEventCache {
             // Send the updates to the listeners.
             let _ = self
                 .sender
-                .send(ThreadEventCacheUpdate { diffs: updates, origin: EventsOrigin::Pagination });
+                .send(TimelineVectorDiffs { diffs: updates, origin: EventsOrigin::Pagination });
         }
 
         Some(BackPaginationOutcome { reached_start, events })

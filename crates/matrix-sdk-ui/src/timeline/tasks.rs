@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 
 use matrix_sdk::{
     event_cache::{
-        EventsOrigin, RoomEventCache, RoomEventCacheSubscriber, RoomEventCacheUpdate,
-        ThreadEventCacheUpdate,
+        EventFocusThreadMode, EventsOrigin, RoomEventCache, RoomEventCacheSubscriber,
+        RoomEventCacheUpdate, TimelineVectorDiffs,
     },
     send_queue::RoomSendQueueUpdate,
 };
@@ -40,7 +40,7 @@ use crate::timeline::{TimelineController, TimelineFocus, event_item::RemoteEvent
 pub(in crate::timeline) async fn pinned_events_task(
     room_event_cache: RoomEventCache,
     timeline_controller: TimelineController,
-    mut pinned_events_recv: Receiver<RoomEventCacheUpdate>,
+    mut pinned_events_recv: Receiver<TimelineVectorDiffs>,
 ) {
     loop {
         trace!("Waiting for an event.");
@@ -49,7 +49,7 @@ pub(in crate::timeline) async fn pinned_events_task(
             Ok(up) => up,
             Err(RecvError::Closed) => break,
             Err(RecvError::Lagged(num_skipped)) => {
-                warn!(num_skipped, "Lagged behind event cache updates, resetting timeline");
+                warn!(num_skipped, "Lagged behind pinned-event cache updates, resetting timeline");
 
                 // The updates might have lagged, but the room event cache might have
                 // events, so retrieve them and add them back again to the timeline,
@@ -74,31 +74,84 @@ pub(in crate::timeline) async fn pinned_events_task(
             }
         };
 
-        match update {
-            RoomEventCacheUpdate::UpdateTimelineEvents { diffs, origin } => {
-                trace!("Received new timeline events diffs");
-                let origin = match origin {
-                    EventsOrigin::Sync => RemoteEventOrigin::Sync,
-                    EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
-                    EventsOrigin::Cache => RemoteEventOrigin::Cache,
-                };
-                timeline_controller.handle_remote_events_with_diffs(diffs, origin).await;
-            }
+        trace!("Received new timeline events diffs");
+        let origin = match update.origin {
+            EventsOrigin::Sync => RemoteEventOrigin::Sync,
+            EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+            EventsOrigin::Cache => RemoteEventOrigin::Cache,
+        };
+        timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
+    }
+}
 
-            RoomEventCacheUpdate::MoveReadMarkerTo { .. }
-            | RoomEventCacheUpdate::AddEphemeralEvents { .. }
-            | RoomEventCacheUpdate::UpdateMembers { .. } => {
-                // Nothing to do; these shouldn't happen for a pinned event sub.
-                // TODO(bnjbvr): then use a different type :)
+/// Long-lived task, in the event focus mode, that updates the timeline after
+/// any changes to the underlying timeline.
+#[instrument(
+    skip_all,
+    fields(
+        room_id = %timeline_controller.room().room_id(),
+        focused_event_id = %focused_event,
+        ?thread_mode
+    )
+)]
+pub(in crate::timeline) async fn event_focused_task(
+    focused_event: OwnedEventId,
+    thread_mode: EventFocusThreadMode,
+    room_event_cache: RoomEventCache,
+    timeline_controller: TimelineController,
+    mut event_focused_events_recv: Receiver<TimelineVectorDiffs>,
+) {
+    loop {
+        trace!("Waiting for an event.");
+
+        let update = match event_focused_events_recv.recv().await {
+            Ok(up) => up,
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(num_skipped)) => {
+                warn!(num_skipped, "Lagged behind focused-event cache updates, resetting timeline");
+
+                // The updates might have lagged, but the room event cache might have
+                // events, so retrieve them and add them back again to the timeline,
+                // after clearing it.
+                let cache = match room_event_cache
+                    .get_event_focused_cache(focused_event.clone(), thread_mode)
+                    .await
+                {
+                    Ok(Some(cache)) => cache,
+                    Ok(None) => {
+                        error!("Focused event timeline doesn't have an attached cache");
+                        break;
+                    }
+                    Err(err) => {
+                        error!(%err, "Failed to get the focused cache for the focused event");
+                        break;
+                    }
+                };
+
+                let (initial_events, _) = cache.subscribe().await;
+
+                timeline_controller
+                    .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
+                    .await;
+
+                continue;
             }
-        }
+        };
+
+        trace!("Received new timeline events diffs");
+        let origin = match update.origin {
+            EventsOrigin::Sync => RemoteEventOrigin::Sync,
+            EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+            EventsOrigin::Cache => RemoteEventOrigin::Cache,
+        };
+        timeline_controller.handle_remote_events_with_diffs(update.diffs, origin).await;
     }
 }
 
 /// For a thread-focused timeline, a long-lived task that will listen to the
 /// underlying thread updates.
 pub(in crate::timeline) async fn thread_updates_task(
-    mut receiver: Receiver<ThreadEventCacheUpdate>,
+    mut receiver: Receiver<TimelineVectorDiffs>,
     room_event_cache: RoomEventCache,
     timeline_controller: TimelineController,
     root: OwnedEventId,
@@ -117,18 +170,7 @@ pub(in crate::timeline) async fn thread_updates_task(
                 // The updates might have lagged, but the room event cache might
                 // have events, so retrieve them and add them back again to the
                 // timeline, after clearing it.
-                let (initial_events, _) =
-                    match room_event_cache.subscribe_to_thread(root.clone()).await {
-                        Ok(values) => values,
-                        Err(err) => {
-                            error!(?err, "Subscribing to thread failed");
-                            break;
-                        }
-                    };
-
-                timeline_controller
-                    .replace_with_initial_remote_events(initial_events, RemoteEventOrigin::Cache)
-                    .await;
+                _ = timeline_controller.init_with_thread_root(&root, &room_event_cache).await;
 
                 continue;
             }
@@ -201,7 +243,7 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
                 timeline_controller.handle_fully_read_marker(event_id).await;
             }
 
-            RoomEventCacheUpdate::UpdateTimelineEvents { diffs, origin } => {
+            RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, origin }) => {
                 trace!("Received new timeline events diffs");
                 let origin = match origin {
                     EventsOrigin::Sync => RemoteEventOrigin::Sync,
@@ -227,7 +269,7 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
             RoomEventCacheUpdate::AddEphemeralEvents { events } => {
                 trace!("Received new ephemeral events from sync.");
 
-                // TODO: (bnjbvr) ephemeral should be handled by the event cache.
+                // TODO: ephemeral (read receipts) should be handled by the event cache (#4113).
                 timeline_controller.handle_ephemeral_events(events).await;
             }
 

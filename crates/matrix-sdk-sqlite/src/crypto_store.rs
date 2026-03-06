@@ -31,7 +31,8 @@ use matrix_sdk_crypto::{
         CryptoStore,
         types::{
             BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-            RoomKeyWithheldEntry, RoomSettings, StoredRoomKeyBundleData,
+            RoomKeyWithheldEntry, RoomPendingKeyBundleDetails, RoomSettings,
+            StoredRoomKeyBundleData,
         },
     },
 };
@@ -41,7 +42,10 @@ use ruma::{
     events::secret::request::SecretName,
 };
 use rusqlite::{OptionalExtension, named_params, params_from_iter};
-use tokio::{fs, sync::Mutex};
+use tokio::{
+    fs,
+    sync::{Mutex, OwnedMutexGuard},
+};
 use tracing::{debug, instrument, warn};
 use vodozemac::Curve25519PublicKey;
 
@@ -62,7 +66,15 @@ const DATABASE_NAME: &str = "matrix-sdk-crypto.sqlite3";
 #[derive(Clone)]
 pub struct SqliteCryptoStore {
     store_cipher: Option<Arc<StoreCipher>>,
+
+    /// The pool of connections.
     pool: SqlitePool,
+
+    /// We make the difference between connections for read operations, and for
+    /// write operations. We keep a single connection apart from write
+    /// operations. All other connections are used for read operations. The
+    /// lock is used to ensure there is one owner at a time.
+    write_connection: Arc<Mutex<SqliteAsyncConn>>,
 
     // DB values cached in memory
     static_account: Arc<RwLock<Option<StaticAccountData>>>,
@@ -135,6 +147,8 @@ impl SqliteCryptoStore {
         Ok(SqliteCryptoStore {
             store_cipher,
             pool,
+            // Use `conn` as our selected write connections.
+            write_connection: Arc::new(Mutex::new(conn)),
             static_account: Arc::new(RwLock::new(None)),
             save_changes_lock: Default::default(),
         })
@@ -168,27 +182,26 @@ impl SqliteCryptoStore {
         self.static_account.read().unwrap().clone()
     }
 
-    async fn acquire(&self) -> Result<SqliteAsyncConn> {
+    /// Acquire a connection for executing read operations.
+    #[instrument(skip_all)]
+    async fn read(&self) -> Result<SqliteAsyncConn> {
         Ok(self.pool.get().await?)
     }
-}
 
-const DATABASE_VERSION: u8 = 14;
+    /// Acquire a connection for executing write operations.
+    #[instrument(skip_all)]
+    async fn write(&self) -> OwnedMutexGuard<SqliteAsyncConn> {
+        self.write_connection.clone().lock_owned().await
+    }
+}
 
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
 
 /// Run migrations for the given version of the database.
 async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
-    if version == 0 {
-        debug!("Creating database");
-    } else if version < DATABASE_VERSION {
-        debug!(version, new_version = DATABASE_VERSION, "Upgrading database");
-    } else {
-        return Ok(());
-    }
-
     if version < 1 {
+        debug!("Creating database");
         // First turn on WAL mode, this can't be done in the transaction, it fails with
         // the error message: "cannot change into wal mode from within a transaction".
         conn.execute_batch("PRAGMA journal_mode = wal;").await?;
@@ -200,6 +213,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 2 {
+        debug!("Upgrading database to version 2");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/002_reset_olm_hash.sql"))?;
             txn.set_db_version(2)
@@ -208,6 +222,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 3 {
+        debug!("Upgrading database to version 3");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/003_room_settings.sql"))?;
             txn.set_db_version(3)
@@ -216,6 +231,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 4 {
+        debug!("Upgrading database to version 4");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/004_drop_outbound_group_sessions.sql"
@@ -226,6 +242,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 5 {
+        debug!("Upgrading database to version 5");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/005_withheld_code.sql"))?;
             txn.set_db_version(5)
@@ -234,6 +251,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 6 {
+        debug!("Upgrading database to version 6");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/006_drop_outbound_group_sessions.sql"
@@ -244,6 +262,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 7 {
+        debug!("Upgrading database to version 7");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/007_lock_leases.sql"))?;
             txn.set_db_version(7)
@@ -252,6 +271,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 8 {
+        debug!("Upgrading database to version 8");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/crypto_store/008_secret_inbox.sql"))?;
             txn.set_db_version(8)
@@ -260,6 +280,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 9 {
+        debug!("Upgrading database to version 9");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/009_inbound_group_session_sender_key_sender_data_type.sql"
@@ -270,6 +291,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 10 {
+        debug!("Upgrading database to version 10");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/010_received_room_key_bundles.sql"
@@ -280,6 +302,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 11 {
+        debug!("Upgrading database to version 11");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/011_received_room_key_bundles_with_curve_key.sql"
@@ -290,6 +313,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 12 {
+        debug!("Upgrading database to version 12");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/012_withheld_code_by_room.sql"
@@ -300,6 +324,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 13 {
+        debug!("Upgrading database to version 13");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/013_lease_locks_with_generation.sql"
@@ -310,11 +335,23 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 14 {
+        debug!("Upgrading database to version 14");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/crypto_store/014_room_key_backups_fully_downloaded.sql"
             ))?;
             txn.set_db_version(14)
+        })
+        .await?;
+    }
+
+    if version < 15 {
+        debug!("Upgrading database to version 15");
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/015_rooms_pending_key_bundle.sql"
+            ))?;
+            txn.set_db_version(15)
         })
         .await?;
     }
@@ -375,6 +412,12 @@ trait SqliteConnectionExt {
     ) -> rusqlite::Result<()>;
 
     fn set_has_downloaded_all_room_keys(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+
+    fn set_room_pending_key_bundle(
+        &self,
+        room_id: &[u8],
+        details: Option<&[u8]>,
+    ) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionExt for rusqlite::Connection {
@@ -516,6 +559,24 @@ impl SqliteConnectionExt for rusqlite::Connection {
             ON CONFLICT (room_id, sender_user_id) DO UPDATE SET bundle_data = ?3",
             (room_id, sender_user_id, data),
         )?;
+        Ok(())
+    }
+
+    fn set_room_pending_key_bundle(
+        &self,
+        room_id: &[u8],
+        data: Option<&[u8]>,
+    ) -> rusqlite::Result<()> {
+        if let Some(data) = data {
+            self.execute(
+                "INSERT INTO rooms_pending_key_bundle (room_id, data)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (room_id) DO UPDATE SET data = ?2",
+                (room_id, data),
+            )?;
+        } else {
+            self.execute("DELETE FROM rooms_pending_key_bundle WHERE room_id = ?1", (room_id,))?;
+        }
         Ok(())
     }
 
@@ -836,6 +897,23 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             .optional()?)
     }
 
+    async fn get_room_pending_key_bundle(&self, room_id: Key) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .query_row(
+                "SELECT data FROM rooms_pending_key_bundle WHERE room_id = ?",
+                (room_id,),
+                |row| row.get(0),
+            )
+            .await
+            .optional()?)
+    }
+
+    async fn get_all_rooms_pending_key_bundle(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .query_many("SELECT data FROM rooms_pending_key_bundle", (), |row| row.get(0))
+            .await?)
+    }
+
     async fn has_downloaded_all_room_keys(&self, room_id: Key) -> Result<bool> {
         Ok(self
             .query_row(
@@ -855,7 +933,7 @@ impl CryptoStore for SqliteCryptoStore {
     type Error = Error;
 
     async fn load_account(&self) -> Result<Option<Account>> {
-        let conn = self.acquire().await?;
+        let conn = self.read().await?;
         if let Some(pickle) = conn.get_kv("account").await? {
             let pickle = self.deserialize_value(&pickle)?;
 
@@ -870,7 +948,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn load_identity(&self) -> Result<Option<PrivateCrossSigningIdentity>> {
-        let conn = self.acquire().await?;
+        let conn = self.read().await?;
         if let Some(i) = conn.get_kv("identity").await? {
             let pickle = self.deserialize_value(&i)?;
             Ok(Some(PrivateCrossSigningIdentity::from_pickle(pickle).map_err(|_| Error::Unpickle)?))
@@ -894,8 +972,8 @@ impl CryptoStore for SqliteCryptoStore {
         };
 
         let this = self.clone();
-        self.acquire()
-            .await?
+        self.write()
+            .await
             .with_transaction(move |txn| {
                 if let Some(pickled_account) = pickled_account {
                     let serialized_account = this.serialize_value(&pickled_account)?;
@@ -946,8 +1024,8 @@ impl CryptoStore for SqliteCryptoStore {
         }
 
         let this = self.clone();
-        self.acquire()
-            .await?
+        self.write()
+            .await
             .with_transaction(move |txn| {
                 if let Some(pickled_private_identity) = &pickled_private_identity {
                     let serialized_private_identity =
@@ -1061,6 +1139,12 @@ impl CryptoStore for SqliteCryptoStore {
                     txn.set_has_downloaded_all_room_keys(&room_id)?;
                 }
 
+                for (room, details) in changes.rooms_pending_key_bundle {
+                    let room_id = this.encode_key("rooms_pending_key_bundle", &room);
+                    let value = details.as_ref().map(|d| this.serialize_value(d)).transpose()?;
+                    txn.set_room_pending_key_bundle(&room_id, value.as_deref())?;
+                }
+
                 Ok::<_, Error>(())
             })
             .await?;
@@ -1094,7 +1178,7 @@ impl CryptoStore for SqliteCryptoStore {
         let device_keys = self.get_own_device().await?.as_device_keys().clone();
 
         let sessions: Vec<_> = self
-            .acquire()
+            .read()
             .await?
             .get_sessions_for_sender_key(self.encode_key("session", sender_key.as_bytes()))
             .await?
@@ -1116,7 +1200,7 @@ impl CryptoStore for SqliteCryptoStore {
     ) -> Result<Option<InboundGroupSession>> {
         let session_id = self.encode_key("inbound_group_session", session_id);
         let Some((room_id_from_db, value, backed_up)) =
-            self.acquire().await?.get_inbound_group_session(session_id).await?
+            self.read().await?.get_inbound_group_session(session_id).await?
         else {
             return Ok(None);
         };
@@ -1131,7 +1215,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn get_inbound_group_sessions(&self) -> Result<Vec<InboundGroupSession>> {
-        self.acquire()
+        self.read()
             .await?
             .get_inbound_group_sessions()
             .await?
@@ -1147,7 +1231,7 @@ impl CryptoStore for SqliteCryptoStore {
         room_id: &RoomId,
     ) -> Result<Vec<InboundGroupSession>> {
         let room_id = self.encode_key("inbound_group_session", room_id.as_bytes());
-        self.acquire()
+        self.read()
             .await?
             .get_inbound_group_sessions_by_room_id(room_id)
             .await?
@@ -1169,7 +1253,7 @@ impl CryptoStore for SqliteCryptoStore {
             after_session_id.map(|session_id| self.encode_key("inbound_group_session", session_id));
         let sender_key = self.encode_key("inbound_group_session", sender_key.to_base64());
 
-        self.acquire()
+        self.read()
             .await?
             .get_inbound_group_sessions_for_device_batch(
                 sender_key,
@@ -1189,7 +1273,7 @@ impl CryptoStore for SqliteCryptoStore {
         &self,
         backup_version: Option<&str>,
     ) -> Result<RoomKeyCounts> {
-        Ok(self.acquire().await?.get_inbound_group_session_counts(backup_version).await?)
+        Ok(self.read().await?.get_inbound_group_session_counts(backup_version).await?)
     }
 
     async fn inbound_group_sessions_for_backup(
@@ -1197,7 +1281,7 @@ impl CryptoStore for SqliteCryptoStore {
         _backup_version: &str,
         limit: usize,
     ) -> Result<Vec<InboundGroupSession>> {
-        self.acquire()
+        self.read()
             .await?
             .get_inbound_group_sessions_for_backup(limit)
             .await?
@@ -1212,8 +1296,8 @@ impl CryptoStore for SqliteCryptoStore {
         session_ids: &[(&RoomId, &str)],
     ) -> Result<()> {
         Ok(self
-            .acquire()
-            .await?
+            .write()
+            .await
             .mark_inbound_group_sessions_as_backed_up(
                 session_ids
                     .iter()
@@ -1224,11 +1308,11 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn reset_backup_state(&self) -> Result<()> {
-        Ok(self.acquire().await?.reset_inbound_group_session_backup_state().await?)
+        Ok(self.write().await.reset_inbound_group_session_backup_state().await?)
     }
 
     async fn load_backup_keys(&self) -> Result<BackupKeys> {
-        let conn = self.acquire().await?;
+        let conn = self.read().await?;
 
         let backup_version = conn
             .get_kv("backup_version_v1")
@@ -1246,7 +1330,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn load_dehydrated_device_pickle_key(&self) -> Result<Option<DehydratedDeviceKey>> {
-        let conn = self.acquire().await?;
+        let conn = self.read().await?;
 
         conn.get_kv(DEHYDRATED_DEVICE_PICKLE_KEY)
             .await?
@@ -1255,17 +1339,14 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn delete_dehydrated_device_pickle_key(&self) -> Result<(), Self::Error> {
-        let conn = self.acquire().await?;
-        conn.clear_kv(DEHYDRATED_DEVICE_PICKLE_KEY).await?;
-
-        Ok(())
+        Ok(self.write().await.clear_kv(DEHYDRATED_DEVICE_PICKLE_KEY).await?)
     }
     async fn get_outbound_group_session(
         &self,
         room_id: &RoomId,
     ) -> Result<Option<OutboundGroupSession>> {
         let room_id = self.encode_key("outbound_group_session", room_id.as_bytes());
-        let Some(value) = self.acquire().await?.get_outbound_group_session(room_id).await? else {
+        let Some(value) = self.read().await?.get_outbound_group_session(room_id).await? else {
             return Ok(None);
         };
 
@@ -1283,7 +1364,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>> {
-        self.acquire()
+        self.read()
             .await?
             .get_tracked_users()
             .await?
@@ -1303,7 +1384,7 @@ impl CryptoStore for SqliteCryptoStore {
             })
             .collect::<Result<_>>()?;
 
-        Ok(self.acquire().await?.add_tracked_users(users).await?)
+        Ok(self.write().await.add_tracked_users(users).await?)
     }
 
     async fn get_device(
@@ -1314,7 +1395,7 @@ impl CryptoStore for SqliteCryptoStore {
         let user_id = self.encode_key("device", user_id.as_bytes());
         let device_id = self.encode_key("device", device_id.as_bytes());
         Ok(self
-            .acquire()
+            .read()
             .await?
             .get_device(user_id, device_id)
             .await?
@@ -1327,7 +1408,7 @@ impl CryptoStore for SqliteCryptoStore {
         user_id: &UserId,
     ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         let user_id = self.encode_key("device", user_id.as_bytes());
-        self.acquire()
+        self.read()
             .await?
             .get_user_devices(user_id)
             .await?
@@ -1351,7 +1432,7 @@ impl CryptoStore for SqliteCryptoStore {
     async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
         let user_id = self.encode_key("identity", user_id.as_bytes());
         Ok(self
-            .acquire()
+            .read()
             .await?
             .get_user_identity(user_id)
             .await?
@@ -1364,7 +1445,7 @@ impl CryptoStore for SqliteCryptoStore {
         message_hash: &matrix_sdk_crypto::olm::OlmMessageHash,
     ) -> Result<bool> {
         let value = rmp_serde::to_vec(message_hash)?;
-        Ok(self.acquire().await?.has_olm_hash(value).await?)
+        Ok(self.read().await?.has_olm_hash(value).await?)
     }
 
     async fn get_outgoing_secret_requests(
@@ -1373,7 +1454,7 @@ impl CryptoStore for SqliteCryptoStore {
     ) -> Result<Option<GossipRequest>> {
         let request_id = self.encode_key("key_requests", request_id.as_bytes());
         Ok(self
-            .acquire()
+            .read()
             .await?
             .get_outgoing_secret_request(request_id)
             .await?
@@ -1385,7 +1466,7 @@ impl CryptoStore for SqliteCryptoStore {
         &self,
         key_info: &SecretInfo,
     ) -> Result<Option<GossipRequest>> {
-        let requests = self.acquire().await?.get_outgoing_secret_requests().await?;
+        let requests = self.read().await?.get_outgoing_secret_requests().await?;
         for (request, sent_out) in requests {
             let request = self.deserialize_key_request(&request, sent_out)?;
             if request.info == *key_info {
@@ -1396,7 +1477,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn get_unsent_secret_requests(&self) -> Result<Vec<GossipRequest>> {
-        self.acquire()
+        self.read()
             .await?
             .get_unsent_secret_requests()
             .await?
@@ -1410,7 +1491,7 @@ impl CryptoStore for SqliteCryptoStore {
 
     async fn delete_outgoing_secret_requests(&self, request_id: &TransactionId) -> Result<()> {
         let request_id = self.encode_key("key_requests", request_id.as_bytes());
-        Ok(self.acquire().await?.delete_key_request(request_id).await?)
+        Ok(self.write().await.delete_key_request(request_id).await?)
     }
 
     async fn get_secrets_from_inbox(
@@ -1419,7 +1500,7 @@ impl CryptoStore for SqliteCryptoStore {
     ) -> Result<Vec<GossippedSecret>> {
         let secret_name = self.encode_key("secrets", secret_name.to_string());
 
-        self.acquire()
+        self.read()
             .await?
             .get_secrets_from_inbox(secret_name)
             .await?
@@ -1430,7 +1511,7 @@ impl CryptoStore for SqliteCryptoStore {
 
     async fn delete_secrets_from_inbox(&self, secret_name: &SecretName) -> Result<()> {
         let secret_name = self.encode_key("secrets", secret_name.to_string());
-        self.acquire().await?.delete_secrets_from_inbox(secret_name).await
+        self.write().await.delete_secrets_from_inbox(secret_name).await
     }
 
     async fn get_withheld_info(
@@ -1441,7 +1522,7 @@ impl CryptoStore for SqliteCryptoStore {
         let room_id = self.encode_key("direct_withheld_info", room_id);
         let session_id = self.encode_key("direct_withheld_info", session_id);
 
-        self.acquire()
+        self.read()
             .await?
             .get_direct_withheld_info(session_id, room_id)
             .await?
@@ -1458,7 +1539,7 @@ impl CryptoStore for SqliteCryptoStore {
     ) -> matrix_sdk_crypto::store::Result<Vec<RoomKeyWithheldEntry>, Self::Error> {
         let room_id = self.encode_key("direct_withheld_info", room_id);
 
-        self.acquire()
+        self.read()
             .await?
             .get_withheld_sessions_by_room_id(room_id)
             .await?
@@ -1469,7 +1550,7 @@ impl CryptoStore for SqliteCryptoStore {
 
     async fn get_room_settings(&self, room_id: &RoomId) -> Result<Option<RoomSettings>> {
         let room_id = self.encode_key("room_settings", room_id.as_bytes());
-        let Some(value) = self.acquire().await?.get_room_settings(room_id).await? else {
+        let Some(value) = self.read().await?.get_room_settings(room_id).await? else {
             return Ok(None);
         };
 
@@ -1485,7 +1566,7 @@ impl CryptoStore for SqliteCryptoStore {
     ) -> Result<Option<StoredRoomKeyBundleData>> {
         let room_id = self.encode_key("received_room_key_bundle", room_id);
         let user_id = self.encode_key("received_room_key_bundle", user_id);
-        self.acquire()
+        self.read()
             .await?
             .get_received_room_key_bundle(room_id, user_id)
             .await?
@@ -1495,11 +1576,33 @@ impl CryptoStore for SqliteCryptoStore {
 
     async fn has_downloaded_all_room_keys(&self, room_id: &RoomId) -> Result<bool> {
         let room_id = self.encode_key("room_key_backups_fully_downloaded", room_id);
-        self.acquire().await?.has_downloaded_all_room_keys(room_id).await
+        self.read().await?.has_downloaded_all_room_keys(room_id).await
+    }
+
+    async fn get_pending_key_bundle_details_for_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<RoomPendingKeyBundleDetails>> {
+        let room_id = self.encode_key("rooms_pending_key_bundle", room_id.as_bytes());
+        let Some(value) = self.read().await?.get_room_pending_key_bundle(room_id).await? else {
+            return Ok(None);
+        };
+
+        let details = self.deserialize_value(&value)?;
+        Ok(Some(details))
+    }
+
+    async fn get_all_rooms_pending_key_bundles(&self) -> Result<Vec<RoomPendingKeyBundleDetails>> {
+        let details = self.read().await?.get_all_rooms_pending_key_bundle().await?;
+        let room_ids = details
+            .into_iter()
+            .map(|value| self.deserialize_value(&value))
+            .collect::<Result<_, _>>()?;
+        Ok(room_ids)
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let Some(serialized) = self.acquire().await?.get_kv(key).await? else {
+        let Some(serialized) = self.read().await?.get_kv(key).await? else {
             return Ok(None);
         };
         let value = if let Some(cipher) = &self.store_cipher {
@@ -1520,14 +1623,14 @@ impl CryptoStore for SqliteCryptoStore {
             value
         };
 
-        self.acquire().await?.set_kv(key, serialized).await?;
+        self.write().await.set_kv(key, serialized).await?;
         Ok(())
     }
 
     async fn remove_custom_value(&self, key: &str) -> Result<()> {
         let key = key.to_owned();
-        self.acquire()
-            .await?
+        self.write()
+            .await
             .interact(move |conn| conn.execute("DELETE FROM kv WHERE key = ?1", (&key,)))
             .await
             .unwrap()?;
@@ -1549,8 +1652,8 @@ impl CryptoStore for SqliteCryptoStore {
 
         // Learn about the `excluded` keyword in https://sqlite.org/lang_upsert.html.
         let generation = self
-            .acquire()
-            .await?
+            .write()
+            .await
             .with_transaction(move |txn| {
                 txn.query_row(
                     "INSERT INTO lease_locks (key, holder, expiration)
@@ -1581,7 +1684,7 @@ impl CryptoStore for SqliteCryptoStore {
     }
 
     async fn next_batch_token(&self) -> Result<Option<String>, Self::Error> {
-        let conn = self.acquire().await?;
+        let conn = self.read().await?;
         if let Some(token) = conn.get_kv("next_batch_token").await? {
             let maybe_token: Option<String> = self.deserialize_value(&token)?;
             Ok(maybe_token)
@@ -1597,7 +1700,7 @@ impl CryptoStore for SqliteCryptoStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::LazyLock};
 
     use matrix_sdk_common::deserialized_responses::WithheldCode;
     use matrix_sdk_crypto::{
@@ -1605,7 +1708,6 @@ mod tests {
         store::CryptoStore,
     };
     use matrix_sdk_test::async_test;
-    use once_cell::sync::Lazy;
     use ruma::{device_id, room_id, user_id};
     use similar_asserts::assert_eq;
     use tempfile::{TempDir, tempdir};
@@ -1614,7 +1716,7 @@ mod tests {
     use super::SqliteCryptoStore;
     use crate::SqliteStoreConfig;
 
-    static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
+    static TMP_DIR: LazyLock<TempDir> = LazyLock::new(|| tempdir().unwrap());
 
     struct TestDb {
         // Needs to be kept alive because the Drop implementation for TempDir deletes the
@@ -2018,14 +2120,15 @@ mod tests {
 
 #[cfg(test)]
 mod encrypted_tests {
+    use std::sync::LazyLock;
+
     use matrix_sdk_crypto::{cryptostore_integration_tests, cryptostore_integration_tests_time};
-    use once_cell::sync::Lazy;
     use tempfile::{TempDir, tempdir};
     use tokio::fs;
 
     use super::SqliteCryptoStore;
 
-    static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
+    static TMP_DIR: LazyLock<TempDir> = LazyLock::new(|| tempdir().unwrap());
 
     async fn get_store(
         name: &str,

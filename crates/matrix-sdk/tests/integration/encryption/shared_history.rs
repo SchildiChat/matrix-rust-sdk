@@ -6,10 +6,11 @@ use matrix_sdk::{
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{
-    InvitedRoomBuilder, JoinedRoomBuilder, StateTestEvent, async_test, event_factory::EventFactory,
+    InvitedRoomBuilder, JoinedRoomBuilder, async_test, event_factory::EventFactory,
 };
 use ruma::{
-    device_id, event_id, events::room::message::RoomMessageEventContent, mxc_uri, room_id, user_id,
+    RoomVersionId, device_id, event_id, events::room::message::RoomMessageEventContent, mxc_uri,
+    room_id, user_id,
 };
 
 #[async_test]
@@ -51,7 +52,7 @@ async fn test_shared_history_out_of_order() {
 
     matrix_mock_server.exchange_e2ee_identities(&alice, &bob).await;
 
-    let event_factory = EventFactory::new().room(room_id);
+    let event_factory = EventFactory::new().room(room_id).sender(alice_user_id);
     let alice_member_event = event_factory.member(alice_user_id).into_raw();
 
     matrix_mock_server
@@ -59,8 +60,8 @@ async fn test_shared_history_out_of_order() {
         .ok_and_run(&alice, |builder| {
             builder.add_joined_room(
                 JoinedRoomBuilder::new(room_id)
-                    .add_state_event(StateTestEvent::Create)
-                    .add_state_event(StateTestEvent::Encryption),
+                    .add_state_event(event_factory.create(alice_user_id, RoomVersionId::V1))
+                    .add_state_event(event_factory.room_encryption()),
             );
         })
         .await;
@@ -128,8 +129,10 @@ async fn test_shared_history_out_of_order() {
     matrix_mock_server.mock_room_join(room_id).ok().mock_once().named("join").mount().await;
     bob_room.join().await.expect("Bob should be able to join the room");
 
-    let details = bob_room
-        .invite_acceptance_details()
+    let details = bob
+        .get_pending_key_bundle_details_for_room(room_id)
+        .await
+        .expect("Bob should be able to get the pending key bundle details for the room")
         .expect("We should have stored invite acceptance details");
 
     assert_eq!(

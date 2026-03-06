@@ -24,10 +24,7 @@ use matrix_sdk::{
         MatrixMockServer, RoomContextResponseTemplate, RoomRelationsResponseTemplate,
     },
 };
-use matrix_sdk_test::{
-    ALICE, BOB, JoinedRoomBuilder, RoomAccountDataTestEvent, async_test,
-    event_factory::EventFactory,
-};
+use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{
     RoomExt as _, TimelineBuilder, TimelineDetails, TimelineEventFocusThreadMode,
     TimelineEventItemId, TimelineFocus, VirtualTimelineItem,
@@ -1356,12 +1353,9 @@ async fn test_sending_read_receipt_with_no_events_doesnt_unset_read_flag() {
     let thread_root_event_id = owned_event_id!("$root");
 
     // Start with a room manually marked as unread.
+    let f = EventFactory::new();
     let room = server
-        .sync_room(
-            &client,
-            JoinedRoomBuilder::new(room_id)
-                .add_account_data(RoomAccountDataTestEvent::MarkedUnread),
-        )
+        .sync_room(&client, JoinedRoomBuilder::new(room_id).add_account_data(f.marked_unread(true)))
         .await;
 
     // Create a threaded timeline, with no events in it.
@@ -1912,9 +1906,12 @@ async fn test_permalink_doesnt_listen_to_thread_sync() {
         .await;
 
     let (room_event_cache, _drop_guards) = room.event_cache().await.unwrap();
-    let hit_start =
-        room_event_cache.paginate_thread_backwards(thread_root.to_owned(), 42).await.unwrap();
-    assert!(hit_start.not());
+    let outcome = room_event_cache
+        .thread_pagination(thread_root.to_owned())
+        .run_backwards_once(42)
+        .await
+        .unwrap();
+    assert!(outcome.reached_start.not());
 
     sleep(Duration::from_millis(100)).await;
 

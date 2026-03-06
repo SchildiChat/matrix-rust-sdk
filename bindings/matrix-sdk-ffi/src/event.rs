@@ -1,3 +1,17 @@
+// Copyright 2025 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for that specific language governing permissions and
+// limitations under the License.
+
 use anyhow::{bail, Context};
 use matrix_sdk::IdParseError;
 use matrix_sdk_ui::timeline::TimelineEventItemId;
@@ -18,7 +32,7 @@ use ruma::{
 
 use crate::{
     room_member::MembershipState,
-    ruma::{MessageType, RtcNotificationType},
+    ruma::{MessageType, RtcCallIntent, RtcNotificationType},
     utils::Timestamp,
     ClientError,
 };
@@ -371,6 +385,8 @@ pub enum MessageLikeEventContent {
         notification_type: RtcNotificationType,
         /// The timestamp at which this notification is considered invalid.
         expiration_ts: Timestamp,
+        /// Soft indication of whether it is an audio or video call.
+        call_intent: Option<RtcCallIntent>,
     },
     CallHangup,
     CallCandidates,
@@ -413,6 +429,7 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
                 MessageLikeEventContent::RtcNotification {
                     notification_type: original_content.notification_type.into(),
                     expiration_ts,
+                    call_intent: original_content.call_intent.map(|intent| intent.into()),
                 }
             }
             AnySyncMessageLikeEvent::CallHangup(_) => MessageLikeEventContent::CallHangup,
@@ -455,7 +472,7 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
                 let original_content = get_message_like_event_original_content(content)?;
                 let in_reply_to_event_id =
                     original_content.relates_to.and_then(|relation| match relation {
-                        Relation::Reply { in_reply_to } => Some(in_reply_to.event_id.to_string()),
+                        Relation::Reply(reply) => Some(reply.in_reply_to.event_id.to_string()),
                         _ => None,
                     });
                 MessageLikeEventContent::RoomMessage {

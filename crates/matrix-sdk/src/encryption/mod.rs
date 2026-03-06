@@ -112,6 +112,7 @@ pub use matrix_sdk_base::crypto::{
     },
     vodozemac,
 };
+use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 
 #[cfg(feature = "experimental-send-custom-to-device")]
 use crate::config::RequestConfig;
@@ -368,12 +369,12 @@ impl OAuthCrossSigningResetInfo {
 
 /// A struct that helps to parse the custom error message Synapse posts if a
 /// duplicate one-time key is uploaded.
-#[derive(Debug)]
-struct DuplicateOneTimeKeyErrorMessage {
+#[derive(Clone, Debug)]
+pub struct DuplicateOneTimeKeyErrorMessage {
     /// The previously uploaded one-time key.
-    old_key: Curve25519PublicKey,
+    pub old_key: Curve25519PublicKey,
     /// The one-time key we're attempting to upload right now.
-    new_key: Curve25519PublicKey,
+    pub new_key: Curve25519PublicKey,
 }
 
 impl FromStr for DuplicateOneTimeKeyErrorMessage {
@@ -678,9 +679,10 @@ impl Client {
                                         .is_some();
 
                                     if message.starts_with("One time key") && !already_reported {
-                                        if let Ok(message) =
-                                            DuplicateOneTimeKeyErrorMessage::from_str(message)
-                                        {
+                                        let error_message =
+                                            DuplicateOneTimeKeyErrorMessage::from_str(message);
+
+                                        if let Ok(message) = &error_message {
                                             error!(
                                                 sentry = true,
                                                 old_key = %message.old_key,
@@ -700,6 +702,17 @@ impl Client {
                                                 StateStoreDataValue::OneTimeKeyAlreadyUploaded,
                                             )
                                             .await?;
+
+                                        if let Err(e) = self
+                                            .inner
+                                            .duplicate_key_upload_error_sender
+                                            .send(error_message.ok())
+                                        {
+                                            error!(
+                                                "Failed to dispatch duplicate key upload error notification: {}",
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1657,26 +1670,28 @@ impl Encryption {
     /// caches.
     ///
     /// The provided `lock_value` must be a unique identifier for this process.
-    /// Check [`Client::cross_process_store_locks_holder_name`] to
-    /// get the global value.
+    /// Use [`Client::cross_process_lock_config`] to get the global value, if
+    /// multi-process is enabled.
     pub async fn enable_cross_process_store_lock(&self, lock_value: String) -> Result<(), Error> {
         // If the lock has already been created, don't recreate it from scratch.
         if let Some(prev_lock) = self.client.locks().cross_process_crypto_store_lock.get() {
             let prev_holder = prev_lock.lock_holder();
-            if prev_holder == lock_value {
+            if prev_holder.is_some() && prev_holder.unwrap() == lock_value {
                 return Ok(());
             }
             warn!(
                 "Recreating cross-process store lock with a different holder value: \
-                 prev was {prev_holder}, new is {lock_value}"
+                 prev was {prev_holder:?}, new is {lock_value}"
             );
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        let lock =
-            olm_machine.store().create_store_lock("cross_process_lock".to_owned(), lock_value);
+        let lock = olm_machine.store().create_store_lock(
+            "cross_process_lock".to_owned(),
+            CrossProcessLockConfig::multi_process(lock_value.to_owned()),
+        );
 
         // Gently try to initialize the crypto store generation counter.
         //
@@ -2017,12 +2032,13 @@ mod tests {
     };
 
     use matrix_sdk_test::{
-        DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
-        test_json,
+        DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, SyncResponseBuilder, async_test,
+        event_factory::EventFactory,
     };
     use ruma::{
         event_id,
         events::{reaction::ReactionEventContent, relation::Annotation},
+        user_id,
     };
     use serde_json::json;
     use wiremock::{
@@ -2053,7 +2069,7 @@ mod tests {
             .and(header("authorization", "Bearer 1234"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(&*test_json::sync_events::ENCRYPTION_CONTENT),
+                    .set_body_json(EventFactory::new().room_encryption().into_content()),
             )
             .mount(&server)
             .await;
@@ -2066,12 +2082,15 @@ mod tests {
             .mount(&server)
             .await;
 
+        let f = EventFactory::new().sender(user_id!("@example:localhost"));
         let response = SyncResponseBuilder::default()
             .add_joined_room(
                 JoinedRoomBuilder::default()
-                    .add_state_event(StateTestEvent::Member)
-                    .add_state_event(StateTestEvent::PowerLevels)
-                    .add_state_event(StateTestEvent::Encryption),
+                    .add_state_event(
+                        f.member(user_id!("@example:localhost")).display_name("example"),
+                    )
+                    .add_state_event(f.default_power_levels())
+                    .add_state_event(f.room_encryption()),
             )
             .build_sync_response();
 

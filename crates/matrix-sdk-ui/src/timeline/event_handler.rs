@@ -26,8 +26,8 @@ use ruma::{
     TransactionId,
     events::{
         AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
-        AnySyncTimelineEvent, FullStateEventContent, MessageLikeEventContent, MessageLikeEventType,
-        StateEventType, SyncStateEvent,
+        AnySyncTimelineEvent, MessageLikeEventContent, MessageLikeEventType,
+        StateEventContentChange, StateEventType, SyncStateEvent,
         poll::unstable_start::{
             NewUnstablePollStartEventContentWithoutRelation, UnstablePollStartEventContent,
         },
@@ -51,14 +51,16 @@ use super::{
     },
     date_dividers::DateDividerAdjuster,
     event_item::{
-        AnyOtherFullStateEventContent, EventSendState, EventTimelineItemKind,
+        AnyOtherStateEventContentChange, EventSendState, EventTimelineItemKind,
         LocalEventTimelineItem, PollState, Profile, RemoteEventOrigin, RemoteEventTimelineItem,
         TimelineEventItemId,
     },
     traits::RoomDataProvider,
 };
 use crate::{
-    timeline::{controller::aggregations::PendingEdit, event_item::OtherMessageLike},
+    timeline::{
+        TimelineUniqueId, controller::aggregations::PendingEdit, event_item::OtherMessageLike,
+    },
     unable_to_decrypt_hook::UtdHookManager,
 };
 
@@ -289,7 +291,7 @@ impl TimelineAction {
                     SyncStateEvent::Original(ev) => {
                         Self::add_item(TimelineItemContent::room_member(
                             ev.state_key,
-                            FullStateEventContent::Original {
+                            StateEventContentChange::Original {
                                 content: ev.content,
                                 prev_content: ev.unsigned.prev_content,
                             },
@@ -299,14 +301,16 @@ impl TimelineAction {
                     SyncStateEvent::Redacted(ev) => {
                         Self::add_item(TimelineItemContent::room_member(
                             ev.state_key,
-                            FullStateEventContent::Redacted(ev.content),
+                            StateEventContentChange::Redacted(ev.content),
                             ev.sender,
                         ))
                     }
                 },
                 ev => Self::add_item(TimelineItemContent::OtherState(OtherState {
                     state_key: ev.state_key().to_owned(),
-                    content: AnyOtherFullStateEventContent::with_event_content(ev.content()),
+                    content: AnyOtherStateEventContentChange::with_event_content(
+                        ev.content_change(),
+                    ),
                 })),
             },
         })
@@ -522,6 +526,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         mut self,
         date_divider_adjuster: &mut DateDividerAdjuster,
         timeline_action: TimelineAction,
+        recycled_timeline_id: Option<TimelineUniqueId>,
     ) -> bool {
         let span = tracing::Span::current();
 
@@ -548,7 +553,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         match timeline_action {
             TimelineAction::AddItem { content } => {
                 if self.ctx.should_add_new_items {
-                    self.add_item(content);
+                    self.add_item(content, recycled_timeline_id);
                     added_item = true;
                 }
             }
@@ -769,7 +774,11 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     ///    `all_remote_events`,
     /// 2. the lastly added or updated remote event must be associated to the
     ///    timeline item being added here.
-    fn add_item(&mut self, content: TimelineItemContent) {
+    fn add_item(
+        &mut self,
+        content: TimelineItemContent,
+        recycled_timeline_id: Option<TimelineUniqueId>,
+    ) {
         let sender = self.ctx.sender.to_owned();
         let sender_profile = TimelineDetails::from_initial_value(self.ctx.sender_profile.clone());
 
@@ -850,7 +859,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             Flow::Local { .. } => {
                 trace!("Adding new local timeline item");
 
-                let item = self.meta.new_timeline_item(item);
+                let item = self.meta.new_timeline_item_with_internal_id(item, recycled_timeline_id);
 
                 self.items.push_local(item);
             }
@@ -864,6 +873,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     item,
                     event_id,
                     txn_id.as_deref(),
+                    recycled_timeline_id,
                 );
 
                 trace!("Adding new remote timeline item at the start");
@@ -883,6 +893,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     item,
                     event_id,
                     txn_id.as_deref(),
+                    recycled_timeline_id,
                 );
 
                 let all_remote_events = self.items.all_remote_events();
@@ -938,6 +949,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     item,
                     event_id,
                     txn_id.as_deref(),
+                    recycled_timeline_id,
                 );
 
                 // Let's find the latest remote event and insert after it
@@ -1027,6 +1039,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         mut new_item: EventTimelineItem,
         event_id: &EventId,
         transaction_id: Option<&TransactionId>,
+        recycled_timeline_id: Option<TimelineUniqueId>,
     ) -> Arc<TimelineItem> {
         // Detect a local timeline item that matches `event_id` or `transaction_id`.
         if let Some((local_timeline_item_index, local_timeline_item)) = items
@@ -1064,7 +1077,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             TimelineItem::new(new_item, recycled.internal_id.clone())
         } else {
             // We haven't found a matching local item to recycle; create a new item.
-            meta.new_timeline_item(new_item)
+            meta.new_timeline_item_with_internal_id(new_item, recycled_timeline_id)
         }
     }
 

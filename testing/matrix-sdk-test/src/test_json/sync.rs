@@ -1,12 +1,13 @@
 //! Complete sync responses.
 
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
+
 use ruma::{RoomId, room_id};
 use serde_json::{Value as JsonValue, json};
 
 use crate::DEFAULT_TEST_ROOM_ID;
 
-pub static SYNC: Lazy<JsonValue> = Lazy::new(|| {
+pub static SYNC: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_1",
@@ -267,7 +268,7 @@ pub static SYNC: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static DEFAULT_SYNC_SUMMARY: Lazy<JsonValue> = Lazy::new(|| {
+pub static DEFAULT_SYNC_SUMMARY: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_1",
@@ -525,304 +526,7 @@ pub static DEFAULT_SYNC_SUMMARY: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static MORE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "device_one_time_keys_count": {},
-        "next_batch": "s526_47314_0_7_1_1_1_11444_2",
-        "device_lists": {
-            "changed": [
-                "@example:example.org"
-            ],
-            "left": []
-        },
-        "rooms": {
-            "invite": {},
-            "join": {
-                *DEFAULT_TEST_ROOM_ID: {
-                    "summary": {},
-                    "account_data": {
-                        "events": []
-                    },
-                    "ephemeral": {
-                        "events": [
-                            {
-                                "content": {
-                                    "$151680659217152dPKjd:localhost": {
-                                        "m.read": {
-                                            "@example:localhost": {
-                                                "ts": 151680989
-                                            }
-                                        }
-                                    }
-                                },
-                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                "type": "m.receipt"
-                            },
-                            {
-                                "content": {
-                                    "user_ids": [
-                                        "@alice:matrix.org",
-                                        "@bob:example.com"
-                                    ]
-                                },
-                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                "type": "m.typing"
-                            }
-                        ]
-                    },
-                    "state": {
-                        "events": []
-                    },
-                    "timeline": {
-                        "events": [
-                            {
-                                "content": {
-                                    "body": "baba",
-                                    "format": "org.matrix.custom.html",
-                                    "formatted_body": "<strong>baba</strong>",
-                                    "msgtype": "m.text"
-                                },
-                                "event_id": "$152037280074GZeOm:localhost",
-                                "origin_server_ts": 152037280000000_u64,
-                                "sender": "@example:localhost",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 598971425
-                                }
-                            },
-                            {
-                                "content": {
-                                    "body": " * edited message",
-                                    "m.new_content": {
-                                        "body": "edited message",
-                                        "msgtype": "m.text"
-                                    },
-                                    "m.relates_to": {
-                                        "event_id": "$someeventid:localhost",
-                                        "rel_type": "m.replace"
-                                    },
-                                    "msgtype": "m.text"
-                                },
-                                "event_id": "$editevid:localhost",
-                                "origin_server_ts": 159026265000000_u64,
-                                "sender": "@alice:matrix.org",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 85
-                                }
-                            },
-                            {
-                                "content": {
-                                    "reason": "😀"
-                                },
-                                "event_id": "$151957878228ssqrJ:localhost",
-                                "origin_server_ts": 151957878000000_u64,
-                                "sender": "@example:localhost",
-                                "type": "m.room.redaction",
-                                "redacts": "$151957878228ssqrj:localhost",
-                                "unsigned": {
-                                    "age": 85
-                                }
-                            },
-                            {
-                                "content": {},
-                                "event_id": "$15275046980maRLj:localhost",
-                                "origin_server_ts": 152750469000000_u64,
-                                "sender": "@example:localhost",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 19334,
-                                    "redacted_because": {
-                                        "content": {},
-                                        "event_id": "$15275047031IXQRi:localhost",
-                                        "origin_server_ts": 152750470000000_u64,
-                                        "redacts": "$15275046980maRLj:localhost",
-                                        "sender": "@example:localhost",
-                                        "type": "m.room.redaction",
-                                        "unsigned": {
-                                            "age": 14523
-                                        }
-                                    },
-                                    "redacted_by": "$15275047031IXQRi:localhost"
-                                }
-                            },
-                            {
-                                "content": {
-                                    "m.relates_to": {
-                                        "event_id": "$15275047031IXQRi:localhost",
-                                        "key": "👍",
-                                        "rel_type": "m.annotation"
-                                    }
-                                },
-                                "event_id": "$15275047031IXQRi:localhost",
-                                "origin_server_ts": 159027581000000_u64,
-                                "sender": "@alice:matrix.org",
-                                "type": "m.reaction",
-                                "unsigned": {
-                                    "age": 85
-                                }
-                            },
-                            {
-                                "content": {
-                                    "body": "This is a notice",
-                                    "format": "org.matrix.custom.html",
-                                    "formatted_body": "<em>This is a notice</em>",
-                                    "msgtype": "m.notice"
-                                },
-                                "event_id": "$098237280074GZeOm:localhost",
-                                "origin_server_ts": 162037280000000_u64,
-                                "sender": "@bot:localhost",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 25
-                                }
-                            },
-                        ],
-                        "limited": false,
-                        "prev_batch": "t392-516_47314_0_7_1_1_1_11444_1"
-                    },
-                    "unread_notifications": {
-                        "highlight_count": 0,
-                        "notification_count": 11
-                    }
-                }
-            },
-            "leave": {}
-        },
-        "to_device": {
-            "events": []
-        },
-        "presence": {
-            "events": []
-        }
-    })
-});
-
-pub static MORE_SYNC_2: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "next_batch": "s526_47314_0_7_1_1_1_11444_3",
-        "rooms": {
-            "join": {
-                *DEFAULT_TEST_ROOM_ID: {
-                    "timeline": {
-                        "events": [
-                            {
-                                "content": {
-                                    "body": "baba",
-                                    "format": "org.matrix.custom.html",
-                                    "formatted_body": "<strong>baba</strong>",
-                                    "msgtype": "m.text"
-                                },
-                                "event_id": "$152037280074GZeOm2:localhost",
-                                "origin_server_ts": 152037280000000_u64,
-                                "sender": "@example:localhost",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 598971425
-                                }
-                            },
-                            {
-                                "content": {
-                                    "body": " * edited message",
-                                    "m.new_content": {
-                                        "body": "edited message",
-                                        "msgtype": "m.text"
-                                    },
-                                    "m.relates_to": {
-                                        "event_id": "$someeventid:localhost",
-                                        "rel_type": "m.replace"
-                                    },
-                                    "msgtype": "m.text"
-                                },
-                                "event_id": "$editevid2:localhost",
-                                "origin_server_ts": 159026265000000_u64,
-                                "sender": "@alice:matrix.org",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 85
-                                }
-                            },
-                            {
-                                "content": {
-                                    "reason": "😀"
-                                },
-                                "event_id": "$151957878228ssqrJ2:localhost",
-                                "origin_server_ts": 151957878000000_u64,
-                                "sender": "@example:localhost",
-                                "type": "m.room.redaction",
-                                "redacts": "$151957878228ssqrj:localhost",
-                                "unsigned": {
-                                    "age": 85
-                                }
-                            },
-                            {
-                                "content": {},
-                                "event_id": "$15275046980maRLj2:localhost",
-                                "origin_server_ts": 152750469000000_u64,
-                                "sender": "@example:localhost",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 19334,
-                                    "redacted_because": {
-                                        "content": {},
-                                        "event_id": "$15275047031IXQRi:localhost",
-                                        "origin_server_ts": 152750470000000_u64,
-                                        "redacts": "$15275046980maRLj:localhost",
-                                        "sender": "@example:localhost",
-                                        "type": "m.room.redaction",
-                                        "unsigned": {
-                                            "age": 14523
-                                        }
-                                    },
-                                    "redacted_by": "$15275047031IXQRi:localhost"
-                                }
-                            },
-                            {
-                                "content": {
-                                    "m.relates_to": {
-                                        "event_id": "$15275047031IXQRi:localhost",
-                                        "key": "👍",
-                                        "rel_type": "m.annotation"
-                                    }
-                                },
-                                "event_id": "$15275047031IXQRi2:localhost",
-                                "origin_server_ts": 159027581000000_u64,
-                                "sender": "@alice:matrix.org",
-                                "type": "m.reaction",
-                                "unsigned": {
-                                    "age": 85
-                                }
-                            },
-                            {
-                                "content": {
-                                    "body": "This is a notice",
-                                    "format": "org.matrix.custom.html",
-                                    "formatted_body": "<em>This is a notice</em>",
-                                    "msgtype": "m.notice"
-                                },
-                                "event_id": "$098237280074GZeOm2:localhost",
-                                "origin_server_ts": 162037280000000_u64,
-                                "sender": "@bot:localhost",
-                                "type": "m.room.message",
-                                "unsigned": {
-                                    "age": 25
-                                }
-                            },
-                        ],
-                        "limited": false,
-                        "prev_batch": "s526_47314_0_7_1_1_1_11444_2"
-                    },
-                    "unread_notifications": {
-                        "highlight_count": 0,
-                        "notification_count": 11
-                    }
-                }
-            },
-        },
-    })
-});
-
-pub static INVITE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
+pub static INVITE_SYNC: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_2",
@@ -881,7 +585,7 @@ pub static INVITE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static LEAVE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
+pub static LEAVE_SYNC: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_1",
@@ -1164,7 +868,7 @@ pub static LEAVE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static LEAVE_SYNC_EVENT: Lazy<JsonValue> = Lazy::new(|| {
+pub static LEAVE_SYNC_EVENT: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "account_data": {
             "events": []
@@ -1231,7 +935,7 @@ pub static LEAVE_SYNC_EVENT: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static JOIN_SPACE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
+pub static JOIN_SPACE_SYNC: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_1",
@@ -1494,20 +1198,20 @@ pub static JOIN_SPACE_SYNC: Lazy<JsonValue> = Lazy::new(|| {
 });
 
 /// In the [`MIXED_SYNC`], the room id of the joined room.
-pub static MIXED_JOINED_ROOM_ID: Lazy<&RoomId> =
-    Lazy::new(|| room_id!("!SVkFJHzfwvuaIEawgC:localhost"));
+pub static MIXED_JOINED_ROOM_ID: LazyLock<&RoomId> =
+    LazyLock::new(|| room_id!("!SVkFJHzfwvuaIEawgC:localhost"));
 /// In the [`MIXED_SYNC`], the room id of the left room.
-pub static MIXED_LEFT_ROOM_ID: Lazy<&RoomId> =
-    Lazy::new(|| room_id!("!SVkFJHzfwvuaIEawgD:localhost"));
+pub static MIXED_LEFT_ROOM_ID: LazyLock<&RoomId> =
+    LazyLock::new(|| room_id!("!SVkFJHzfwvuaIEawgD:localhost"));
 /// In the [`MIXED_SYNC`], the room id of the invited room.
-pub static MIXED_INVITED_ROOM_ID: Lazy<&RoomId> =
-    Lazy::new(|| room_id!("!SVkFJHzfwvuaIEawgE:localhost"));
+pub static MIXED_INVITED_ROOM_ID: LazyLock<&RoomId> =
+    LazyLock::new(|| room_id!("!SVkFJHzfwvuaIEawgE:localhost"));
 /// In the [`MIXED_SYNC`], the room id of the knocked room.
-pub static MIXED_KNOCKED_ROOM_ID: Lazy<&RoomId> =
-    Lazy::new(|| room_id!("!SVkFJHzfwvuaIEawgF:localhost"));
+pub static MIXED_KNOCKED_ROOM_ID: LazyLock<&RoomId> =
+    LazyLock::new(|| room_id!("!SVkFJHzfwvuaIEawgF:localhost"));
 
 /// A sync that contains updates to joined/invited/knocked/left rooms.
-pub static MIXED_SYNC: Lazy<JsonValue> = Lazy::new(|| {
+pub static MIXED_SYNC: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "account_data": {
             "events": []
@@ -1695,127 +1399,7 @@ pub static MIXED_SYNC: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static VOIP_SYNC: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "device_one_time_keys_count": {},
-        "next_batch": "s526_47314_0_7_1_1_1_11444_1",
-        "device_lists": {
-            "changed": [
-                "@example:example.org"
-            ],
-            "left": []
-        },
-        "rooms": {
-            "invite": {},
-            "join": {
-                *DEFAULT_TEST_ROOM_ID: {
-                    "summary": {},
-                    "account_data": {
-                        "events": []
-                    },
-                    "ephemeral": {
-                        "events": [ ]
-                    },
-                    "state": {
-                        "events": []
-                    },
-                    "timeline": {
-                        "events": [
-                            {
-                                "content": {
-                                    "call_id": "12345",
-                                    "lifetime": 60000,
-                                    "offer": {
-                                        "sdp": "v=0\r\no=- 6584580628695956864 2 IN IP4 127.0.0.1[...]",
-                                        "type": "offer"
-                                    },
-                                    "version": 0
-                                },
-                                "event_id": "$143273582443PhrSn:example.org",
-                                "origin_server_ts": 143273582000000_u64,
-                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                "sender": "@example:example.org",
-                                "type": "m.call.invite",
-                                "unsigned": {
-                                    "age": 1234
-                                }
-                            },
-                            {
-                                "content": {
-                                    "answer": {
-                                        "sdp": "v=0\r\no=- 6584580628695956864 2 IN IP4 127.0.0.1[...]",
-                                        "type": "answer"
-                                    },
-                                    "call_id": "12345",
-                                    "lifetime": 60000,
-                                    "version": 0
-                                },
-                                "event_id": "$143273582443PhrSn:example.org",
-                                "origin_server_ts": 143273582000000_u64,
-                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                "sender": "@example:example.org",
-                                "type": "m.call.answer",
-                                "unsigned": {
-                                    "age": 1234
-                                }
-                            },
-                            {
-                                "content": {
-                                    "call_id": "12345",
-                                    "candidates": [
-                                        {
-                                            "candidate": "candidate:863018703 1 udp 2122260223 10.9.64.156 43670 type host generation 0",
-                                            "sdpMLineIndex": 0,
-                                            "sdpMid": "audio"
-                                        }
-                                    ],
-                                    "version": 0
-                                },
-                                "event_id": "$143273582443PhrSn:example.org",
-                                "origin_server_ts": 143273582000000_u64,
-                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                "sender": "@example:example.org",
-                                "type": "m.call.candidates",
-                                "unsigned": {
-                                    "age": 1234
-                                }
-                            },
-                            {
-                                "content": {
-                                    "call_id": "12345",
-                                    "version": 0
-                                },
-                                "event_id": "$143273582443PhrSn:example.org",
-                                "origin_server_ts": 143273582000000_u64,
-                                "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-                                "sender": "@example:example.org",
-                                "type": "m.call.hangup",
-                                "unsigned": {
-                                    "age": 1234
-                                }
-                            }
-                        ],
-                        "limited": true,
-                        "prev_batch": "t392-516_47314_0_7_1_1_1_11444_1"
-                    },
-                    "unread_notifications": {
-                        "highlight_count": 0,
-                        "notification_count": 11
-                    }
-                }
-            },
-            "leave": {}
-        },
-        "to_device": {
-            "events": []
-        },
-        "presence": {
-            "events": []
-        }
-    })
-});
-
-pub static SYNC_ADMIN_AND_MOD: Lazy<JsonValue> = Lazy::new(|| {
+pub static SYNC_ADMIN_AND_MOD: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_1",
@@ -2004,7 +1588,7 @@ pub static SYNC_ADMIN_AND_MOD: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static CUSTOM_ROOM_POWER_LEVELS: Lazy<JsonValue> = Lazy::new(|| {
+pub static CUSTOM_ROOM_POWER_LEVELS: LazyLock<JsonValue> = LazyLock::new(|| {
     json!({
         "device_one_time_keys_count": {},
         "next_batch": "s526_47314_0_7_1_1_1_11444_1",

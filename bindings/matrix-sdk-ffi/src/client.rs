@@ -1,3 +1,17 @@
+// Copyright 2025 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for that specific language governing permissions and
+// limitations under the License.
+
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -13,9 +27,7 @@ use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 #[cfg(feature = "sqlite")]
 use matrix_sdk::STATE_STORE_DATABASE_NAME;
 use matrix_sdk::{
-    authentication::oauth::{
-        AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
-    },
+    authentication::oauth::{ClientId, OAuthAuthorizationData, OAuthError, OAuthSession},
     deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
     executor::AbortOnDrop,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
@@ -45,7 +57,9 @@ use matrix_sdk::{
     task_monitor::BackgroundTaskFailureReason,
     Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
 };
-use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_common::{
+    cross_process_lock::CrossProcessLockConfig, stream::StreamExt, SendOutsideWasm, SyncOutsideWasm,
+};
 use matrix_sdk_ui::{
     notification_client::{
         NotificationClient as MatrixNotificationClient,
@@ -59,6 +73,9 @@ use oauth2::Scope;
 use ruma::{
     api::client::{
         alias::get_alias,
+        discovery::get_authorization_server_metadata::v1::{
+            AccountManagementActionData, DeviceDeleteData, DeviceViewData,
+        },
         error::ErrorKind,
         profile::{AvatarUrl, DisplayName},
         room::create_room::{v3::CreationContent, RoomPowerLevelsContentOverride},
@@ -237,6 +254,32 @@ pub trait AccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_change(&self, event: AccountDataEvent);
 }
 
+/// A listener for duplicate key upload errors triggered by requests to
+/// /keys/upload.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait DuplicateKeyUploadErrorListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called once when uploading keys fails.
+    fn on_duplicate_key_upload_error(&self, message: Option<DuplicateOneTimeKeyErrorMessage>);
+}
+
+/// Information about the old and new key that caused a duplicate key upload
+/// error in /keys/upload.
+#[derive(uniffi::Record)]
+pub struct DuplicateOneTimeKeyErrorMessage {
+    /// The previously uploaded one-time key, encoded as unpadded base64.
+    pub old_key: String,
+    /// The one-time key we attempted to upload, encoded as unpadded base64
+    pub new_key: String,
+}
+
+impl From<matrix_sdk::encryption::DuplicateOneTimeKeyErrorMessage>
+    for DuplicateOneTimeKeyErrorMessage
+{
+    fn from(value: matrix_sdk::encryption::DuplicateOneTimeKeyErrorMessage) -> Self {
+        Self { old_key: value.old_key.to_base64(), new_key: value.new_key.to_base64() }
+    }
+}
+
 /// A listener for changes of room account data events.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
@@ -299,7 +342,6 @@ pub struct Client {
 impl Client {
     pub async fn new(
         sdk_client: MatrixClient,
-        enable_oidc_refresh_lock: bool,
         session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
         store_path: Option<PathBuf>,
     ) -> Result<Self, ClientError> {
@@ -331,8 +373,7 @@ impl Client {
             }
         });
 
-        let cross_process_store_locks_holder_name =
-            sdk_client.cross_process_store_locks_holder_name().to_owned();
+        let store_mode = sdk_client.cross_process_lock_config();
 
         let client = Client {
             inner: AsyncRuntimeDropped::new(sdk_client.clone()),
@@ -342,18 +383,18 @@ impl Client {
             store_path,
         };
 
-        if enable_oidc_refresh_lock {
-            if session_delegate.is_none() {
-                return Err(anyhow::anyhow!(
-                    "missing session delegates when enabling the cross-process lock"
-                ))?;
+        match store_mode {
+            CrossProcessLockConfig::MultiProcess { holder_name } => {
+                if session_delegate.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "missing session delegates with multi-process lock configuration"
+                    ))?;
+                }
+                client.inner.oauth().enable_cross_process_refresh_lock(holder_name.clone()).await?;
             }
-
-            client
-                .inner
-                .oauth()
-                .enable_cross_process_refresh_lock(cross_process_store_locks_holder_name)
-                .await?;
+            CrossProcessLockConfig::SingleProcess => {
+                client.inner.oauth();
+            }
         }
 
         if let Some(session_delegate) = session_delegate {
@@ -742,6 +783,28 @@ impl Client {
                         .on_error(report.room_id.to_string(), ClientError::from_err(report.error)),
                     Err(err) => {
                         error!("error when listening to the send queue error reporter: {err}");
+                    }
+                }
+            }
+        })))
+    }
+
+    /// Subscribe to duplicate key upload errors triggered by requests to
+    /// /keys/upload.
+    pub fn subscribe_to_duplicate_key_upload_errors(
+        &self,
+        listener: Box<dyn DuplicateKeyUploadErrorListener>,
+    ) -> Arc<TaskHandle> {
+        let mut subscriber = self.inner.subscribe_to_duplicate_key_upload_errors();
+
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            loop {
+                match subscriber.recv().await {
+                    Ok(message) => {
+                        listener.on_duplicate_key_upload_error(message.map(|m| m.into()))
+                    }
+                    Err(err) => {
+                        error!("error when listening to key upload errors: {err}");
                     }
                 }
             }
@@ -1250,20 +1313,20 @@ impl Client {
             return Ok(None);
         }
 
-        let mut url_builder = match self.inner.oauth().account_management_url().await {
-            Ok(Some(url_builder)) => url_builder,
-            Ok(None) => return Ok(None),
+        let server_metadata = match self.inner.oauth().cached_server_metadata().await {
+            Ok(server_metadata) => server_metadata,
             Err(e) => {
-                error!("Failed retrieving account management URL: {e}");
-                return Err(e.into());
+                error!("Failed retrieving cached server metadata: {e}");
+                return Err(OAuthError::from(e).into());
             }
         };
 
-        if let Some(action) = action {
-            url_builder = url_builder.action(action.into());
+        Ok(if let Some(action) = &action {
+            server_metadata.account_management_url_with_action(action.into())
+        } else {
+            server_metadata.account_management_uri
         }
-
-        Ok(Some(url_builder.build().to_string()))
+        .map(Into::into))
     }
 
     pub fn user_id(&self) -> Result<String, ClientError> {
@@ -2191,8 +2254,8 @@ impl Client {
             debug!("Applying session change: {session_change:?}");
             let delegate = delegate_data.delegate.clone();
             get_runtime_handle().spawn_blocking(move || match session_change {
-                SessionChange::UnknownToken { soft_logout } => {
-                    delegate.did_receive_auth_error(soft_logout);
+                SessionChange::UnknownToken(unknown_token) => {
+                    delegate.did_receive_auth_error(unknown_token.soft_logout);
                 }
                 SessionChange::TokensRefreshed => {}
             });
@@ -2612,23 +2675,23 @@ pub(crate) struct OidcSessionData {
 #[derive(uniffi::Enum)]
 pub enum AccountManagementAction {
     Profile,
-    SessionsList,
-    SessionView { device_id: String },
-    SessionEnd { device_id: String },
+    DevicesList,
+    DeviceView { device_id: String },
+    DeviceDelete { device_id: String },
     AccountDeactivate,
     CrossSigningReset,
 }
 
-impl From<AccountManagementAction> for AccountManagementActionFull {
-    fn from(value: AccountManagementAction) -> Self {
+impl<'a> From<&'a AccountManagementAction> for AccountManagementActionData<'a> {
+    fn from(value: &'a AccountManagementAction) -> Self {
         match value {
             AccountManagementAction::Profile => Self::Profile,
-            AccountManagementAction::SessionsList => Self::SessionsList,
-            AccountManagementAction::SessionView { device_id } => {
-                Self::SessionView { device_id: device_id.into() }
+            AccountManagementAction::DevicesList => Self::DevicesList,
+            AccountManagementAction::DeviceView { device_id } => {
+                Self::DeviceView(DeviceViewData::new(device_id.as_str().into()))
             }
-            AccountManagementAction::SessionEnd { device_id } => {
-                Self::SessionEnd { device_id: device_id.into() }
+            AccountManagementAction::DeviceDelete { device_id } => {
+                Self::DeviceDelete(DeviceDeleteData::new(device_id.as_str().into()))
             }
             AccountManagementAction::AccountDeactivate => Self::AccountDeactivate,
             AccountManagementAction::CrossSigningReset => Self::CrossSigningReset,

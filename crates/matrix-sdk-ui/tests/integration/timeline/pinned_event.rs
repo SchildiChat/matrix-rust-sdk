@@ -15,8 +15,7 @@ use matrix_sdk::{
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use matrix_sdk_common::executor::spawn;
 use matrix_sdk_test::{
-    BOB, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
-    event_factory::EventFactory,
+    BOB, JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
 };
 use matrix_sdk_ui::timeline::{RoomExt, TimelineBuilder, TimelineFocus};
 use ruma::{
@@ -29,14 +28,12 @@ use ruma::{
                 EncryptedEventScheme, MegolmV1AesSha2ContentInit, RoomEncryptedEventContent,
             },
             message::RoomMessageEventContentWithoutRelation,
-            pinned_events::RoomPinnedEventsEventContent,
         },
     },
     owned_device_id, owned_room_id, owned_user_id, room_id,
     serde::Raw,
     user_id,
 };
-use serde_json::json;
 use stream_assert::assert_pending;
 use tokio::time::sleep;
 use wiremock::{
@@ -866,7 +863,8 @@ async fn test_ensure_max_concurrency_is_observed() {
     let (client, server) = logged_in_client_with_server().await;
     let room_id = owned_room_id!("!a_room:example.org");
 
-    let pinned_event_ids: Vec<String> = (0..100).map(|idx| format!("${idx}")).collect();
+    let pinned_event_ids: Vec<OwnedEventId> =
+        (0..100).map(|idx| EventId::parse(format!("${idx}")).unwrap()).collect();
 
     let max_concurrent_requests = 10;
 
@@ -874,25 +872,12 @@ async fn test_ensure_max_concurrency_is_observed() {
     client.event_cache().config_mut().await.max_pinned_events_concurrent_requests =
         max_concurrent_requests;
 
+    let f = EventFactory::new().room(&room_id).sender(user_id!("@example:localhost"));
     let joined_room_builder = JoinedRoomBuilder::new(&room_id)
         // Set up encryption
-        .add_state_event(StateTestEvent::Encryption)
+        .add_state_event(f.room_encryption())
         // Add 100 pinned events
-        .add_state_event(StateTestEvent::Custom(json!(
-            {
-                "content": {
-                    "pinned": pinned_event_ids
-                },
-                "event_id": "$15139375513VdeRF:localhost",
-                "origin_server_ts": 151393755,
-                "sender": "@example:localhost",
-                "state_key": "",
-                "type": "m.room.pinned_events",
-                "unsigned": {
-                    "age": 703422
-                }
-            }
-        )));
+        .add_state_bulk(vec![f.room_pinned_events(pinned_event_ids).into()]);
 
     let pinned_event =
         EventFactory::new().room(&room_id).sender(*BOB).text_msg("A message").into_raw_timeline();
@@ -991,18 +976,18 @@ impl PinnedEventsSync {
         client: &Client,
         server: &MatrixMockServer,
     ) -> Result<Room, matrix_sdk::Error> {
+        let f = EventFactory::new().room(&self.room_id).sender(user_id!("@example:localhost"));
         let mut joined_room_builder = JoinedRoomBuilder::new(&self.room_id)
             // Set up encryption
-            .add_state_event(StateTestEvent::Encryption);
+            .add_state_event(f.room_encryption());
 
         joined_room_builder = joined_room_builder.add_timeline_bulk(self.timeline_events);
 
         if let Some(pinned_event_ids) = self.pinned_event_ids {
             let pinned_events_event = EventFactory::new()
                 .room(&self.room_id)
-                .event(RoomPinnedEventsEventContent::new(pinned_event_ids))
                 .sender(user_id!("@example:localhost"))
-                .state_key("")
+                .room_pinned_events(pinned_event_ids)
                 .into();
 
             joined_room_builder = joined_room_builder.add_state_bulk(vec![pinned_events_event]);

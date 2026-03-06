@@ -62,13 +62,6 @@ mod keys {
 /// The database name.
 const DATABASE_NAME: &str = "matrix-sdk-event-cache.sqlite3";
 
-/// Identifier of the latest database version.
-///
-/// This is used to figure whether the SQLite database requires a migration.
-/// Every new SQL migration should imply a bump of this number, and changes in
-/// the [`run_migrations`] function.
-const DATABASE_VERSION: u8 = 14;
-
 /// The string used to identify a chunk of type events, in the `type` field in
 /// the database.
 const CHUNK_TYPE_EVENT_TYPE_STRING: &str = "E";
@@ -320,7 +313,7 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
         )?;
         let prev_token_bytes = store.decode_value(&encoded_prev_token)?;
         let prev_token = serde_json::from_slice(&prev_token_bytes)?;
-        Ok(Gap { prev_token })
+        Ok(Gap { token: prev_token })
     }
 
     fn load_events_content(
@@ -356,18 +349,11 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
 
 /// Run migrations for the given version of the database.
 async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
-    if version == 0 {
-        debug!("Creating database");
-    } else if version < DATABASE_VERSION {
-        debug!(version, new_version = DATABASE_VERSION, "Upgrading database");
-    } else {
-        return Ok(());
-    }
-
     // Always enable foreign keys for the current connection.
     conn.execute_batch("PRAGMA foreign_keys = ON;").await?;
 
     if version < 1 {
+        debug!("Creating database");
         // First turn on WAL mode, this can't be done in the transaction, it fails with
         // the error message: "cannot change into wal mode from within a transaction".
         conn.execute_batch("PRAGMA journal_mode = wal;").await?;
@@ -379,6 +365,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 2 {
+        debug!("Upgrading database to version 2");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/event_cache_store/002_lease_locks.sql"))?;
             txn.set_db_version(2)
@@ -387,6 +374,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 3 {
+        debug!("Upgrading database to version 3");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/event_cache_store/003_events.sql"))?;
             txn.set_db_version(3)
@@ -395,6 +383,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 4 {
+        debug!("Upgrading database to version 4");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/004_ignore_policy.sql"
@@ -405,6 +394,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 5 {
+        debug!("Upgrading database to version 5");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/005_events_index_on_event_id.sql"
@@ -415,6 +405,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 6 {
+        debug!("Upgrading database to version 6");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/event_cache_store/006_events.sql"))?;
             txn.set_db_version(6)
@@ -423,6 +414,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 7 {
+        debug!("Upgrading database to version 7");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/007_event_chunks.sql"
@@ -433,6 +425,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 8 {
+        debug!("Upgrading database to version 8");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/008_linked_chunk_id.sql"
@@ -443,6 +436,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 9 {
+        debug!("Upgrading database to version 9");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/009_related_event_index.sql"
@@ -453,6 +447,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 10 {
+        debug!("Upgrading database to version 10");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!("../migrations/event_cache_store/010_drop_media.sql"))?;
             txn.set_db_version(10)
@@ -467,6 +462,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 11 {
+        debug!("Upgrading database to version 11");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/011_empty_event_cache.sql"
@@ -477,6 +473,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 12 {
+        debug!("Upgrading database to version 12");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/012_store_event_type.sql"
@@ -487,6 +484,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 13 {
+        debug!("Upgrading database to version 13");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/013_lease_locks_with_generation.sql"
@@ -497,6 +495,7 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
     }
 
     if version < 14 {
+        debug!("Upgrading database to version 14");
         conn.with_transaction(|txn| {
             txn.execute_batch(include_str!(
                 "../migrations/event_cache_store/014_event_chunks_event_id_index.sql"
@@ -598,7 +597,7 @@ impl EventCacheStore for SqliteEventCacheStore {
                     }
 
                     Update::NewGapChunk { previous, new, next, gap } => {
-                        let serialized = serde_json::to_vec(&gap.prev_token)?;
+                        let serialized = serde_json::to_vec(&gap.token)?;
                         let prev_token = this.encode_value(serialized)?;
 
                         let previous = previous.as_ref().map(ChunkIdentifier::index);
@@ -1648,7 +1647,10 @@ fn insert_chunk(
 mod tests {
     use std::{
         path::PathBuf,
-        sync::atomic::{AtomicU32, Ordering::SeqCst},
+        sync::{
+            LazyLock,
+            atomic::{AtomicU32, Ordering::SeqCst},
+        },
     };
 
     use assert_matches::assert_matches;
@@ -1661,7 +1663,6 @@ mod tests {
         linked_chunk::{ChunkContent, ChunkIdentifier, LinkedChunkId, Position, Update},
     };
     use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, async_test};
-    use once_cell::sync::Lazy;
     use ruma::event_id;
     use tempfile::{TempDir, tempdir};
 
@@ -1672,7 +1673,7 @@ mod tests {
         utils::{EncryptableStore as _, SqliteAsyncConnExt},
     };
 
-    static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
+    static TMP_DIR: LazyLock<TempDir> = LazyLock::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
 
     fn new_event_cache_store_workspace() -> PathBuf {
@@ -1908,14 +1909,16 @@ mod tests {
 
 #[cfg(test)]
 mod encrypted_tests {
-    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::{
+        LazyLock,
+        atomic::{AtomicU32, Ordering::SeqCst},
+    };
 
     use matrix_sdk_base::{
         event_cache::store::{EventCacheStore, EventCacheStoreError},
         event_cache_store_integration_tests, event_cache_store_integration_tests_time,
     };
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
-    use once_cell::sync::Lazy;
     use ruma::{
         event_id,
         events::{relation::RelationType, room::message::RoomMessageEventContentWithoutRelation},
@@ -1925,7 +1928,7 @@ mod encrypted_tests {
 
     use super::SqliteEventCacheStore;
 
-    static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
+    static TMP_DIR: LazyLock<TempDir> = LazyLock::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
 
     async fn get_event_cache_store() -> Result<SqliteEventCacheStore, EventCacheStoreError> {

@@ -6,7 +6,7 @@ use imbl::Vector;
 use matrix_sdk::{
     Client, ThreadingSupport, assert_let_timeout,
     deserialized_responses::{ThreadSummaryStatus, TimelineEvent},
-    event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate, ThreadEventCacheUpdate},
+    event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate, TimelineVectorDiffs},
     sleep::sleep,
     test_utils::{
         assert_event_matches_msg,
@@ -28,13 +28,13 @@ use tokio::sync::broadcast;
 /// stabilize.
 async fn wait_for_initial_events(
     mut events: Vec<TimelineEvent>,
-    stream: &mut broadcast::Receiver<ThreadEventCacheUpdate>,
+    stream: &mut broadcast::Receiver<TimelineVectorDiffs>,
 ) -> Vec<TimelineEvent> {
     if events.is_empty() {
         // Wait for a first update.
         let mut vector = Vector::new();
 
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = stream.recv());
 
         for diff in diffs {
             diff.apply(&mut vector);
@@ -111,11 +111,14 @@ async fn test_thread_can_paginate_even_if_seen_sync_event() {
         .mount()
         .await;
 
-    let hit_start =
-        room_event_cache.paginate_thread_backwards(thread_root_id.to_owned(), 42).await.unwrap();
-    assert!(hit_start);
+    let outcome = room_event_cache
+        .thread_pagination(thread_root_id.to_owned())
+        .run_backwards_once(42)
+        .await
+        .unwrap();
+    assert!(outcome.reached_start);
 
-    assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread_stream.recv());
+    assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread_stream.recv());
     assert_eq!(diffs.len(), 1);
     assert_let!(VectorDiff::Insert { index: 0, value } = &diffs[0]);
     assert_eq!(value.event_id().as_deref(), Some(thread_root_id));
@@ -180,7 +183,7 @@ async fn test_ignored_user_empties_threads() {
 
     // We do receive a clear.
     {
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread_stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread_stream.recv());
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Clear = &diffs[0]);
     }
@@ -201,7 +204,7 @@ async fn test_ignored_user_empties_threads() {
 
     // We do receive the new event.
     {
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread_stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread_stream.recv());
         assert_eq!(diffs.len(), 1);
 
         assert_let!(VectorDiff::Append { values: events } = &diffs[0]);
@@ -284,7 +287,7 @@ async fn test_gappy_sync_empties_all_threads() {
         .await;
 
     // The first thread contains all thread events, including the root.
-    assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread1_stream.recv());
+    assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread1_stream.recv());
     assert_eq!(diffs.len(), 1);
     assert_let!(VectorDiff::Append { values: thread1_events } = &diffs[0]);
     assert_eq!(thread1_events.len(), 3);
@@ -294,7 +297,7 @@ async fn test_gappy_sync_empties_all_threads() {
 
     // The second thread contains the in-thread event (but not the root, for the
     // same reason as above).
-    assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread2_stream.recv());
+    assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread2_stream.recv());
     assert_eq!(diffs.len(), 1);
     assert_let!(VectorDiff::Append { values: thread2_events } = &diffs[0]);
     assert_eq!(thread2_events.len(), 2);
@@ -303,7 +306,8 @@ async fn test_gappy_sync_empties_all_threads() {
 
     // The room contains all five events.
     assert_let_timeout!(
-        Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = room_stream.recv()
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+            room_stream.recv()
     );
     assert_eq!(diffs.len(), 3);
     assert_let!(VectorDiff::Append { values: room_events } = &diffs[0]);
@@ -325,12 +329,12 @@ async fn test_gappy_sync_empties_all_threads() {
 
     // Both threads are cleared.
     {
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread1_stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread1_stream.recv());
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Clear = &diffs[0]);
     }
     {
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread2_stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread2_stream.recv());
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Clear = &diffs[0]);
     }
@@ -338,7 +342,8 @@ async fn test_gappy_sync_empties_all_threads() {
     // The room is shrunk to the gap.
     {
         assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = room_stream.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                room_stream.recv()
         );
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Clear = &diffs[0]);
@@ -439,7 +444,11 @@ async fn test_deduplication() {
         .mount()
         .await;
 
-    room_event_cache.paginate_thread_backwards(thread_root.to_owned(), 42).await.unwrap();
+    room_event_cache
+        .thread_pagination(thread_root.to_owned())
+        .run_backwards_once(42)
+        .await
+        .unwrap();
 
     // The events were already known, so the stream is still empty.
     assert!(thread_stream.is_empty());
@@ -473,11 +482,15 @@ async fn thread_subscription_test_setup() -> ThreadSubscriptionTestSetup {
     // Assuming a client that's interested in thread subscriptions,
     let client = server
         .client_builder()
+        .no_server_versions()
         .on_builder(|builder| {
             builder.with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
         })
         .build()
         .await;
+
+    // Make sure to advertise support for thread subscriptions.
+    server.mock_versions().ok_with_unstable_features().mount().await;
 
     // Immediately subscribe the event cache to sync updates.
     client.event_cache().subscribe().unwrap();
@@ -574,7 +587,8 @@ async fn test_auto_subscribe_thread_via_sync() {
 
     // Let the event cache process the update.
     assert_let_timeout!(
-        Ok(RoomEventCacheUpdate::UpdateTimelineEvents { .. }) = s.subscriber.recv()
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            s.subscriber.recv()
     );
     assert_let_timeout!(Ok(()) = thread_subscriber_updates.recv());
 
@@ -604,7 +618,8 @@ async fn test_dont_auto_subscribe_on_already_subscribed_thread() {
 
     // Let the event cache process the update.
     assert_let_timeout!(
-        Ok(RoomEventCacheUpdate::UpdateTimelineEvents { .. }) = s.subscriber.recv()
+        Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { .. })) =
+            s.subscriber.recv()
     );
 
     // Let a bit of time for the background thread subscriber task to process the
@@ -686,12 +701,15 @@ async fn test_auto_subscribe_on_thread_paginate() {
         .mount()
         .await;
 
-    let hit_start =
-        room_event_cache.paginate_thread_backwards(thread_root_id.to_owned(), 42).await.unwrap();
-    assert!(hit_start);
+    let outcome = room_event_cache
+        .thread_pagination(thread_root_id.to_owned())
+        .run_backwards_once(42)
+        .await
+        .unwrap();
+    assert!(outcome.reached_start);
 
     // Let the event cache process the update.
-    assert_let_timeout!(Ok(ThreadEventCacheUpdate { .. }) = thread_stream.recv());
+    assert_let_timeout!(Ok(TimelineVectorDiffs { .. }) = thread_stream.recv());
     assert_let_timeout!(Ok(()) = thread_subscriber_updates.recv());
     assert!(thread_subscriber_updates.is_empty());
 }
@@ -772,12 +790,15 @@ async fn test_auto_subscribe_on_thread_paginate_root_event() {
         .mount()
         .await;
 
-    let hit_start =
-        room_event_cache.paginate_thread_backwards(thread_root_id.to_owned(), 42).await.unwrap();
-    assert!(hit_start);
+    let outcome = room_event_cache
+        .thread_pagination(thread_root_id.to_owned())
+        .run_backwards_once(42)
+        .await
+        .unwrap();
+    assert!(outcome.reached_start);
 
     // Let the event cache process the update.
-    assert_let_timeout!(Ok(ThreadEventCacheUpdate { .. }) = thread_stream.recv());
+    assert_let_timeout!(Ok(TimelineVectorDiffs { .. }) = thread_stream.recv());
     assert_let_timeout!(Ok(()) = thread_subscriber_updates.recv());
 }
 
@@ -851,7 +872,7 @@ async fn test_redact_touches_threads() {
 
     // The redaction affects the thread cache: it *removes* the redacted event.
     {
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread_stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread_stream.recv());
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Remove { index: 1 } = &diffs[0]);
 
@@ -864,7 +885,8 @@ async fn test_redact_touches_threads() {
     // - the thread summary is updated correctly.
     {
         assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = room_stream.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                room_stream.recv()
         );
         assert_eq!(diffs.len(), 3);
 
@@ -907,7 +929,7 @@ async fn test_redact_touches_threads() {
 
     // The redaction affects the thread cache: it *removes* the redacted event.
     {
-        assert_let_timeout!(Ok(ThreadEventCacheUpdate { diffs, .. }) = thread_stream.recv());
+        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = thread_stream.recv());
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Remove { index: 1 } = &diffs[0]);
 
@@ -920,7 +942,8 @@ async fn test_redact_touches_threads() {
     // - the thread summary is removed from the thread root.
     {
         assert_let_timeout!(
-            Ok(RoomEventCacheUpdate::UpdateTimelineEvents { diffs, .. }) = room_stream.recv()
+            Ok(RoomEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                room_stream.recv()
         );
         assert_eq!(diffs.len(), 3);
 

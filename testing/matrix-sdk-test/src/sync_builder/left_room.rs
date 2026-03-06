@@ -5,7 +5,7 @@ use ruma::{
     serde::Raw,
 };
 
-use super::{RoomAccountDataTestEvent, StateMutExt, StateTestEvent};
+use super::StateMutExt;
 use crate::DEFAULT_TEST_ROOM_ID;
 
 pub struct LeftRoomBuilder {
@@ -69,12 +69,6 @@ impl LeftRoomBuilder {
         self
     }
 
-    /// Add an event to the state.
-    pub fn add_state_event(mut self, event: StateTestEvent) -> Self {
-        self.inner.state.events_mut().push(event.into());
-        self
-    }
-
     /// Add events in bulk to the state.
     pub fn add_state_bulk<I>(mut self, events: I) -> Self
     where
@@ -85,7 +79,7 @@ impl LeftRoomBuilder {
     }
 
     /// Add room account data.
-    pub fn add_account_data(mut self, event: RoomAccountDataTestEvent) -> Self {
+    pub fn add_account_data(mut self, event: impl Into<Raw<AnyRoomAccountDataEvent>>) -> Self {
         self.inner.account_data.events.push(event.into());
         self
     }
