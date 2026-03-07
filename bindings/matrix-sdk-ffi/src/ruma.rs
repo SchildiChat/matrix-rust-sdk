@@ -250,6 +250,33 @@ pub fn message_event_content_from_html_as_emote(
     )))
 }
 
+#[matrix_sdk_ffi_macros::export]
+pub fn message_event_content_from_plaintext(
+    body: String,
+) -> Arc<RoomMessageEventContentWithoutRelation> {
+    Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::text_plain(
+        body,
+    )))
+}
+
+#[matrix_sdk_ffi_macros::export]
+pub fn message_event_content_from_plaintext_as_notice(
+    body: String,
+) -> Arc<RoomMessageEventContentWithoutRelation> {
+    Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::notice_plain(
+        body,
+    )))
+}
+
+#[matrix_sdk_ffi_macros::export]
+pub fn message_event_content_from_plaintext_as_emote(
+    body: String,
+) -> Arc<RoomMessageEventContentWithoutRelation> {
+    Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::emote_plain(
+        body,
+    )))
+}
+
 #[derive(Clone, uniffi::Object)]
 pub struct MediaSource {
     pub(crate) media_source: RumaMediaSource,
