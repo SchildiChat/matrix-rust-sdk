@@ -277,6 +277,11 @@ pub fn message_event_content_from_plaintext_as_emote(
     )))
 }
 
+#[matrix_sdk_ffi_macros::export]
+pub fn markdown_to_html(markdown: String) -> Option<String> {
+    RumaFormattedBody::markdown(&markdown).map(|formatted| formatted.body)
+}
+
 #[derive(Clone, uniffi::Object)]
 pub struct MediaSource {
     pub(crate) media_source: RumaMediaSource,
