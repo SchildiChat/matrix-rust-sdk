@@ -490,7 +490,7 @@ async fn thread_subscription_test_setup() -> ThreadSubscriptionTestSetup {
         .await;
 
     // Make sure to advertise support for thread subscriptions.
-    server.mock_versions().ok_with_unstable_features().mount().await;
+    server.mock_versions().with_thread_subscriptions().ok().mount().await;
 
     // Immediately subscribe the event cache to sync updates.
     client.event_cache().subscribe().unwrap();
@@ -899,12 +899,7 @@ async fn test_redact_touches_threads() {
         {
             assert_let!(VectorDiff::Set { index: 1, value: new_event } = &diffs[1]);
             let deserialized = new_event.raw().deserialize().unwrap();
-
-            // TODO: replace with https://github.com/ruma/ruma/pull/2254 when it's been merged in Ruma.
-            assert!(match deserialized {
-                AnySyncTimelineEvent::MessageLike(ev) => ev.is_redacted(),
-                AnySyncTimelineEvent::State(_ev) => unreachable!(),
-            });
+            assert!(deserialized.is_redacted());
         }
 
         // The thread summary is updated.
@@ -956,12 +951,7 @@ async fn test_redact_touches_threads() {
         {
             assert_let!(VectorDiff::Set { index: 2, value: new_event } = &diffs[1]);
             let deserialized = new_event.raw().deserialize().unwrap();
-
-            // TODO: replace with https://github.com/ruma/ruma/pull/2254 when it's been merged in Ruma.
-            assert!(match deserialized {
-                AnySyncTimelineEvent::MessageLike(ev) => ev.is_redacted(),
-                AnySyncTimelineEvent::State(_ev) => unreachable!(),
-            });
+            assert!(deserialized.is_redacted());
         }
 
         // The thread summary is removed.

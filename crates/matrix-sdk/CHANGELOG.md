@@ -8,6 +8,12 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add `Recovery::recover_and_fix_backup` to automatically fix key storage backup if the
+  private backup decryption key is missing, invalid or inconsistent with the public key.
+  ([#6252](https://github.com/matrix-org/matrix-rust-sdk/pull/6252))
+- Attempt to import stored room key bundles for rooms awaiting bundles at
+  client startup.
+  ([#6215](https://github.com/matrix-org/matrix-rust-sdk/pull/6215))
 - Add `OAuth::cached_server_metadata()` that caches the authorization server
   metadata for a while.
   ([#6217](https://github.com/matrix-org/matrix-rust-sdk/pull/6217))
@@ -88,10 +94,19 @@ All notable changes to this project will be documented in this file.
 
 ### Refactor
 
+- [**breaking**] The `UrlOrQuery` enum was moved from the `authentication::oauth`
+  module to the `utils` module. It can also be converted from a `QueryString`.
+  ([#6224](https://github.com/matrix-org/matrix-rust-sdk/pull/6224))
+- [**breaking**] `MatrixAuth::login_with_sso_callback()` takes a `UrlOrQuery`
+  instead of a `Url`, to make it more convenient to use with
+  `LocalServerBuilder` / `LocalServerRedirectHandle`.
+  ([#6224](https://github.com/matrix-org/matrix-rust-sdk/pull/6224))
+- [**breaking**] `Room::report_content()` no longer takes a `score` argument, because it was
+  removed from the Matrix specification. The `ReportedContentScore` type was removed too.
+  ([#6256](https://github.com/matrix-org/matrix-rust-sdk/pull/6256))
 - [**breaking**] `Client::enabled_thread_subscriptions()` is now async and fallible, as it will
   check for both static enablement of the thread subscription feature as well as dynamically
   checking that the user's homeserver supports it.
-  ([#6245](https://github.com/matrix-org/matrix-rust-sdk/pull/6245))
 - [**breaking**] `SessionChange::UnknownToken` is now a tuple variant containing
   an `UnknownTokenErrorData`.
   ([#6241](https://github.com/matrix-org/matrix-rust-sdk/pull/6241))

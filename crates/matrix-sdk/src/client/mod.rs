@@ -3702,7 +3702,13 @@ pub(crate) mod tests {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().no_server_versions().build().await;
 
-        server.mock_versions().ok_with_unstable_features().mock_once().mount().await;
+        server
+            .mock_versions()
+            .with_feature("org.matrix.e2e_cross_signing", true)
+            .ok()
+            .mock_once()
+            .mount()
+            .await;
 
         let unstable_features = client.unstable_features().await.unwrap();
         assert!(unstable_features.contains(&FeatureFlag::from("org.matrix.e2e_cross_signing")));
@@ -3714,7 +3720,7 @@ pub(crate) mod tests {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().no_server_versions().build().await;
 
-        server.mock_versions().ok_with_unstable_features().mock_once().mount().await;
+        server.mock_versions().with_push_encrypted_events().ok().mock_once().mount().await;
 
         let msc4028_enabled = client.can_homeserver_push_encrypted_event_to_device().await.unwrap();
         assert!(msc4028_enabled);
@@ -3831,7 +3837,8 @@ pub(crate) mod tests {
         let versions_mock = server
             .mock_versions()
             .expect_default_access_token()
-            .ok_with_unstable_features()
+            .with_feature("org.matrix.e2e_cross_signing", true)
+            .ok()
             .named("first versions mock")
             .expect(1)
             .mount_as_scoped()
@@ -4405,10 +4412,9 @@ pub(crate) mod tests {
 
         server
             .mock_versions()
-            .ok_custom(
-                &["v1.7", "v1.8", "v1.9", "v1.10"],
-                &[("org.matrix.msc3916.stable", true)].into(),
-            )
+            .with_versions(vec!["v1.7", "v1.8", "v1.9", "v1.10"])
+            .with_feature("org.matrix.msc3916.stable", true)
+            .ok()
             .named("versions")
             .expect(1)
             .mount()
@@ -4431,7 +4437,8 @@ pub(crate) mod tests {
 
         server
             .mock_versions()
-            .ok_custom(&["v1.1"], &Default::default())
+            .with_versions(vec!["v1.1"])
+            .ok()
             .named("versions")
             .expect(1)
             .mount()
