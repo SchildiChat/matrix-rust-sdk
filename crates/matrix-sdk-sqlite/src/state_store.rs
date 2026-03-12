@@ -1045,6 +1045,24 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
             .optional()?)
     }
 
+    /// SC
+    async fn get_global_account_data_events(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .prepare("SELECT data FROM global_account_data", |mut stmt| {
+                stmt.query(())?.mapped(|row| row.get(0)).collect()
+            })
+            .await?)
+    }
+
+    /// SC
+    async fn get_room_account_data_events(&self, room_id: Key) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .prepare("SELECT data FROM room_account_data WHERE room_id = ?", |mut stmt| {
+                stmt.query((room_id,))?.mapped(|row| row.get(0)).collect()
+            })
+            .await?)
+    }
+
     async fn get_display_names(
         &self,
         room_id: Key,
@@ -1806,6 +1824,32 @@ impl StateStore for SqliteStateStore {
             .await?
             .map(|value| self.deserialize_json(&value))
             .transpose()
+    }
+
+    /// SC
+    async fn get_account_data_events(&self) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>> {
+        self.read()
+            .await?
+            .get_global_account_data_events()
+            .await?
+            .iter()
+            .map(|value| self.deserialize_json(value))
+            .collect()
+    }
+
+    /// SC
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>> {
+        let room_id = self.encode_key(keys::ROOM_ACCOUNT_DATA, room_id);
+        self.read()
+            .await?
+            .get_room_account_data_events(room_id)
+            .await?
+            .iter()
+            .map(|value| self.deserialize_json(value))
+            .collect()
     }
 
     async fn get_user_room_receipt_event(
