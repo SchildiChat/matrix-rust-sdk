@@ -1388,6 +1388,20 @@ impl_state_store!({
             .transpose()
     }
 
+    async fn get_account_data_events(&self) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>> {
+        Ok(self
+            .inner
+            .transaction(keys::ACCOUNT_DATA)
+            .with_mode(TransactionMode::Readonly)
+            .build()?
+            .object_store(keys::ACCOUNT_DATA)?
+            .get_all()
+            .await?
+            .filter_map(Result::ok)
+            .filter_map(|f| self.deserialize_value(&f).ok())
+            .collect())
+    }
+
     async fn get_room_account_data_event(
         &self,
         room_id: &RoomId,
@@ -1402,6 +1416,25 @@ impl_state_store!({
             .await?
             .map(|f| self.deserialize_value(&f))
             .transpose()
+    }
+
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>> {
+        let range = self.encode_to_range(keys::ROOM_ACCOUNT_DATA, room_id);
+        Ok(self
+            .inner
+            .transaction(keys::ROOM_ACCOUNT_DATA)
+            .with_mode(TransactionMode::Readonly)
+            .build()?
+            .object_store(keys::ROOM_ACCOUNT_DATA)?
+            .get_all()
+            .with_query(&range)
+            .await?
+            .filter_map(Result::ok)
+            .filter_map(|f| self.deserialize_value(&f).ok())
+            .collect())
     }
 
     async fn get_user_room_receipt_event(

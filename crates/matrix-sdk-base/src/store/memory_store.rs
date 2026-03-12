@@ -731,6 +731,10 @@ impl StateStore for MemoryStore {
         Ok(self.inner.read().unwrap().account_data.get(&event_type).cloned())
     }
 
+    async fn get_account_data_events(&self) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>> {
+        Ok(self.inner.read().unwrap().account_data.values().cloned().collect())
+    }
+
     async fn get_room_account_data_event(
         &self,
         room_id: &RoomId,
@@ -744,6 +748,20 @@ impl StateStore for MemoryStore {
             .get(room_id)
             .and_then(|m| m.get(&event_type))
             .cloned())
+    }
+
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .room_account_data
+            .get(room_id)
+            .map(|events| events.values().cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn get_user_room_receipt_event(

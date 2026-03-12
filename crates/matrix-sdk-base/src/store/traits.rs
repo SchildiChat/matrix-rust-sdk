@@ -243,6 +243,11 @@ pub trait StateStore: AsyncTraitDeps {
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEvent>>, Self::Error>;
 
+    /// Get all events out of the account data store.
+    async fn get_account_data_events(
+        &self,
+    ) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>, Self::Error>;
+
     /// Get an event out of the room account data store.
     ///
     /// # Arguments
@@ -257,6 +262,12 @@ pub trait StateStore: AsyncTraitDeps {
         room_id: &RoomId,
         event_type: RoomAccountDataEventType,
     ) -> Result<Option<Raw<AnyRoomAccountDataEvent>>, Self::Error>;
+
+    /// Get all room account data events for the given room out of the store.
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>, Self::Error>;
 
     /// Get an event out of the user room receipt store.
     ///
@@ -656,12 +667,25 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         self.0.get_account_data_event(event_type).await.map_err(Into::into)
     }
 
+    async fn get_account_data_events(
+        &self,
+    ) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>, Self::Error> {
+        self.0.get_account_data_events().await.map_err(Into::into)
+    }
+
     async fn get_room_account_data_event(
         &self,
         room_id: &RoomId,
         event_type: RoomAccountDataEventType,
     ) -> Result<Option<Raw<AnyRoomAccountDataEvent>>, Self::Error> {
         self.0.get_room_account_data_event(room_id, event_type).await.map_err(Into::into)
+    }
+
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>, Self::Error> {
+        self.0.get_room_account_data_events(room_id).await.map_err(Into::into)
     }
 
     async fn get_user_room_receipt_event(

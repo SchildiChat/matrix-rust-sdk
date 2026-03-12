@@ -1389,11 +1389,27 @@ impl Client {
         Ok(event.map(|e| e.json().get().to_owned()))
     }
 
+    pub async fn account_data_events(
+        &self,
+    ) -> Result<Vec<crate::ruma::AccountDataRawEvent>, ClientError> {
+        let events = self.inner.state_store().get_account_data_events().await?;
+        events.into_iter().map(account_data_raw_event_from_event).collect()
+    }
+
     /// SC: get room account data event as JSON string
     pub async fn room_account_data(&self, room_id: String, event_type: String) -> Result<Option<String>, ClientError> {
         let room_id = RoomId::parse(room_id)?;
         let event = self.inner.account().room_account_data_raw((&room_id).into(), event_type.into()).await?;
         Ok(event.map(|e| e.json().get().to_owned()))
+    }
+
+    pub async fn room_account_data_events(
+        &self,
+        room_id: String,
+    ) -> Result<Vec<crate::ruma::AccountDataRawEvent>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let events = self.inner.state_store().get_room_account_data_events(&room_id).await?;
+        events.into_iter().map(account_data_raw_event_from_event).collect()
     }
 
     /// Set the given account data content for the given event type.
@@ -3002,6 +3018,23 @@ impl From<matrix_sdk::StoreSizes> for StoreSizes {
             media_store: value.media_store.map(|v| v as u64),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct RawAccountDataEventContent {
+    #[serde(rename = "type")]
+    event_type: String,
+    content: Raw<Value>,
+}
+
+fn account_data_raw_event_from_event<Ev>(
+    event: Raw<Ev>,
+) -> Result<crate::ruma::AccountDataRawEvent, ClientError> {
+    let event = event.deserialize_as_unchecked::<RawAccountDataEventContent>()?;
+    Ok(crate::ruma::AccountDataRawEvent {
+        event_type: event.event_type,
+        content: event.content.json().get().to_owned(),
+    })
 }
 
 #[cfg(test)]

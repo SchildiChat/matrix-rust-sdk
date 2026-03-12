@@ -1190,6 +1190,12 @@ pub enum AccountDataEventType {
     SecretStorageKey { key_id: String },
 }
 
+#[derive(Clone, uniffi::Record)]
+pub struct AccountDataRawEvent {
+    pub event_type: String,
+    pub content: String,
+}
+
 impl TryFrom<RumaGlobalAccountDataEventType> for AccountDataEventType {
     type Error = String;
 
