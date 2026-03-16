@@ -101,6 +101,22 @@ pub struct RoomInfo {
     /// Whether creators are privileged over every other user (have infinite
     /// power level).
     privileged_creators_role: bool,
+    /// All `m.bridge` state events in the room.
+    bridge_states: Vec<BridgeState>,
+}
+
+#[derive(uniffi::Record)]
+pub struct BridgeState {
+    state_key: String,
+    bridge_bot_user_id: Option<String>,
+    protocol: Option<BridgeStateProtocolInfo>,
+}
+
+#[derive(uniffi::Record)]
+pub struct BridgeStateProtocolInfo {
+    id: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
 }
 
 impl RoomInfo {
@@ -217,6 +233,19 @@ impl RoomInfo {
                 .and_then(|version| version.rules())
                 .map(|rules| rules.authorization.explicitly_privilege_room_creators)
                 .unwrap_or_default(),
+            bridge_states: room
+                .bridge_states()
+                .into_iter()
+                .map(|(state_key, content)| BridgeState {
+                    state_key,
+                    bridge_bot_user_id: content.bridge_bot.map(|user_id| user_id.to_string()),
+                    protocol: content.protocol.map(|protocol| BridgeStateProtocolInfo {
+                        id: protocol.id,
+                        display_name: protocol.displayname,
+                        avatar_url: protocol.avatar_url.map(|url| url.to_string()),
+                    }),
+                })
+                .collect(),
         })
     }
 }
