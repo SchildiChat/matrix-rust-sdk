@@ -28,6 +28,7 @@ use ruma::{
     events::{
         AnyPossiblyRedactedStateEventContent, AnyStrippedStateEvent, AnySyncStateEvent,
         AnySyncTimelineEvent, StateEventType,
+        bridge::BridgeEventContent,
         call::member::{
             CallMemberStateKey, MembershipData, PossiblyRedactedCallMemberEventContent,
         },
@@ -176,6 +177,9 @@ pub struct BaseRoomInfo {
     pub(crate) notable_tags: RoomNotableTags,
     /// The `m.room.pinned_events` of this room.
     pub(crate) pinned_events: Option<PossiblyRedactedRoomPinnedEventsEventContent>,
+    /// All `m.bridge` events in this room, keyed by state key.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub(crate) bridge_states: BTreeMap<String, MinimalStateEvent<BridgeEventContent>>,
 }
 
 impl BaseRoomInfo {
@@ -199,7 +203,8 @@ impl BaseRoomInfo {
         &mut self,
         raw_event: &mut RawStateEventWithKeys<T>,
     ) -> bool {
-        match (&raw_event.event_type, raw_event.state_key.as_str()) {
+        let state_key = raw_event.state_key.clone();
+        match (&raw_event.event_type, state_key.as_str()) {
             (StateEventType::RoomEncryption, "") => {
                 // To avoid breaking encrypted rooms, we ignore `m.room.encryption` events that
                 // fail to deserialize or that are redacted (i.e. they don't contain the
@@ -434,7 +439,26 @@ impl BaseRoomInfo {
                     self.pinned_events.take().is_some()
                 }
             }
-            _ => false,
+            (_, state_key) => {
+                if let Some(any_event) = raw_event.deserialize()
+                    && let Some(content) = as_variant!(
+                        any_event.get_content(),
+                        AnyPossiblyRedactedStateEventContent::Bridge
+                    )
+                {
+                    self.bridge_states.insert(
+                        state_key.to_owned(),
+                        MinimalStateEvent {
+                            content,
+                            event_id: any_event.get_event_id().map(ToOwned::to_owned),
+                        },
+                    );
+
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -485,6 +509,7 @@ impl BaseRoomInfo {
             self.space_children.retain(|_, s| s.event_id.as_deref() != Some(redacts));
             self.rtc_member_events
                 .retain(|_, member_event| member_event.event_id.as_deref() != Some(redacts));
+            self.bridge_states.retain(|_, bridge| bridge.event_id.as_deref() != Some(redacts));
         }
     }
 
@@ -525,6 +550,7 @@ impl Default for BaseRoomInfo {
             is_marked_unread_source: AccountDataSource::Unstable,
             notable_tags: RoomNotableTags::empty(),
             pinned_events: None,
+            bridge_states: BTreeMap::new(),
         }
     }
 }
@@ -1049,6 +1075,11 @@ impl RoomInfo {
     /// Get the content of the `m.room.create` event if any.
     pub fn create(&self) -> Option<&RoomCreateWithCreatorEventContent> {
         Some(&self.base_info.create.as_ref()?.content)
+    }
+
+    /// Get all `m.bridge` state events in this room, keyed by state key.
+    pub fn bridge_states(&self) -> &BTreeMap<String, MinimalStateEvent<BridgeEventContent>> {
+        &self.base_info.bridge_states
     }
 
     /// Get the content of the `m.room.tombstone` event if any.

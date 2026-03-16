@@ -47,6 +47,7 @@ use ruma::{
     EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId,
     RoomVersionId, UserId,
     events::{
+        bridge::BridgeEventContent,
         direct::OwnedDirectUserIdentifier,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
@@ -361,6 +362,16 @@ impl Room {
     /// Get the service members in this room, if available.
     pub fn service_members(&self) -> Option<BTreeSet<OwnedUserId>> {
         self.info.read().service_members().cloned()
+    }
+
+    /// Get all `m.bridge` state events in this room.
+    pub fn bridge_states(&self) -> Vec<(String, BridgeEventContent)> {
+        self.info
+            .read()
+            .bridge_states()
+            .iter()
+            .map(|(state_key, event)| (state_key.clone(), event.content.clone()))
+            .collect()
     }
 
     /// Get the current power levels of this room.
