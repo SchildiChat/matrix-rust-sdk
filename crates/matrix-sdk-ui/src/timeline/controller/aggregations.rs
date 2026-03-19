@@ -123,6 +123,8 @@ pub(crate) enum AggregationKind {
         /// The send status of the reaction this is, with handles to abort it if
         /// we can, etc.
         reaction_status: ReactionStatus,
+        /// SC com.beeper.reaction.shortcode
+        shortcode: Option<String>,
     },
 
     /// An event has been redacted.
@@ -257,7 +259,7 @@ impl Aggregation {
                 Err(err) => ApplyAggregationResult::Error(err),
             },
 
-            AggregationKind::Reaction { key, sender, timestamp, reaction_status } => {
+            AggregationKind::Reaction { key, sender, timestamp, reaction_status, shortcode } => {
                 let Some(reactions) = event.content().reactions() else {
                     // An item that can't hold any reactions.
                     return ApplyAggregationResult::LeftItemIntact;
@@ -296,7 +298,7 @@ impl Aggregation {
 
                     reactions.entry(key.clone()).or_default().insert(
                         sender.clone(),
-                        ReactionInfo { timestamp: *timestamp, status: reaction_status.clone() },
+                        ReactionInfo { timestamp: *timestamp, status: reaction_status.clone(), shortcode: shortcode.clone() },
                     );
 
                     ApplyAggregationResult::UpdatedItem

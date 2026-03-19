@@ -140,7 +140,7 @@ pub(super) struct TimelineEventContext {
 #[derive(Clone, Debug)]
 pub(super) enum HandleAggregationKind {
     /// Adding a reaction to the related event.
-    Reaction { key: String },
+    Reaction { key: String, shortcode: Option<String> },
 
     /// Redacting (removing) the related event.
     Redaction,
@@ -370,7 +370,7 @@ impl TimelineAction {
                 // This is a reaction to a message.
                 Self::HandleAggregation {
                     related_event: c.relates_to.event_id.clone(),
-                    kind: HandleAggregationKind::Reaction { key: c.relates_to.key },
+                    kind: HandleAggregationKind::Reaction { key: c.relates_to.key, shortcode: c.shortcode },
                 }
             }
 
@@ -605,8 +605,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             }
 
             TimelineAction::HandleAggregation { related_event, kind } => match kind {
-                HandleAggregationKind::Reaction { key } => {
-                    self.handle_reaction(related_event, key);
+                HandleAggregationKind::Reaction { key, shortcode } => {
+                    self.handle_reaction(related_event, key, shortcode);
                 }
                 HandleAggregationKind::Redaction => {
                     self.handle_redaction(related_event);
@@ -681,7 +681,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     /// Reactions to local events are applied in
     /// [`crate::timeline::TimelineController::handle_local_echo`].
     #[instrument(skip(self))]
-    fn handle_reaction(&mut self, relates_to: OwnedEventId, reaction_key: String) {
+    fn handle_reaction(&mut self, relates_to: OwnedEventId, reaction_key: String, shortcode: Option<String>) {
         let target = TimelineEventItemId::EventId(relates_to);
 
         // Add the aggregation to the manager.
@@ -703,6 +703,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 sender: self.ctx.sender.clone(),
                 timestamp: self.ctx.timestamp,
                 reaction_status,
+                shortcode, // SC
             },
         );
 

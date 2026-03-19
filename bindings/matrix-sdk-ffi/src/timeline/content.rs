@@ -219,6 +219,7 @@ pub enum TimelineItemContent {
 #[derive(Clone, uniffi::Record)]
 pub struct Reaction {
     pub key: String,
+    pub shortcode: Option<String>,
     pub senders: Vec<ReactionSenderData>,
 }
 
