@@ -90,6 +90,7 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
             .iter()
             .map(|(k, v)| Reaction {
                 key: k.to_owned(),
+                shortcode: v.first().map(|r| r.1.shortcode.clone()).flatten(), // SC
                 senders: v
                     .into_iter()
                     .map(|(sender_id, info)| ReactionSenderData {

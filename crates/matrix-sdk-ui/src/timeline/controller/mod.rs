@@ -1297,6 +1297,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 sender: self.room_data_provider.own_user_id().to_owned(),
                 timestamp: MilliSecondsSinceUnixEpoch::now(),
                 reaction_status,
+                shortcode: None, // SC
             },
         );
 

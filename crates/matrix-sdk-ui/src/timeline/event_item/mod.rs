@@ -687,6 +687,8 @@ pub struct ReactionInfo {
     pub timestamp: MilliSecondsSinceUnixEpoch,
     /// Current status of this reaction.
     pub status: ReactionStatus,
+    /// SC com.beeper.reaction.shortcode
+    pub shortcode: Option<String>,
 }
 
 /// Reactions grouped by key first, then by sender.
