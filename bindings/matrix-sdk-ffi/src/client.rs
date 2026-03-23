@@ -1071,6 +1071,11 @@ impl Client {
                         is_space: room.is_space(),
                     };
 
+                    // SC
+                    let room_appeared_unread_after_sync = room.num_unread_notifications() > 0
+                        || room.num_unread_mentions() > 0
+                        || room.is_marked_unread();
+
                     listener.on_notification(
                         NotificationItem {
                             event,
@@ -1081,6 +1086,7 @@ impl Client {
                             has_mention: Some(has_mention),
                             thread_id,
                             actions: Some(actions),
+                            room_appeared_unread_after_sync: Some(room_appeared_unread_after_sync), // SC
                         },
                         room_id,
                     );
