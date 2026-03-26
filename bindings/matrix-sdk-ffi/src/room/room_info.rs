@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use matrix_sdk::{EncryptionState, RoomState};
+use matrix_sdk::{CallIntentConsensus, EncryptionState, RoomState};
 use tracing::warn;
 
 use crate::{
@@ -25,9 +25,38 @@ use crate::{
         power_levels::RoomPowerLevels, Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom,
     },
     room_member::RoomMember,
+    ruma::RtcCallIntent,
+};
+
+// SC start
+use crate::{
     space_child_info::{SpaceChildInfo, space_children_info},
     event::StateEventType,
 };
+// SC end
+
+#[derive(Clone, uniffi::Enum)]
+pub enum RtcCallIntentConsensus {
+    Full(RtcCallIntent),
+    Partial { intent: RtcCallIntent, agreeing_count: u64, total_count: u64 },
+    None,
+}
+
+impl From<CallIntentConsensus> for RtcCallIntentConsensus {
+    fn from(value: CallIntentConsensus) -> Self {
+        match value {
+            CallIntentConsensus::Full(intent) => RtcCallIntentConsensus::Full(intent.into()),
+            CallIntentConsensus::Partial { intent, agreeing_count, total_count } => {
+                RtcCallIntentConsensus::Partial {
+                    intent: intent.into(),
+                    agreeing_count,
+                    total_count,
+                }
+            }
+            CallIntentConsensus::None => RtcCallIntentConsensus::None,
+        }
+    }
+}
 
 #[derive(uniffi::Record)]
 pub struct RoomInfo {
@@ -75,6 +104,8 @@ pub struct RoomInfo {
     /// SC: Space-specific fields
     space_children: Vec<SpaceChildInfo>,
     can_user_manage_spaces: bool,
+    /// SC end
+    active_room_call_consensus_intent: RtcCallIntentConsensus,
     /// Whether this room has been explicitly marked as unread
     is_marked_unread: bool,
     /// "Interesting" messages received in that room, independently of the
@@ -217,6 +248,7 @@ impl RoomInfo {
                 .iter()
                 .map(|u| u.to_string())
                 .collect(),
+            active_room_call_consensus_intent: room.active_room_call_consensus_intent().into(),
             is_marked_unread: room.is_marked_unread(),
             space_children: space_children_info(&room),
             can_user_manage_spaces,

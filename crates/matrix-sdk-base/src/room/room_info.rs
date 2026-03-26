@@ -51,6 +51,7 @@ use ruma::{
             tombstone::PossiblyRedactedRoomTombstoneEventContent,
             topic::PossiblyRedactedRoomTopicEventContent,
         },
+        rtc::notification::CallIntent,
         tag::{TagEventContent, TagName, Tags},
     },
     room::RoomType,
@@ -70,6 +71,7 @@ use crate::{
     latest_event::LatestEventValue,
     notification_settings::RoomNotificationMode,
     read_receipts::RoomReadReceipts,
+    room::call::CallIntentConsensus,
     store::{DynStateStore, StateStoreExt},
     sync::UnreadNotificationsCount,
     utils::{AnyStateEventEnum, RawStateEventWithKeys},
@@ -77,7 +79,7 @@ use crate::{
 
 // SC start
 use std::collections::HashMap;
-use ruma::events::space::child::SpaceChildEventContent;
+use ruma::events::space::child::PossiblyRedactedSpaceChildEventContent;
 // SC end
 
 /// The default value of the maximum power level.
@@ -157,7 +159,8 @@ pub struct BaseRoomInfo {
     pub(crate) topic: Option<MinimalStateEvent<PossiblyRedactedRoomTopicEventContent>>,
     /// The space children of this room, if it is a space.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-    pub(crate) space_children: HashMap<OwnedRoomId, MinimalStateEvent<SpaceChildEventContent>>,
+    pub(crate) space_children:
+        HashMap<OwnedRoomId, MinimalStateEvent<PossiblyRedactedSpaceChildEventContent>>,
     /// All minimal state events that containing one or more running matrixRTC
     /// memberships.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
@@ -1127,6 +1130,66 @@ impl RoomInfo {
         !self.active_room_call_memberships().is_empty()
     }
 
+    /// Get the call intent consensus for the current call, based on what
+    /// members are advertising.
+    ///
+    /// This provides detailed information about the consensus state (is it an
+    /// audio or video call), including whether it's full (all members
+    /// agree) or partial (only some members advertise), allowing callers to
+    /// distinguish between different levels of consensus.
+    ///
+    /// # Returns
+    ///
+    /// - [`CallIntentConsensus::Full`] if all members advertise and agree on
+    ///   the same intent
+    /// - [`CallIntentConsensus::Partial`] if only some members advertise but
+    ///   those who do agree
+    /// - [`CallIntentConsensus::None`] if no one advertises or advertisers
+    ///   disagree
+    pub fn active_room_call_consensus_intent(&self) -> CallIntentConsensus {
+        let memberships = self.active_room_call_memberships();
+        let total_count: u64 = memberships.len() as u64;
+
+        if total_count == 0 {
+            return CallIntentConsensus::None;
+        }
+
+        // Track the first intent found and count how many members advertise it
+        let mut consensus_intent: Option<CallIntent> = None;
+        let mut agreeing_count: u64 = 0;
+
+        for (_, data) in memberships.iter() {
+            if let Some(intent) = data.call_intent() {
+                match &consensus_intent {
+                    // First intent found, set it as consensus
+                    None => {
+                        consensus_intent = Some(intent.clone());
+                        agreeing_count = 1;
+                    }
+                    // Check if this intent matches the consensus
+                    Some(current) if current == intent => {
+                        agreeing_count += 1;
+                    }
+                    // Intents differ, no consensus
+                    Some(_) => return CallIntentConsensus::None,
+                }
+            }
+        }
+
+        // Return the appropriate consensus type based on participation
+        match consensus_intent {
+            None => CallIntentConsensus::None,
+            Some(intent) if agreeing_count == total_count => {
+                // All members advertise and agree
+                CallIntentConsensus::Full(intent)
+            }
+            Some(intent) => {
+                // Some members advertise and agree, others don't advertise
+                CallIntentConsensus::Partial { intent, agreeing_count, total_count }
+            }
+        }
+    }
+
     /// Returns a Vec of userId's that participate in the room call.
     ///
     /// matrix_rtc memberships with application "m.call" and scope "m.room" are
@@ -1170,6 +1233,16 @@ impl RoomInfo {
             .as_ref()
             .and_then(|content| content.pinned.as_deref())
             .is_some_and(|pinned| pinned.contains(&event_id.to_owned()))
+    }
+
+    /// Returns the computed read receipts for this room.
+    pub fn read_receipts(&self) -> &RoomReadReceipts {
+        &self.read_receipts
+    }
+
+    /// Set the computed read receipts for this room.
+    pub fn set_read_receipts(&mut self, read_receipts: RoomReadReceipts) {
+        self.read_receipts = read_receipts;
     }
 
     /// Apply migrations to this `RoomInfo` if needed.

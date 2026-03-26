@@ -28,7 +28,7 @@ pub fn space_children_info(room: &matrix_sdk::Room) -> Vec<SpaceChildInfo> {
     for (r, ev) in room.space_children().iter() {
         // Hasn't been replaced by empty state event?
         // The spec tells us to ignore children without `via`
-        if !ev.content.via.is_empty() {
+        if ev.content.via.as_deref().is_some_and(|v| !v.is_empty()) {
             space_children.push(
                 SpaceChildInfo::new(
                     r.to_string(),

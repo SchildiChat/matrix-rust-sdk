@@ -43,8 +43,7 @@ use super::{
     filters::BoxedFilterFn,
     /*
     sorters::{
-        BoxedSorterFn, new_sorter_latest_event, new_sorter_lexicographic, new_sorter_name,
-        new_sorter_recency,
+        new_sorter_latest_event, new_sorter_lexicographic, new_sorter_name, new_sorter_recency,
     },
     */
 };
@@ -149,25 +148,6 @@ impl RoomList {
         page_size: usize,
     ) -> (impl Stream<Item = Vec<VectorDiff<RoomListItem>>> + '_, RoomListDynamicEntriesController)
     {
-        self.entries_with_dynamic_adapters_impl(page_size, false)
-    }
-
-    #[doc(hidden)]
-    pub fn entries_with_dynamic_adapters_with(
-        &self,
-        page_size: usize,
-        enable_latest_event_sorter: bool,
-    ) -> (impl Stream<Item = Vec<VectorDiff<RoomListItem>>> + '_, RoomListDynamicEntriesController)
-    {
-        self.entries_with_dynamic_adapters_impl(page_size, enable_latest_event_sorter)
-    }
-
-    fn entries_with_dynamic_adapters_impl(
-        &self,
-        page_size: usize,
-        enable_latest_event_sorter: bool,
-    ) -> (impl Stream<Item = Vec<VectorDiff<RoomListItem>>> + '_, RoomListDynamicEntriesController)
-    {
         let room_info_notable_update_receiver = self.client.room_info_notable_update_receiver();
         let list = self.sliding_sync_list.clone();
 
@@ -199,31 +179,23 @@ impl RoomList {
                 let stream = merge_stream_and_receiver(values.clone(), raw_stream, room_info_notable_update_receiver.resubscribe());
 
                 /*
-                let mut sorters: Vec<BoxedSorterFn> = Vec::with_capacity(3);
-
-                if enable_latest_event_sorter {
-                    // Sort by latest event's kind, i.e. put the rooms with a
-                    // **local** latest event first.
-                    sorters.push(Box::new(new_sorter_latest_event()));
-                }
-
-                // Sort rooms by their recency (either by looking
-                // at their latest event's timestamp, or their
-                // `recency_stamp`).
-                sorters.push(Box::new(new_sorter_recency()));
-                // Finally, sort by name.
-                sorters.push(Box::new(new_sorter_name()));
-
                 let (values, stream) = (values, stream)
                     .filter(filter_fn)
-                    .sort_by(new_sorter_lexicographic(sorters))
+                    .sort_by(new_sorter_lexicographic(vec![
+                        // Sort by latest event's kind, i.e. put the rooms with a
+                        // **local** latest event first.
+                        Box::new(new_sorter_latest_event()),
+                        // Sort rooms by their recency (either by looking
+                        // at their latest event's timestamp, or their
+                        // `recency_stamp`).
+                        Box::new(new_sorter_recency()),
+                        // Finally, sort by name.
+                        Box::new(new_sorter_name()),
+                    ]))
                     .dynamic_head_with_initial_value(page_size, limit_stream.clone());
                 */
 
-                // TODO switch to this one again when upstream deprecates
-                // `enable_latest_event_sorter` or something
-                //let sc_sort_order_fn: BoxedSorterFn = current_sc_inbox_settings.sort_order.into();
-                let sc_sort_order_fn: BoxedSorterFn = crate::room_list_service::sc_room_list::get_sc_sort_box(current_sc_inbox_settings.sort_order, enable_latest_event_sorter);
+                let sc_sort_order_fn: BoxedSorterFn = current_sc_inbox_settings.sort_order.into();
                 let (values, stream) = (values, stream)
                     .filter(filter_fn)
                     .sort_by(sc_sort_order_fn)
