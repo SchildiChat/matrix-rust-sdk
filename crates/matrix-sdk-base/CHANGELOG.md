@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add support in the `MemoryStore`'s implementation of `EventCacheStore` for 
+  having duplicate events in a room, where each duplicate is in a different 
+  `LinkedChunk`. This is useful, e.g., when an event is in a room and a 
+  thread in that room. 
+  (#[6200](https://github.com/matrix-org/matrix-rust-sdk/pull/6200))
 - Add `StateStore::upsert_thread_subscriptions()` method for bulk upserts.
   ([#5848](https://github.com/matrix-org/matrix-rust-sdk/pull/5848))
 - The `LatestEventValue::LocalHasBeenSent` variant gains a new `event_id:
@@ -33,6 +38,11 @@ All notable changes to this project will be documented in this file.
 - [**breaking**] `RelationalLinkedChunk::apply_updates` returns an error rather
   than panicking. This is necessary in order to ensure certain behaviors are disallowed.
   ([#6061](https://github.com/matrix-org/matrix-rust-sdk/pull/6061))
+- Add `RoomInfo::active_room_call_consensus_intent()` method to get the call intent for the current call,
+  based on what members are advertising.
+  ([#6274](https://github.com/matrix-org/matrix-rust-sdk/pull/6274))
+- Add `Room::is_call` to check for Call rooms (MSC3417)
+  ([#6315](https://github.com/matrix-org/matrix-rust-sdk/pull/6315))
 
 ### Refactor
 
