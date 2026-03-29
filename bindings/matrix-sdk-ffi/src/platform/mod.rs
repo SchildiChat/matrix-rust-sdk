@@ -49,9 +49,6 @@ const DEFAULT_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 mod rolling_writer;
 pub mod tracing;
 
-#[cfg(target_os = "android")]
-mod android_platform;
-
 use rolling_writer::SizeAndDateRollingWriter;
 
 use self::tracing::LogLevel;
@@ -685,9 +682,6 @@ pub fn init_platform(
         }
     }
 
-    #[cfg(target_os = "android")]
-    android_platform::init();
-
     Ok(())
 }
 
@@ -745,10 +739,6 @@ fn setup_multithreaded_tokio_runtime() {
 
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all();
-        #[cfg(target_os = "android")]
-        builder.on_thread_start(|| {
-            _ = android_platform::android_attach_current_thread_permanently();
-        });
         builder
     }));
 }
