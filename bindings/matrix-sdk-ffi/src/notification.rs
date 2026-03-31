@@ -73,10 +73,6 @@ pub struct NotificationItem {
 
     /// The push actions for this notification (notify, sound, highlight, etc.).
     pub actions: Option<Vec<crate::notification_settings::Action>>,
-
-    /// SC: Whether the room still appeared unread after the sync that emitted this
-    /// notification had been fully processed.
-    pub room_appeared_unread_after_sync: Option<bool>,
 }
 
 impl NotificationItem {
@@ -120,7 +116,6 @@ impl NotificationItem {
             actions: item
                 .actions
                 .map(|a| a.into_iter().filter_map(|action| action.try_into().ok()).collect()),
-            room_appeared_unread_after_sync: None, // SC
         }
     }
 }
