@@ -29,6 +29,7 @@ mod space_child_info;
 mod spaces;
 mod store;
 mod sync_service;
+mod sync_v2;
 mod task_handle;
 mod timeline;
 mod utd;
