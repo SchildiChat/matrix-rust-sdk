@@ -117,6 +117,9 @@ pub struct RoomInfo {
     /// Events causing mentions/highlights for the user, according to their
     /// notification settings.
     num_unread_mentions: u64,
+    /// Whether any client-generated unread count is based on incomplete local
+    /// information.
+    has_incomplete_unread_count: bool,
     /// The currently pinned event ids.
     pinned_event_ids: Vec<String>,
     /// The join rule for this room, if known.
@@ -255,6 +258,7 @@ impl RoomInfo {
             num_unread_messages: room.num_unread_messages(),
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),
+            has_incomplete_unread_count: room.has_incomplete_unread_count(),
             pinned_event_ids,
             join_rule,
             history_visibility: room.history_visibility_or_default().try_into()?,

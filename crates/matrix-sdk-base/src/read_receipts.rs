@@ -51,6 +51,11 @@ pub struct RoomReadReceipts {
     /// mentions)
     pub num_mentions: u64,
 
+    /// Whether any unread count is best-effort because the local timeline is
+    /// incomplete or there are unresolved pending receipts.
+    #[serde(default)]
+    pub has_incomplete_unread_count: bool,
+
     /// The latest read receipt (main-threaded or unthreaded) known for the
     /// room.
     pub latest_active: Option<LatestReadReceipt>,
@@ -73,6 +78,7 @@ impl Default for RoomReadReceipts {
             num_unread: Default::default(),
             num_notifications: Default::default(),
             num_mentions: Default::default(),
+            has_incomplete_unread_count: true,
             latest_active: Default::default(),
             pending: new_nonempty_ring_buffer(),
         }

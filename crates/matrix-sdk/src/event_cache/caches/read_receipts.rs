@@ -97,6 +97,7 @@ use matrix_sdk_base::{
 };
 use matrix_sdk_common::{
     deserialized_responses::TimelineEvent, ring_buffer::RingBuffer,
+    linked_chunk::Position,
     serde_helpers::extract_thread_root,
 };
 use ruma::{
@@ -353,6 +354,8 @@ pub(crate) fn compute_unread_counts(
     )
     .map(|event_id| LatestReadReceipt { event_id });
 
+    let active_receipt = new_receipt.clone().or_else(|| read_receipts.latest_active.clone());
+
     if let Some(new_receipt) = new_receipt {
         // We've found the id of an event to which the receipt attaches. The associated
         // event may either come from the new batch of events associated to
@@ -373,6 +376,11 @@ pub(crate) fn compute_unread_counts(
             linked_chunk.events().map(|(_pos, event)| event),
             with_threading_support,
         );
+        read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
+            linked_chunk,
+            active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
+            !read_receipts.pending.is_empty(),
+        );
 
         debug!(?read_receipts, "after finding a better receipt");
         return;
@@ -390,7 +398,51 @@ pub(crate) fn compute_unread_counts(
         read_receipts.process_event(event, user_id, with_threading_support);
     }
 
+    read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
+        linked_chunk,
+        active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
+        !read_receipts.pending.is_empty(),
+    );
+
     debug!(?read_receipts, "no better receipt");
+}
+
+fn has_incomplete_unread_count(
+    linked_chunk: &EventLinkedChunk,
+    active_receipt_event_id: Option<&EventId>,
+    has_pending_receipts: bool,
+) -> bool {
+    if has_pending_receipts {
+        return true;
+    }
+
+    match active_receipt_event_id.and_then(|event_id| find_event_position(linked_chunk, event_id)) {
+        Some(position) => has_gap_after_position(linked_chunk, position),
+        None => {
+            linked_chunk.chunks().any(|chunk| chunk.is_gap())
+                || linked_chunk.chunks().next().is_none_or(|chunk| !chunk.is_definitive_head())
+        }
+    }
+}
+
+fn find_event_position(linked_chunk: &EventLinkedChunk, event_id: &EventId) -> Option<Position> {
+    linked_chunk
+        .events()
+        .find_map(|(position, event)| (event.event_id().as_deref() == Some(event_id)).then_some(position))
+}
+
+fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -> bool {
+    for chunk in linked_chunk.rchunks() {
+        if chunk.identifier() == position.chunk_identifier() {
+            return false;
+        }
+
+        if chunk.is_gap() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Is the event worth marking a room as unread?
