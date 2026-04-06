@@ -1079,6 +1079,54 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         Ok(())
     }
 
+    /// SC: Optimistically apply a locally-sent unthreaded read receipt to the
+    /// current room info and recompute client-side unread counts from it.
+    pub async fn update_unreads_with_local_receipt(
+        &mut self,
+        event_id: OwnedEventId,
+    ) -> Result<(), EventCacheError> {
+        let Some(room) = self.state.weak_room.get() else {
+            debug!(%event_id, "can't update local read receipt: client's closing");
+            return Ok(());
+        };
+
+        let state = &mut *self.state;
+        let user_id = &state.own_user_id;
+        let room_id = &state.room_id;
+
+        let prev_read_receipts = room.read_receipts().clone();
+        let mut read_receipts = prev_read_receipts.clone();
+        read_receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt { event_id });
+
+        compute_unread_counts(
+            user_id,
+            room_id,
+            None,
+            &state.room_linked_chunk,
+            &mut read_receipts,
+            state.enabled_thread_support,
+        );
+
+        if prev_read_receipts != read_receipts {
+            let client = room.client();
+            let _state_store_lock = client.base_client().state_store_lock().lock().await;
+
+            let mut room_info = room.clone_info();
+            room_info.set_read_receipts(read_receipts);
+
+            let mut state_changes = StateChanges::default();
+            state_changes.add_room(room_info.clone());
+
+            if let Err(error) = client.state_store().save_changes(&state_changes).await {
+                error!(room_id = ?room.room_id(), ?error, "Failed to save the changes");
+            }
+
+            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT);
+        }
+
+        Ok(())
+    }
+
     pub(in super::super) fn get_or_reload_thread(
         &mut self,
         root_event_id: OwnedEventId,
