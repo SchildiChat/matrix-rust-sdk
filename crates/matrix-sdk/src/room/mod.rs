@@ -2161,9 +2161,37 @@ impl Room {
         thread: ReceiptThread,
         event_id: OwnedEventId,
     ) -> Result<()> {
+        self.send_single_receipt_inner(receipt_type, thread, event_id, false).await
+    }
+
+    /// Send a request to set a single receipt while allowing the fully-read
+    /// marker to move backwards.
+    #[instrument(skip_all)]
+    pub async fn send_single_receipt_allowing_backward(
+        &self,
+        receipt_type: create_receipt::v3::ReceiptType,
+        thread: ReceiptThread,
+        event_id: OwnedEventId,
+    ) -> Result<()> {
+        self.send_single_receipt_inner(receipt_type, thread, event_id, true).await
+    }
+
+    #[instrument(skip_all)]
+    async fn send_single_receipt_inner(
+        &self,
+        receipt_type: create_receipt::v3::ReceiptType,
+        thread: ReceiptThread,
+        event_id: OwnedEventId,
+        allow_backward: bool,
+    ) -> Result<()> {
         // Since the receipt type and the thread aren't Hash/Ord, flatten then as a
         // string key.
-        let request_key = format!("{}|{}", receipt_type, thread.as_str().unwrap_or("<unthreaded>"));
+        let request_key = format!(
+            "{}|{}|allow_backward={}",
+            receipt_type,
+            thread.as_str().unwrap_or("<unthreaded>"),
+            allow_backward
+        );
 
         self.client
             .inner
@@ -2179,6 +2207,7 @@ impl Room {
                     event_id,
                 );
                 request.thread = thread;
+                request.allow_backward = allow_backward;
 
                 self.client.send(request).await?;
 
@@ -2211,6 +2240,7 @@ impl Room {
             fully_read,
             read_receipt: public_read_receipt,
             private_read_receipt,
+            allow_backward: false,
         });
 
         self.client.send(request).await?;
