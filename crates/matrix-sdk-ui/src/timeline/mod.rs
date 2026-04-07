@@ -769,7 +769,11 @@ impl Timeline {
         event_id: OwnedEventId,
     ) -> Result<bool> {
         trace!("force-sending receipt");
-        self.room().send_single_receipt(receipt_type, thread, event_id).await?;
+        if receipt_type == ReceiptType::FullyRead {
+            self.room().send_single_receipt_allowing_backward(receipt_type, thread, event_id).await?;
+        } else {
+            self.room().send_single_receipt(receipt_type, thread, event_id).await?;
+        }
         Ok(true)
     }
 
