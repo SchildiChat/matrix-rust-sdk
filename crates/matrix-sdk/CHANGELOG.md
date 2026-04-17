@@ -8,6 +8,27 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Latest Event does not emit an update when it computes the same value as the
+  previous Latest Event.
+  ([#6396](https://github.com/matrix-org/matrix-rust-sdk/pull/6396))
+- Add support for pushing the backup key to other clients, and receiving a
+  pushed backup key from other clients
+  ([MSC4385](https://github.com/matrix-org/matrix-spec-proposals/pull/4385)),
+  gated behind the `experimental-push-secrets` feature.
+  ([#6432](https://github.com/matrix-org/matrix-rust-sdk/pull/6432))
+- Add `room_versions()` & `account_moderation()` to `HomeserverCapabilities`.
+  ([#6413](https://github.com/matrix-org/matrix-rust-sdk/pull/6413))
+- Enable sending redaction events through the send queue via `RoomSendQueue::redact`.
+  This includes local echoes for redaction events through the new `LocalEchoContent::Redaction`
+  variant.
+  ([#6250](https://github.com/matrix-org/matrix-rust-sdk/pull/6250))
+- [**breaking**] Remove support for `native-tls` and remove all feature
+  flags for selecting TLS backend, as `rustls` is the now the only supported
+  TLS backend.
+  ([#6409](https://github.com/matrix-org/matrix-rust-sdk/pull/6409))
+- [**breaking**] Added `HomeserverCapabilities` and `Client::homeserver_capabilities()` to get the capabilities
+  of the homeserver. This replaces `Client::get_capabilities()`. 
+  ([#6371](https://github.com/matrix-org/matrix-rust-sdk/pull/6371))
 - [**breaking**] `matrix_sdk::error::Error` has a new variant `Timeout` which occurs when
   a cross-signing reset does not succeed after some period of time.
   ([#6325](https://github.com/matrix-org/matrix-rust-sdk/pull/6325))
@@ -86,9 +107,28 @@ All notable changes to this project will be documented in this file.
   to true will now trigger a download of all historical keys for the room in
   question from the client's key backup.
   ([#6017](https://github.com/matrix-org/matrix-rust-sdk/pull/6017))
+- Add widget partial support for MSC4039. Allows widgets to download non-encrypted files from the
+  content repository (like avatars).
+  ([#6354](https://github.com/matrix-org/matrix-rust-sdk/pull/6354))
+
+### Breaking Changes
+
+- `Room::observe_live_location_shares` has been replaced by `Room::live_location_shares`.
+  The new API returns a `LiveLocationShares` struct with a `subscribe()` method that provides an initial
+  snapshot (`Vector<LiveLocationShare>`) and a batched stream of `VectorDiff` updates, instead of
+  emitting individual `LiveLocationShare` items as beacon events arrive. The initial snapshot is loaded
+  from the event cache on creation, includes the own user's shares (previously excluded), and properly
+  handles share start/stop by listening to beacon_info state events.
+  ([#6385](https://github.com/matrix-org/matrix-rust-sdk/pull/6385))
 
 ### Bugfix
 
+- Fix an infinite loop when loading pinned events from the storage.
+  ([#6453](https://github.com/matrix-org/matrix-rust-sdk/pull/6453))
+- `beacon_info` stop events (`live: false`, [MSC3672](https://github.com/matrix-org/matrix-spec-proposals/pull/3672))
+  are now also eligible as the latest event for a room, preventing the live location sharing item
+  from disappearing from the room list summary once the session ends.
+  ([#6373](https://github.com/matrix-org/matrix-rust-sdk/pull/6373))
 - Android: add back custom certificates and disabling SSL verification options in `ClientBuilder` using 
   the previous `webkpi` verifier instead of platform verifier, otherwise these features will fail. 
   ([#6328](https://github.com/matrix-org/matrix-rust-sdk/pull/6328))
@@ -125,6 +165,10 @@ All notable changes to this project will be documented in this file.
 
 ### Refactor
 
+- [**breaking**] Update `Encryption::{spin_lock_store, try_lock_once_store}` so that lock dirtiness
+  is determined entirely by `CrossProcessLock`, rather than logic defined by `OlmMachine`. Also enforce
+  that lock generation is opaque by removing `CrossProcessLockStoreGuardWithGeneration`.
+  ([#6326](https://github.com/matrix-org/matrix-rust-sdk/pull/6326))
 - [**breaking**] The `EventCache` now owns pagination tasks, and will run them to completion, even
   if a manual caller stopped polling the called future.
   ([#6304](https://github.com/matrix-org/matrix-rust-sdk/pull/6304))

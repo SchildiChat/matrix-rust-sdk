@@ -100,12 +100,20 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::MemberHints, ""),
     (StateEventType::SpaceParent, "*"),
     (StateEventType::SpaceChild, "*"),
+    // Required for live location sharing to work - beacon events reference this state.
+    (StateEventType::BeaconInfo, "*"),
 ];
 
 /// The default `required_state` constant value for sliding sync room
 /// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
 const DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: &[(StateEventType, &str)] =
     &[(StateEventType::RoomPinnedEvents, "")];
+
+/// The default Sliding Sync connection ID for the room list service.
+pub(crate) const DEFAULT_CONNECTION_ID: &str = "room-list";
+
+/// The default timeline limit for the room list service.
+pub(crate) const DEFAULT_LIST_TIMELINE_LIMIT: u32 = 3;
 
 /// The default `timeline_limit` value when used with room subscriptions.
 const DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT: u32 = 20;
@@ -135,16 +143,25 @@ impl RoomListService {
     /// to create one in this case using
     /// [`EncryptionSyncService`][crate::encryption_sync_service::EncryptionSyncService].
     pub async fn new(client: Client) -> Result<Self, Error> {
-        Self::new_with_share_pos(client, true).await
+        Self::new_with(client, true, DEFAULT_CONNECTION_ID, DEFAULT_LIST_TIMELINE_LIMIT).await
     }
 
-    /// Like [`RoomListService::new`] but with a flag to turn the
-    /// [`SlidingSyncBuilder::share_pos`] on and off.
+    /// Like [`RoomListService::new`] but with additional configuration options.
+    ///
+    /// - `share_pos`: toggles [`SlidingSyncBuilder::share_pos`] for
+    ///   cross-process position sharing.
+    /// - `connection_id`: the Sliding Sync connection ID
+    /// - `timeline_limit`: the timeline limit
     ///
     /// [`SlidingSyncBuilder::share_pos`]: matrix_sdk::sliding_sync::SlidingSyncBuilder::share_pos
-    pub async fn new_with_share_pos(client: Client, share_pos: bool) -> Result<Self, Error> {
+    pub async fn new_with(
+        client: Client,
+        share_pos: bool,
+        connection_id: &str,
+        timeline_limit: u32,
+    ) -> Result<Self, Error> {
         let mut builder = client
-            .sliding_sync("room-list")
+            .sliding_sync(connection_id)
             .map_err(Error::SlidingSync)?
             .with_account_data_extension(
                 assign!(http::request::AccountData::default(), { enabled: Some(true) }),
@@ -202,7 +219,7 @@ impl RoomListService {
                         SlidingSyncMode::new_selective()
                             .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
                     )
-                    .timeline_limit(3)
+                    .timeline_limit(timeline_limit)
                     .required_state(
                         DEFAULT_REQUIRED_STATE
                             .iter()
@@ -560,50 +577,18 @@ mod tests {
     use std::future::ready;
 
     use futures_util::{StreamExt, pin_mut};
-    use matrix_sdk::{
-        Client, SlidingSyncMode, config::RequestConfig, test_utils::client::mock_matrix_session,
-    };
-    use matrix_sdk_test::async_test;
-    use ruma::api::MatrixVersion;
-    use serde_json::json;
-    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate, http::Method};
+    use matrix_sdk::{SlidingSyncMode, test_utils::mocks::MatrixMockServer};
+    use matrix_sdk_test::{TestError, async_test};
+    use ruma::{api::client::sync::sync_events::v5, assign, uint};
 
     use super::{ALL_ROOMS_LIST_NAME, Error, RoomListService, State};
 
-    async fn new_client() -> (Client, MockServer) {
-        let session = mock_matrix_session();
-
-        let server = MockServer::start().await;
-        let client = Client::builder()
-            .homeserver_url(server.uri())
-            .server_versions([MatrixVersion::V1_0])
-            .request_config(RequestConfig::new().disable_retry())
-            .build()
-            .await
-            .unwrap();
-        client.restore_session(session).await.unwrap();
-
-        (client, server)
-    }
-
-    pub(super) async fn new_room_list() -> Result<RoomListService, Error> {
-        let (client, _) = new_client().await;
-
-        RoomListService::new(client).await
-    }
-
-    struct SlidingSyncMatcher;
-
-    impl Match for SlidingSyncMatcher {
-        fn matches(&self, request: &Request) -> bool {
-            request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
-                && request.method == Method::POST
-        }
-    }
-
     #[async_test]
-    async fn test_all_rooms_are_declared() -> Result<(), Error> {
-        let room_list = new_room_list().await?;
+    async fn test_all_rooms_are_declared() -> Result<(), TestError> {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_list = RoomListService::new(client).await?;
+
         let sliding_sync = room_list.sliding_sync();
 
         // List is present, in Selective mode.
@@ -622,7 +607,8 @@ mod tests {
 
     #[async_test]
     async fn test_expire_sliding_sync_session_manually() -> Result<(), Error> {
-        let (client, server) = new_client().await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
         let room_list = RoomListService::new(client).await?;
 
@@ -631,20 +617,17 @@ mod tests {
 
         // Run a first sync.
         {
-            let _mock_guard = Mock::given(SlidingSyncMatcher)
-                .respond_with(move |_request: &Request| {
-                    ResponseTemplate::new(200).set_body_json(json!({
-                        "pos": "0",
-                        "lists": {
-                            ALL_ROOMS_LIST_NAME: {
-                                "count": 0,
-                                "ops": [],
-                            },
-                        },
-                        "rooms": {},
-                    }))
+            let _mock_guard = server
+                .mock_sliding_sync()
+                .ok({
+                    let mut response = v5::Response::new("0".to_owned());
+                    response.lists.insert(
+                        ALL_ROOMS_LIST_NAME.to_owned(),
+                        assign!(v5::response::List::default(), { count: uint!(0) }),
+                    );
+                    response
                 })
-                .mount_as_scoped(&server)
+                .mount_as_scoped()
                 .await;
 
             let _ = sync.next().await;
