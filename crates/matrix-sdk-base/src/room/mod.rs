@@ -224,12 +224,6 @@ impl Room {
         self.info.read().read_receipts.num_mentions
     }
 
-    /// Whether any client-generated unread count is based on incomplete local
-    /// information.
-    pub fn has_incomplete_unread_count(&self) -> bool {
-        self.info.read().read_receipts.has_incomplete_unread_count
-    }
-
     /// Get the detailed information about read receipts for the room.
     pub fn read_receipts(&self) -> RoomReadReceipts {
         self.info.read().read_receipts.clone()
