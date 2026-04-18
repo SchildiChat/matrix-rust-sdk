@@ -15,40 +15,38 @@
 use std::{collections::HashMap, fs, path::PathBuf, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
-use futures_util::{pin_mut, StreamExt};
+use futures_util::{StreamExt, pin_mut};
 use matrix_sdk::{
-    encryption::LocalTrust,
-    room::{
-        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
-    },
-    send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
     ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
     DraftAttachment as SdkDraftAttachment, DraftAttachmentContent, DraftThumbnail, EncryptionState,
     PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
     SuccessorRoom as SdkSuccessorRoom,
+    encryption::LocalTrust,
+    room::{
+        Room as SdkRoom, RoomMemberRole, edit::EditedContent, power_levels::RoomPowerLevelChanges,
+    },
+    send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
 };
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
-    timeline::{default_event_filter, RoomExt, TimelineBuilder},
+    timeline::{RoomExt, TimelineBuilder, default_event_filter},
     unable_to_decrypt_hook::UtdHookManager,
 };
 use mime::Mime;
 use ruma::{
-    assign,
+    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
+    ServerName, UserId, assign,
     events::{
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
         receipt::ReceiptThread,
         room::{
-            avatar::ImageInfo as RumaAvatarImageInfo,
+            MediaSource as RumaMediaSource, avatar::ImageInfo as RumaAvatarImageInfo,
             history_visibility::HistoryVisibility as RumaHistoryVisibility,
             join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
-            MediaSource as RumaMediaSource,
         },
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
-    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
-    ServerName, UserId,
 };
-use tracing::{error, warn};
+use tracing::error;
 
 // SC
 use crate::space_child_info::{SpaceChildInfo, space_children_info};
@@ -57,25 +55,23 @@ use ruma::RoomId;
 
 use self::{power_levels::RoomPowerLevels, room_info::RoomInfo};
 use crate::{
+    TaskHandle,
     chunk_iterator::ChunkIterator,
     client::{JoinRule, RoomVisibility},
     error::{ClientError, MediaInfoError, NotYetImplemented, QueueWedgeError, RoomError},
     event::TimelineEvent,
     identity_status_change::IdentityStatusChange,
-    live_location_share::{LastLocation, LiveLocationShare},
+    live_location_share::LiveLocationShares,
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
-    ruma::{
-        AudioInfo, FileInfo, ImageInfo, LocationContent, MediaSource, ThumbnailInfo, VideoInfo,
-    },
+    ruma::{AudioInfo, FileInfo, ImageInfo, MediaSource, ThumbnailInfo, VideoInfo},
     runtime::get_runtime_handle,
     timeline::{
+        AbstractProgress, LatestEventValue, ReceiptType, SendHandle, Timeline, UploadSource,
         configuration::{TimelineConfiguration, TimelineFilter},
         threads::{ThreadListService, ThreadSubscription},
-        AbstractProgress, LatestEventValue, ReceiptType, SendHandle, Timeline, UploadSource,
     },
-    utils::{u64_to_uint, AsyncRuntimeDropped},
-    TaskHandle,
+    utils::{AsyncRuntimeDropped, u64_to_uint},
 };
 
 mod power_levels;
@@ -851,12 +847,18 @@ impl Room {
     pub async fn force_send_single_receipt(&self, receipt_type: ReceiptType, event_id: String) -> Result<(), ClientError> {
         let timeline = TimelineBuilder::new(&self.inner).build().await?;
         let event_id = EventId::parse(event_id)?;
+        let should_update_local_unreads = matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         timeline.force_send_single_receipt(
             receipt_type.into(),
             ReceiptThread::Unthreaded,
-            event_id,
+            event_id.clone(),
         ).await?;
+        if should_update_local_unreads {
+            if let Ok((room_event_cache, _drop_handles)) = self.inner.event_cache().await {
+                let _ = room_event_cache.update_unreads_with_local_receipt(event_id).await;
+            }
+        }
         Ok(())
     }
     pub async fn get_state_event_raw(&self, event_type: String, state_key: String) -> Result<Option<String>, ClientError> {
@@ -1232,46 +1234,16 @@ impl Room {
         }))))
     }
 
-    /// Subscribes to live location shares in this room, using a `listener` to
-    /// be notified of the changes.
+    /// Returns the active live location shares for this room.
     ///
-    /// The current live location shares will be emitted immediately when
-    /// subscribing, along with a [`TaskHandle`] to cancel the subscription.
-    pub fn subscribe_to_live_location_shares(
-        self: Arc<Self>,
-        listener: Box<dyn LiveLocationShareListener>,
-    ) -> Arc<TaskHandle> {
-        let room = self.inner.clone();
-
-        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            let subscription = room.observe_live_location_shares();
-            let stream = subscription.subscribe();
-            let mut pinned_stream = pin!(stream);
-
-            while let Some(event) = pinned_stream.next().await {
-                let last_location = LocationContent {
-                    body: "".to_owned(),
-                    geo_uri: event.last_location.location.uri.clone().to_string(),
-                    description: None,
-                    zoom_level: None,
-                    asset: event.beacon_info.as_ref().map(|b| b.asset.type_.clone()).into(),
-                };
-
-                let Some(beacon_info) = event.beacon_info else {
-                    warn!("Live location share is missing the associated beacon_info state, skipping event.");
-                    continue;
-                };
-
-                listener.call(vec![LiveLocationShare {
-                    last_location: LastLocation {
-                        location: last_location,
-                        ts: event.last_location.ts.0.into(),
-                    },
-                    is_live: beacon_info.is_live(),
-                    user_id: event.user_id.to_string(),
-                }])
-            }
-        })))
+    /// The returned [`LiveLocationShares`] object tracks which users are
+    /// currently sharing their live location. It keeps the underlying event
+    /// handlers registered — and therefore the share list up-to-date — for as
+    /// long as it is alive. Call [`LiveLocationShares::subscribe`] on it to
+    /// receive an initial snapshot and a stream of incremental updates.
+    pub async fn live_location_shares(&self) -> Arc<LiveLocationShares> {
+        let inner = self.inner.live_location_shares().await;
+        Arc::new(LiveLocationShares::new(inner))
     }
 
     /// Forget this room.
@@ -1306,12 +1278,11 @@ impl Room {
 
         // If no server names are provided and the room's membership is invited,
         // add the server name from the sender's user id as a fallback value
-        if server_names.is_empty() {
-            if let Ok(invite_details) = self.inner.invite_details().await {
-                if let Some(inviter) = invite_details.inviter {
-                    server_names.push(inviter.user_id().server_name().to_owned());
-                }
-            }
+        if server_names.is_empty()
+            && let Ok(invite_details) = self.inner.invite_details().await
+            && let Some(inviter) = invite_details.inviter
+        {
+            server_names.push(inviter.user_id().server_name().to_owned());
         }
 
         let room_preview = client.get_room_preview(&room_or_alias_id, server_names).await?;
@@ -1393,12 +1364,6 @@ impl Room {
             .into_full_event(self.inner.room_id().to_owned())
             .into())
     }
-}
-
-/// A listener for receiving new live location shares in a room.
-#[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait LiveLocationShareListener: SyncOutsideWasm + SendOutsideWasm {
-    fn call(&self, live_location_shares: Vec<LiveLocationShare>);
 }
 
 /// A listener for receiving call decline events in a room.
@@ -1767,23 +1732,30 @@ impl TryFrom<DraftAttachment> for SdkDraftAttachment {
     type Error = ClientError;
 
     fn try_from(value: DraftAttachment) -> Result<Self, Self::Error> {
+        fn draft_thumbnail(
+            thumbnail_info: Option<ThumbnailInfo>,
+            thumbnail_source: Option<UploadSource>,
+        ) -> Result<Option<DraftThumbnail>, ClientError> {
+            if let Some(info) = thumbnail_info
+                && let Some(source) = thumbnail_source
+            {
+                let (data, filename) = read_upload_source(source)?;
+                Ok(Some(DraftThumbnail {
+                    filename,
+                    data,
+                    mimetype: info.mimetype,
+                    width: info.width,
+                    height: info.height,
+                    size: info.size,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
         match value {
             DraftAttachment::Image { image_info, source, thumbnail_source, .. } => {
                 let (data, filename) = read_upload_source(source)?;
-                let thumbnail = match (image_info.thumbnail_info, thumbnail_source) {
-                    (Some(info), Some(source)) => {
-                        let (data, filename) = read_upload_source(source)?;
-                        Some(DraftThumbnail {
-                            filename,
-                            data,
-                            mimetype: info.mimetype,
-                            width: info.width,
-                            height: info.height,
-                            size: info.size,
-                        })
-                    }
-                    _ => None,
-                };
                 Ok(Self {
                     filename,
                     content: DraftAttachmentContent::Image {
@@ -1793,26 +1765,12 @@ impl TryFrom<DraftAttachment> for SdkDraftAttachment {
                         width: image_info.width,
                         height: image_info.height,
                         blurhash: image_info.blurhash,
-                        thumbnail,
+                        thumbnail: draft_thumbnail(image_info.thumbnail_info, thumbnail_source)?,
                     },
                 })
             }
             DraftAttachment::Video { video_info, source, thumbnail_source, .. } => {
                 let (data, filename) = read_upload_source(source)?;
-                let thumbnail = match (video_info.thumbnail_info, thumbnail_source) {
-                    (Some(info), Some(source)) => {
-                        let (data, filename) = read_upload_source(source)?;
-                        Some(DraftThumbnail {
-                            filename,
-                            data,
-                            mimetype: info.mimetype,
-                            width: info.width,
-                            height: info.height,
-                            size: info.size,
-                        })
-                    }
-                    _ => None,
-                };
                 Ok(Self {
                     filename,
                     content: DraftAttachmentContent::Video {
@@ -1823,7 +1781,7 @@ impl TryFrom<DraftAttachment> for SdkDraftAttachment {
                         height: video_info.height,
                         duration: video_info.duration,
                         blurhash: video_info.blurhash,
-                        thumbnail,
+                        thumbnail: draft_thumbnail(video_info.thumbnail_info, thumbnail_source)?,
                     },
                 })
             }

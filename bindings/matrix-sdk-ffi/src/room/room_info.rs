@@ -22,7 +22,7 @@ use crate::{
     error::ClientError,
     notification_settings::RoomNotificationMode,
     room::{
-        power_levels::RoomPowerLevels, Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom,
+        Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom, power_levels::RoomPowerLevels,
     },
     room_member::RoomMember,
     ruma::RtcCallIntent,
@@ -104,6 +104,7 @@ pub struct RoomInfo {
     /// SC: Space-specific fields
     space_children: Vec<SpaceChildInfo>,
     can_user_manage_spaces: bool,
+    has_incomplete_unread_count: bool,
     /// SC end
     active_room_call_consensus_intent: RtcCallIntentConsensus,
     /// Whether this room has been explicitly marked as unread
@@ -250,8 +251,11 @@ impl RoomInfo {
                 .collect(),
             active_room_call_consensus_intent: room.active_room_call_consensus_intent().into(),
             is_marked_unread: room.is_marked_unread(),
+            // SC start
             space_children: space_children_info(&room),
             can_user_manage_spaces,
+            has_incomplete_unread_count: room.has_incomplete_unread_count(),
+            // SC end
             num_unread_messages: room.num_unread_messages(),
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),

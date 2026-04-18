@@ -199,6 +199,12 @@ impl Room {
         self.info.read().unread_count
     }
 
+    /// SC: Whether any client-generated unread count is based on incomplete local
+    /// information.
+    pub fn has_incomplete_unread_count(&self) -> bool {
+        self.info.read().read_receipts.has_incomplete_unread_count
+    }
+
     /// Get the number of unread messages (computed client-side).
     ///
     /// This might be more precise than [`Self::unread_notification_counts`] for

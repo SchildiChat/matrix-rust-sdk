@@ -515,6 +515,9 @@ impl SqliteStateStore {
             StateStoreDataKey::ThreadSubscriptionsCatchupTokens => {
                 Cow::Borrowed(StateStoreDataKey::THREAD_SUBSCRIPTIONS_CATCHUP_TOKENS)
             }
+            StateStoreDataKey::HomeserverCapabilities => {
+                Cow::Borrowed(StateStoreDataKey::HOMESERVER_CAPABILITIES)
+            }
         };
 
         self.encode_key(keys::KV_BLOB, &*key_s)
@@ -1179,6 +1182,9 @@ impl StateStore for SqliteStateStore {
                             self.deserialize_value(&data)?,
                         )
                     }
+                    StateStoreDataKey::HomeserverCapabilities => {
+                        StateStoreDataValue::HomeserverCapabilities(self.deserialize_value(&data)?)
+                    }
                 })
             })
             .transpose()
@@ -1228,6 +1234,11 @@ impl StateStore for SqliteStateStore {
                 &value
                     .into_thread_subscriptions_catchup_tokens()
                     .expect("Session data is not a list of thread subscription catchup tokens"),
+            )?,
+            StateStoreDataKey::HomeserverCapabilities => self.serialize_value(
+                &value
+                    .into_homeserver_capabilities()
+                    .expect("Session data is not the homeserver capabilities"),
             )?,
         };
 

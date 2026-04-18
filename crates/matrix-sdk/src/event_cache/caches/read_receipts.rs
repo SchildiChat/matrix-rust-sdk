@@ -94,6 +94,7 @@
 use matrix_sdk_base::{
     read_receipts::{LatestReadReceipt, RoomReadReceipts},
     serde_helpers::extract_relation,
+    store::DynStateStore,
 };
 use matrix_sdk_common::{
     deserialized_responses::TimelineEvent, ring_buffer::RingBuffer,
@@ -110,7 +111,12 @@ use ruma::{
 };
 use tracing::{debug, instrument, trace, warn};
 
-use crate::event_cache::caches::event_linked_chunk::EventLinkedChunk;
+use crate::event_cache::{
+    automatic_pagination::AutomaticPagination, caches::event_linked_chunk::EventLinkedChunk,
+};
+
+// SC
+use matrix_sdk_common::linked_chunk::Position;
 
 trait RoomReadReceiptsExt {
     /// Update the [`RoomReadReceipts`] unread counts according to the new
@@ -219,6 +225,10 @@ impl RoomReadReceiptsExt for RoomReadReceipts {
     }
 }
 
+/// The receipt types we look for, in order of priority (the first ones are more
+/// likely to be ahead in the timeline, so we look for them first).
+const ALL_RECEIPT_TYPES: [ReceiptType; 2] = [ReceiptType::ReadPrivate, ReceiptType::Read];
+
 /// Return a new better (i.e. more recent) receipt based on a search of the
 /// linked chunk.
 ///
@@ -227,7 +237,9 @@ impl RoomReadReceiptsExt for RoomReadReceipts {
 /// - it's an implicit read receipt (i.e. an event we've sent),
 /// - it's holding onto a new read receipt we've just received,
 /// - it was a pending receipt for which we found the event now,
-/// - by default, it was the current active receipt.
+///
+/// A receipt returned in this function **must** point to an event that is in
+/// the linked chunk.
 fn select_best_receipt(
     user_id: &UserId,
     linked_chunk: &EventLinkedChunk,
@@ -240,7 +252,7 @@ fn select_best_receipt(
     // to the pending receipts list. We'll try to chase them later.
     if let Some(receipt_event) = new_receipt_event {
         for (event_id, receipts) in &receipt_event.0 {
-            for ty in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+            for ty in ALL_RECEIPT_TYPES {
                 if let Some(receipts) = receipts.get(&ty)
                     && let Some(receipt) = receipts.get(user_id)
                     && matches!(receipt.thread, ReceiptThread::Main | ReceiptThread::Unthreaded)
@@ -263,35 +275,34 @@ fn select_best_receipt(
     // i.e., we've found a better receipt, *and* there's no more pending receipt
     // to try to match against events in the linked chunk.
 
-    let mut found = None;
+    let mut receipt = None;
 
     for (event, event_id) in
         linked_chunk.revents().filter_map(|(_pos, ev)| Some((ev, ev.event_id()?)))
     {
-        if found.is_none() {
+        if receipt.is_none() {
             // Try to see if the latest active receipt is still the most recent receipt.
             if latest_active == Some(&event_id) {
                 // The latest active receipt is still the most recent receipt, so keep it.
                 trace!(active = %event_id, "the latest active receipt is still the most recent; stopping search");
-                found = Some(event_id.clone());
+                receipt = Some(event_id.clone());
             }
             // Try to find an implicit read receipt (i.e. an event sent by the current
             // user).
             //
             // If the client is enabled with threading support, skip events that are in threads.
-            else if event.raw().get_field::<OwnedUserId>("sender").ok().flatten().as_deref()
-                == Some(user_id)
+            else if event.sender().as_deref() == Some(user_id)
                 && (!with_threading_support || extract_thread_root(event.raw()).is_none())
             {
                 trace!(implicit = %event_id, "found an implicit receipt; stopping search");
-                found = Some(event_id.clone());
+                receipt = Some(event_id.clone());
             }
         }
 
         // Early exit condition (see the comment above): we've already found a most
         // recent receipt, and there's no other pending receipts to match against known
         // events.
-        if found.is_some() && pending_receipts.is_empty() {
+        if receipt.is_some() && pending_receipts.is_empty() {
             trace!("exiting loop; found a better receipt, and no more pending receipt to match");
             break;
         }
@@ -301,9 +312,9 @@ fn select_best_receipt(
         // one!
         pending_receipts.retain(|pending| {
             if *pending == event_id {
-                if found.is_none() {
+                if receipt.is_none() {
                     trace!(pending = %event_id, "found a pending receipt; stopping search");
-                    found = Some(event_id.clone());
+                    receipt = Some(event_id.clone());
                 } else {
                     trace!(%event_id, "discarding a pending receipt that wasn't selected");
                 }
@@ -318,13 +329,48 @@ fn select_best_receipt(
         });
     }
 
-    found.or_else(|| latest_active.map(|event_id| {
-        // The only time when we can run into this is because we didn't find a more recent receipt,
-        // and the previously active one wasn't loaded in the linked chunk. In this case, every
-        // event currently loaded in the linked chunk will be processed in `process_event()`.
-        trace!(%event_id, "reusing previous active receipt (but we didn't find it in the linked chunk)");
-        event_id.to_owned()
-    }))
+    receipt
+}
+
+/// Try to find extra read receipts that were in the store but never saved in
+/// the [`RoomReadReceipts`] data structure.
+///
+/// Doesn't return a `Result`, because this is entirely optional; if the store
+/// fails to load these receipts, the worst that can happen is incorrect unread
+/// counts until the next receipt event is received from sync.
+async fn try_find_store_receipts(
+    store: &DynStateStore,
+    user_id: &UserId,
+    room_id: &RoomId,
+    read_receipts: &mut RoomReadReceipts,
+) {
+    for receipt_type in ALL_RECEIPT_TYPES {
+        // Implementation note: we want to prioritize a `Unthreaded` receipt over a
+        // `Main`-threaded one, for better compatibility with thread-unaware clients.
+        for receipt_thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+            if let Ok(Some((event_id, _receipt))) = store
+                .get_user_room_receipt_event(
+                    room_id,
+                    receipt_type.clone(),
+                    receipt_thread.clone(),
+                    user_id,
+                )
+                .await
+            {
+                trace!(%event_id, ?receipt_type, ?receipt_thread, "Found a dormant receipt in the store");
+
+                if read_receipts.latest_active.is_none() {
+                    read_receipts.latest_active =
+                        Some(LatestReadReceipt { event_id: event_id.clone() });
+                } else {
+                    // This loop has already flagged a read receipt as the new `latest_active`.
+                    // Extra read receipts can go to the pending receipts list, as they're lower
+                    // priority, by the implementation notes above.
+                    read_receipts.pending.push(event_id.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Given a set of events coming from sync, for a room, update the
@@ -333,37 +379,49 @@ fn select_best_receipt(
 ///
 /// See this module's documentation for more information.
 #[instrument(skip_all, fields(room_id = %room_id))]
-pub(crate) fn compute_unread_counts(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compute_unread_counts(
     user_id: &UserId,
     room_id: &RoomId,
     receipt_event: Option<&ReceiptEventContent>,
     linked_chunk: &EventLinkedChunk,
     read_receipts: &mut RoomReadReceipts,
     with_threading_support: bool,
+    automatic_pagination: Option<&AutomaticPagination>,
+    state_store: &DynStateStore,
 ) {
     debug!(?read_receipts, "Starting");
 
-    let new_receipt = select_best_receipt(
+    // If we don't have a latest active receipt for this room, try to reload one
+    // from the state store into the `RoomReadReceipts`.
+    if read_receipts.latest_active.is_none() {
+        try_find_store_receipts(state_store, user_id, room_id, read_receipts).await;
+    }
+
+    let better_receipt = select_best_receipt(
         user_id,
         linked_chunk,
         &mut read_receipts.pending,
         receipt_event,
         read_receipts.latest_active.as_ref().map(|latest_active| latest_active.event_id.as_ref()),
         with_threading_support,
-    )
-    .map(|event_id| LatestReadReceipt { event_id });
+    );
 
-    if let Some(new_receipt) = new_receipt {
+    // SC
+    let active_receipt = better_receipt
+        .clone()
+        .map(|event_id| LatestReadReceipt { event_id })
+        .or_else(|| read_receipts.latest_active.clone());
+
+    if let Some(event_id) = better_receipt {
         // We've found the id of an event to which the receipt attaches. The associated
         // event may either come from the new batch of events associated to
         // this sync, or it may live in the past timeline events we know
         // about.
 
-        let event_id = new_receipt.event_id.clone();
-
         // First, save the event id as the latest one that has a read receipt.
         trace!(%event_id, "Saving a new active read receipt");
-        read_receipts.latest_active = Some(new_receipt);
+        read_receipts.latest_active = Some(LatestReadReceipt { event_id: event_id.clone() });
 
         // The event for the receipt is in the linked chunk, so we'll find it and can
         // count safely from here.
@@ -374,8 +432,25 @@ pub(crate) fn compute_unread_counts(
             with_threading_support,
         );
 
+        // SC
+        read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
+            linked_chunk,
+            active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
+            read_receipts.pending.iter(),
+        );
+
         debug!(?read_receipts, "after finding a better receipt");
         return;
+    }
+
+    // Request a pagination: we haven't found a better receipt, but we haven't even
+    // found the latest active receipt!
+    if let Some(automatic_pagination) = automatic_pagination {
+        if automatic_pagination.run_once(room_id) {
+            trace!("Requested pagination to find a better receipt");
+        } else {
+            warn!("Failed to request pagination to find a better receipt");
+        }
     }
 
     // If we haven't returned at this point, it means we don't have any new "active"
@@ -390,8 +465,89 @@ pub(crate) fn compute_unread_counts(
         read_receipts.process_event(event, user_id, with_threading_support);
     }
 
+    // SC
+    read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
+        linked_chunk,
+        active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
+        read_receipts.pending.iter(),
+    );
+
     debug!(?read_receipts, "no better receipt");
 }
+
+// SC start
+fn has_incomplete_unread_count<'a>(
+    linked_chunk: &EventLinkedChunk,
+    active_receipt_event_id: Option<&EventId>,
+    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
+) -> bool {
+    match active_receipt_event_id.and_then(|event_id| find_event_position(linked_chunk, event_id)) {
+        Some(position) => {
+            has_gap_after_position(linked_chunk, position)
+                || has_pending_receipt_after_position(linked_chunk, position, pending_receipts)
+        }
+        None => {
+            if pending_receipts.into_iter().next().is_some() {
+                return true;
+            }
+
+            linked_chunk.chunks().any(|chunk| chunk.is_gap())
+                || linked_chunk.chunks().next().is_none_or(|chunk| !chunk.is_definitive_head())
+        }
+    }
+}
+
+fn find_event_position(linked_chunk: &EventLinkedChunk, event_id: &EventId) -> Option<Position> {
+    linked_chunk
+        .events()
+        .find_map(|(position, event)| (event.event_id().as_deref() == Some(event_id)).then_some(position))
+}
+
+fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -> bool {
+    for chunk in linked_chunk.rchunks() {
+        if chunk.identifier() == position.chunk_identifier() {
+            return false;
+        }
+
+        if chunk.is_gap() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_pending_receipt_after_position<'a>(
+    linked_chunk: &EventLinkedChunk,
+    position: Position,
+    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
+) -> bool {
+    let pending_receipts = pending_receipts.collect::<Vec<_>>();
+    let mut seen_active_receipt = false;
+
+    for (current_position, event) in linked_chunk.events() {
+        if current_position == position {
+            seen_active_receipt = true;
+            continue;
+        }
+
+        if seen_active_receipt
+            && event
+                .event_id()
+                .is_some_and(|event_id| {
+                    pending_receipts.iter().any(|pending| {
+                        let pending: &EventId = pending.as_ref();
+                        pending == event_id
+                    })
+                })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+// SC end
 
 /// Is the event worth marking a room as unread?
 fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool {
@@ -462,7 +618,7 @@ mod tests {
             room::{member::MembershipState, message::MessageType},
         },
         owned_event_id,
-        push::Action,
+        push::{Action, HighlightTweakValue, Tweak},
         room_id, user_id,
     };
 
@@ -595,7 +751,7 @@ mod tests {
 
         let event = make_event(
             user_id!("@bob:example.org"),
-            vec![Action::SetTweak(ruma::push::Tweak::Highlight(true))],
+            vec![Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes))],
         );
         let mut receipts = RoomReadReceipts::default();
         receipts.process_event(&event, user_id, threading_support);
@@ -605,7 +761,7 @@ mod tests {
 
         let event = make_event(
             user_id!("@bob:example.org"),
-            vec![Action::SetTweak(ruma::push::Tweak::Highlight(true)), Action::Notify],
+            vec![Action::SetTweak(Tweak::Highlight(HighlightTweakValue::Yes)), Action::Notify],
         );
         let mut receipts = RoomReadReceipts::default();
         receipts.process_event(&event, user_id, threading_support);
@@ -836,7 +992,7 @@ mod tests {
         let with_threading_support = false;
 
         // Then there's no best receipt.
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -844,7 +1000,7 @@ mod tests {
             active_receipt,
             with_threading_support,
         );
-        assert!(result.is_none());
+        assert!(receipt.is_none());
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -873,7 +1029,7 @@ mod tests {
         let with_threading_support = false;
 
         // Then there's a new best receipt, which is the implicit one.
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -881,7 +1037,7 @@ mod tests {
             active_receipt,
             with_threading_support,
         );
-        assert_eq!(result.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), event_id!("$2"));
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -910,7 +1066,7 @@ mod tests {
         let with_threading_support = false;
 
         // Then the best receipt is still $2.
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -918,7 +1074,7 @@ mod tests {
             active_receipt,
             with_threading_support,
         );
-        assert_eq!(result.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), event_id!("$2"));
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -952,7 +1108,7 @@ mod tests {
         let with_threading_support = false;
 
         // Then there's a new best receipt, which is the explicit one from the event
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -960,7 +1116,7 @@ mod tests {
             active_receipt,
             with_threading_support,
         );
-        assert_eq!(result.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), event_id!("$2"));
         // And there are no pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -994,7 +1150,7 @@ mod tests {
         let with_threading_support = false;
 
         // Then there's no new best receipts.
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -1003,7 +1159,7 @@ mod tests {
             with_threading_support,
         );
 
-        assert!(result.is_none());
+        assert!(receipt.is_none());
         // And there's a new pending receipt for $4.
         assert_eq!(pending_receipts.len(), 1);
         assert_eq!(pending_receipts.get(0).unwrap(), event_id!("$4"));
@@ -1035,7 +1191,7 @@ mod tests {
         let with_threading_support = false;
 
         // Then there's a new best receipt, which is the matched pending receipt.
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -1043,7 +1199,7 @@ mod tests {
             active_receipt,
             with_threading_support,
         );
-        assert_eq!(result.unwrap(), event_id!("$2"));
+        assert_eq!(receipt.unwrap(), event_id!("$2"));
         // And there are no more pending receipts.
         assert!(pending_receipts.is_empty());
     }
@@ -1085,7 +1241,7 @@ mod tests {
 
         // Then there's a new best receipt, which is the most advanced in the linked
         // chunk: $4.
-        let result = select_best_receipt(
+        let receipt = select_best_receipt(
             own_user_id,
             &lc,
             &mut pending_receipts,
@@ -1093,7 +1249,7 @@ mod tests {
             active_receipt,
             with_threading_support,
         );
-        assert_eq!(result.unwrap(), event_id!("$4"));
+        assert_eq!(receipt.unwrap(), event_id!("$4"));
 
         // Receipt 6 is still pending, and there's a new pending receipt for 7 too. ($2
         // has been cleaned because it has been seen).

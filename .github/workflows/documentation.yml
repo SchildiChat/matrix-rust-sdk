@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@64c5c20c872907b6f7cd50994ac189e7274160f2 # v2
+        uses: taiki-e/install-action@85b24a67ef0c632dfefad70b9d5ce8fddb040754 # v2
         with:
           tool: protoc@3.20.3
 
@@ -61,4 +61,4 @@ jobs:
       - name: Deploy to GitHub Pages
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: deployment
-        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

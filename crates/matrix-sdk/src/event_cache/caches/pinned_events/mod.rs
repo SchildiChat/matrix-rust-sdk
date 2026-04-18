@@ -124,15 +124,16 @@ impl<'a> PinnedEventCacheStateLockWriteGuard<'a> {
             return Ok(());
         };
 
-        let mut previous = last_chunk.previous;
-        self.state.chunk.replace_with(Some(last_chunk), chunk_id_gen)?;
+        {
+            let mut current_chunk_identifier = last_chunk.identifier;
+            self.state.chunk.replace_with(Some(last_chunk), chunk_id_gen)?;
 
-        // Reload the entire chunk.
-        while let Some(previous_chunk_id) = previous {
-            let prev = self.store.load_previous_chunk(linked_chunk_id, previous_chunk_id).await?;
-            if let Some(prev_chunk) = prev {
-                previous = prev_chunk.previous;
-                self.state.chunk.insert_new_chunk_as_first(prev_chunk)?;
+            // Reload the entire chunk.
+            while let Some(previous_chunk) =
+                self.store.load_previous_chunk(linked_chunk_id, current_chunk_identifier).await?
+            {
+                current_chunk_identifier = previous_chunk.identifier;
+                self.state.chunk.insert_new_chunk_as_first(previous_chunk)?;
             }
         }
 
@@ -227,7 +228,7 @@ impl PinnedEventCache {
         let task = Arc::new(
             room.client()
                 .task_monitor()
-                .spawn_background_task(
+                .spawn_infinite_task(
                     "pinned_event_listener_task",
                     Self::pinned_event_listener_task(room, state.clone()),
                 )
@@ -463,7 +464,7 @@ impl PinnedEventCache {
     async fn reload_pinned_events(room: Room) -> Result<Option<Vec<Event>>> {
         let (max_events_to_load, max_concurrent_requests) = {
             let client = room.client();
-            let config = client.event_cache().config().await;
+            let config = client.event_cache().config();
             (config.max_pinned_events_to_load, config.max_pinned_events_concurrent_requests)
         };
 
@@ -479,6 +480,8 @@ impl PinnedEventCache {
         if pinned_event_ids.is_empty() {
             return Ok(Some(Vec::new()));
         }
+
+        let mut num_successful_loads = 0;
 
         let mut loaded_events: Vec<Event> =
             stream::iter(pinned_event_ids.clone().into_iter().map(|event_id| {
@@ -500,16 +503,23 @@ impl PinnedEventCache {
                 }
             }))
             .buffer_unordered(max_concurrent_requests)
-            // Flatten all the vectors.
+            // Count successful queries.
+            .inspect(|result| {
+                if result.is_ok() {
+                    num_successful_loads += 1;
+                }
+            })
+            // Get rid of error results.
             .flat_map(stream::iter)
+            // Flatten the list of `Vec<Event>` into a list of `Event`.
             .flat_map(stream::iter)
             .collect()
             .await;
 
-        if loaded_events.len() != pinned_event_ids.len() {
+        if num_successful_loads != pinned_event_ids.len() {
             warn!(
                 "only successfully loaded {} out of {} pinned events",
-                loaded_events.len(),
+                num_successful_loads,
                 pinned_event_ids.len()
             );
         }
