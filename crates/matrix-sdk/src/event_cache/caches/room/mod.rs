@@ -350,6 +350,12 @@ impl RoomEventCache {
         Ok(())
     }
 
+    /// SC: Optimistically update unread counts after successfully sending an
+    /// unthreaded read receipt.
+    pub async fn update_unreads_with_local_receipt(&self, event_id: OwnedEventId) -> Result<()> {
+        self.inner.state.write().await?.update_unreads_with_local_receipt(event_id).await
+    }
+
     /// Return a reference to the state.
     pub(in super::super) fn state(&self) -> &LockedRoomEventCacheState {
         &self.inner.state

@@ -115,6 +115,9 @@ use crate::event_cache::{
     automatic_pagination::AutomaticPagination, caches::event_linked_chunk::EventLinkedChunk,
 };
 
+// SC
+use matrix_sdk_common::linked_chunk::Position;
+
 trait RoomReadReceiptsExt {
     /// Update the [`RoomReadReceipts`] unread counts according to the new
     /// event.
@@ -404,6 +407,12 @@ pub(crate) async fn compute_unread_counts(
         with_threading_support,
     );
 
+    // SC
+    let active_receipt = better_receipt
+        .clone()
+        .map(|event_id| LatestReadReceipt { event_id })
+        .or_else(|| read_receipts.latest_active.clone());
+
     if let Some(event_id) = better_receipt {
         // We've found the id of an event to which the receipt attaches. The associated
         // event may either come from the new batch of events associated to
@@ -421,6 +430,13 @@ pub(crate) async fn compute_unread_counts(
             user_id,
             linked_chunk.events().map(|(_pos, event)| event),
             with_threading_support,
+        );
+
+        // SC
+        read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
+            linked_chunk,
+            active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
+            read_receipts.pending.iter(),
         );
 
         debug!(?read_receipts, "after finding a better receipt");
@@ -449,8 +465,89 @@ pub(crate) async fn compute_unread_counts(
         read_receipts.process_event(event, user_id, with_threading_support);
     }
 
+    // SC
+    read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
+        linked_chunk,
+        active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
+        read_receipts.pending.iter(),
+    );
+
     debug!(?read_receipts, "no better receipt");
 }
+
+// SC start
+fn has_incomplete_unread_count<'a>(
+    linked_chunk: &EventLinkedChunk,
+    active_receipt_event_id: Option<&EventId>,
+    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
+) -> bool {
+    match active_receipt_event_id.and_then(|event_id| find_event_position(linked_chunk, event_id)) {
+        Some(position) => {
+            has_gap_after_position(linked_chunk, position)
+                || has_pending_receipt_after_position(linked_chunk, position, pending_receipts)
+        }
+        None => {
+            if pending_receipts.into_iter().next().is_some() {
+                return true;
+            }
+
+            linked_chunk.chunks().any(|chunk| chunk.is_gap())
+                || linked_chunk.chunks().next().is_none_or(|chunk| !chunk.is_definitive_head())
+        }
+    }
+}
+
+fn find_event_position(linked_chunk: &EventLinkedChunk, event_id: &EventId) -> Option<Position> {
+    linked_chunk
+        .events()
+        .find_map(|(position, event)| (event.event_id().as_deref() == Some(event_id)).then_some(position))
+}
+
+fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -> bool {
+    for chunk in linked_chunk.rchunks() {
+        if chunk.identifier() == position.chunk_identifier() {
+            return false;
+        }
+
+        if chunk.is_gap() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_pending_receipt_after_position<'a>(
+    linked_chunk: &EventLinkedChunk,
+    position: Position,
+    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
+) -> bool {
+    let pending_receipts = pending_receipts.collect::<Vec<_>>();
+    let mut seen_active_receipt = false;
+
+    for (current_position, event) in linked_chunk.events() {
+        if current_position == position {
+            seen_active_receipt = true;
+            continue;
+        }
+
+        if seen_active_receipt
+            && event
+                .event_id()
+                .is_some_and(|event_id| {
+                    pending_receipts.iter().any(|pending| {
+                        let pending: &EventId = pending.as_ref();
+                        pending == event_id
+                    })
+                })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+// SC end
 
 /// Is the event worth marking a room as unread?
 fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool {

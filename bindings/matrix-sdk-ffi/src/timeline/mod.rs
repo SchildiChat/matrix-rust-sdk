@@ -387,10 +387,16 @@ impl Timeline {
         event_id: String,
     ) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
+        let should_update_local_unreads = matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         self.inner
-            .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
+            .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id.clone())
             .await?;
+        if should_update_local_unreads {
+            if let Ok((room_event_cache, _drop_handles)) = self.inner.room().event_cache().await {
+                let _ = room_event_cache.update_unreads_with_local_receipt(event_id).await;
+            }
+        }
         Ok(())
     }
 

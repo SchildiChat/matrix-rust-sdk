@@ -847,12 +847,18 @@ impl Room {
     pub async fn force_send_single_receipt(&self, receipt_type: ReceiptType, event_id: String) -> Result<(), ClientError> {
         let timeline = TimelineBuilder::new(&self.inner).build().await?;
         let event_id = EventId::parse(event_id)?;
+        let should_update_local_unreads = matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         timeline.force_send_single_receipt(
             receipt_type.into(),
             ReceiptThread::Unthreaded,
-            event_id,
+            event_id.clone(),
         ).await?;
+        if should_update_local_unreads {
+            if let Ok((room_event_cache, _drop_handles)) = self.inner.event_cache().await {
+                let _ = room_event_cache.update_unreads_with_local_receipt(event_id).await;
+            }
+        }
         Ok(())
     }
     pub async fn get_state_event_raw(&self, event_type: String, state_key: String) -> Result<Option<String>, ClientError> {
