@@ -851,16 +851,12 @@ impl Room {
     pub async fn force_send_single_receipt(&self, receipt_type: ReceiptType, event_id: String) -> Result<(), ClientError> {
         let timeline = TimelineBuilder::new(&self.inner).build().await?;
         let event_id = EventId::parse(event_id)?;
-        let should_update_local_unreads =
-            matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         timeline.force_send_single_receipt(
             receipt_type.into(),
             ReceiptThread::Unthreaded,
-            event_id.clone(),
+            event_id,
         ).await?;
-        update_local_unreads_after_receipt(&self.inner, should_update_local_unreads, &event_id)
-            .await;
         Ok(())
     }
     pub async fn get_state_event_raw(&self, event_type: String, state_key: String) -> Result<Option<String>, ClientError> {
@@ -2123,25 +2119,9 @@ impl TryFrom<SdkRoomSendQueueUpdate> for RoomSendQueueUpdate {
     }
 }
 
-
-// SC start
 pub fn sc_event_not_redacted_filter(event: &AnySyncTimelineEvent) -> bool {
     match event {
         AnySyncTimelineEvent::MessageLike(msg) => !msg.is_redacted(),
         AnySyncTimelineEvent::State(state) => !state.is_redacted(),
     }
 }
-async fn update_local_unreads_after_receipt(
-    room: &SdkRoom,
-    should_update_local_unreads: bool,
-    event_id: &EventId,
-) {
-    if !should_update_local_unreads {
-        return;
-    }
-
-    if let Ok((room_event_cache, _drop_handles)) = room.event_cache().await {
-        let _ = room_event_cache.update_unreads_with_local_receipt(event_id.to_owned()).await;
-    }
-}
-// SC end

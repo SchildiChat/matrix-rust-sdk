@@ -379,7 +379,7 @@ pub(crate) fn compute_unread_counts(
         read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
             linked_chunk,
             active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
-            read_receipts.pending.iter(),
+            !read_receipts.pending.is_empty(),
         );
 
         debug!(?read_receipts, "after finding a better receipt");
@@ -401,28 +401,24 @@ pub(crate) fn compute_unread_counts(
     read_receipts.has_incomplete_unread_count = has_incomplete_unread_count(
         linked_chunk,
         active_receipt.as_ref().map(|receipt| receipt.event_id.as_ref()),
-        read_receipts.pending.iter(),
+        !read_receipts.pending.is_empty(),
     );
 
     debug!(?read_receipts, "no better receipt");
 }
 
-// SC start
-fn has_incomplete_unread_count<'a>(
+fn has_incomplete_unread_count(
     linked_chunk: &EventLinkedChunk,
     active_receipt_event_id: Option<&EventId>,
-    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
+    has_pending_receipts: bool,
 ) -> bool {
-    match active_receipt_event_id.and_then(|event_id| find_event_position(linked_chunk, event_id)) {
-        Some(position) => {
-            has_gap_after_position(linked_chunk, position)
-                || has_pending_receipt_after_position(linked_chunk, position, pending_receipts)
-        }
-        None => {
-            if pending_receipts.into_iter().next().is_some() {
-                return true;
-            }
+    if has_pending_receipts {
+        return true;
+    }
 
+    match active_receipt_event_id.and_then(|event_id| find_event_position(linked_chunk, event_id)) {
+        Some(position) => has_gap_after_position(linked_chunk, position),
+        None => {
             linked_chunk.chunks().any(|chunk| chunk.is_gap())
                 || linked_chunk.chunks().next().is_none_or(|chunk| !chunk.is_definitive_head())
         }
@@ -448,38 +444,6 @@ fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -
 
     false
 }
-
-fn has_pending_receipt_after_position<'a>(
-    linked_chunk: &EventLinkedChunk,
-    position: Position,
-    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
-) -> bool {
-    let pending_receipts = pending_receipts.collect::<Vec<_>>();
-    let mut seen_active_receipt = false;
-
-    for (current_position, event) in linked_chunk.events() {
-        if current_position == position {
-            seen_active_receipt = true;
-            continue;
-        }
-
-        if seen_active_receipt
-            && event
-                .event_id()
-                .is_some_and(|event_id| {
-                    pending_receipts.iter().any(|pending| {
-                        let pending: &EventId = pending.as_ref();
-                        pending == event_id
-                    })
-                })
-        {
-            return true;
-        }
-    }
-
-    false
-}
-// SC end
 
 /// Is the event worth marking a room as unread?
 fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool {

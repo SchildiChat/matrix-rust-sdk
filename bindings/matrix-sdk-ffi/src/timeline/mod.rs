@@ -379,22 +379,10 @@ impl Timeline {
         event_id: String,
     ) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
-        let should_update_local_unreads =
-            matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         self.inner
-            .force_send_single_receipt(
-                receipt_type.into(),
-                ReceiptThread::Unthreaded,
-                event_id.clone(),
-            )
+            .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
             .await?;
-        update_local_unreads_after_receipt(
-            self.inner.room(),
-            should_update_local_unreads,
-            &event_id,
-        )
-        .await;
         Ok(())
     }
 
@@ -1669,21 +1657,5 @@ mod galleries {
 
             Ok(handle)
         }
-    }
-}
-
-
-// SC
-async fn update_local_unreads_after_receipt(
-    room: &matrix_sdk::Room,
-    should_update_local_unreads: bool,
-    event_id: &EventId,
-) {
-    if !should_update_local_unreads {
-        return;
-    }
-
-    if let Ok((room_event_cache, _drop_handles)) = room.event_cache().await {
-        let _ = room_event_cache.update_unreads_with_local_receipt(event_id.to_owned()).await;
     }
 }
