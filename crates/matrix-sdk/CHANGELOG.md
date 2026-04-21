@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add new high-level search helpers in `matrix_sdk_ui::search` to perform searches for messages in
+  a room or across all rooms.
+  ([#6394](https://github.com/matrix-org/matrix-rust-sdk/pull/6394))
 - Latest Event does not emit an update when it computes the same value as the
   previous Latest Event.
   ([#6396](https://github.com/matrix-org/matrix-rust-sdk/pull/6396))
@@ -123,6 +126,8 @@ All notable changes to this project will be documented in this file.
 
 ### Bugfix
 
+- Reject invalid edits as candidates for the latest event.
+  ([#6454](https://github.com/matrix-org/matrix-rust-sdk/pull/6454))
 - Fix an infinite loop when loading pinned events from the storage.
   ([#6453](https://github.com/matrix-org/matrix-rust-sdk/pull/6453))
 - `beacon_info` stop events (`live: false`, [MSC3672](https://github.com/matrix-org/matrix-spec-proposals/pull/3672))
@@ -133,10 +138,11 @@ All notable changes to this project will be documented in this file.
   the previous `webkpi` verifier instead of platform verifier, otherwise these features will fail. 
   ([#6328](https://github.com/matrix-org/matrix-rust-sdk/pull/6328))
 - Room keys are now rotated whenever the client receives an `m.room.member` event not belonging
-  to the current user with `leave` membership in order to prevent
+  to the current user with non-`join` membership in order to prevent
   [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268) from leaking room keys
   in an unintuitive manner.
   ([#6292](https://github.com/matrix-org/matrix-rust-sdk/pull/6292))
+  ([#6457](https://github.com/matrix-org/matrix-rust-sdk/pull/6457))
 - Only share historic room keys on invite if the current room history is shared.
   ([#6275](https://github.com/matrix-org/matrix-rust-sdk/pull/6275))
 - The event cache's thread subscriptions background task won't enable if the server doesn't

@@ -206,6 +206,7 @@ impl RoomList {
                     .chain(stream);
             }
         }
+        .fuse()
         .switch();
 
         (stream, dynamic_entries_controller)

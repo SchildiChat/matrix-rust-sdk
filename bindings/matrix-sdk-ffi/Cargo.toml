@@ -24,7 +24,7 @@ crate-type = [
 ]
 
 [features]
-default = ["bundled-sqlite", "unstable-msc4274", "experimental-element-recent-emojis"]
+default = ["bundled-sqlite", "unstable-msc4274", "experimental-element-recent-emojis", "experimental-push-secrets"]
 # Use SQLite for the session storage.
 sqlite = ["matrix-sdk/sqlite"]
 # Use an embedded version of SQLite.
@@ -56,6 +56,7 @@ matrix-sdk = { workspace = true, features = [
     "socks",
     "uniffi",
     "federation-api",
+    "experimental-search"
 ] }
 matrix-sdk-base.workspace = true
 matrix-sdk-common.workspace = true
