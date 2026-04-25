@@ -30,8 +30,9 @@ use crate::{
 
 // SC start
 use crate::{
-    space_child_info::{SpaceChildInfo, space_children_info},
     event::StateEventType,
+    space_catch_all_info::{SpaceCatchAllInfo, space_catch_all_info},
+    space_child_info::{SpaceChildInfo, space_children_info},
 };
 // SC end
 
@@ -103,6 +104,7 @@ pub struct RoomInfo {
     active_room_call_participants: Vec<String>,
     /// SC: Space-specific fields
     space_children: Vec<SpaceChildInfo>,
+    space_catch_all: Option<SpaceCatchAllInfo>,
     can_user_manage_spaces: bool,
     has_incomplete_unread_count: bool,
     /// SC end
@@ -253,6 +255,7 @@ impl RoomInfo {
             is_marked_unread: room.is_marked_unread(),
             // SC start
             space_children: space_children_info(&room),
+            space_catch_all: space_catch_all_info(&room),
             can_user_manage_spaces,
             has_incomplete_unread_count: room.has_incomplete_unread_count(),
             // SC end

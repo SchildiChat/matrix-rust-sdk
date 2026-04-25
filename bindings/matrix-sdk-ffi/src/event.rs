@@ -272,6 +272,9 @@ impl From<RumaTimelineEventType> for TimelineEventType {
             RumaTimelineEventType::SpaceParent => {
                 Self::State { value: StateEventType::SpaceParent }
             }
+            RumaTimelineEventType::SpaceCatchAll => {
+                Self::State { value: StateEventType::SpaceCatchAll }
+            }
             RumaTimelineEventType::BeaconInfo => Self::State { value: StateEventType::BeaconInfo },
             RumaTimelineEventType::CallMember => Self::State { value: StateEventType::CallMember },
             RumaTimelineEventType::MemberHints => {
@@ -320,6 +323,7 @@ pub enum StateEventContent {
     RoomTombstone,
     RoomTopic { topic: String },
     SpaceChild,
+    SpaceCatchAll,
     SpaceParent,
 }
 
@@ -358,6 +362,7 @@ impl TryFrom<AnySyncStateEvent> for StateEventContent {
                 StateEventContent::RoomTopic { topic: content.topic }
             }
             AnySyncStateEvent::SpaceChild(_) => StateEventContent::SpaceChild,
+            AnySyncStateEvent::SpaceCatchAll(_) => StateEventContent::SpaceCatchAll,
             AnySyncStateEvent::SpaceParent(_) => StateEventContent::SpaceParent,
             _ => bail!("Unsupported state event: {:?}", value.event_type()),
         };
@@ -540,6 +545,7 @@ pub enum StateEventType {
     RoomTombstone,
     RoomTopic,
     SpaceChild,
+    SpaceCatchAll,
     SpaceParent,
     Custom { value: String },
 }
@@ -571,6 +577,7 @@ impl From<StateEventType> for ruma::events::StateEventType {
             StateEventType::RoomTombstone => Self::RoomTombstone,
             StateEventType::RoomTopic => Self::RoomTopic,
             StateEventType::SpaceChild => Self::SpaceChild,
+            StateEventType::SpaceCatchAll => Self::SpaceCatchAll,
             StateEventType::SpaceParent => Self::SpaceParent,
             StateEventType::Custom { value } => value.into(),
         }

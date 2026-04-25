@@ -79,7 +79,10 @@ use crate::{
 
 // SC start
 use std::collections::HashMap;
-use ruma::events::space::child::PossiblyRedactedSpaceChildEventContent;
+use ruma::events::{
+    space::child::PossiblyRedactedSpaceChildEventContent,
+    space_catchall::PossiblyRedactedSpaceCatchAllEventContent,
+};
 // SC end
 
 /// The default value of the maximum power level.
@@ -161,6 +164,9 @@ pub struct BaseRoomInfo {
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub(crate) space_children:
         HashMap<OwnedRoomId, MinimalStateEvent<PossiblyRedactedSpaceChildEventContent>>,
+    /// The catch-all space child definition for this room, if it is a space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) space_catch_all: Option<SpaceCatchAllState>,
     /// All minimal state events that containing one or more running matrixRTC
     /// memberships.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
@@ -397,6 +403,19 @@ impl BaseRoomInfo {
                 }
                 true
             }
+            (StateEventType::SpaceCatchAll, "") => {
+                if let Some(event) = raw_event.deserialize_as_minimal_event(|any_event| {
+                    as_variant!(any_event, AnyPossiblyRedactedStateEventContent::SpaceCatchAll)
+                }) {
+                    self.space_catch_all = Some(SpaceCatchAllState {
+                        state_key: state_key.to_owned(),
+                        event,
+                    });
+                    true
+                } else {
+                    self.space_catch_all.take().is_some()
+                }
+            }
             (StateEventType::CallMember, _) => {
                 if let Ok(call_member_key) = raw_event.state_key.parse::<CallMemberStateKey>() {
                     if let Some(any_event) = raw_event.deserialize()
@@ -508,6 +527,10 @@ impl BaseRoomInfo {
             && ev.event_id.as_deref() == Some(redacts)
         {
             ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.space_catch_all
+            && ev.event.event_id.as_deref() == Some(redacts)
+        {
+            ev.event.redact(&redaction_rules);
         } else {
             self.space_children.retain(|_, s| s.event_id.as_deref() != Some(redacts));
             self.rtc_member_events
@@ -531,6 +554,13 @@ impl BaseRoomInfo {
     }
 }
 
+// SC
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpaceCatchAllState {
+    pub state_key: String,
+    pub event: MinimalStateEvent<PossiblyRedactedSpaceCatchAllEventContent>,
+}
+
 impl Default for BaseRoomInfo {
     fn default() -> Self {
         Self {
@@ -548,6 +578,7 @@ impl Default for BaseRoomInfo {
             tombstone: None,
             topic: None,
             space_children: Default::default(),
+            space_catch_all: None,
             rtc_member_events: BTreeMap::new(),
             is_marked_unread: false,
             is_marked_unread_source: AccountDataSource::Unstable,
