@@ -26,6 +26,7 @@ mod ruma;
 mod runtime;
 mod search;
 mod session_verification;
+mod space_catch_all_info;
 mod space_child_info;
 mod spaces;
 mod store;

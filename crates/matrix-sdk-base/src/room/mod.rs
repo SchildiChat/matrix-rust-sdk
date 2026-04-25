@@ -169,6 +169,11 @@ impl Room {
         return self.info.read().base_info.space_children.clone()
     }
 
+    /// Space catch-all definition if this is a space.
+    pub fn space_catch_all(&self) -> Option<room_info::SpaceCatchAllState> {
+        self.info.read().base_info.space_catch_all.clone()
+    }
+
     /// Whether this room is a Call room as defined by [MSC3417].
     ///
     /// [MSC3417]: <https://github.com/matrix-org/matrix-spec-proposals/pull/3417>

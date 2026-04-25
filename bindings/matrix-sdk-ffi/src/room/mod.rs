@@ -49,7 +49,10 @@ use ruma::{
 use tracing::error;
 
 // SC
-use crate::space_child_info::{SpaceChildInfo, space_children_info};
+use crate::{
+    space_catch_all_info::{SpaceCatchAllInfo, space_catch_all_info},
+    space_child_info::{SpaceChildInfo, space_children_info},
+};
 use ruma::RoomId;
 // SC end
 
@@ -149,6 +152,10 @@ impl Room {
 
     pub fn space_children(&self) -> Vec<SpaceChildInfo> {
         return space_children_info(&self.inner);
+    }
+
+    pub fn space_catch_all(&self) -> Option<SpaceCatchAllInfo> {
+        space_catch_all_info(&self.inner)
     }
 
     /// If this room is tombstoned, return the “reference” to the successor room

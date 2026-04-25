@@ -79,6 +79,7 @@ use tracing::{debug, error, warn};
 /// sliding sync room subscriptions.
 const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::Bridge, "*"), // SC
+    (StateEventType::SpaceCatchAll, ""), // SC
     (StateEventType::RoomName, ""),
     (StateEventType::RoomEncryption, ""),
     (StateEventType::RoomMember, "$LAZY"),
