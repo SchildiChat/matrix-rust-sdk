@@ -147,6 +147,13 @@ impl TimelineBuilder {
         self
     }
 
+    /// SC: Whether events that are normally folded into other timeline items
+    /// should also be rendered as standalone timeline items.
+    pub fn render_aggregations(mut self, render: bool) -> Self {
+        self.settings.render_aggregations = render;
+        self
+    }
+
     /// Create a [`Timeline`] with the options set on this builder.
     #[tracing::instrument(
         skip(self),

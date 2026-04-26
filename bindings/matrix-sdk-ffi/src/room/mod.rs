@@ -267,7 +267,8 @@ impl Room {
             }
 
             TimelineFilter::ScSettings { show_redactions, filter } => { // SC
-                // Like upstream EventTypeFilter
+                // Like upstream EventTypeFilter but with show_redactions check
+                // and also render_aggregation() (view hidden events) enabled if not set
                 if let Some(event_type_filter) = filter {
                     builder = builder.event_filter(move |event, room_version_id| {
                         // Always perform the default filter first
@@ -276,11 +277,13 @@ impl Room {
                             (show_redactions || sc_event_not_redacted_filter(event))
                     });
                 } else if !show_redactions {
+                    builder = builder.render_aggregations(true);
                     builder = builder.event_filter(move |event, _room_version_id| {
                         sc_event_not_redacted_filter(event)
                     });
                 } else {
-                    // #nofilter.
+                    builder = builder.render_aggregations(true);
+                    builder = builder.event_filter(move |_, _| true);
                 }
             }
 
