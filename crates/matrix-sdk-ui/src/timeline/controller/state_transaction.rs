@@ -49,6 +49,11 @@ use crate::timeline::{
     event_handler::{FailedToParseEvent, RemovedItem, TimelineAction},
 };
 
+// SC start
+use crate::timeline::event_item::AnyOtherStateEventContentChange;
+use crate::timeline::{MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState};
+// SC end
+
 pub(in crate::timeline) struct TimelineStateTransaction<'a, P: RoomDataProvider> {
     /// A vector transaction over the items themselves. Holds temporary state
     /// until committed.
@@ -73,6 +78,102 @@ pub(in crate::timeline) struct TimelineStateTransaction<'a, P: RoomDataProvider>
 }
 
 impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
+    // SC: synthesize a cheap standalone item for events that upstream would fold
+    // into another timeline item.
+    fn sc_standalone_aggregation_content(
+        raw: &Raw<AnySyncTimelineEvent>,
+        action: &TimelineAction,
+    ) -> Option<crate::timeline::TimelineItemContent> {
+        if !matches!(action, TimelineAction::HandleAggregation { .. }) {
+            return None;
+        }
+
+        let event_type = raw.get_field::<String>("type").ok().flatten();
+        let state_key = raw.get_field::<String>("state_key").ok().flatten();
+
+        Some(if let Some(state_key) = state_key {
+            crate::timeline::TimelineItemContent::OtherState(OtherState {
+                state_key,
+                content: AnyOtherStateEventContentChange::_Custom {
+                    event_type: event_type.clone().unwrap_or_default(),
+                },
+            })
+        } else {
+            crate::timeline::TimelineItemContent::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::Other(OtherMessageLike::from_event_type(
+                    event_type.as_deref().unwrap_or_default().into(),
+                )),
+                reactions: Default::default(),
+                thread_root: None,
+                in_reply_to: None,
+                thread_summary: None,
+            })
+        })
+    }
+
+    // SC: render a cheap standalone item for folded events before letting the
+    // normal upstream aggregation handling update its target item.
+    async fn handle_sc_standalone_aggregation_item(
+        &mut self,
+        raw: &Raw<AnySyncTimelineEvent>,
+        timeline_action: &TimelineAction,
+        settings: &TimelineSettings,
+        sender: &OwnedUserId,
+        sender_profile: &Option<Profile>,
+        forwarder: &Option<OwnedUserId>,
+        forwarder_profile: &Option<Profile>,
+        timestamp: MilliSecondsSinceUnixEpoch,
+        is_highlighted: bool,
+        event_id: &OwnedEventId,
+        encryption_info: &Option<std::sync::Arc<matrix_sdk::deserialized_responses::EncryptionInfo>>,
+        txn_id: &Option<OwnedTransactionId>,
+        position: TimelineItemPosition,
+        recycled_timeline_id: &mut Option<TimelineUniqueId>,
+        should_add_new_items: bool,
+        can_show_read_receipts: bool,
+        date_divider_adjuster: &mut DateDividerAdjuster,
+    ) {
+        let Some(content) = Self::sc_standalone_aggregation_content(raw, timeline_action) else {
+            return;
+        };
+
+        let read_receipts = if settings.track_read_receipts.is_enabled() && can_show_read_receipts {
+            self.meta.read_receipts.compute_event_receipts(
+                event_id,
+                &mut self.items,
+                matches!(position, TimelineItemPosition::End { .. }),
+            )
+        } else {
+            Default::default()
+        };
+
+        let ctx = TimelineEventContext {
+            sender: sender.clone(),
+            sender_profile: sender_profile.clone(),
+            forwarder: forwarder.clone(),
+            forwarder_profile: forwarder_profile.clone(),
+            timestamp,
+            read_receipts,
+            is_highlighted,
+            flow: Flow::Remote {
+                event_id: event_id.clone(),
+                raw_event: raw.clone(),
+                encryption_info: encryption_info.clone(),
+                txn_id: txn_id.clone(),
+                position,
+            },
+            should_add_new_items,
+        };
+
+        TimelineEventHandler::new(self, ctx)
+            .handle_event(
+                date_divider_adjuster,
+                TimelineAction::AddItem { content },
+                recycled_timeline_id.take(),
+            )
+            .await;
+    }
+
     /// Create a new [`TimelineStateTransaction`].
     pub(super) fn new(
         items: &'a mut ObservableItems,
@@ -779,7 +880,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         settings: &TimelineSettings,
         date_divider_adjuster: &mut DateDividerAdjuster,
         profiles: &mut HashMap<OwnedUserId, Option<Profile>>,
-        recycled_timeline_id: Option<TimelineUniqueId>,
+        mut recycled_timeline_id: Option<TimelineUniqueId>,
     ) -> RemovedItem {
         let is_highlighted =
             event.push_actions().is_some_and(|actions| actions.iter().any(Action::is_highlight));
@@ -903,6 +1004,30 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 profiles.insert(sender.clone(), profile.clone());
                 profile
             };
+
+            // SC
+            if settings.render_aggregations && should_add {
+                self.handle_sc_standalone_aggregation_item(
+                    &raw,
+                    &timeline_action,
+                    settings,
+                    &sender,
+                    &sender_profile,
+                    &forwarder,
+                    &forwarder_profile,
+                    timestamp,
+                    is_highlighted,
+                    &event_id,
+                    &encryption_info,
+                    &txn_id,
+                    position,
+                    &mut recycled_timeline_id,
+                    should_add,
+                    can_show_read_receipts,
+                    date_divider_adjuster,
+                )
+                .await;
+            }
 
             let ctx = TimelineEventContext {
                 sender,

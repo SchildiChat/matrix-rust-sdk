@@ -219,6 +219,10 @@ pub(super) struct TimelineSettings {
     /// Are unparsable events added as timeline items of their own kind?
     pub(super) add_failed_to_parse: bool,
 
+    /// SC: Should events that normally only update other timeline items also
+    /// get a standalone timeline item of their own? Think "show hidden events"
+    pub(super) render_aggregations: bool,
+
     /// Should the timeline items be grouped by day or month?
     pub(super) date_divider_mode: DateDividerMode,
 }
@@ -239,6 +243,7 @@ impl Default for TimelineSettings {
             track_read_receipts: TimelineReadReceiptTracking::Disabled,
             event_filter: Arc::new(default_event_filter),
             add_failed_to_parse: true,
+            render_aggregations: false, // SC
             date_divider_mode: DateDividerMode::Daily,
         }
     }
