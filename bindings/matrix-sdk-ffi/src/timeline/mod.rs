@@ -295,7 +295,7 @@ impl Timeline {
         // Start with passing all the items of a *non-empty* timeline as a reset update
         // (if the initial items are empty, then the timeline would transition
         // from empty to empty, which is a no-op).
-        if !timeline_items.is_empty() {
+        if true || !timeline_items.is_empty() { // SC: always update to fix stuck timeline loads
             listener
                 .on_update(vec![TimelineDiff::new(VectorDiff::Reset { values: timeline_items })]);
         }
