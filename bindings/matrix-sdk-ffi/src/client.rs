@@ -1322,6 +1322,22 @@ impl Client {
         events.into_iter().map(account_data_raw_event_from_event).collect()
     }
 
+    /// SC: set room account data content for the given room and event type.
+    ///
+    /// It should be supplied as a JSON string.
+    pub async fn set_room_account_data(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: String,
+    ) -> Result<(), ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let room = self.inner.get_room(&room_id).context("Room not found")?;
+        let raw_content = Raw::from_json_string(content)?;
+        room.set_account_data_raw(event_type.into(), raw_content).await?;
+        Ok(())
+    }
+
     /// Set the given account data content for the given event type.
     ///
     /// It should be supplied as a JSON string.
