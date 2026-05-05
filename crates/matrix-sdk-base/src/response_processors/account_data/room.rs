@@ -86,6 +86,24 @@ pub fn for_room(
                         );
                     }
 
+                    // SC: MSC4431
+                    _ if event.event_type().to_string()
+                        == "de.gematik.msc4431.room.name.private" =>
+                    {
+                        on_room_info(
+                            room_id,
+                            &mut context.state_changes,
+                            state_store,
+                            |_| {
+                                context
+                                    .room_info_notable_updates
+                                    .entry(room_id.to_owned())
+                                    .or_default()
+                                    .insert(RoomInfoNotableUpdateReasons::DISPLAY_NAME);
+                            },
+                        );
+                    }
+
                     // Nothing.
                     _ => {}
                 }
