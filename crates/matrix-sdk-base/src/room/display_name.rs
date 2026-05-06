@@ -119,7 +119,7 @@ impl Room {
         let display_name_or_summary = {
             let inner = self.info.read();
 
-            match (inner.name(), inner.canonical_alias()) {
+            match (inner.private_room_name.as_deref().or(inner.name()), inner.canonical_alias()) {
                 (Some(name), _) => {
                     let name = RoomDisplayName::Named(name.trim().to_owned());
                     DisplayNameOrSummary::DisplayName(name)

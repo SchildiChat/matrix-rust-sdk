@@ -94,12 +94,23 @@ pub fn for_room(
                             room_id,
                             &mut context.state_changes,
                             state_store,
-                            |_| {
-                                context
-                                    .room_info_notable_updates
-                                    .entry(room_id.to_owned())
-                                    .or_default()
-                                    .insert(RoomInfoNotableUpdateReasons::DISPLAY_NAME);
+                            |room_info| {
+                                let private_room_name = raw_event
+                                    .get_field::<serde_json::Value>("content")
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|content| content.get("name").cloned())
+                                    .and_then(|name| name.as_str().map(ToOwned::to_owned))
+                                    .filter(|name| !name.is_empty());
+
+                                if room_info.private_room_name != private_room_name {
+                                    room_info.private_room_name = private_room_name;
+                                    context
+                                        .room_info_notable_updates
+                                        .entry(room_id.to_owned())
+                                        .or_default()
+                                        .insert(RoomInfoNotableUpdateReasons::DISPLAY_NAME);
+                                }
                             },
                         );
                     }

@@ -654,6 +654,10 @@ pub struct RoomInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_display_name: Option<RoomDisplayName>,
 
+    /// SC: Room name as defined by MSC4431 private room-name account data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) private_room_name: Option<String>,
+
     /// SC: cached avatar_url, following [`cached_display_name`] logic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cached_avatar_url: Option<OwnedMxcUri>,
@@ -701,6 +705,7 @@ impl RoomInfo {
             base_info: Box::new(BaseRoomInfo::new()),
             warned_about_unknown_room_version_rules: Arc::new(false.into()),
             cached_display_name: None,
+            private_room_name: None,
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,

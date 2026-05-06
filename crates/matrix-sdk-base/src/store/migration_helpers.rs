@@ -115,6 +115,7 @@ impl RoomInfoV1 {
             base_info: base_info.migrate(create),
             warned_about_unknown_room_version_rules: Arc::new(false.into()),
             cached_display_name: None,
+            private_room_name: None,
             cached_avatar_url: None,
             cached_user_defined_notification_mode: None,
             recency_stamp: None,
