@@ -44,6 +44,26 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Expose `RoomMember::is_service_member` field. ([#6536](https://github.com/matrix-org/matrix-rust-sdk/pull/6536))
+- Expose `beacon` and `beacon_info` fields in `RoomPowerLevelsValues` and `RoomPowerLevelChanges`,
+  allowing clients to read and update the power levels required to send beacon (live location)
+  message events and beacon info state events respectively.
+  ([#6540](https://github.com/matrix-org/matrix-rust-sdk/pull/6540))
+- Expose `ClientBuilder::dm_room_definition` to customize the DM room definition used by the `Client`, 
+  added `RoomInfo::is_dm` field based on it. ([#6490](https://github.com/matrix-org/matrix-rust-sdk/pull/6490))
+- Expose `HumanQrGrantLoginError::Unknown` reason in error message.
+  ([#6514](https://github.com/matrix-org/matrix-rust-sdk/pull/6514))
+- Add a list of `declined_by: Vec<String>` to the `TimelineItemContent::RtcNotification`, this will contain the list
+  of users that have declined the call.
+  ([#6494](https://github.com/matrix-org/matrix-rust-sdk/pull/6494))
+- Add `RoomInfo::active_service_members_count` and `NotificationRoomInfo::active_service_members_count`,
+  returning the amount of service members that are part of the room.
+  ([#6483](https://github.com/matrix-org/matrix-rust-sdk/pull/6483))
+- Add `Client::get_dm_rooms` function to get a list with the DMs for the provided user id.
+  ([#6487](https://github.com/matrix-org/matrix-rust-sdk/pull/6487))
+- Expose `ffi::NotificationRoomInfo::service_members` so clients can use the list of service
+  members to calculate if a room is a DM from the notification info.
+  ([#6474](https://github.com/matrix-org/matrix-rust-sdk/pull/6474))
 - Enable `experimental-push-secrets` feature by default. 
   ([#6473](https://github.com/matrix-org/matrix-rust-sdk/pull/6394))
 - Add new high-level search helpers `RoomSearchIterator` and `GlobalSearchIterator` to perform
@@ -156,8 +176,14 @@ All notable changes to this project will be documented in this file.
 
 ### Refactor
 
+- [**breaking**] All OIDC related types and functions have been renamed from `Oidc`/`oidc` to `OAuth`/`oauth` to align
+  with the finalised naming in the spec.
+  ([#6500](https://github.com/matrix-org/matrix-rust-sdk/pull/6500))
+- [**breaking**] `LiveLocationShares` has been renamed to `LiveLocationsObserver` and
+  `Room::live_location_shares` to `Room::live_locations_observer`.
+  ([#6446](https://github.com/matrix-org/matrix-rust-sdk/pull/6446))
 - [**breaking**] `Room::observe_live_location_shares` has been replaced by
-  `Room::live_location_shares`. Call [`LiveLocationShares::subscribe`] on it to
+  `Room::live_locations_observer`. Call [`LiveLocationsObserver::subscribe`] on it to
   receive an initial snapshot and a stream of incremental updates.The stream is seeded from the event cache
   on creation and includes the own user's shares (previously excluded). `LiveLocationShare.is_live`
   has been removed; instead `ts` (start timestamp) and `timeout` (duration in milliseconds) are now

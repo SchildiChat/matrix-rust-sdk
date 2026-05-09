@@ -61,10 +61,13 @@ use crate::{
     TaskHandle,
     chunk_iterator::ChunkIterator,
     client::{JoinRule, RoomVisibility},
-    error::{ClientError, MediaInfoError, NotYetImplemented, QueueWedgeError, RoomError},
+    error::{
+        ClientError, LiveLocationError, MediaInfoError, NotYetImplemented, QueueWedgeError,
+        RoomError,
+    },
     event::TimelineEvent,
     identity_status_change::IdentityStatusChange,
-    live_location_share::LiveLocationShares,
+    live_locations_observer::LiveLocationsObserver,
     room_member::{RoomMember, RoomMemberWithSenderInfo},
     room_preview::RoomPreview,
     ruma::{AudioInfo, FileInfo, ImageInfo, MediaSource, ThumbnailInfo, VideoInfo},
@@ -1186,23 +1189,23 @@ impl Room {
     }
 
     /// Start the current users live location share in the room.
-    pub async fn start_live_location_share(&self, duration_millis: u64) -> Result<(), ClientError> {
-        self.inner.start_live_location_share(duration_millis, None).await?;
-        Ok(())
+    pub async fn start_live_location_share(
+        &self,
+        duration_millis: u64,
+    ) -> Result<String, ClientError> {
+        let response = self.inner.start_live_location_share(duration_millis, None).await?;
+        Ok(response.event_id.into())
     }
 
     /// Stop the current users live location share in the room.
-    pub async fn stop_live_location_share(&self) -> Result<(), ClientError> {
-        self.inner.stop_live_location_share().await.expect("Unable to stop live location share");
+    pub async fn stop_live_location_share(&self) -> Result<(), LiveLocationError> {
+        self.inner.stop_live_location_share().await?;
         Ok(())
     }
 
     /// Send the current users live location beacon in the room.
-    pub async fn send_live_location(&self, geo_uri: String) -> Result<(), ClientError> {
-        self.inner
-            .send_location_beacon(geo_uri)
-            .await
-            .expect("Unable to send live location beacon");
+    pub async fn send_live_location(&self, geo_uri: String) -> Result<(), LiveLocationError> {
+        self.inner.send_location_beacon(geo_uri).await?;
         Ok(())
     }
 
@@ -1246,14 +1249,14 @@ impl Room {
 
     /// Returns the active live location shares for this room.
     ///
-    /// The returned [`LiveLocationShares`] object tracks which users are
+    /// The returned [`LiveLocationsObserver`] object tracks which users are
     /// currently sharing their live location. It keeps the underlying event
     /// handlers registered — and therefore the share list up-to-date — for as
-    /// long as it is alive. Call [`LiveLocationShares::subscribe`] on it to
+    /// long as it is alive. Call [`LiveLocationsObserver::subscribe`] on it to
     /// receive an initial snapshot and a stream of incremental updates.
-    pub async fn live_location_shares(&self) -> Arc<LiveLocationShares> {
-        let inner = self.inner.live_location_shares().await;
-        Arc::new(LiveLocationShares::new(inner))
+    pub async fn live_locations_observer(&self) -> Arc<LiveLocationsObserver> {
+        let inner = self.inner.live_locations_observer().await;
+        Arc::new(LiveLocationsObserver::new(inner))
     }
 
     /// Forget this room.

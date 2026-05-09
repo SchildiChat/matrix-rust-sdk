@@ -83,7 +83,7 @@ impl DecryptedForwardedRoomKeyEvent {
 /// `m.olm.v1.curve25519-aes-sha2` algorithm
 pub type DecryptedSecretSendEvent = DecryptedOlmV1Event<SecretSendContent>;
 
-/// An `io.element.msc4268.room_key_bundle` to-device event which has
+/// An `m.room_key_bundle` to-device event which has
 /// been decrypted using using the `m.olm.v1.curve25519-aes-sha2` algorithm
 pub type DecryptedRoomKeyBundleEvent = DecryptedOlmV1Event<RoomKeyBundleContent>;
 
@@ -104,7 +104,7 @@ pub enum AnyDecryptedOlmEvent {
     SecretSend(DecryptedSecretSendEvent),
     /// The `m.dummy` decrypted to-device event.
     Dummy(DecryptedDummyEvent),
-    /// The `io.element.msc4268.room_key_bundle` decrypted to-device event.
+    /// The `m.room_key_bundle` decrypted to-device event.
     RoomKeyBundle(DecryptedRoomKeyBundleEvent),
     /// The `io.element.msc4385.secret.push` decrypted to-device event.
     #[cfg(feature = "experimental-push-secrets")]
@@ -352,7 +352,7 @@ impl<'de> Deserialize<'de> for AnyDecryptedOlmEvent {
             }
             SecretSendContent::EVENT_TYPE => AnyDecryptedOlmEvent::SecretSend(from_str(json)?),
             DummyEventContent::EVENT_TYPE => AnyDecryptedOlmEvent::Dummy(from_str(json)?),
-            RoomKeyBundleContent::EVENT_TYPE => {
+            RoomKeyBundleContent::EVENT_TYPE | RoomKeyBundleContent::UNSTABLE_EVENT_TYPE => {
                 AnyDecryptedOlmEvent::RoomKeyBundle(from_str(json)?)
             }
             #[cfg(feature = "experimental-push-secrets")]
@@ -368,7 +368,11 @@ mod tests {
 
     use assert_matches::assert_matches;
     use insta::{assert_json_snapshot, with_settings};
-    use ruma::{KeyId, device_id, owned_user_id};
+    use ruma::{
+        KeyId, OwnedMxcUri, device_id,
+        events::room::{EncryptedFile, V2EncryptedFileInfo},
+        owned_room_id, owned_user_id, user_id,
+    };
     use serde_json::{Value, json};
     use similar_asserts::assert_eq;
     use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
@@ -376,7 +380,10 @@ mod tests {
     use super::AnyDecryptedOlmEvent;
     use crate::types::{
         DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures,
-        events::olm_v1::DecryptedRoomKeyEvent,
+        events::{
+            olm_v1::{DecryptedRoomKeyBundleEvent, DecryptedRoomKeyEvent},
+            room_key_bundle::RoomKeyBundleContent,
+        },
     };
 
     const ED25519_KEY: &str = "aOfOnlaeMb5GW1TxkZ8pXnblkGMgAvps+lAukrdYaZk";
@@ -470,6 +477,47 @@ mod tests {
             },
             "type": "m.secret.send"
         })
+    }
+
+    fn room_key_bundle_event(stable: bool) -> Value {
+        json!({
+            "sender": "@u:s.co",
+            "recipient": "@x:s.co",
+            "keys": {
+                "ed25519": "ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE"
+            },
+            "recipient_keys": {
+                "ed25519": "ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE"
+            },
+            "content": {
+                "room_id": "!r:s.co",
+                "file": {
+                    "url": "test",
+                    "v": "v2",
+                    "key": {
+                        "kty": "oct",
+                        "key_ops": [
+                            "decrypt",
+                            "encrypt"
+                        ],
+                        "alg": "A256CTR",
+                        "k": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "ext": true
+                    },
+                    "iv": "AAAAAAAAAAAAAAAAAAAAAA",
+                    "hashes": {}
+                }
+            },
+            "type": if stable { "m.room_key_bundle" } else { "io.element.msc4268.room_key_bundle" }
+        })
+    }
+
+    fn room_key_bundle_event_stable() -> Value {
+        room_key_bundle_event(true)
+    }
+
+    fn room_key_bundle_event_unstable() -> Value {
+        room_key_bundle_event(false)
     }
 
     /// Return the JSON for creating sender device keys, and the matching
@@ -582,6 +630,12 @@ mod tests {
 
             // `m.dummy`
             dummy_event => Dummy,
+
+            // `m.room_key_bundle`
+            room_key_bundle_event_stable => RoomKeyBundle,
+
+            // `m.io.element.msc4268.room_key_bundle`
+            room_key_bundle_event_unstable => RoomKeyBundle,
         );
 
         Ok(())
@@ -631,6 +685,29 @@ mod tests {
     }
 
     #[test]
+    fn serialize_room_key_bundle() {
+        let room_id = owned_room_id!("!r:s.co");
+        let sender = user_id!("@u:s.co");
+        let recipient = user_id!("@x:s.co");
+
+        let key =
+            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap();
+
+        let content = RoomKeyBundleContent {
+            room_id,
+            file: EncryptedFile::new(
+                OwnedMxcUri::from("test"),
+                V2EncryptedFileInfo::encode([0; 32], [0; 16]).into(),
+                Default::default(),
+            ),
+        };
+
+        let event = DecryptedRoomKeyBundleEvent::new(sender, recipient, key, None, content);
+
+        assert_eq!(serde_json::to_value(&event).unwrap(), room_key_bundle_event_stable());
+    }
+
+    #[test]
     fn test_serialization_cycle() {
         let event_json = json!({
             "sender": "@alice:example.org",
@@ -644,7 +721,7 @@ mod tests {
             "content": {
                 "algorithm": "m.megolm.v1.aes-sha2",
                 "room_id": "!Cuyf34gef24t:localhost",
-                "org.matrix.msc3061.shared_history": true,
+                "m.shared_history": true,
                 "session_id": "ZFD6+OmV7fVCsJ7Gap8UnORH8EnmiAkes8FAvQuCw/I",
                 "session_key": "AgAAAADNp1EbxXYOGmJtyX4AkD1bvJvAUyPkbIaKxtnGKjv\
                             SQ3E/4mnuqdM4vsmNzpO1EeWzz1rDkUpYhYE9kP7sJhgLXi\

@@ -141,7 +141,7 @@ impl<'a> PinnedEventCacheStateLockWriteGuard<'a> {
         self.state.chunk.store_updates().take();
 
         // Let observers know about it.
-        self.notify_subscribers(EventsOrigin::Sync);
+        self.notify_subscribers(EventsOrigin::Cache);
 
         Ok(())
     }
@@ -200,6 +200,9 @@ impl PinnedEventCacheState {
 }
 
 /// All the information related to a room's pinned events cache.
+///
+/// This is cheap to clone, because it's a shallow data type.
+#[derive(Clone)]
 pub struct PinnedEventCache {
     state: Arc<PinnedEventCacheStateLock>,
 

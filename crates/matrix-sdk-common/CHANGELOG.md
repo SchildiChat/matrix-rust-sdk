@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- [**breaking**] Change to the stable identifiers for `m.history_not_shared`.
+  We still support reading the unstable identifier.
+  ([#6467](https://github.com/matrix-org/matrix-rust-sdk/pull/6467))
 - Add a method to check the validity of edits.
   ([#6454](https://github.com/matrix-org/matrix-rust-sdk/pull/6454))
 - A background task monitor has been added, that can spawn background tasks and monitor their
@@ -44,6 +47,11 @@ All notable changes to this project will be documented in this file.
 - Fix an off-by-one check for `Error:InvalidItemIndex` in `LinkedChunk::remove_item_at`.
   ([#6057](https://github.com/matrix-org/matrix-rust-sdk/pull/6057))
 - Fix `TimelineEvent::from_bundled_latest_event` sometimes removing the `session_id` of UTDs. This broken event could later be saved to the event cache and become an unresolvable UTD. ([#5970](https://github.com/matrix-org/matrix-rust-sdk/pull/5970)).
+
+### Refactor
+
+- [**breaking**] Remove `ttl_cache::TtlCache` because it is now unused.
+  ([#6484](https://github.com/matrix-org/matrix-rust-sdk/pull/6484))
 
 ## [0.16.0] - 2025-12-04
 

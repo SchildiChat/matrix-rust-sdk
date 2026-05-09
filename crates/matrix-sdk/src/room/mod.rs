@@ -180,7 +180,7 @@ use crate::{
     error::{BeaconError, WrongRoomState},
     event_cache::{self, EventCacheDropHandles, RoomEventCache},
     event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
-    live_location_share::LiveLocationShares,
+    live_locations_observer::LiveLocationsObserver,
     media::{MediaFormat, MediaRequestParameters},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     room::{
@@ -718,13 +718,13 @@ impl Room {
 
     /// Subscribes to active live location shares in this room.
     ///
-    /// Returns a [`LiveLocationShares`] that holds the current state and
+    /// Returns a [`LiveLocationsObserver`] that holds the current state and
     /// exposes a stream of incremental [`eyeball_im::VectorDiff`] updates via
-    /// [`LiveLocationShares::subscribe`].
+    /// [`LiveLocationsObserver::subscribe`].
     ///
     /// Event handlers are active for as long as the returned struct is alive.
-    pub async fn live_location_shares(&self) -> LiveLocationShares {
-        LiveLocationShares::new(self.clone()).await
+    pub async fn live_locations_observer(&self) -> LiveLocationsObserver {
+        LiveLocationsObserver::new(self.clone()).await
     }
 
     /// Returns a wrapping `TimelineEvent` for the input `AnyTimelineEvent`,
@@ -4067,15 +4067,21 @@ impl Room {
     /// # Errors
     ///
     /// Returns an error if the room is not joined, if the beacon information
-    /// is redacted or stripped, or if the state event is not found.
+    /// is redacted or stripped, if the state event is not found, or if the
+    /// existing beacon is no longer live.
     pub async fn stop_live_location_share(
         &self,
     ) -> Result<send_state_event::v3::Response, BeaconError> {
         self.ensure_room_joined()?;
 
         let mut beacon_info_event = self.get_user_beacon_info(self.own_user_id()).await?;
-        beacon_info_event.content.stop();
-        Ok(self.send_state_event_for_key(self.own_user_id(), beacon_info_event.content).await?)
+
+        if beacon_info_event.content.live {
+            beacon_info_event.content.stop();
+            Ok(self.send_state_event_for_key(self.own_user_id(), beacon_info_event.content).await?)
+        } else {
+            Err(BeaconError::NotLive)
+        }
     }
 
     /// Send a location beacon event in the current room.
@@ -4099,7 +4105,11 @@ impl Room {
 
         if beacon_info_event.content.is_live() {
             let content = BeaconEventContent::new(beacon_info_event.event_id, geo_uri, None);
-            Ok(self.send(content).await?.response)
+            Ok(self
+                .send(content)
+                .with_request_config(RequestConfig::new().retry_limit(6))
+                .await?
+                .response)
         } else {
             Err(BeaconError::NotLive)
         }
@@ -4648,6 +4658,11 @@ impl Room {
         } else {
             Ok(false)
         }
+    }
+
+    /// Checks if the current room is a DM.
+    pub async fn is_dm(&self) -> Result<bool> {
+        Ok(self.inner.is_dm(self.client.dm_room_definition()).await?)
     }
 }
 

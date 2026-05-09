@@ -37,7 +37,7 @@ use matrix_sdk_base::{
         SupportedVersionsResponse, ThreadSubscriptionStatus, WellKnownResponse,
         compare_thread_subscription_bump_stamps,
     },
-    ttl_cache::TtlValue,
+    ttl::TtlValue,
 };
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
 use ruma::{
@@ -674,7 +674,7 @@ impl_state_store!({
                 .transpose()?
                 .map(StateStoreDataValue::ThreadSubscriptionsCatchupTokens),
             StateStoreDataKey::HomeserverCapabilities => value
-                .map(|f| self.deserialize_value::<Capabilities>(&f))
+                .map(|f| self.deserialize_value::<TtlValue<Capabilities>>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::HomeserverCapabilities),
         };

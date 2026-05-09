@@ -22,7 +22,7 @@ use std::{
 use as_variant::as_variant;
 use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
-use matrix_sdk_common::{AsyncTraitDeps, ttl_cache::TtlValue};
+use matrix_sdk_common::{AsyncTraitDeps, ttl::TtlValue};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
@@ -1171,7 +1171,7 @@ pub enum StateStoreDataValue {
     ThreadSubscriptionsCatchupTokens(Vec<ThreadSubscriptionCatchupToken>),
 
     /// The capabilities the homeserver supports or disables.
-    HomeserverCapabilities(Capabilities),
+    HomeserverCapabilities(TtlValue<Capabilities>),
 }
 
 /// Tokens to use when catching up on thread subscriptions.
@@ -1376,7 +1376,7 @@ impl StateStoreDataValue {
 
     /// Get this value if it is the data for the capabilities the homeserver
     /// supports or disables.
-    pub fn into_homeserver_capabilities(self) -> Option<Capabilities> {
+    pub fn into_homeserver_capabilities(self) -> Option<TtlValue<Capabilities>> {
         as_variant!(self, Self::HomeserverCapabilities)
     }
 }

@@ -28,7 +28,9 @@ use matrix_sdk::STATE_STORE_DATABASE_NAME;
 use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::{
     Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
-    authentication::oauth::{ClientId, OAuthAuthorizationData, OAuthError, OAuthSession},
+    authentication::oauth::{
+        ClientId, OAuthAuthorizationData, OAuthError as SdkOAuthError, OAuthSession,
+    },
     deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
     executor::AbortOnDrop,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
@@ -38,7 +40,7 @@ use matrix_sdk::{
             account::request_openid_token,
             discovery::{
                 discover_homeserver::RtcFocusInfo,
-                get_authorization_server_metadata::v1::Prompt as RumaOidcPrompt,
+                get_authorization_server_metadata::v1::Prompt as RumaOAuthPrompt,
             },
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{Visibility, create_room},
@@ -124,9 +126,12 @@ use super::{
 };
 use crate::{
     ClientError,
-    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
+    authentication::{
+        HomeserverLoginDetails, OAuthConfiguration, OAuthError, SsoError, SsoHandler,
+    },
     client,
     encryption::Encryption,
+    live_locations_observer::BeaconInfoUpdate,
     notification::{
         NotificationClient, NotificationEvent, NotificationItem, NotificationRoomInfo,
         NotificationSenderInfo,
@@ -265,6 +270,13 @@ pub trait AccountDataListener: SyncOutsideWasm + SendOutsideWasm {
 pub trait DuplicateKeyUploadErrorListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called once when uploading keys fails.
     fn on_duplicate_key_upload_error(&self, message: Option<DuplicateOneTimeKeyErrorMessage>);
+}
+
+/// A listener for the current user's client-wide beacon_info updates.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait BeaconInfoListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called whenever the current user's beacon_info changes in any room.
+    fn on_update(&self, update: BeaconInfoUpdate);
 }
 
 /// Information about the old and new key that caused a duplicate key upload
@@ -462,7 +474,7 @@ impl Client {
     /// Information about login options for the client's homeserver.
     pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
         let oauth = self.inner.oauth();
-        let (supports_oidc_login, supported_oidc_prompts) = match oauth.server_metadata().await {
+        let (supports_oauth_login, supported_oauth_prompts) = match oauth.server_metadata().await {
             Ok(metadata) => {
                 let prompts =
                     metadata.prompt_values_supported.into_iter().map(Into::into).collect();
@@ -470,7 +482,7 @@ impl Client {
                 (true, prompts)
             }
             Err(error) => {
-                error!("Failed to fetch OIDC provider metadata: {error}");
+                error!("Failed to fetch OAuth provider metadata: {error}");
                 (false, Default::default())
             }
         };
@@ -498,8 +510,8 @@ impl Client {
         Arc::new(HomeserverLoginDetails {
             url: self.homeserver(),
             sliding_sync_version,
-            supports_oidc_login,
-            supported_oidc_prompts,
+            supports_oauth_login,
+            supported_oauth_prompts,
             supports_sso_login,
             supports_password_login,
         })
@@ -594,14 +606,14 @@ impl Client {
         Ok(Arc::new(SsoHandler { client: Arc::clone(self), url }))
     }
 
-    /// Requests the URL needed for opening a web view using OIDC. Once the web
-    /// view has succeeded, call `login_with_oidc_callback` with the callback it
-    /// returns. If a failure occurs and a callback isn't available, make sure
-    /// to call `abort_oidc_auth` to inform the client of this.
+    /// Requests the URL needed for opening a web view using OAuth. Once the web
+    /// view has succeeded, call `login_with_oauth_callback` with the callback
+    /// it returns. If a failure occurs and a callback isn't available, make
+    /// sure to call `abort_oauth_auth` to inform the client of this.
     ///
     /// # Arguments
     ///
-    /// * `oidc_configuration` - The configuration used to load the credentials
+    /// * `oauth_configuration` - The configuration used to load the credentials
     ///   of the client if it is already registered with the authorization
     ///   server, or register the client and store its credentials if it isn't.
     ///
@@ -626,16 +638,16 @@ impl Client {
     ///   The scopes for API access and the device ID according to the
     ///   [specification](https://spec.matrix.org/v1.15/client-server-api/#allocated-scope-tokens)
     ///   are always requested.
-    pub async fn url_for_oidc(
+    pub async fn url_for_oauth(
         &self,
-        oidc_configuration: &OidcConfiguration,
-        prompt: Option<OidcPrompt>,
+        oauth_configuration: &OAuthConfiguration,
+        prompt: Option<OAuthPrompt>,
         login_hint: Option<String>,
         device_id: Option<String>,
         additional_scopes: Option<Vec<String>>,
-    ) -> Result<Arc<OAuthAuthorizationData>, OidcError> {
-        let registration_data = oidc_configuration.registration_data()?;
-        let redirect_uri = oidc_configuration.redirect_uri()?;
+    ) -> Result<Arc<OAuthAuthorizationData>, OAuthError> {
+        let registration_data = oauth_configuration.registration_data()?;
+        let redirect_uri = oauth_configuration.redirect_uri()?;
 
         let device_id = device_id.map(OwnedDeviceId::from);
 
@@ -661,15 +673,15 @@ impl Client {
         Ok(Arc::new(data))
     }
 
-    /// Aborts an existing OIDC login operation that might have been cancelled,
+    /// Aborts an existing OAuth login operation that might have been cancelled,
     /// failed etc.
-    pub async fn abort_oidc_auth(&self, authorization_data: Arc<OAuthAuthorizationData>) {
+    pub async fn abort_oauth_auth(&self, authorization_data: Arc<OAuthAuthorizationData>) {
         self.inner.oauth().abort_login(&authorization_data.state).await;
     }
 
-    /// Completes the OIDC login process.
-    pub async fn login_with_oidc_callback(&self, callback_url: String) -> Result<(), OidcError> {
-        let url = Url::parse(&callback_url).or(Err(OidcError::CallbackUrlInvalid))?;
+    /// Completes the OAuth login process.
+    pub async fn login_with_oauth_callback(&self, callback_url: String) -> Result<(), OAuthError> {
+        let url = Url::parse(&callback_url).or(Err(OAuthError::CallbackUrlInvalid))?;
 
         self.inner.oauth().finish_login(url.into()).await?;
 
@@ -681,13 +693,13 @@ impl Client {
     ///
     /// # Arguments
     ///
-    /// * `oidc_configuration` - The data to restore or register the client with
-    ///   the server.
+    /// * `oauth_configuration` - The data to restore or register the client
+    ///   with the server.
     pub fn new_login_with_qr_code_handler(
         self: Arc<Self>,
-        oidc_configuration: OidcConfiguration,
+        oauth_configuration: OAuthConfiguration,
     ) -> LoginWithQrCodeHandler {
-        LoginWithQrCodeHandler::new(self.inner.oauth(), oidc_configuration)
+        LoginWithQrCodeHandler::new(self.inner.oauth(), oauth_configuration)
     }
 
     /// Create a handler for granting login from this device to a new device by
@@ -839,6 +851,25 @@ impl Client {
                 }
             }
         })))
+    }
+
+    /// Subscribe to beacon_info updates for the current user across all rooms.
+    ///
+    /// The listener is only called for new matching updates; there is no
+    /// initial replay.
+    pub fn subscribe_to_own_beacon_info_updates(
+        &self,
+        listener: Box<dyn BeaconInfoListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let stream = self.inner.observe_own_beacon_info_updates()?;
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            pin_mut!(stream);
+
+            while let Some(update) = stream.next().await {
+                listener.on_update(update.into());
+            }
+        }))))
     }
 
     /// Subscribe to updates of global account data events.
@@ -1209,7 +1240,7 @@ impl Client {
             Ok(server_metadata) => server_metadata,
             Err(e) => {
                 error!("Failed retrieving cached server metadata: {e}");
-                return Err(OAuthError::from(e).into());
+                return Err(SdkOAuthError::from(e).into());
             }
         };
 
@@ -1530,12 +1561,23 @@ impl Client {
         Ok(room)
     }
 
+    /// Get the first existing DM room with the given user, if any.
     pub fn get_dm_room(&self, user_id: String) -> Result<Option<Arc<Room>>, ClientError> {
         let user_id = UserId::parse(user_id)?;
         let sdk_room = self.inner.get_dm_room(&user_id);
         let dm =
             sdk_room.map(|room| Arc::new(Room::new(room, self.utd_hook_manager.get().cloned())));
         Ok(dm)
+    }
+
+    /// Get an iterator with the existing DM rooms for the given user.
+    pub fn get_dm_rooms(&self, user_id: String) -> Result<Vec<Arc<Room>>, ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        let sdk_rooms = self.inner.get_dm_rooms(&user_id);
+        let dms = sdk_rooms
+            .map(|room| Arc::new(Room::new(room, self.utd_hook_manager.get().cloned())))
+            .collect();
+        Ok(dms)
     }
 
     pub async fn search_users(
@@ -2221,6 +2263,19 @@ async fn notification_handler(
         topic: room.topic(),
         join_rule: room.join_rule().map(TryInto::try_into).transpose().ok().flatten(),
         joined_members_count: room.joined_members_count(),
+        service_members: room
+            .service_members()
+            .unwrap_or_default()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        active_service_members_count: room
+            .active_service_members()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .len() as u64,
         is_encrypted: Some(room.encryption_state().is_encrypted()),
         is_direct,
         is_space: room.is_space(),
@@ -2684,7 +2739,7 @@ pub struct Session {
     pub homeserver_url: String,
     /// Additional data for this session if OpenID Connect was used for
     /// authentication.
-    pub oidc_data: Option<String>,
+    pub oauth_data: Option<String>,
     /// The sliding sync version used for this session.
     pub sliding_sync_version: SlidingSyncVersion,
 }
@@ -2709,27 +2764,27 @@ impl Session {
                     user_id: user_id.to_string(),
                     device_id: device_id.to_string(),
                     homeserver_url,
-                    oidc_data: None,
+                    oauth_data: None,
                     sliding_sync_version,
                 })
             }
-            // Build the session from the OIDC UserSession.
+            // Build the session from the OAuth UserSession.
             AuthApi::OAuth(api) => {
                 let matrix_sdk::authentication::oauth::UserSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
                     tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
                 } = api.user_session().context("Missing session")?;
-                let client_id = api.client_id().context("OIDC client ID is missing.")?.clone();
-                let oidc_data = OidcSessionData { client_id };
+                let client_id = api.client_id().context("OAuth client ID is missing.")?.clone();
+                let oauth_data = OAuthSessionData { client_id };
 
-                let oidc_data = serde_json::to_string(&oidc_data).ok();
+                let oauth_data_string = serde_json::to_string(&oauth_data).ok();
                 Ok(Session {
                     access_token,
                     refresh_token,
                     user_id: user_id.to_string(),
                     device_id: device_id.to_string(),
                     homeserver_url,
-                    oidc_data,
+                    oauth_data: oauth_data_string,
                     sliding_sync_version,
                 })
             }
@@ -2751,13 +2806,13 @@ impl TryFrom<Session> for AuthSession {
             user_id,
             device_id,
             homeserver_url: _,
-            oidc_data,
+            oauth_data: oauth_data_string,
             sliding_sync_version: _,
         } = value;
 
-        if let Some(oidc_data) = oidc_data {
-            // Create an OidcSession.
-            let oidc_data = serde_json::from_str::<OidcSessionData>(&oidc_data)?;
+        if let Some(oauth_data_string) = oauth_data_string {
+            // Create an OAuth Session.
+            let oauth_data = serde_json::from_str::<OAuthSessionData>(&oauth_data_string)?;
 
             let user_session = matrix_sdk::authentication::oauth::UserSession {
                 meta: matrix_sdk::SessionMeta {
@@ -2767,7 +2822,7 @@ impl TryFrom<Session> for AuthSession {
                 tokens: matrix_sdk::SessionTokens { access_token, refresh_token },
             };
 
-            let session = OAuthSession { client_id: oidc_data.client_id, user: user_session };
+            let session = OAuthSession { client_id: oauth_data.client_id, user: user_session };
 
             Ok(AuthSession::OAuth(session.into()))
         } else {
@@ -2785,10 +2840,9 @@ impl TryFrom<Session> for AuthSession {
     }
 }
 
-/// Represents a client registration against an OpenID Connect authentication
-/// issuer.
+/// Represents a client registration against an OAuth authentication issuer.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct OidcSessionData {
+pub(crate) struct OAuthSessionData {
     client_id: ClientId,
 }
 
@@ -2914,7 +2968,7 @@ impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
 }
 
 #[derive(Clone, uniffi::Enum)]
-pub enum OidcPrompt {
+pub enum OAuthPrompt {
     /// The Authorization Server should prompt the End-User to create a user
     /// account.
     ///
@@ -2933,10 +2987,10 @@ pub enum OidcPrompt {
     Unknown { value: String },
 }
 
-impl From<RumaOidcPrompt> for OidcPrompt {
-    fn from(value: RumaOidcPrompt) -> Self {
+impl From<RumaOAuthPrompt> for OAuthPrompt {
+    fn from(value: RumaOAuthPrompt) -> Self {
         match value {
-            RumaOidcPrompt::Create => Self::Create,
+            RumaOAuthPrompt::Create => Self::Create,
             value => match value.as_str() {
                 "consent" => Self::Consent,
                 "login" => Self::Login,
@@ -2946,13 +3000,13 @@ impl From<RumaOidcPrompt> for OidcPrompt {
     }
 }
 
-impl From<OidcPrompt> for RumaOidcPrompt {
-    fn from(value: OidcPrompt) -> Self {
+impl From<OAuthPrompt> for RumaOAuthPrompt {
+    fn from(value: OAuthPrompt) -> Self {
         match value {
-            OidcPrompt::Create => Self::Create,
-            OidcPrompt::Consent => Self::from("consent"),
-            OidcPrompt::Login => Self::from("login"),
-            OidcPrompt::Unknown { value } => value.into(),
+            OAuthPrompt::Create => Self::Create,
+            OAuthPrompt::Consent => Self::from("consent"),
+            OAuthPrompt::Login => Self::from("login"),
+            OAuthPrompt::Unknown { value } => value.into(),
         }
     }
 }
@@ -3047,7 +3101,7 @@ impl TryFrom<AllowRule> for RumaAllowRule {
                 let room_id = RoomId::parse(room_id)?;
                 Ok(Self::RoomMembership(ruma::room::RoomMembership::new(room_id)))
             }
-            AllowRule::Custom { json } => Ok(Self::_Custom(Box::new(serde_json::from_str(&json)?))),
+            AllowRule::Custom { json } => Ok(serde_json::from_str(&json)?),
         }
     }
 }

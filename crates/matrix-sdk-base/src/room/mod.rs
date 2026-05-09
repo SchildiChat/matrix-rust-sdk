@@ -56,6 +56,7 @@ use ruma::{
             guest_access::GuestAccess,
             history_visibility::HistoryVisibility,
             join_rules::JoinRule,
+            member::MembershipState,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, RoomPowerLevelsSource},
         },
     },
@@ -69,7 +70,7 @@ pub use tombstone::{PredecessorRoom, SuccessorRoom};
 use tracing::{info, instrument, warn};
 
 use crate::{
-    Error,
+    DmRoomDefinition, Error,
     deserialized_responses::MemberEvent,
     notification_settings::RoomNotificationMode,
     read_receipts::RoomReadReceipts,
@@ -333,6 +334,26 @@ impl Room {
         }
     }
 
+    /// Checks if the current room is a DM based on the rules from the
+    /// [`DmRoomDefinition`].
+    pub async fn is_dm(&self, dm_room_definition: &DmRoomDefinition) -> StoreResult<bool> {
+        let is_direct = self.is_direct().await?;
+
+        match *dm_room_definition {
+            DmRoomDefinition::MatrixSpec => Ok(is_direct),
+            DmRoomDefinition::TwoMembers => {
+                if !is_direct {
+                    return Ok(false);
+                }
+                let active_service_member_count =
+                    self.active_service_members().await?.unwrap_or_default().len() as u64;
+                let has_at_most_two_members =
+                    self.active_members_count().saturating_sub(active_service_member_count) <= 2;
+                Ok(has_at_most_two_members)
+            }
+        }
+    }
+
     /// If this room is a direct message, get the members that we're sharing the
     /// room with.
     ///
@@ -490,8 +511,18 @@ impl Room {
     }
 
     /// Get the heroes for this room.
+    ///
+    /// This also filters out possible service members from the list of heroes
+    /// returned by the homeserver.
     pub fn heroes(&self) -> Vec<RoomHero> {
-        self.info.read().heroes().to_vec()
+        let guard = self.info.read();
+        let heroes = guard.heroes();
+
+        if let Some(service_members) = guard.service_members() {
+            heroes.iter().filter(|hero| !service_members.contains(&hero.user_id)).cloned().collect()
+        } else {
+            heroes.to_vec()
+        }
     }
 
     /// Get the receipt as an `OwnedEventId` and `Receipt` tuple for the given
@@ -549,6 +580,34 @@ impl Room {
     pub fn pinned_event_ids(&self) -> Option<Vec<OwnedEventId>> {
         self.info.read().pinned_event_ids()
     }
+
+    /// Returns the list of service members that are either in a joined or
+    /// invited state in this room, checking the service member list against the
+    /// locally available room members.
+    pub async fn active_service_members(&self) -> StoreResult<Option<Vec<RoomMember>>> {
+        if let Some(service_members) = self.service_members() {
+            let mut found = Vec::new();
+            for user_id in service_members {
+                match self.get_member(&user_id).await {
+                    Ok(Some(member)) => {
+                        // We only care about active members (joined or invited)
+                        if matches!(
+                            member.membership(),
+                            MembershipState::Join | MembershipState::Invite
+                        ) {
+                            found.push(member);
+                        }
+                    }
+                    Ok(None) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+
+            Ok(Some(found))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 // See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
@@ -580,4 +639,52 @@ pub(crate) enum AccountDataSource {
     /// The source is account data with the unstable prefix.
     #[default]
     Unstable,
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_sdk_test::{
+        JoinedRoomBuilder, SyncResponseBuilder, async_test, event_factory::EventFactory,
+    };
+    use ruma::{room_id, user_id};
+    use serde_json::json;
+
+    use super::*;
+    use crate::test_utils::logged_in_base_client;
+
+    #[async_test]
+    async fn test_room_heroes_filters_out_service_members() {
+        let client = logged_in_base_client(None).await;
+        let user_id = &client.session_meta().unwrap().user_id;
+        let service_member_id = user_id!("@service:example.org");
+        let alice_id = user_id!("@alice:example.org");
+        let room_id = room_id!("!room:example.org");
+
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+
+        // Create a room response with 2 heroes, one of them a service member.
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id)
+                    .set_room_summary(json!({
+                        "m.joined_member_count": 3,
+                        "m.invited_member_count": 0,
+                        "m.heroes": [alice_id.to_owned(), service_member_id.to_owned()],
+                    }))
+                    .add_state_event(
+                        EventFactory::new()
+                            .sender(user_id)
+                            .member_hints(BTreeSet::from([service_member_id.to_owned()])),
+                    ),
+            )
+            .build_sync_response();
+
+        client.receive_sync_response(response).await.unwrap();
+
+        // The service member should be filtered out.
+        let heroes = room.heroes();
+        assert_eq!(heroes.len(), 1);
+        assert_eq!(heroes[0].user_id, alice_id);
+    }
 }

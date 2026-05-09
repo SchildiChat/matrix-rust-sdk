@@ -8,6 +8,23 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Added `beacon` and `beacon_info` fields to `RoomPowerLevelChanges`, allowing callers to read
+  and update the power levels required to send beacon (live location) message events and beacon
+  info state events respectively.
+  ([#6540](https://github.com/matrix-org/matrix-rust-sdk/pull/6540))
+- Added `DmRoomDefinition` as a parameter of `ClientBuilder` so we can specify it when creating a Client. 
+  Also added a `Room::is_dm` method and added some logic to use the new DM definitions in `Client::get_dm_rooms` 
+  and when using message search. ([#6490](https://github.com/matrix-org/matrix-rust-sdk/pull/6490))
+- Sharing encrypted history on room invite, per
+  [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268) is
+  now enabled by default (though can still be disabled via
+  `ClientBuilder::with_enable_share_history_on_invite`).
+  ([#6497](https://github.com/matrix-org/matrix-rust-sdk/pull/6497))
+- Add `Client::get_dm_rooms` function to get an iterator with the DMs for the provided user id.
+  ([#6487](https://github.com/matrix-org/matrix-rust-sdk/pull/6487))
+- Support the stable `m.key_backup` prefix for MSC4287: Sharing key backup
+  preference between clients.
+  ([#6410](https://github.com/matrix-org/matrix-rust-sdk/pull/6410))
 - Add new high-level search helpers in `matrix_sdk_ui::search` to perform searches for messages in
   a room or across all rooms.
   ([#6394](https://github.com/matrix-org/matrix-rust-sdk/pull/6394))
@@ -30,7 +47,7 @@ All notable changes to this project will be documented in this file.
   TLS backend.
   ([#6409](https://github.com/matrix-org/matrix-rust-sdk/pull/6409))
 - [**breaking**] Added `HomeserverCapabilities` and `Client::homeserver_capabilities()` to get the capabilities
-  of the homeserver. This replaces `Client::get_capabilities()`. 
+  of the homeserver. This replaces `Client::get_capabilities()`.
   ([#6371](https://github.com/matrix-org/matrix-rust-sdk/pull/6371))
 - [**breaking**] `matrix_sdk::error::Error` has a new variant `Timeout` which occurs when
   a cross-signing reset does not succeed after some period of time.
@@ -116,8 +133,12 @@ All notable changes to this project will be documented in this file.
 
 ### Breaking Changes
 
-- `Room::observe_live_location_shares` has been replaced by `Room::live_location_shares`.
-  The new API returns a `LiveLocationShares` struct with a `subscribe()` method that provides an initial
+- [**breaking**] `LiveLocationShares` has been renamed to `LiveLocationsObserver` and
+  `Room::live_location_shares` to `Room::live_locations_observer`.
+  ([#6446](https://github.com/matrix-org/matrix-rust-sdk/pull/6446))
+
+- `Room::observe_live_location_shares` has been replaced by `Room::live_locations_observer`.
+  The new API returns a `LiveLocationsObserver` struct with a `subscribe()` method that provides an initial
   snapshot (`Vector<LiveLocationShare>`) and a batched stream of `VectorDiff` updates, instead of
   emitting individual `LiveLocationShare` items as beacon events arrive. The initial snapshot is loaded
   from the event cache on creation, includes the own user's shares (previously excluded), and properly
@@ -126,6 +147,14 @@ All notable changes to this project will be documented in this file.
 
 ### Bugfix
 
+- Add the `session` key in `OAuthCrossSigningResetInfo`, allowing to provide `AuthData::OAuth` in
+  `CrossSigningResetHandle::auth()`, to match the behavior described in the Matrix spec.
+  ([#6525](https://github.com/matrix-org/matrix-rust-sdk/pull/6525))
+- When threads are enabled, a focused event timeline is used and the focused event is not part of a thread, 
+  hide other threaded events by default like it happens on the live focus timeline. 
+  ([#6519](https://github.com/matrix-org/matrix-rust-sdk/pull/6519))
+- Add a recursion limit attribute that raises it from the default value of 128 to 256.
+  ([#6489](https://github.com/matrix-org/matrix-rust-sdk/pull/6489))
 - Reject invalid edits as candidates for the latest event.
   ([#6454](https://github.com/matrix-org/matrix-rust-sdk/pull/6454))
 - Fix an infinite loop when loading pinned events from the storage.
@@ -134,8 +163,8 @@ All notable changes to this project will be documented in this file.
   are now also eligible as the latest event for a room, preventing the live location sharing item
   from disappearing from the room list summary once the session ends.
   ([#6373](https://github.com/matrix-org/matrix-rust-sdk/pull/6373))
-- Android: add back custom certificates and disabling SSL verification options in `ClientBuilder` using 
-  the previous `webkpi` verifier instead of platform verifier, otherwise these features will fail. 
+- Android: add back custom certificates and disabling SSL verification options in `ClientBuilder` using
+  the previous `webkpi` verifier instead of platform verifier, otherwise these features will fail.
   ([#6328](https://github.com/matrix-org/matrix-rust-sdk/pull/6328))
 - Room keys are now rotated whenever the client receives an `m.room.member` event not belonging
   to the current user with non-`join` membership in order to prevent
@@ -171,6 +200,11 @@ All notable changes to this project will be documented in this file.
 
 ### Refactor
 
+- [**breaking**] Upgrade Ruma to 0.15.1.
+  ([#6503](https://github.com/matrix-org/matrix-rust-sdk/pull/6503))
+- Revert back to to determining lock dirtiness in `Encryption::{spin_lock_store, try_lock_once_store}`
+  through logic defined in `OlmMachine`, rather than `CrossProcessLock`.
+  ([#6496](https://github.com/matrix-org/matrix-rust-sdk/pull/6496))
 - [**breaking**] Update `Encryption::{spin_lock_store, try_lock_once_store}` so that lock dirtiness
   is determined entirely by `CrossProcessLock`, rather than logic defined by `OlmMachine`. Also enforce
   that lock generation is opaque by removing `CrossProcessLockStoreGuardWithGeneration`.
@@ -220,9 +254,9 @@ All notable changes to this project will be documented in this file.
   ```
 - `RoomPaginationStatus` is renamed to `PaginationStatus`.
   ([#6174](https://github.com/matrix-org/matrix-rust-sdk/pull/6174/))
-- [**breaking**] Replaced `ClientBuilder::cross_process_store_locks_holder_name` with 
-  `ClientBuilder::cross_process_store_config` to allow specifying the configuration for the cross-process lock and 
-  whether it should act as a no-op (client used in a single process) or we should keep the previous behavior (client 
+- [**breaking**] Replaced `ClientBuilder::cross_process_store_locks_holder_name` with
+  `ClientBuilder::cross_process_store_config` to allow specifying the configuration for the cross-process lock and
+  whether it should act as a no-op (client used in a single process) or we should keep the previous behavior (client
   used in multiple processes). ([#6160](https://github.com/matrix-org/matrix-rust-sdk/pull/6160))
 
 ## [0.16.0] - 2025-12-04

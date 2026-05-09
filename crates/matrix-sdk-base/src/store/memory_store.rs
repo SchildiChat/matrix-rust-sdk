@@ -20,7 +20,7 @@ use std::{
 
 use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
-use matrix_sdk_common::{ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK, ttl_cache::TtlValue};
+use matrix_sdk_common::{ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK, ttl::TtlValue};
 use ruma::{
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
     OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
@@ -93,7 +93,7 @@ struct MemoryStoreInner {
     seen_knock_requests: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, OwnedUserId>>,
     thread_subscriptions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, StoredThreadSubscription>>,
     thread_subscriptions_catchup_tokens: Option<Vec<ThreadSubscriptionCatchupToken>>,
-    homeserver_capabilities: Option<Capabilities>,
+    homeserver_capabilities: Option<TtlValue<Capabilities>>,
 }
 
 /// In-memory, non-persistent implementation of the `StateStore`.

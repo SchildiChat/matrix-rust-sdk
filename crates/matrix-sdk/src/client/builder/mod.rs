@@ -28,7 +28,9 @@ use homeserver_config::*;
 use matrix_sdk_base::crypto::DecryptionSettings;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{CollectStrategy, TrustRequirement};
-use matrix_sdk_base::{BaseClient, ThreadingSupport, store::StoreConfig, ttl_cache::TtlValue};
+use matrix_sdk_base::{
+    BaseClient, DmRoomDefinition, ThreadingSupport, store::StoreConfig, ttl::TtlValue,
+};
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 #[cfg(feature = "sqlite")]
 use matrix_sdk_sqlite::SqliteStoreConfig;
@@ -126,6 +128,7 @@ pub struct ClientBuilder {
     threading_support: ThreadingSupport,
     #[cfg(feature = "experimental-search")]
     search_index_store_kind: SearchIndexStoreKind,
+    dm_room_definition: DmRoomDefinition,
 }
 
 impl ClientBuilder {
@@ -155,14 +158,23 @@ impl ClientBuilder {
                 sender_device_trust_requirement: TrustRequirement::Untrusted,
             },
             #[cfg(feature = "e2e-encryption")]
-            enable_share_history_on_invite: false,
+            enable_share_history_on_invite: true,
             cross_process_lock_config: CrossProcessLockConfig::MultiProcess {
                 holder_name: Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
             },
             threading_support: ThreadingSupport::Disabled,
             #[cfg(feature = "experimental-search")]
             search_index_store_kind: SearchIndexStoreKind::InMemory,
+            dm_room_definition: DmRoomDefinition::MatrixSpec,
         }
+    }
+
+    /// Sets the definition the [`Client`] will use to check if a room is a DM.
+    ///
+    /// By default this is [`DmRoomDefinition::MatrixSpec`].
+    pub fn dm_room_definition(mut self, dm_room_definition: DmRoomDefinition) -> Self {
+        self.dm_room_definition = dm_room_definition;
+        self
     }
 
     /// Set the homeserver URL to use.
@@ -486,6 +498,9 @@ impl ClientBuilder {
     /// Whether to enable the experimental support for sending and receiving
     /// encrypted room history on invite, per [MSC4268].
     ///
+    /// This setting is now enabled by default, but can be disabled via this
+    /// method.
+    ///
     /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
     #[cfg(feature = "e2e-encryption")]
     pub fn with_enable_share_history_on_invite(
@@ -564,6 +579,7 @@ impl ClientBuilder {
             let mut client = BaseClient::new(
                 build_store_config(self.store_config, &self.cross_process_lock_config).await?,
                 self.threading_support,
+                self.dm_room_definition,
             );
 
             #[cfg(feature = "e2e-encryption")]
@@ -613,7 +629,7 @@ impl ClientBuilder {
             None => NotSet,
         };
         let well_known = match well_known {
-            Some(well_known) => Cached(Some(well_known.into())),
+            Some(well_known) => Cached(TtlValue::new(Some(well_known.into()))),
             None => NotSet,
         };
 
