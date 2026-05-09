@@ -8,6 +8,7 @@ use std::{
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use growable_bloom_filter::GrowableBloomBuilder;
+use matrix_sdk_common::ttl::TtlValue;
 use matrix_sdk_test::{TestResult, event_factory::EventFactory};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, TransactionId, UserId,
@@ -46,7 +47,7 @@ use serde_json::json;
 
 use super::{
     DependentQueuedRequestKind, DisplayName, DynStateStore, RoomLoadSettings,
-    SupportedVersionsResponse, TtlStoreValue, WellKnownResponse, send_queue::SentRequestKey,
+    SupportedVersionsResponse, WellKnownResponse, send_queue::SentRequestKey,
 };
 use crate::{
     RoomInfo, RoomMemberships, RoomState, StateChanges, StateStoreDataKey, StateStoreDataValue,
@@ -531,7 +532,7 @@ impl StateStoreIntegrationTests for DynStateStore {
 
         self.set_kv_data(
             StateStoreDataKey::SupportedVersions,
-            StateStoreDataValue::SupportedVersions(TtlStoreValue::new(supported_versions.clone())),
+            StateStoreDataValue::SupportedVersions(TtlValue::new(supported_versions.clone())),
         )
         .await?;
 
@@ -539,7 +540,7 @@ impl StateStoreIntegrationTests for DynStateStore {
             Ok(Some(StateStoreDataValue::SupportedVersions(stored_supported_versions))) =
                 self.get_kv_data(StateStoreDataKey::SupportedVersions).await
         );
-        assert_let!(Some(stored_supported_versions) = stored_supported_versions.into_data());
+        let stored_supported_versions = stored_supported_versions.into_data();
         assert_eq!(supported_versions, stored_supported_versions);
 
         let stored_supported = stored_supported_versions.supported_versions();
@@ -563,7 +564,7 @@ impl StateStoreIntegrationTests for DynStateStore {
 
         self.set_kv_data(
             StateStoreDataKey::WellKnown,
-            StateStoreDataValue::WellKnown(TtlStoreValue::new(Some(well_known.clone()))),
+            StateStoreDataValue::WellKnown(TtlValue::new(Some(well_known.clone()))),
         )
         .await?;
 
@@ -571,7 +572,7 @@ impl StateStoreIntegrationTests for DynStateStore {
             Ok(Some(StateStoreDataValue::WellKnown(stored_well_known))) =
                 self.get_kv_data(StateStoreDataKey::WellKnown).await
         );
-        assert_let!(Some(stored_well_known) = stored_well_known.into_data());
+        let stored_well_known = stored_well_known.into_data();
         assert_eq!(stored_well_known, Some(well_known));
 
         self.remove_kv_data(StateStoreDataKey::WellKnown).await?;
@@ -579,7 +580,7 @@ impl StateStoreIntegrationTests for DynStateStore {
 
         self.set_kv_data(
             StateStoreDataKey::WellKnown,
-            StateStoreDataValue::WellKnown(TtlStoreValue::new(None)),
+            StateStoreDataValue::WellKnown(TtlValue::new(None)),
         )
         .await?;
 
@@ -587,7 +588,7 @@ impl StateStoreIntegrationTests for DynStateStore {
             Ok(Some(StateStoreDataValue::WellKnown(stored_well_known))) =
                 self.get_kv_data(StateStoreDataKey::WellKnown).await
         );
-        assert_let!(Some(stored_well_known) = stored_well_known.into_data());
+        let stored_well_known = stored_well_known.into_data();
         assert_eq!(stored_well_known, None);
 
         Ok(())

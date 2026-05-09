@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
@@ -66,6 +67,9 @@ pub mod sync;
 #[cfg(feature = "experimental-widgets")]
 pub mod widget;
 
+#[cfg(feature = "experimental-search")]
+pub mod message_search;
+
 pub use account::Account;
 pub use authentication::{AuthApi, AuthSession, SessionTokens};
 pub use client::homeserver_capabilities::HomeserverCapabilities;
@@ -76,8 +80,8 @@ pub use client::{
     sanitize_server_name,
 };
 pub use error::{
-    Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError, Result,
-    RumaApiError,
+    BeaconError, Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError,
+    Result, RumaApiError,
 };
 pub use http_client::TransmissionProgress;
 #[cfg(all(feature = "e2e-encryption", feature = "sqlite"))]
@@ -99,7 +103,7 @@ pub use sliding_sync::{
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub mod live_location_share;
+pub mod live_locations_observer;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 

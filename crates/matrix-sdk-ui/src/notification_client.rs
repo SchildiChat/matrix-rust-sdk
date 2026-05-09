@@ -20,6 +20,7 @@ use std::{
 };
 
 use futures_util::{StreamExt as _, pin_mut};
+use itertools::Itertools;
 use matrix_sdk::{
     Client, ClientBuildError, SlidingSyncList, SlidingSyncMode, room::Room, sleep::sleep,
 };
@@ -938,6 +939,9 @@ pub struct NotificationItem {
     pub is_direct_message_room: bool,
     /// Numbers of members who joined the room.
     pub joined_members_count: u64,
+    /// Number of service members in the room.
+    pub service_members: Vec<String>,
+    pub active_service_members_count: u64,
     /// Is the room a space?
     pub is_space: bool,
 
@@ -1022,6 +1026,15 @@ impl NotificationItem {
         let is_noisy = push_actions.map(|actions| actions.iter().any(|a| a.sound().is_some()));
         let has_mention = push_actions.map(|actions| actions.iter().any(|a| a.is_highlight()));
         let thread_id = event.thread_id().clone();
+        let service_members = room
+            .service_members()
+            .unwrap_or_default()
+            .iter()
+            .map(ToString::to_string)
+            .collect_vec();
+
+        let active_service_members_count =
+            room.active_service_members().await?.unwrap_or_default().len() as u64;
 
         let item = NotificationItem {
             event,
@@ -1041,6 +1054,8 @@ impl NotificationItem {
                 .map(|state| state.is_encrypted())
                 .ok(),
             joined_members_count: room.joined_members_count(),
+            service_members,
+            active_service_members_count,
             is_space: room.is_space(),
             is_noisy,
             has_mention,

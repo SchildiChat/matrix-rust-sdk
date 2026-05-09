@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Fix a possible panic in `RoomList::entries_with_dynamic_adapters`.
+  ([#6459](https://github.com/matrix-org/matrix-rust-sdk/pull/6459))
 - Keep stopped `beacon_info` live location sessions visible in
   `Room::latest_event()`, so room summaries still show the last live location
   sharing session after it ends.
@@ -36,6 +38,9 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- Add a list of `declined_by: Vec<OwnedUserId>` to the `TimelineItemContent::RtcNotification`, this will contain the list
+  of users that have declined the call.
+  ([#6494](https://github.com/matrix-org/matrix-rust-sdk/pull/6494))
 - [**breaking**] Add the `suggested` field to the `SpaceRoom` struct,
   which indicates whether a space's admins have marked that sub-space/room
   as a "suggested" one to join. ([6417](https://github.com/matrix-org/matrix-rust-sdk/pull/6417))
@@ -97,6 +102,8 @@ All notable changes to this project will be documented in this file.
   
 ### Refactor
 
+- Use `DmRoomDefinition` to check if a room should be considered part of the `RoomCategory::People` or 
+  `RoomCategory::Room` when using room list filters. ([#6490](https://github.com/matrix-org/matrix-rust-sdk/pull/6490))
 - [**breaking**] `AnyOtherStateEventContentChange::RoomAliases` was removed. This state event type
   was removed from the Matrix specification a while ago, and support for it has been removed in Ruma.
   ([#6414](https://github.com/matrix-org/matrix-rust-sdk/pull/6414))

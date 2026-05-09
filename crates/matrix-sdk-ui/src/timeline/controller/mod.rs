@@ -23,8 +23,6 @@ use eyeball_im::{VectorDiff, VectorSubscriberStream};
 use eyeball_im_util::vector::{FilterMap, VectorObserverExt};
 use futures_core::Stream;
 use imbl::Vector;
-#[cfg(test)]
-use matrix_sdk::Result;
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
@@ -321,6 +319,9 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
                         // their parent `beacon_info` state event's timeline
                         // item. They are never rendered as standalone items.
                         AnyMessageLikeEventContent::Beacon(_) => false,
+                        // Ignore decline events, the matching RtcNotification event will be updated
+                        // to reflect the decline.
+                        AnyMessageLikeEventContent::RtcDecline(_) => false,
 
                         _ => false,
                     }

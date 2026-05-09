@@ -32,18 +32,16 @@ use matrix_sdk_base::crypto::{
     DecryptionSettings, store::LockableCryptoStore, store::types::RoomPendingKeyBundleDetails,
 };
 use matrix_sdk_base::{
-    BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
-    StateStoreDataKey, StateStoreDataValue, StoreError, SyncOutsideWasm, ThreadingSupport,
+    BaseClient, DmRoomDefinition, RoomInfoNotableUpdate, RoomState, RoomStateFilter,
+    SendOutsideWasm, SessionMeta, StateStoreDataKey, StateStoreDataValue, StoreError,
+    SyncOutsideWasm, ThreadingSupport,
     event_cache::store::EventCacheStoreLock,
     media::store::MediaStoreLock,
-    store::{
-        DynStateStore, RoomLoadSettings, SupportedVersionsResponse, TtlStoreValue,
-        WellKnownResponse,
-    },
+    store::{DynStateStore, RoomLoadSettings, SupportedVersionsResponse, WellKnownResponse},
     sync::{Notification, RoomUpdates},
     task_monitor::TaskMonitor,
 };
-use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, ttl_cache::TtlCache};
+use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, ttl::TtlValue};
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent};
 use ruma::{
@@ -76,7 +74,7 @@ use ruma::{
         path_builder::PathBuilder,
     },
     assign,
-    events::direct::DirectUserIdentifier,
+    events::{beacon_info::OriginalSyncBeaconInfoEvent, direct::DirectUserIdentifier},
     push::Ruleset,
     time::Instant,
 };
@@ -86,7 +84,7 @@ use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 use url::Url;
 
 use self::{
-    caches::{CachedValue, ClientCaches},
+    caches::{Cache, CachedValue, ClientCaches},
     futures::SendRequest,
 };
 use crate::{
@@ -110,6 +108,7 @@ use crate::{
     },
     http_client::{HttpClient, SupportedAuthScheme, SupportedPathBuilder},
     latest_events::LatestEvents,
+    live_locations_observer::BeaconInfoUpdate,
     media::MediaError,
     notification_settings::NotificationSettings,
     room::RoomMember,
@@ -245,6 +244,27 @@ pub(crate) struct ClientLocks {
 
     #[cfg(feature = "e2e-encryption")]
     pub(crate) cross_process_crypto_store_lock: OnceCell<CrossProcessLock<LockableCryptoStore>>,
+
+    /// Latest "generation" of data known by the crypto store.
+    ///
+    /// This is a counter that only increments, set in the database (and can
+    /// wrap). It's incremented whenever some process acquires a lock for the
+    /// first time. *This assumes the crypto store lock is being held, to
+    /// avoid data races on writing to this value in the store*.
+    ///
+    /// The current process will maintain this value in local memory and in the
+    /// DB over time. Observing a different value than the one read in
+    /// memory, when reading from the store indicates that somebody else has
+    /// written into the database under our feet.
+    ///
+    /// TODO: this should live in the `OlmMachine`, since it's information
+    /// related to the lock. As of today (2023-07-28), we blow up the entire
+    /// olm machine when there's a generation mismatch. So storing the
+    /// generation in the olm machine would make the client think there's
+    /// *always* a mismatch, and that's why we need to store the generation
+    /// outside the `OlmMachine`.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) crypto_store_generation: Arc<Mutex<Option<u64>>>,
 }
 
 pub(crate) struct ClientInner {
@@ -390,8 +410,8 @@ impl ClientInner {
         sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
         base_client: BaseClient,
-        supported_versions: CachedValue<SupportedVersions>,
-        well_known: CachedValue<Option<WellKnownResponse>>,
+        supported_versions: CachedValue<TtlValue<SupportedVersions>>,
+        well_known: CachedValue<TtlValue<Option<WellKnownResponse>>>,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
         send_queue: Arc<SendQueueData>,
@@ -403,9 +423,10 @@ impl ClientInner {
         thread_subscription_catchup: OnceCell<Arc<ThreadSubscriptionCatchup>>,
     ) -> Arc<Self> {
         let caches = ClientCaches {
-            supported_versions: supported_versions.into(),
-            well_known: well_known.into(),
-            server_metadata: Mutex::new(TtlCache::new()),
+            supported_versions: Cache::with_value(supported_versions),
+            well_known: Cache::with_value(well_known),
+            server_metadata: Cache::new(),
+            homeserver_capabilities: Cache::new(),
         };
 
         let client = Self {
@@ -542,7 +563,7 @@ impl Client {
     ) -> Result<()> {
         self.set_homeserver(homeserver_url);
         self.reset_well_known().await?;
-        if let Some(well_known) = self.load_or_fetch_well_known().await? {
+        if let Some(well_known) = self.well_known().await {
             self.set_homeserver(Url::parse(&well_known.homeserver.base_url)?);
         }
         Ok(())
@@ -1075,6 +1096,33 @@ impl Client {
                 room_id,
             )),
         )
+    }
+
+    /// Subscribe to future `beacon_info` updates for the current user across
+    /// all rooms.
+    ///
+    /// This stream is push-only: it emits only future updates observed during
+    /// sync processing and does not replay existing state.
+    pub fn observe_own_beacon_info_updates(
+        &self,
+    ) -> Result<impl Stream<Item = BeaconInfoUpdate> + use<>> {
+        let observer = self.observe_events::<OriginalSyncBeaconInfoEvent, Room>();
+        let mut stream = observer.subscribe();
+        let own_user_id = self.user_id().ok_or(Error::AuthenticationRequired)?.to_owned();
+        Ok(async_stream::stream! {
+            let _observer = observer;
+
+            while let Some((event, room)) = stream.next().await {
+                if event.state_key != own_user_id {
+                    continue;
+                }
+                yield BeaconInfoUpdate {
+                    room_id: room.room_id().to_owned(),
+                    event_id: event.event_id,
+                    content: event.content,
+                };
+            }
+        })
     }
 
     /// Remove the event handler associated with the handle.
@@ -1799,18 +1847,36 @@ impl Client {
         self.create_room(request).await
     }
 
-    /// Get the existing DM room with the given user, if any.
+    /// Get the first existing DM room with the given user, if any.
     pub fn get_dm_room(&self, user_id: &UserId) -> Option<Room> {
+        self.get_dm_rooms(user_id).next()
+    }
+
+    /// Get an iterator with the existing DM rooms for the given user.
+    pub fn get_dm_rooms(&self, user_id: &UserId) -> impl Iterator<Item = Room> {
         let rooms = self.joined_rooms();
 
+        let dm_definition = &self.base_client().dm_room_definition;
+
         // Find the room we share with the `user_id` and only with `user_id`
-        let room = rooms.into_iter().find(|r| {
+        let rooms = rooms.into_iter().filter(move |r| {
             let targets = r.direct_targets();
-            targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(user_id))
+            let targets_match =
+                targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(user_id));
+            match dm_definition {
+                DmRoomDefinition::MatrixSpec => targets_match,
+                DmRoomDefinition::TwoMembers => {
+                    let service_members_count =
+                        r.service_members().map(|s| s.len()).unwrap_or_default() as u64;
+                    let active_non_service_members =
+                        r.active_members_count().saturating_sub(service_members_count);
+                    targets_match && active_non_service_members <= 2
+                }
+            }
         });
 
-        trace!(?user_id, ?room, "Found DM room with user");
-        room
+        trace!(?user_id, ?rooms, "Found DM rooms with user");
+        rooms
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -2109,59 +2175,17 @@ impl Client {
     ///
     /// If `failsafe` is true, this will try to minimize side effects to avoid
     /// possible deadlocks.
-    async fn load_or_fetch_supported_versions(
+    async fn fetch_supported_versions(
         &self,
         failsafe: bool,
     ) -> HttpResult<SupportedVersionsResponse> {
-        match self.state_store().get_kv_data(StateStoreDataKey::SupportedVersions).await {
-            Ok(Some(stored)) => {
-                if let Some(supported_versions) =
-                    stored.into_supported_versions().and_then(|value| value.into_data())
-                {
-                    return Ok(supported_versions);
-                }
-            }
-            Ok(None) => {
-                // fallthrough: cache is empty
-            }
-            Err(err) => {
-                warn!("error when loading cached supported versions: {err}");
-                // fallthrough to network.
-            }
-        }
-
         let server_versions = self.fetch_server_versions_inner(failsafe, None).await?;
         let supported_versions = SupportedVersionsResponse {
             versions: server_versions.versions,
             unstable_features: server_versions.unstable_features,
         };
 
-        // Only attempt to cache the result in storage if the request was authenticated.
-        if self.auth_ctx().has_valid_access_token()
-            && let Err(err) = self
-                .state_store()
-                .set_kv_data(
-                    StateStoreDataKey::SupportedVersions,
-                    StateStoreDataValue::SupportedVersions(TtlStoreValue::new(
-                        supported_versions.clone(),
-                    )),
-                )
-                .await
-        {
-            warn!("error when caching supported versions: {err}");
-        }
-
         Ok(supported_versions)
-    }
-
-    pub(crate) async fn get_cached_supported_versions(&self) -> Option<SupportedVersions> {
-        let supported_versions = &self.inner.caches.supported_versions;
-
-        if let CachedValue::Cached(val) = &*supported_versions.read().await {
-            Some(val.clone())
-        } else {
-            None
-        }
     }
 
     /// Get the Matrix versions and features supported by the homeserver by
@@ -2204,30 +2228,87 @@ impl Client {
         &self,
         failsafe: bool,
     ) -> HttpResult<SupportedVersions> {
+        match self.supported_versions_cached_inner(failsafe).await {
+            Ok(Some(value)) => {
+                return Ok(value);
+            }
+            Ok(None) => {
+                // The cache is empty, make a request.
+            }
+            Err(error) => {
+                warn!("error when loading cached supported versions: {error}");
+                // Fallthrough to make a request.
+            }
+        }
+
+        self.refresh_supported_versions_cache(failsafe).await
+    }
+
+    /// Refresh the Matrix versions and features supported by the homeserver in
+    /// the cache.
+    ///
+    /// If `failsafe` is true, this will try to minimize side effects to avoid
+    /// possible deadlocks.
+    async fn refresh_supported_versions_cache(
+        &self,
+        failsafe: bool,
+    ) -> HttpResult<SupportedVersions> {
         let cached_supported_versions = &self.inner.caches.supported_versions;
-        if let CachedValue::Cached(val) = &*cached_supported_versions.read().await {
-            return Ok(val.clone());
-        }
 
-        let mut guarded_supported_versions = cached_supported_versions.write().await;
-        if let CachedValue::Cached(val) = &*guarded_supported_versions {
-            return Ok(val.clone());
-        }
+        let mut supported_versions_guard = match cached_supported_versions.refresh_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // There is already a refresh in progress, wait for it to finish.
+                let guard = cached_supported_versions.refresh_lock.lock().await;
 
-        let supported = self.load_or_fetch_supported_versions(failsafe).await?;
+                if let Err(error) = guard.as_ref() {
+                    // There was an error in the previous refresh, return it.
+                    return Err(HttpError::Cached(error.clone()));
+                }
 
-        // Fill both unstable features and server versions at once.
-        let mut supported_versions = supported.supported_versions();
-        if supported_versions.versions.is_empty() {
-            supported_versions.versions = [MatrixVersion::V1_0].into();
-        }
+                // Reuse the data if it was cached and it hasn't expired.
+                if let CachedValue::Cached(value) = cached_supported_versions.value()
+                    && !value.has_expired()
+                {
+                    return Ok(value.into_data());
+                }
+
+                // The data wasn't cached or has expired, we need to make another request.
+                guard
+            }
+        };
+
+        let response = match self.fetch_supported_versions(failsafe).await {
+            Ok(response) => {
+                *supported_versions_guard = Ok(());
+                TtlValue::new(response)
+            }
+            Err(error) => {
+                let error = Arc::new(error);
+                *supported_versions_guard = Err(error.clone());
+                return Err(HttpError::Cached(error));
+            }
+        };
+
+        let supported_versions = response.as_ref().map(|response| response.supported_versions());
 
         // Only cache the result if the request was authenticated.
         if self.auth_ctx().has_valid_access_token() {
-            *guarded_supported_versions = CachedValue::Cached(supported_versions.clone());
+            if let Err(err) = self
+                .state_store()
+                .set_kv_data(
+                    StateStoreDataKey::SupportedVersions,
+                    StateStoreDataValue::SupportedVersions(response),
+                )
+                .await
+            {
+                warn!("error when caching supported versions: {err}");
+            }
+
+            cached_supported_versions.set_value(supported_versions.clone());
         }
 
-        Ok(supported_versions)
+        Ok(supported_versions.into_data())
     }
 
     /// Get the Matrix versions and features supported by the homeserver by
@@ -2235,8 +2316,11 @@ impl Client {
     ///
     /// For a version of this function that fetches the supported versions and
     /// features from the homeserver if the [`SupportedVersions`] aren't
-    /// found in the cache, take a look at the [`Client::server_versions()`]
+    /// found in the cache, take a look at the [`Client::supported_versions()`]
     /// method.
+    ///
+    /// If the data in the cache has expired, this will trigger a background
+    /// task to refresh it.
     ///
     /// # Examples
     ///
@@ -2264,21 +2348,47 @@ impl Client {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn supported_versions_cached(&self) -> Result<Option<SupportedVersions>, StoreError> {
-        if let Some(cached) = self.get_cached_supported_versions().await {
-            Ok(Some(cached))
-        } else if let Some(stored) =
-            self.state_store().get_kv_data(StateStoreDataKey::SupportedVersions).await?
+        self.supported_versions_cached_inner(false).await
+    }
+
+    async fn supported_versions_cached_inner(
+        &self,
+        failsafe: bool,
+    ) -> Result<Option<SupportedVersions>, StoreError> {
+        let supported_versions_cache = &self.inner.caches.supported_versions;
+
+        let value = if let CachedValue::Cached(cached) = supported_versions_cache.value() {
+            cached
+        } else if let Some(stored) = self
+            .state_store()
+            .get_kv_data(StateStoreDataKey::SupportedVersions)
+            .await?
+            .and_then(|value| value.into_supported_versions())
         {
-            if let Some(supported) =
-                stored.into_supported_versions().and_then(|value| value.into_data())
-            {
-                Ok(Some(supported.supported_versions()))
-            } else {
-                Ok(None)
-            }
+            let stored = stored.map(|response| response.supported_versions());
+
+            // Copy the data from the store in the in-memory cache.
+            supported_versions_cache.set_value(stored.clone());
+
+            stored
         } else {
-            Ok(None)
+            return Ok(None);
+        };
+
+        // Spawn a task to refresh the cache if it has expired and we have a valid
+        // access token.
+        if value.has_expired() && self.auth_ctx().has_valid_access_token() {
+            debug!("spawning task to refresh supported versions cache");
+
+            let client = self.clone();
+            self.task_monitor().spawn_finite_task("refresh supported versions cache", async move {
+                if let Err(error) = client.refresh_supported_versions_cache(failsafe).await {
+                    warn!("failed to refresh supported versions cache: {error}");
+                }
+            });
         }
+
+        Ok(Some(value.into_data()))
     }
 
     /// Get the Matrix versions supported by the homeserver by fetching them
@@ -2332,65 +2442,111 @@ impl Client {
     /// stale entry in the cache. This functions makes it possible to force
     /// reset it.
     pub async fn reset_supported_versions(&self) -> Result<()> {
-        // Empty the in-memory caches.
-        self.inner.caches.supported_versions.write().await.take();
+        // Empty the in-memory cache.
+        self.inner.caches.supported_versions.reset();
 
         // Empty the store cache.
         Ok(self.state_store().remove_kv_data(StateStoreDataKey::SupportedVersions).await?)
     }
 
-    /// Load well-known from storage, or fetch it from network and cache it.
-    async fn load_or_fetch_well_known(&self) -> HttpResult<Option<WellKnownResponse>> {
-        match self.state_store().get_kv_data(StateStoreDataKey::WellKnown).await {
-            Ok(Some(stored)) => {
-                if let Some(well_known) =
-                    stored.into_well_known().and_then(|value| value.into_data())
-                {
-                    return Ok(well_known);
-                }
-            }
-            Ok(None) => {
-                // fallthrough: cache is empty
-            }
-            Err(err) => {
-                warn!("error when loading cached well-known: {err}");
-                // fallthrough to network.
-            }
+    /// Get the well-known file of the homeserver from the cache.
+    ///
+    /// If the data in the cache has expired, this will trigger a background
+    /// task to refresh it.
+    async fn well_known_cached(
+        &self,
+    ) -> Result<CachedValue<Option<WellKnownResponse>>, StoreError> {
+        let well_known_cache = &self.inner.caches.well_known;
+
+        let value = if let CachedValue::Cached(cached) = well_known_cache.value() {
+            cached
+        } else if let Some(stored) = self
+            .state_store()
+            .get_kv_data(StateStoreDataKey::WellKnown)
+            .await?
+            .and_then(|value| value.into_well_known())
+        {
+            // Copy the data from the store into the in-memory cache.
+            well_known_cache.set_value(stored.clone());
+
+            stored
+        } else {
+            return Ok(CachedValue::NotSet);
+        };
+
+        // Spawn a task to refresh the cache if it has expired.
+        if value.has_expired() {
+            debug!("spawning task to refresh well-known cache");
+
+            let client = self.clone();
+            self.task_monitor().spawn_finite_task("refresh well-known cache", async move {
+                client.refresh_well_known_cache().await;
+            });
         }
 
-        let well_known = self.fetch_client_well_known().await.map(Into::into);
+        Ok(CachedValue::Cached(value.into_data()))
+    }
 
-        // Attempt to cache the result in storage.
+    /// Refresh the well-known file of the homeserver in the cache.
+    async fn refresh_well_known_cache(&self) -> Option<WellKnownResponse> {
+        let well_known_cache = &self.inner.caches.well_known;
+
+        let _well_known_guard = match well_known_cache.refresh_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // There is already a refresh in progress, wait for it to finish.
+                let guard = well_known_cache.refresh_lock.lock().await;
+
+                // A refresh can't fail because we ignore failures, so there shouldn't be an
+                // error in the refresh lock.
+
+                // Reuse the data if it was cached and it hasn't expired.
+                if let CachedValue::Cached(value) = well_known_cache.value()
+                    && !value.has_expired()
+                {
+                    return value.into_data();
+                }
+
+                // The data wasn't cached or has expired, we need to make another request.
+                guard
+            }
+        };
+
+        let well_known = TtlValue::new(self.fetch_client_well_known().await.map(Into::into));
+
         if let Err(err) = self
             .state_store()
             .set_kv_data(
                 StateStoreDataKey::WellKnown,
-                StateStoreDataValue::WellKnown(TtlStoreValue::new(well_known.clone())),
+                StateStoreDataValue::WellKnown(well_known.clone()),
             )
             .await
         {
             warn!("error when caching well-known: {err}");
         }
 
-        Ok(well_known)
+        well_known_cache.set_value(well_known.clone());
+
+        well_known.into_data()
     }
 
-    async fn get_or_load_and_cache_well_known(&self) -> HttpResult<Option<WellKnownResponse>> {
-        let well_known = &self.inner.caches.well_known;
-        if let CachedValue::Cached(val) = &*well_known.read().await {
-            return Ok(val.clone());
+    /// Get the well-known file of the homeserver by fetching it from the server
+    /// or the cache.
+    async fn well_known(&self) -> Option<WellKnownResponse> {
+        match self.well_known_cached().await {
+            Ok(CachedValue::Cached(value)) => {
+                return value;
+            }
+            Ok(CachedValue::NotSet) => {
+                // The cache is empty, make a request.
+            }
+            Err(error) => {
+                warn!("error when loading cached well-known: {error}");
+                // Fallthrough to make a request.
+            }
         }
 
-        let mut guarded_well_known = well_known.write().await;
-        if let CachedValue::Cached(val) = &*guarded_well_known {
-            return Ok(val.clone());
-        }
-
-        let well_known = self.load_or_fetch_well_known().await?;
-
-        *guarded_well_known = CachedValue::Cached(well_known.clone());
-
-        Ok(well_known)
+        self.refresh_well_known_cache().await
     }
 
     /// Get information about the homeserver's advertised RTC foci by fetching
@@ -2414,7 +2570,7 @@ impl Client {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn rtc_foci(&self) -> HttpResult<Vec<RtcFocusInfo>> {
-        let well_known = self.get_or_load_and_cache_well_known().await?;
+        let well_known = self.well_known().await;
 
         Ok(well_known.map(|well_known| well_known.rtc_foci).unwrap_or_default())
     }
@@ -2425,7 +2581,7 @@ impl Client {
     /// in the cache. This functions makes it possible to force reset it.
     pub async fn reset_well_known(&self) -> Result<()> {
         // Empty the in-memory caches.
-        self.inner.caches.well_known.write().await.take();
+        self.inner.caches.well_known.reset();
 
         // Empty the store cache.
         Ok(self.state_store().remove_kv_data(StateStoreDataKey::WellKnown).await?)
@@ -3081,8 +3237,8 @@ impl Client {
                     .base_client
                     .clone_with_in_memory_state_store(cross_process_lock_config.clone(), false)
                     .await?,
-                self.inner.caches.supported_versions.read().await.clone(),
-                self.inner.caches.well_known.read().await.clone(),
+                self.inner.caches.supported_versions.value(),
+                self.inner.caches.well_known.value(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
                 self.inner.send_queue_data.clone(),
@@ -3341,6 +3497,12 @@ impl Client {
     ) -> Result<Option<RoomPendingKeyBundleDetails>> {
         Ok(self.base_client().get_pending_key_bundle_details_for_room(room_id).await?)
     }
+
+    /// Returns the [`DmRoomDefinition`] this client uses to check if a room is
+    /// a DM.
+    pub fn dm_room_definition(&self) -> &DmRoomDefinition {
+        &self.inner.base_client.dm_room_definition
+    }
 }
 
 /// Contains the disk size of the different stores, if known. It won't be
@@ -3422,6 +3584,7 @@ pub(crate) mod tests {
     use matrix_sdk_base::{
         RoomState,
         store::{MemoryStore, StoreConfig},
+        ttl::TtlValue,
     };
     use matrix_sdk_test::{
         DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, SyncResponseBuilder, async_test,
@@ -3458,7 +3621,7 @@ pub(crate) mod tests {
     use super::Client;
     use crate::{
         Error, TransmissionProgress,
-        client::{WeakClient, futures::SendMediaUploadRequest},
+        client::{WeakClient, caches::CachedValue, futures::SendMediaUploadRequest},
         config::{RequestConfig, SyncSettings},
         futures::SendRequest,
         media::MediaError,
@@ -3846,6 +4009,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains(&FeatureFlag::from("org.matrix.e2e_cross_signing"))
         );
+
         let supported = client.supported_versions().await.unwrap();
         assert!(supported.versions.contains(&MatrixVersion::V1_0));
         assert!(supported.features.contains(&FeatureFlag::from("org.matrix.e2e_cross_signing")));
@@ -3857,15 +4021,29 @@ pub(crate) mod tests {
 
         drop(versions_mock);
 
-        // Now, reset the cache, and observe the endpoints being called again once.
+        // Now, reset the cache, and observe the endpoint being called again once.
         client.reset_supported_versions().await.unwrap();
 
-        server.mock_versions().ok().expect(1).named("second versions mock").mount().await;
+        server.mock_versions().ok().expect(2).named("second versions mock").mount().await;
 
         // Hits network again.
         assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
         // Hits in-memory cache again.
         assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
+        assert_matches!(client.inner.caches.supported_versions.value(), CachedValue::Cached(value) if !value.has_expired());
+
+        // Force an expiry of the data.
+        let supported_versions = client.supported_versions_cached().await.unwrap().unwrap();
+        let mut ttl_value = TtlValue::new(supported_versions);
+        ttl_value.expire();
+        client.inner.caches.supported_versions.set_value(ttl_value);
+
+        // Call the method to trigger a cache refresh background task.
+        client.supported_versions_cached().await.unwrap().unwrap();
+
+        // We wait for the task to finish, the endpoint should have been called again.
+        sleep(Duration::from_secs(1)).await;
+        assert_matches!(client.inner.caches.supported_versions.value(), CachedValue::Cached(value) if !value.has_expired());
     }
 
     #[async_test]
@@ -3925,12 +4103,27 @@ pub(crate) mod tests {
         // Now, reset the cache, and observe the endpoints being called again once.
         client.reset_well_known().await.unwrap();
 
-        server.mock_well_known().ok().named("second well known mock").expect(1).mount().await;
+        server.mock_well_known().ok().named("second well known mock").expect(2).mount().await;
 
         // Hits network again.
         assert_eq!(client.rtc_foci().await.unwrap(), rtc_foci);
         // Hits in-memory cache again.
         assert_eq!(client.rtc_foci().await.unwrap(), rtc_foci);
+
+        // Force an expiry of the data.
+        let well_known = client.well_known().await;
+        let mut ttl_value = TtlValue::new(well_known);
+        ttl_value.expire();
+        client.inner.caches.well_known.set_value(ttl_value);
+
+        // Call the method again to trigger a cache refresh background task.
+        client.well_known().await;
+
+        // We wait for the task to finish, the endpoint should have been called again.
+        // We need to wait a bit because the first requests using the server name of the
+        // user will fail, only the requests using the homeserver URL will succeed.
+        sleep(Duration::from_secs(5)).await;
+        assert_matches!(client.inner.caches.well_known.value(), CachedValue::Cached(value) if !value.has_expired());
     }
 
     #[async_test]
