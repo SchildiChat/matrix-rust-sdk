@@ -34,7 +34,6 @@ use crate::{
     space_catch_all_info::{SpaceCatchAllInfo, space_catch_all_info},
     space_child_info::{SpaceChildInfo, space_children_info},
 };
-use matrix_sdk::ruma::events::RoomAccountDataEventType;
 // SC end
 
 #[derive(Clone, uniffi::Enum)]
@@ -258,7 +257,7 @@ impl RoomInfo {
             active_room_call_consensus_intent: room.active_room_call_consensus_intent().into(),
             is_marked_unread: room.is_marked_unread(),
             // SC start
-            private_room_name: private_room_name(room).await,
+            private_room_name: room.private_room_name(),
             space_children: space_children_info(&room),
             space_catch_all: space_catch_all_info(&room),
             can_user_manage_spaces,
@@ -292,21 +291,4 @@ impl RoomInfo {
                 .collect(),
         })
     }
-}
-
-// SC: MSC4431
-async fn private_room_name(room: &matrix_sdk::Room) -> Option<String> {
-    let raw_event = room
-        .account_data(RoomAccountDataEventType::from("de.gematik.msc4431.room.name.private"))
-        .await
-        .ok()
-        .flatten()?;
-
-    raw_event
-        .get_field::<serde_json::Value>("content")
-        .ok()
-        .flatten()?
-        .get("name")?
-        .as_str()
-        .map(ToOwned::to_owned)
 }

@@ -94,7 +94,15 @@ pub fn for_room(
                             room_id,
                             &mut context.state_changes,
                             state_store,
-                            |_| {
+                            |room_info| {
+                                room_info.base_info.private_room_name = raw_event
+                                    .get_field::<serde_json::Value>("content")
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|content| {
+                                        content.get("name")?.as_str().map(ToOwned::to_owned)
+                                    });
+
                                 context
                                     .room_info_notable_updates
                                     .entry(room_id.to_owned())

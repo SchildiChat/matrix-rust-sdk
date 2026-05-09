@@ -49,6 +49,11 @@ pub fn new_filter(pattern: &str) -> impl Filter + use<> {
     let searcher = NormalizedMatcher::new().with_pattern(pattern);
 
     move |room| -> bool {
+        // SC: MSC4431 private room names search
+        if room.private_room_name().as_ref().is_some_and(|private_room_name| searcher.matches(private_room_name)) {
+            return true;
+        }
+
         let Some(room_name) = room.cached_display_name() else {
             error!(room_id = ?room.room_id(), "Missing cached room display name");
 

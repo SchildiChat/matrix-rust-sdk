@@ -160,11 +160,13 @@ pub struct BaseRoomInfo {
     pub(crate) tombstone: Option<MinimalStateEvent<PossiblyRedactedRoomTombstoneEventContent>>,
     /// The topic of this room.
     pub(crate) topic: Option<MinimalStateEvent<PossiblyRedactedRoomTopicEventContent>>,
-    /// The space children of this room, if it is a space.
+    /// SC: The MSC4431 private room name from room account data.
+    pub(crate) private_room_name: Option<String>,
+    /// SC: The space children of this room, if it is a space.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub(crate) space_children:
         HashMap<OwnedRoomId, MinimalStateEvent<PossiblyRedactedSpaceChildEventContent>>,
-    /// The catch-all space child definition for this room, if it is a space.
+    /// SC: The catch-all space child definition for this room, if it is a space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) space_catch_all: Option<SpaceCatchAllState>,
     /// All minimal state events that containing one or more running matrixRTC
@@ -577,8 +579,11 @@ impl Default for BaseRoomInfo {
             name: None,
             tombstone: None,
             topic: None,
+            // SC start
+            private_room_name: None,
             space_children: Default::default(),
             space_catch_all: None,
+            // SC end
             rtc_member_events: BTreeMap::new(),
             is_marked_unread: false,
             is_marked_unread_source: AccountDataSource::Unstable,
@@ -1111,7 +1116,12 @@ impl RoomInfo {
         Some(&self.base_info.create.as_ref()?.content)
     }
 
-    /// Get all `m.bridge` state events in this room, keyed by state key.
+    /// SC: Get the MSC4431 private room name for this room.
+    pub fn private_room_name(&self) -> Option<&str> {
+        self.base_info.private_room_name.as_deref().filter(|name| !name.is_empty())
+    }
+
+    /// SC: Get all `m.bridge` state events in this room, keyed by state key.
     pub fn bridge_states(&self) -> &BTreeMap<String, MinimalStateEvent<BridgeEventContent>> {
         &self.base_info.bridge_states
     }
