@@ -211,6 +211,11 @@ impl Room {
         self.info.read().read_receipts.has_incomplete_unread_count
     }
 
+    /// SC: Get the MSC4431 private room name of this room.
+    pub fn private_room_name(&self) -> Option<String> {
+        self.info.read().private_room_name().map(ToOwned::to_owned)
+    }
+
     /// Get the number of unread messages (computed client-side).
     ///
     /// This might be more precise than [`Self::unread_notification_counts`] for
