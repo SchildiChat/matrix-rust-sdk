@@ -1103,20 +1103,15 @@ impl<'a> RoomEventCacheStateLockWriteGuard<'a> {
         .await;
 
         if prev_read_receipts != read_receipts {
-            let client = room.client();
-            let _state_store_lock = client.base_client().state_store_lock().lock().await;
-
-            let mut room_info = room.clone_info();
-            room_info.set_read_receipts(read_receipts);
-
-            let mut state_changes = StateChanges::default();
-            state_changes.add_room(room_info.clone());
-
-            if let Err(error) = client.state_store().save_changes(&state_changes).await {
+            let result = room
+                .update_and_save_room_info(|mut room_info| {
+                    room_info.set_read_receipts(read_receipts);
+                    (room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT)
+                })
+                .await;
+            if let Err(error) = result {
                 error!(room_id = ?room.room_id(), ?error, "Failed to save the changes");
             }
-
-            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT);
         }
 
         Ok(())

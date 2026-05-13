@@ -662,6 +662,21 @@ impl<T: StateStore> StateStore for &T {
         (*self).get_account_data_event(event_type).await
     }
 
+    // SC
+    async fn get_account_data_events(
+        &self,
+    ) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>, Self::Error> {
+        (*self).get_account_data_events().await
+    }
+
+    // SC
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>, Self::Error> {
+        (*self).get_room_account_data_events(room_id).await
+    }
+
     async fn get_room_account_data_event(
         &self,
         room_id: &RoomId,
@@ -960,6 +975,21 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEvent>>, Self::Error> {
         self.deref().get_account_data_event(event_type).await
+    }
+
+    // SC
+    async fn get_account_data_events(
+        &self,
+    ) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>, Self::Error> {
+        self.deref().get_account_data_events().await
+    }
+
+    // SC
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>, Self::Error> {
+        self.deref().get_room_account_data_events(room_id).await
     }
 
     async fn get_room_account_data_event(
@@ -1653,6 +1683,21 @@ impl<T: StateStore> StateStore for SaveLockedStateStore<T> {
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEvent>>, Self::Error> {
         self.store.get_account_data_event(event_type).await
+    }
+
+    // SC
+    async fn get_account_data_events(
+        &self,
+    ) -> Result<Vec<Raw<AnyGlobalAccountDataEvent>>, Self::Error> {
+        self.store.get_account_data_events().await
+    }
+
+    // SC
+    async fn get_room_account_data_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<Raw<AnyRoomAccountDataEvent>>, Self::Error> {
+        self.store.get_room_account_data_events(room_id).await
     }
 
     async fn get_room_account_data_event(
