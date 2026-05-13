@@ -6,8 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.17.0] - 2026-05-08
+
 ### Features
 
+- [**breaking**] `Room::is_dm` was renamed to `Room::compute_is_dm` to match its behavior, since it'll now compute 
+  and cache the result. A new *synchronous* `Room::is_dm` function was added which centralizes the logic of 
+  checking if something is a DM based on that cached value and the provided `DmRoomDefinition`. `Room::sync_members` 
+  will also now compute active service members. ([#6537](https://github.com/matrix-org/matrix-rust-sdk/pull/6537))
+- [**breaking**] Enforce atomic and synchronized updates to `RoomInfo`. Requires 
+  `StateStore::save_changes` to acquire state store lock and replaces `Room::set_room_info` 
+  with an atomic version, `Room::update_room_info`, which is also synchronized by
+  the state store lock.
+  ([#6478](https://github.com/matrix-org/matrix-rust-sdk/pull/6478))
 - Added `beacon` and `beacon_info` fields to `RoomPowerLevelChanges`, allowing callers to read
   and update the power levels required to send beacon (live location) message events and beacon
   info state events respectively.

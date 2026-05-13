@@ -203,9 +203,6 @@ impl RoomInfo {
             false
         };
 
-        let active_service_members_count =
-            room.active_service_members().await?.unwrap_or_default().len() as u64;
-
         Ok(Self {
             id: room.room_id().to_string(),
             encryption_state: room.encryption_state(),
@@ -217,7 +214,7 @@ impl RoomInfo {
             topic: room.topic(),
             avatar_url: room.cached_avatar_url().map(Into::into),
             is_direct: room.is_direct().await?,
-            is_dm: room.is_dm().await?,
+            is_dm: room.compute_is_dm().await?,
             is_public: room.is_public(),
             is_space,
             successor_room: room.successor_room().map(Into::into),
@@ -242,7 +239,7 @@ impl RoomInfo {
             active_members_count: room.active_members_count(),
             invited_members_count: room.invited_members_count(),
             joined_members_count: room.joined_members_count(),
-            active_service_members_count,
+            active_service_members_count: room.active_service_members_count().unwrap_or_default(),
             service_members: room
                 .service_members()
                 .iter()

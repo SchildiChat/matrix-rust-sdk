@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.17.0] - 2026-05-08
+
 ### Bug Fixes
 
 - Add `Client::set_avatar_url` to manually set the avatar URL of the user to a provided MXC one.
@@ -44,6 +46,8 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- `RoomNotificationInfo`, `NotificationItem` and `SpaceRoom` now have `is_dm` fields. 
+  ([#6537](https://github.com/matrix-org/matrix-rust-sdk/pull/6537))
 - Expose `RoomMember::is_service_member` field. ([#6536](https://github.com/matrix-org/matrix-rust-sdk/pull/6536))
 - Expose `beacon` and `beacon_info` fields in `RoomPowerLevelsValues` and `RoomPowerLevelChanges`,
   allowing clients to read and update the power levels required to send beacon (live location)
