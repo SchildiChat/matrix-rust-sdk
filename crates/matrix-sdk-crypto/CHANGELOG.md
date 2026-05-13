@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.17.0] - 2026-05-08
+
+### Bug Fixes
+
+- Check the user ID in the `sender_device_keys` property of Olm-encrypted
+to-device events to prevent sender spoofing by homeserver owners.
+([#6553](https://github.com/matrix-org/matrix-rust-sdk/pull/6553))
+
 ### Features
 
 - [**breaking**] Change to the stable identifiers for `m.room_key_bundle`,
