@@ -723,7 +723,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
                 self.room_data_provider.load_fully_read_marker().await
             {
                 state.handle_fully_read_marker(fully_read_event_id);
-            } else if let Some(latest_receipt_event_id) = state
+            } else if /* SC: no do not fall back RM to RR */ false && let Some(latest_receipt_event_id) = state
                 .latest_user_read_receipt_timeline_event_id(self.room_data_provider.own_user_id())
             {
                 // Fall back to read receipt if no fully read marker exists.
