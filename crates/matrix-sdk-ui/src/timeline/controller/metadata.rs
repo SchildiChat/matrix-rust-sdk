@@ -291,8 +291,11 @@ impl TimelineMetadata {
             }
 
             (Some(from), Some(to)) => {
-                if from >= to {
-                    // The read marker can't move backwards.
+                // SC: condition changed for allowing backwards movement, only
+                //  check if marker is already where it belongs
+                //if from >= to {
+                if from == to + 1 {
+                    // The read marker can't move backwards. - SC: invalid comment
                     if from + 1 == items.len() {
                         // The read marker has nothing after it. An item disappeared; remove it.
                         items.remove(from);
@@ -309,7 +312,8 @@ impl TimelineMetadata {
                     // Since the fully-read event's index was shifted to the left
                     // by one position by the remove call above, insert the fully-
                     // read marker at its previous position, rather than that + 1
-                    items.insert(to, read_marker, None);
+                    //items.insert(to, read_marker, None);
+                    items.insert(if from > to { to + 1 } else { to }, read_marker, None);
                     self.has_up_to_date_read_marker_item = true;
                 } else {
                     self.has_up_to_date_read_marker_item = false;
