@@ -80,6 +80,7 @@ use tracing::{debug, error, warn};
 const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::Bridge, "*"), // SC
     (StateEventType::SpaceCatchAll, ""), // SC
+    (StateEventType::RoomImagePack, "*"), // SC
     (StateEventType::RoomName, ""),
     (StateEventType::RoomEncryption, ""),
     (StateEventType::RoomMember, "$LAZY"),
