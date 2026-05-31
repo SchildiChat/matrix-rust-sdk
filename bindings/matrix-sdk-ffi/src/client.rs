@@ -1398,6 +1398,23 @@ impl Client {
         Ok(())
     }
 
+    /// SC: Subscribe to image pack state events across all joined rooms.
+    pub fn subscribe_to_image_pack_state_events(
+        &self,
+        primary_room_ids: Vec<String>,
+        listener: Box<dyn crate::sc_image_pack_observer::RoomImagePackStateEventsListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let primary_room_ids = primary_room_ids
+            .into_iter()
+            .map(RoomId::parse)
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        Ok(crate::sc_image_pack_observer::subscribe_to_image_pack_state_events(
+            (&*self.inner).clone(),
+            primary_room_ids,
+            listener,
+        ))
+    }
+
     /// Set the given account data content for the given event type.
     ///
     /// It should be supplied as a JSON string.
