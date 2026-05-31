@@ -80,6 +80,7 @@ ruma = { git = "https://github.com/SchildiChat/ruma", rev = "a0832bd65", feature
     "compat-encrypted-stickers",
     "compat-lax-room-create-deser",
     "compat-lax-room-topic-deser",
+    "unstable-msc2545",
     "unstable-msc2654",
     "unstable-msc3230",
     "unstable-msc3401",
