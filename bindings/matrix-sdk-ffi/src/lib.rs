@@ -24,6 +24,9 @@ mod room_member;
 mod room_preview;
 mod ruma;
 mod runtime;
+// SC start
+mod sc_image_pack_observer;
+// SC end
 #[cfg(feature = "experimental-search")]
 mod search;
 mod session_verification;
