@@ -65,9 +65,9 @@ use crate::{
         Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMembersUpdate, RoomState,
     },
     store::{
-        BaseStateStore, DynStateStore, MemoryStore, Result as StoreResult, RoomLoadSettings,
-        StateChanges, StateStoreDataKey, StateStoreDataValue, StateStoreExt, StoreConfig,
-        ambiguity_map::AmbiguityCache,
+        AvatarCache, BaseStateStore, DynStateStore, MemoryStore, Result as StoreResult,
+        RoomLoadSettings, StateChanges, StateStoreDataKey, StateStoreDataValue, StateStoreExt,
+        StoreConfig, ambiguity_map::AmbiguityCache,
     },
     sync::{RoomUpdates, SyncResponse},
 };
@@ -594,6 +594,10 @@ impl BaseClient {
 
         let now = if enabled!(Level::INFO) { Some(Instant::now()) } else { None };
 
+        // Acquire the state store lock and hold on to it while processing
+        // the sync response below.
+        let state_store_guard = self.state_store_lock().lock().await;
+
         let user_id = self
             .session_meta()
             .expect("Sync shouldn't run without an authenticated user")
@@ -644,6 +648,7 @@ impl BaseClient {
             .collect();
 
         let mut ambiguity_cache = AmbiguityCache::new(self.state_store.inner.clone());
+        let mut avatar_cache = AvatarCache::new(self.state_store.inner.clone());
 
         let global_account_data_processor =
             processors::account_data::global(&response.account_data.events);
@@ -670,6 +675,7 @@ impl BaseClient {
                     &room_id,
                     requested_required_states,
                     &mut ambiguity_cache,
+                    &mut avatar_cache,
                 ),
                 joined_room,
                 &mut updated_members_in_room,
@@ -693,6 +699,7 @@ impl BaseClient {
                     &room_id,
                     requested_required_states,
                     &mut ambiguity_cache,
+                    &mut avatar_cache,
                 ),
                 left_room,
                 processors::notification::Notification::new(
@@ -763,7 +770,7 @@ impl BaseClient {
         processors::changes::save_and_apply(
             context,
             &self.state_store,
-            &self.state_store_lock().lock().await,
+            &state_store_guard,
             &self.ignore_user_list_changes,
             Some(response.next_batch.clone()),
         )
@@ -781,12 +788,7 @@ impl BaseClient {
         .await;
 
         // Save the new display name updates if any.
-        processors::changes::save_only(
-            context,
-            &self.state_store,
-            &self.state_store_lock().lock().await,
-        )
-        .await?;
+        processors::changes::save_only(context, &self.state_store, &state_store_guard).await?;
 
         for (room_id, member_ids) in updated_members_in_room {
             if let Some(room) = self.get_room(&room_id) {
@@ -794,6 +796,9 @@ impl BaseClient {
                     room.room_member_updates_sender.send(RoomMembersUpdate::Partial(member_ids));
             }
         }
+
+        // Release the state store lock
+        drop(state_store_guard);
 
         if enabled!(Level::INFO) {
             info!("Processed a sync response in {:?}", now.map(|now| now.elapsed()));
@@ -1148,6 +1153,32 @@ impl BaseClient {
             None => None,
         };
         Ok(result)
+    }
+
+    /// Close all stores, releasing database connections and file locks.
+    ///
+    /// In-flight operations will complete before this returns.
+    pub async fn close_stores(&self) -> Result<()> {
+        self.state_store.close().await?;
+        self.event_cache_store.close().await.map_err(Error::EventCacheStore)?;
+        self.media_store.close().await.map_err(Error::MediaStore)?;
+
+        #[cfg(feature = "e2e-encryption")]
+        self.crypto_store.close().await.map_err(Error::CryptoStore)?;
+
+        Ok(())
+    }
+
+    /// Reopen all stores after a close, re-opening database connections.
+    pub async fn reopen_stores(&self) -> Result<()> {
+        #[cfg(feature = "e2e-encryption")]
+        self.crypto_store.reopen().await.map_err(Error::CryptoStore)?;
+
+        self.media_store.reopen().await.map_err(Error::MediaStore)?;
+        self.event_cache_store.reopen().await.map_err(Error::EventCacheStore)?;
+        self.state_store.reopen().await?;
+
+        Ok(())
     }
 }
 

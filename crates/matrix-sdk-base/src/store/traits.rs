@@ -29,11 +29,12 @@ use ruma::{
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
     api::{
         MatrixVersion, SupportedVersions,
-        client::discovery::{
-            discover_homeserver::{
-                self, HomeserverInfo, IdentityServerInfo, RtcFocusInfo, TileServerInfo,
+        client::{
+            discovery::{
+                discover_homeserver::{self, HomeserverInfo, IdentityServerInfo, TileServerInfo},
+                get_capabilities::v3::Capabilities,
             },
-            get_capabilities::v3::Capabilities,
+            rtc::RtcTransport,
         },
     },
     events::{
@@ -528,6 +529,17 @@ pub trait StateStore: AsyncTraitDeps {
         thread_id: &EventId,
     ) -> Result<Option<StoredThreadSubscription>, Self::Error>;
 
+    /// Close the store, releasing all held resources (database connections,
+    /// file descriptors, file locks).
+    ///
+    /// In-flight operations complete before this method returns. After it
+    /// returns, operations will fail until [`Self::reopen()`] is called.
+    async fn close(&self) -> Result<(), Self::Error>;
+
+    /// Reopen the store after a [`Self::close()`], re-acquiring database
+    /// connections.
+    async fn reopen(&self) -> Result<(), Self::Error>;
+
     /// Perform database optimizations if any are available, i.e. vacuuming in
     /// SQLite.
     ///
@@ -846,6 +858,14 @@ impl<T: StateStore> StateStore for &T {
         (*self).load_thread_subscription(room, thread_id).await
     }
 
+    async fn close(&self) -> Result<(), Self::Error> {
+        (*self).close().await
+    }
+
+    async fn reopen(&self) -> Result<(), Self::Error> {
+        (*self).reopen().await
+    }
+
     async fn optimize(&self) -> Result<(), Self::Error> {
         (*self).optimize().await
     }
@@ -1159,6 +1179,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         thread_id: &EventId,
     ) -> Result<Option<StoredThreadSubscription>, Self::Error> {
         self.deref().load_thread_subscription(room, thread_id).await
+    }
+
+    async fn close(&self) -> Result<(), Self::Error> {
+        self.deref().close().await
+    }
+
+    async fn reopen(&self) -> Result<(), Self::Error> {
+        self.deref().reopen().await
     }
 
     async fn optimize(&self) -> Result<(), Self::Error> {
@@ -1499,6 +1527,14 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         thread_id: &EventId,
     ) -> Result<(), Self::Error> {
         self.0.remove_thread_subscription(room, thread_id).await.map_err(Into::into)
+    }
+
+    async fn close(&self) -> Result<(), Self::Error> {
+        self.0.close().await.map_err(Into::into)
+    }
+
+    async fn reopen(&self) -> Result<(), Self::Error> {
+        self.0.reopen().await.map_err(Into::into)
     }
 
     async fn optimize(&self) -> Result<(), Self::Error> {
@@ -1853,6 +1889,14 @@ impl<T: StateStore> StateStore for SaveLockedStateStore<T> {
         self.store.upsert_thread_subscriptions(updates).await
     }
 
+    async fn load_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<Option<StoredThreadSubscription>, Self::Error> {
+        self.store.load_thread_subscription(room, thread_id).await
+    }
+
     async fn remove_thread_subscription(
         &self,
         room: &RoomId,
@@ -1861,12 +1905,12 @@ impl<T: StateStore> StateStore for SaveLockedStateStore<T> {
         self.store.remove_thread_subscription(room, thread_id).await
     }
 
-    async fn load_thread_subscription(
-        &self,
-        room: &RoomId,
-        thread_id: &EventId,
-    ) -> Result<Option<StoredThreadSubscription>, Self::Error> {
-        self.store.load_thread_subscription(room, thread_id).await
+    async fn close(&self) -> Result<(), Self::Error> {
+        self.store.close().await
+    }
+
+    async fn reopen(&self) -> Result<(), Self::Error> {
+        self.store.reopen().await
     }
 
     async fn optimize(&self) -> Result<(), Self::Error> {
@@ -2098,7 +2142,7 @@ pub struct WellKnownResponse {
     pub tile_server: Option<TileServerInfo>,
 
     /// A list of the available MatrixRTC foci, ordered by priority.
-    pub rtc_foci: Vec<RtcFocusInfo>,
+    pub rtc_foci: Vec<RtcTransport>,
 }
 
 impl From<discover_homeserver::Response> for WellKnownResponse {

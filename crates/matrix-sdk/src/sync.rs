@@ -210,6 +210,7 @@ impl Client {
                 account_data,
                 ephemeral,
                 ambiguity_changes: _,
+                avatar_changes: _,
             } = room_info;
 
             let room = Some(&room);
