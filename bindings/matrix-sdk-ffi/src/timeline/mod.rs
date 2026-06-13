@@ -74,6 +74,7 @@ use crate::{
 };
 
 // SC start
+use crate::ruma::StickerEventContent;
 use ruma::events::receipt::ReceiptThread;
 use ruma::UserId;
 // SC end
@@ -431,6 +432,24 @@ impl Timeline {
             Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
             Err(err) => {
                 error!("error when sending a message: {err}");
+                Err(err.into())
+            }
+        }
+    }
+
+    /// SC
+    pub async fn send_sticker(
+        self: Arc<Self>,
+        content: Arc<StickerEventContent>,
+    ) -> Result<Arc<SendHandle>, ClientError> {
+        match self
+            .inner
+            .send(AnyMessageLikeEventContent::Sticker(content.content.clone()))
+            .await
+        {
+            Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
+            Err(err) => {
+                error!("error when sending a sticker: {err}");
                 Err(err.into())
             }
         }

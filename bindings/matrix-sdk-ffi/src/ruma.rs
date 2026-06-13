@@ -87,6 +87,11 @@ use ruma::{
 };
 use tracing::info;
 
+// SC start
+use ruma::OwnedMxcUri;
+use ruma::events::sticker::StickerEventContent as RumaStickerEventContent;
+// SC end
+
 use crate::{
     error::{ClientError, MediaInfoError},
     helpers::unwrap_or_clone_arc,
@@ -205,6 +210,7 @@ pub fn message_event_content_from_markdown(
     Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::text_markdown(md)))
 }
 
+// SC
 #[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_markdown_as_notice(
     md: String,
@@ -229,6 +235,7 @@ pub fn message_event_content_from_html(
     )))
 }
 
+// SC
 #[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_html_as_notice(
     body: String,
@@ -249,6 +256,7 @@ pub fn message_event_content_from_html_as_emote(
     )))
 }
 
+// SC
 #[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_plaintext(
     body: String,
@@ -258,6 +266,7 @@ pub fn message_event_content_from_plaintext(
     )))
 }
 
+// SC
 #[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_plaintext_as_notice(
     body: String,
@@ -267,6 +276,7 @@ pub fn message_event_content_from_plaintext_as_notice(
     )))
 }
 
+// SC
 #[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_plaintext_as_emote(
     body: String,
@@ -276,9 +286,36 @@ pub fn message_event_content_from_plaintext_as_emote(
     )))
 }
 
+// SC
 #[matrix_sdk_ffi_macros::export]
 pub fn markdown_to_html(markdown: String) -> Option<String> {
     RumaFormattedBody::markdown(&markdown).map(|formatted| formatted.body)
+}
+
+// SC
+#[matrix_sdk_ffi_macros::export]
+pub fn sticker_event_content_new(
+    url: String,
+    body: String,
+    info: Option<String>,
+) -> Result<Arc<StickerEventContent>, ClientError> {
+    let url = OwnedMxcUri::from(url);
+    url.validate().map_err(ClientError::from_err)?;
+
+    let info = info
+        .map(|info| serde_json::from_str::<RumaImageInfo>(&info))
+        .transpose()?
+        .unwrap_or_else(RumaImageInfo::new);
+
+    Ok(Arc::new(StickerEventContent {
+        content: RumaStickerEventContent::new(body, info, url),
+    }))
+}
+
+// SC
+#[derive(Clone, uniffi::Object)]
+pub struct StickerEventContent {
+    pub(crate) content: RumaStickerEventContent,
 }
 
 #[derive(Clone, uniffi::Object)]
