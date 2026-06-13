@@ -63,6 +63,10 @@ use self::{
 };
 use crate::timeline::controller::CryptoDropHandles;
 
+// SC start
+use ruma::events::{relation::Reply as RumaReply, sticker::StickerEventContent};
+// SC end
+
 mod algorithms;
 mod builder;
 mod controller;
@@ -408,6 +412,25 @@ impl Timeline {
         let content = self.room().make_reply_event(content, reply).await?;
         self.send(content.into()).await?;
         Ok(())
+    }
+
+    /// SC
+    pub async fn send_sticker_reply(
+        &self,
+        mut content: StickerEventContent,
+        in_reply_to: OwnedEventId,
+    ) -> Result<SendHandle, Error> {
+        content.relates_to = Some(if let Some(thread_root) = self.controller.thread_root() {
+            Relation::Thread(Thread::reply(thread_root, in_reply_to))
+        } else {
+            Relation::Reply(RumaReply::with_event_id(in_reply_to))
+        });
+
+        Ok(self
+            .room()
+            .send_queue()
+            .send(AnyMessageLikeEventContent::Sticker(content))
+            .await?)
     }
 
     /// Given a message or media to send, and an optional `in_reply_to` event,

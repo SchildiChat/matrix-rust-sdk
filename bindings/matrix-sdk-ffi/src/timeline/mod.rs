@@ -455,6 +455,22 @@ impl Timeline {
         }
     }
 
+    /// SC
+    pub async fn send_sticker_reply(
+        self: Arc<Self>,
+        content: Arc<StickerEventContent>,
+        event_id: String,
+    ) -> Result<Arc<SendHandle>, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
+        match self.inner.send_sticker_reply(content.content.clone(), event_id).await {
+            Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
+            Err(err) => {
+                error!("error when sending a sticker reply: {err}");
+                Err(err.into())
+            }
+        }
+    }
+
     pub fn send_image(
         self: Arc<Self>,
         params: UploadParameters,
