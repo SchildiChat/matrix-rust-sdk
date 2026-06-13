@@ -109,7 +109,7 @@ impl managed::Manager for Manager {
         let path = self.database_path.clone();
         SyncWrapper::new(RUNTIME, move || {
             let conn = rusqlite::Connection::open(path)?;
-            conn.busy_timeout(std::time::Duration::from_secs(30))?;
+            conn.busy_timeout(Duration::from_secs(30))?;
             Ok(conn)
         })
         .await
