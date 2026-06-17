@@ -543,26 +543,39 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         self.check_no_unused_unique_ids();
     }
 
-    fn check_no_duplicate_read_receipts(&self) {
-        let mut by_user_id = HashMap::new();
+    /// Check whether any read receipts are duplicated. If so, log an error
+    /// message.
+    ///
+    /// Returns true if some receipts are duplicated, and false if all is fine.
+    /// This return value is used for testing, and ignored in production (the
+    /// error log is sufficient).
+    fn check_no_duplicate_read_receipts(&self) -> bool {
+        let mut by_user_and_thread = HashMap::new();
         let mut duplicates = HashSet::new();
 
         for item in self.items.iter_remotes_region().filter_map(|(_, item)| item.as_event()) {
             if let Some(event_id) = item.event_id() {
-                for (user_id, _read_receipt) in item.read_receipts() {
-                    if let Some(prev_event_id) = by_user_id.insert(user_id, event_id) {
-                        duplicates.insert((user_id.clone(), prev_event_id, event_id));
+                for (user_id, read_receipt) in item.read_receipts() {
+                    let key = (user_id, read_receipt.thread.as_str());
+                    if let Some(prev_event_id) = by_user_and_thread.insert(key, event_id) {
+                        duplicates.insert((key.0, key.1, prev_event_id, event_id));
                     }
                 }
             }
         }
 
-        if !duplicates.is_empty() {
+        if duplicates.is_empty() {
+            // No duplicates - all good
+            false
+        } else {
+            // Some duplicates - log an error and return true (used in tests)
             tracing::error!(
                 ?duplicates,
                 items = ?self.items,
                 "duplicate read receipts in this timeline",
             );
+
+            true
         }
     }
 
@@ -1301,4 +1314,148 @@ async fn get_forwarder_info<P: RoomDataProvider>(
     };
 
     (forwarder, forwarder_profile.flatten())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use matrix_sdk::Room;
+    use ruma::{
+        MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
+        events::receipt::{Receipt, ReceiptThread},
+        owned_event_id, owned_user_id,
+        room_version_rules::RoomVersionRules,
+    };
+
+    use crate::timeline::{
+        EventTimelineItem, MsgLikeContent, TimelineDetails, TimelineItem, TimelineItemContent,
+        TimelineItemKind, TimelineUniqueId,
+        controller::{
+            ObservableItems, TimelineFocusKind, TimelineMetadata, TimelineStateTransaction,
+        },
+        event_item::{EventTimelineItemKind, RemoteEventOrigin, RemoteEventTimelineItem},
+    };
+
+    #[test]
+    fn detects_duplicate_read_receipts_in_same_receipt_thread() {
+        // Given a timeline with clashing receipts
+        let mut items = create_items_with_receipts(vec![
+            (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
+            (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
+        ]);
+
+        // When we check for duplicates
+        let user_id = owned_user_id!("@foo:s.co");
+        let mut meta = TimelineMetadata::new(user_id, RoomVersionRules::V12, None, None, true);
+        let focus = TimelineFocusKind::PinnedEvents;
+        let transaction: TimelineStateTransaction<'_, Room> =
+            TimelineStateTransaction::new(&mut items, &mut meta, &focus);
+
+        let dups = transaction.check_no_duplicate_read_receipts();
+
+        // Then some duplicates were found
+        assert!(dups);
+    }
+
+    #[test]
+    fn if_there_are_no_duplicate_receipts_we_report_no_duplicates() {
+        // Given a timeline with receipts, but no clashes (users are different)
+        let mut items = create_items_with_receipts(vec![
+            (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
+            (owned_user_id!("@user2:s.co"), create_receipt(ReceiptThread::Unthreaded)),
+        ]);
+
+        // When we check for duplicates
+        let user_id = owned_user_id!("@foo:s.co");
+        let mut meta = TimelineMetadata::new(user_id, RoomVersionRules::V12, None, None, true);
+        let focus = TimelineFocusKind::PinnedEvents;
+        let transaction: TimelineStateTransaction<'_, Room> =
+            TimelineStateTransaction::new(&mut items, &mut meta, &focus);
+
+        let dups = transaction.check_no_duplicate_read_receipts();
+
+        // Then no duplicates were found
+        assert!(!dups);
+    }
+
+    #[test]
+    fn if_there_are_receipts_for_different_receipt_threads_we_report_no_duplicates() {
+        // Given a timeline with receipts, but no clashes (users are different)
+        let mut items = create_items_with_receipts(vec![
+            (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
+            (
+                owned_user_id!("@user1:s.co"),
+                create_receipt(ReceiptThread::Thread(owned_event_id!("$thread_root"))),
+            ),
+        ]);
+
+        // When we check for duplicates
+        let user_id = owned_user_id!("@foo:s.co");
+        let mut meta = TimelineMetadata::new(user_id, RoomVersionRules::V12, None, None, true);
+        let focus = TimelineFocusKind::PinnedEvents;
+        let transaction: TimelineStateTransaction<'_, Room> =
+            TimelineStateTransaction::new(&mut items, &mut meta, &focus);
+
+        let dups = transaction.check_no_duplicate_read_receipts();
+
+        // Then no duplicates were found
+        assert!(!dups);
+    }
+
+    fn create_receipt(receipt_thread: ReceiptThread) -> Receipt {
+        let mut receipt = Receipt::new(MilliSecondsSinceUnixEpoch::now());
+        receipt.thread = receipt_thread;
+        receipt
+    }
+
+    fn create_items_with_receipts(receipts: Vec<(OwnedUserId, Receipt)>) -> ObservableItems {
+        let mut items = ObservableItems::new();
+        {
+            let mut t = items.transaction();
+
+            for (num, receipt) in receipts.into_iter().enumerate() {
+                let event_id = OwnedEventId::try_from(format!("$event-{num}")).unwrap();
+                let timeline_id = format!("timeline-{num}");
+
+                t.push_front(event_with_receipt_item(event_id, timeline_id, receipt), None);
+            }
+            t.commit();
+        }
+        items
+    }
+
+    fn event_with_receipt_item(
+        event_id: OwnedEventId,
+        timeline_id: String,
+        receipt: (OwnedUserId, Receipt),
+    ) -> Arc<TimelineItem> {
+        let event_kind = EventTimelineItemKind::Remote(RemoteEventTimelineItem {
+            event_id,
+            transaction_id: None,
+            read_receipts: [receipt].into(),
+            is_own: false,
+            is_highlighted: false,
+            encryption_info: None,
+            original_json: None,
+            latest_edit_json: None,
+            origin: RemoteEventOrigin::Sync,
+        });
+
+        let event_timeline_item = EventTimelineItem::new(
+            owned_user_id!("@u:s.co"),
+            TimelineDetails::Pending,
+            None,
+            None,
+            MilliSecondsSinceUnixEpoch::now(),
+            TimelineItemContent::MsgLike(MsgLikeContent::redacted()),
+            event_kind,
+            false,
+        );
+
+        TimelineItem::new(
+            TimelineItemKind::Event(event_timeline_item),
+            TimelineUniqueId(timeline_id),
+        )
+    }
 }
