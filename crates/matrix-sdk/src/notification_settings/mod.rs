@@ -24,7 +24,8 @@ use ruma::{
     },
     events::push_rules::PushRulesEvent,
     push::{
-        Action, NewPushRule, PredefinedUnderrideRuleId, RuleKind, Ruleset, SoundTweakValue, Tweak,
+        Action, EventMatchConditionData, NewConditionalPushRule, NewPushRule,
+        PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset, SoundTweakValue, Tweak,
     },
 };
 use tokio::sync::{
@@ -278,10 +279,9 @@ impl NotificationSettings {
         rule_id: String,
         rule_kind: RuleKind,
         actions: Vec<Action>,
-        conditions: Vec<ruma::push::PushCondition>,
+        conditions: Vec<PushCondition>,
     ) -> Result<(), NotificationSettingsError> {
-        let new_conditional_rule =
-            ruma::push::NewConditionalPushRule::new(rule_id, conditions, actions);
+        let new_conditional_rule = NewConditionalPushRule::new(rule_id, conditions, actions);
 
         let new_push_rule = match rule_kind {
             RuleKind::Override => NewPushRule::Override(new_conditional_rule),
@@ -301,6 +301,164 @@ impl NotificationSettings {
         Ok(())
     }
 
+    fn encrypted_room_wakeup_push_rule(room_id: &RoomId) -> NewPushRule {
+        NewPushRule::Override(NewConditionalPushRule::new(
+            rules::encrypted_room_wakeup_rule_id(room_id),
+            vec![
+                PushCondition::EventMatch(EventMatchConditionData::new(
+                    "type".to_owned(),
+                    "m.room.encrypted".to_owned(),
+                )),
+                PushCondition::EventMatch(EventMatchConditionData::new(
+                    "room_id".to_owned(),
+                    room_id.to_string(),
+                )),
+            ],
+            vec![Action::Notify],
+        ))
+    }
+
+    fn encrypted_room_wakeup_rule_needed(
+        mode: RoomNotificationMode,
+        is_encrypted: IsEncrypted,
+        fallback_enabled: bool,
+    ) -> bool {
+        fallback_enabled
+            && matches!(is_encrypted, IsEncrypted::Yes)
+            && matches!(mode, RoomNotificationMode::MentionsAndKeywordsOnly)
+    }
+
+    async fn reconcile_encrypted_room_wakeup_rule(
+        &self,
+        room_id: &RoomId,
+        needs_wakeup_rule: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        let rules = self.rules.read().await.clone();
+        let wakeup_rule_exists = rules.get_encrypted_room_wakeup_rule(room_id).is_some();
+        let has_valid_wakeup_rule = rules.has_valid_encrypted_room_wakeup_rule(room_id);
+
+        if has_valid_wakeup_rule == needs_wakeup_rule && (needs_wakeup_rule || !wakeup_rule_exists)
+        {
+            return Ok(());
+        }
+
+        let after_rule_id = rules.last_custom_override_rule_id();
+        let mut rule_commands = RuleCommands::new(rules.ruleset);
+
+        if needs_wakeup_rule {
+            rule_commands.insert_custom_rule_after(
+                Self::encrypted_room_wakeup_push_rule(room_id),
+                after_rule_id,
+            )?;
+        } else if wakeup_rule_exists {
+            rule_commands
+                .delete_rule(RuleKind::Override, rules::encrypted_room_wakeup_rule_id(room_id))?;
+        }
+
+        self.run_server_commands(&rule_commands).await?;
+
+        let rules = &mut *self.rules.write().await;
+        rules.apply(rule_commands);
+
+        Ok(())
+    }
+
+    /// Reconcile the Schildi encrypted wakeup fallback rule for a room without
+    /// changing the room's notification mode.
+    ///
+    /// This is intended for rooms that inherit their notification mode from
+    /// account defaults. The fallback rule is auxiliary state: it wakes the
+    /// client for encrypted events so the client can decrypt and apply local
+    /// mention filtering, but it must not turn the room into a custom
+    /// notification room.
+    pub async fn reconcile_room_encrypted_wakeup_fallback(
+        &self,
+        room_id: &RoomId,
+        effective_mode: RoomNotificationMode,
+        is_encrypted: IsEncrypted,
+        fallback_enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        self.reconcile_encrypted_room_wakeup_rule(
+            room_id,
+            Self::encrypted_room_wakeup_rule_needed(effective_mode, is_encrypted, fallback_enabled),
+        )
+        .await
+    }
+
+    /// Set the notification mode for a room and manage the Schildi encrypted
+    /// wakeup fallback rule for homeservers/accounts where encrypted event push
+    /// is not effectively available.
+    ///
+    /// The fallback rule is only useful for encrypted rooms in
+    /// [`RoomNotificationMode::MentionsAndKeywordsOnly`]: it asks the server to
+    /// wake the client for encrypted events in that room, then the client can
+    /// decrypt and apply local mention filtering.
+    pub async fn set_room_notification_mode_with_encrypted_wakeup_fallback(
+        &self,
+        room_id: &RoomId,
+        mode: RoomNotificationMode,
+        is_encrypted: IsEncrypted,
+        fallback_enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        let rules = self.rules.read().await.clone();
+        let current_mode = rules.get_user_defined_room_notification_mode(room_id);
+        let needs_wakeup_rule =
+            Self::encrypted_room_wakeup_rule_needed(mode, is_encrypted, fallback_enabled);
+
+        if current_mode == Some(mode) {
+            self.reconcile_encrypted_room_wakeup_rule(room_id, needs_wakeup_rule).await?;
+            return Ok(());
+        }
+
+        let (new_rule_kind, notify) = match mode {
+            RoomNotificationMode::AllMessages => (RuleKind::Room, true),
+            RoomNotificationMode::MentionsAndKeywordsOnly => (RuleKind::Room, false),
+            RoomNotificationMode::Mute => (RuleKind::Override, false),
+        };
+
+        let new_rule_id = room_id.as_str();
+        let wakeup_rule_id = rules::encrypted_room_wakeup_rule_id(room_id);
+        let wakeup_rule_exists = rules.get_encrypted_room_wakeup_rule(room_id).is_some();
+        let mut custom_rules: Vec<(RuleKind, String)> = rules
+            .get_custom_rules_for_room(room_id)
+            .into_iter()
+            .filter(|(kind, rule_id)| {
+                (kind != &new_rule_kind || rule_id != new_rule_id)
+                    && (!needs_wakeup_rule || rule_id != &wakeup_rule_id)
+            })
+            .collect();
+        if !needs_wakeup_rule
+            && wakeup_rule_exists
+            && !custom_rules
+                .iter()
+                .any(|(kind, rule_id)| kind == &RuleKind::Override && rule_id == &wakeup_rule_id)
+        {
+            custom_rules.push((RuleKind::Override, wakeup_rule_id.clone()));
+        }
+
+        let after_rule_id = rules.last_custom_override_rule_id();
+        let mut rule_commands = RuleCommands::new(rules.ruleset);
+        rule_commands.insert_rule(new_rule_kind.clone(), room_id, notify)?;
+
+        if needs_wakeup_rule {
+            rule_commands.insert_custom_rule_after(
+                Self::encrypted_room_wakeup_push_rule(room_id),
+                after_rule_id,
+            )?;
+        }
+
+        for (kind, rule_id) in custom_rules {
+            rule_commands.delete_rule(kind, rule_id)?;
+        }
+
+        self.run_server_commands(&rule_commands).await?;
+
+        let rules = &mut *self.rules.write().await;
+        rules.apply(rule_commands);
+
+        Ok(())
+    }
+
     /// Set the notification mode for a room.
     pub async fn set_room_notification_mode(
         &self,
@@ -311,6 +469,8 @@ impl NotificationSettings {
 
         // Check that the current mode is not already the target mode.
         if rules.get_user_defined_room_notification_mode(room_id) == Some(mode) {
+            drop(rules);
+            self.reconcile_encrypted_room_wakeup_rule(room_id, false).await?;
             return Ok(());
         }
 
@@ -332,11 +492,14 @@ impl NotificationSettings {
 
         // Extract all the custom rules except the one we just created.
         let new_rule_id = room_id.as_str();
-        let custom_rules: Vec<(RuleKind, String)> = rules
+        let mut custom_rules: Vec<(RuleKind, String)> = rules
             .get_custom_rules_for_room(room_id)
             .into_iter()
             .filter(|(kind, rule_id)| kind != &new_rule_kind || rule_id != new_rule_id)
             .collect();
+        if let Some(wakeup_rule_id) = rules.get_encrypted_room_wakeup_rule(room_id) {
+            custom_rules.push((RuleKind::Override, wakeup_rule_id));
+        }
 
         // Build the command list to delete all other custom rules, with the exception
         // of the newly inserted rule.
@@ -361,7 +524,10 @@ impl NotificationSettings {
     ) -> Result<(), NotificationSettingsError> {
         let rules = self.rules.read().await.clone();
 
-        let custom_rules = rules.get_custom_rules_for_room(room_id);
+        let mut custom_rules = rules.get_custom_rules_for_room(room_id);
+        if let Some(wakeup_rule_id) = rules.get_encrypted_room_wakeup_rule(room_id) {
+            custom_rules.push((RuleKind::Override, wakeup_rule_id));
+        }
         if custom_rules.is_empty() {
             return Ok(());
         }
@@ -551,8 +717,9 @@ impl NotificationSettings {
                         },
                     )?;
                 }
-                Command::SetCustomPushRule { rule } => {
-                    let request = set_pushrule::v3::Request::new(rule.clone());
+                Command::SetCustomPushRule { rule, after } => {
+                    let mut request = set_pushrule::v3::Request::new(rule.clone());
+                    request.after = after.clone();
 
                     self.client.send(request).with_request_config(request_config).await.map_err(
                         |error| {
@@ -595,9 +762,9 @@ mod tests {
     use ruma::{
         OwnedRoomId, RoomId, owned_room_id,
         push::{
-            Action, AnyPushRuleRef, EventMatchConditionData, NewPatternedPushRule, NewPushRule,
-            PredefinedContentRuleId, PredefinedOverrideRuleId, PredefinedUnderrideRuleId,
-            PushCondition, RuleKind, Ruleset,
+            Action, AnyPushRuleRef, EventMatchConditionData, NewConditionalPushRule,
+            NewPatternedPushRule, NewPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
+            PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
         },
     };
     use stream_assert::{assert_next_eq, assert_pending};
@@ -1002,6 +1169,150 @@ mod tests {
             RoomNotificationMode::Mute,
             settings.get_user_defined_room_notification_mode(&room_id).await.unwrap()
         );
+
+        server.verify().await;
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_set_room_notification_mode_with_encrypted_wakeup_fallback_manages_rule()
+    -> TestResult {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let wakeup_put_was_called = Arc::new(AtomicBool::default());
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"_matrix/client/r0/pushrules/global/override/chat\.schildi\.encrypted_room_wakeup\..*",
+            ))
+            .and({
+                let wakeup_put_was_called = wakeup_put_was_called.clone();
+                move |request: &wiremock::Request| {
+                    assert_eq!(request.url.query(), Some("after=com.example.custom"));
+                    wakeup_put_was_called.store(true, Ordering::SeqCst);
+                    true
+                }
+            })
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(r"_matrix/client/r0/pushrules/global/room/.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"_matrix/client/r0/pushrules/global/override/chat\.schildi\.encrypted_room_wakeup\..*",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let room_id = get_test_room_id();
+        let mut ruleset = get_server_default_ruleset();
+        let custom_override_rule = NewConditionalPushRule::new(
+            "com.example.custom".to_owned(),
+            vec![PushCondition::EventMatch(EventMatchConditionData::new(
+                "type".to_owned(),
+                "m.room.message".to_owned(),
+            ))],
+            vec![],
+        );
+        ruleset.insert(NewPushRule::Override(custom_override_rule), None, None)?;
+        let settings = NotificationSettings::new(client, ruleset);
+
+        settings
+            .set_room_notification_mode_with_encrypted_wakeup_fallback(
+                &room_id,
+                RoomNotificationMode::MentionsAndKeywordsOnly,
+                IsEncrypted::Yes,
+                true,
+            )
+            .await?;
+
+        assert!(wakeup_put_was_called.load(Ordering::SeqCst));
+        assert_eq!(
+            settings.get_user_defined_room_notification_mode(&room_id).await,
+            Some(RoomNotificationMode::MentionsAndKeywordsOnly)
+        );
+        assert!(settings.rules.read().await.get_encrypted_room_wakeup_rule(&room_id).is_some());
+
+        settings
+            .set_room_notification_mode_with_encrypted_wakeup_fallback(
+                &room_id,
+                RoomNotificationMode::AllMessages,
+                IsEncrypted::Yes,
+                true,
+            )
+            .await?;
+
+        assert_eq!(
+            settings.get_user_defined_room_notification_mode(&room_id).await,
+            Some(RoomNotificationMode::AllMessages)
+        );
+        assert!(settings.rules.read().await.get_encrypted_room_wakeup_rule(&room_id).is_none());
+
+        server.verify().await;
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_reconcile_room_encrypted_wakeup_fallback_does_not_create_custom_room_mode()
+    -> TestResult {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"_matrix/client/r0/pushrules/global/override/chat\.schildi\.encrypted_room_wakeup\..*",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r"_matrix/client/r0/pushrules/global/override/chat\.schildi\.encrypted_room_wakeup\..*",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let room_id = get_test_room_id();
+        let settings = NotificationSettings::new(client, get_server_default_ruleset());
+
+        settings
+            .reconcile_room_encrypted_wakeup_fallback(
+                &room_id,
+                RoomNotificationMode::MentionsAndKeywordsOnly,
+                IsEncrypted::Yes,
+                true,
+            )
+            .await?;
+
+        assert_eq!(settings.get_user_defined_room_notification_mode(&room_id).await, None);
+        assert!(settings.get_rooms_with_user_defined_rules(Some(true)).await.is_empty());
+        assert!(settings.rules.read().await.get_encrypted_room_wakeup_rule(&room_id).is_some());
+
+        settings
+            .reconcile_room_encrypted_wakeup_fallback(
+                &room_id,
+                RoomNotificationMode::AllMessages,
+                IsEncrypted::Yes,
+                true,
+            )
+            .await?;
+
+        assert!(settings.rules.read().await.get_encrypted_room_wakeup_rule(&room_id).is_none());
 
         server.verify().await;
         Ok(())

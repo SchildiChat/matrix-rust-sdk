@@ -539,6 +539,62 @@ impl NotificationSettings {
         Ok(())
     }
 
+    /// Set the notification mode for a room and manage the Schildi encrypted
+    /// wakeup fallback rule.
+    ///
+    /// `encrypted_wakeup_fallback_enabled` should only be set by clients that
+    /// explicitly opt into the compatibility fallback for accounts where
+    /// encrypted event push is not effectively available.
+    pub async fn set_room_notification_mode_with_encrypted_wakeup_fallback(
+        &self,
+        room_id: String,
+        mode: RoomNotificationMode,
+        is_encrypted: bool,
+        encrypted_wakeup_fallback_enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        let parsed_room_id = RoomId::parse(&room_id)
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
+
+        self.sdk_notification_settings
+            .read()
+            .await
+            .set_room_notification_mode_with_encrypted_wakeup_fallback(
+                &parsed_room_id,
+                mode.into(),
+                is_encrypted.into(),
+                encrypted_wakeup_fallback_enabled,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Reconcile the Schildi encrypted wakeup fallback rule for a room without
+    /// changing the room's notification mode.
+    pub async fn reconcile_room_encrypted_wakeup_fallback(
+        &self,
+        room_id: String,
+        effective_mode: RoomNotificationMode,
+        is_encrypted: bool,
+        encrypted_wakeup_fallback_enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        let parsed_room_id = RoomId::parse(&room_id)
+            .map_err(|_e| NotificationSettingsError::InvalidRoomId { room_id })?;
+
+        self.sdk_notification_settings
+            .read()
+            .await
+            .reconcile_room_encrypted_wakeup_fallback(
+                &parsed_room_id,
+                effective_mode.into(),
+                is_encrypted.into(),
+                encrypted_wakeup_fallback_enabled,
+            )
+            .await?;
+
+        Ok(())
+    }
+
     /// Get the user defined room notification mode
     pub async fn get_user_defined_room_notification_mode(
         &self,

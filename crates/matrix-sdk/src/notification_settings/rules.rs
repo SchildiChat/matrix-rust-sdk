@@ -5,8 +5,8 @@ use indexmap::IndexSet;
 use ruma::{
     RoomId,
     push::{
-        AnyPushRuleRef, PatternedPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
-        PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
+        AnyPushRuleRef, ConditionalPushRule, PatternedPushRule, PredefinedContentRuleId,
+        PredefinedOverrideRuleId, PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
     },
 };
 
@@ -15,6 +15,36 @@ use crate::{
     error::NotificationSettingsError,
     notification_settings::{IsEncrypted, IsOneToOne},
 };
+
+pub(crate) const ENCRYPTED_ROOM_WAKEUP_RULE_PREFIX: &str = "chat.schildi.encrypted_room_wakeup.";
+
+pub(crate) fn encrypted_room_wakeup_rule_id(room_id: &RoomId) -> String {
+    format!("{ENCRYPTED_ROOM_WAKEUP_RULE_PREFIX}{room_id}")
+}
+
+fn is_encrypted_room_wakeup_rule_for_room(rule: &ConditionalPushRule, room_id: &RoomId) -> bool {
+    rule.rule_id == encrypted_room_wakeup_rule_id(room_id)
+        && rule.enabled
+        && rule.actions.iter().any(|action| action.should_notify())
+        && rule.conditions.iter().any(|condition| {
+            matches!(
+                condition,
+                PushCondition::EventMatch(data)
+                    if data.key == "type" && data.pattern == "m.room.encrypted"
+            )
+        })
+        && rule.conditions.iter().any(|condition| {
+            matches!(
+                condition,
+                PushCondition::EventMatch(data)
+                    if data.key == "room_id" && data.pattern == *room_id
+            )
+        })
+}
+
+fn is_schildi_encrypted_room_wakeup_rule(rule_id: &str) -> bool {
+    rule_id.starts_with(ENCRYPTED_ROOM_WAKEUP_RULE_PREFIX)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Rules {
@@ -32,6 +62,9 @@ impl Rules {
 
         // add any `Override` rules matching this `room_id`
         for rule in &self.ruleset.override_ {
+            if is_schildi_encrypted_room_wakeup_rule(&rule.rule_id) {
+                continue;
+            }
             // if the rule_id is the room_id
             if &rule.rule_id == room_id || rule.conditions.iter().any(|x| matches!(
                 x,
@@ -60,6 +93,37 @@ impl Rules {
         }
 
         custom_rules
+    }
+
+    /// Get the Schildi-owned encrypted wakeup rule ID for a room if present.
+    pub(crate) fn get_encrypted_room_wakeup_rule(&self, room_id: &RoomId) -> Option<String> {
+        let rule_id = encrypted_room_wakeup_rule_id(room_id);
+        self.ruleset
+            .override_
+            .iter()
+            .find(|rule| rule.rule_id == rule_id)
+            .map(|rule| rule.rule_id.clone())
+    }
+
+    /// Whether the Schildi-owned encrypted wakeup rule for a room has the
+    /// expected structure.
+    pub(crate) fn has_valid_encrypted_room_wakeup_rule(&self, room_id: &RoomId) -> bool {
+        self.ruleset
+            .override_
+            .iter()
+            .any(|rule| is_encrypted_room_wakeup_rule_for_room(rule, room_id))
+    }
+
+    /// Return the last custom override rule before SDK/default override rules.
+    pub(crate) fn last_custom_override_rule_id(&self) -> Option<String> {
+        self.ruleset
+            .override_
+            .iter()
+            .filter(|rule| {
+                !rule.default && !rule.rule_id.starts_with(ENCRYPTED_ROOM_WAKEUP_RULE_PREFIX)
+            })
+            .map(|rule| rule.rule_id.clone())
+            .last()
     }
 
     /// Gets the user defined notification mode for a room.
@@ -134,6 +198,11 @@ impl Rules {
         let mut room_ids = HashSet::new();
         for rule in &self.ruleset {
             if rule.is_server_default() {
+                continue;
+            }
+            if let AnyPushRuleRef::Override(r) = rule
+                && is_schildi_encrypted_room_wakeup_rule(&r.rule_id)
+            {
                 continue;
             }
             if test_if_enabled && rule.enabled() != must_be_enabled {
@@ -269,8 +338,8 @@ impl Rules {
                 Command::SetPushRuleActions { kind, rule_id, actions } => {
                     _ = self.ruleset.set_actions(kind, rule_id, actions);
                 }
-                Command::SetCustomPushRule { rule } => {
-                    _ = self.ruleset.insert(rule, None, None);
+                Command::SetCustomPushRule { rule, after } => {
+                    _ = self.ruleset.insert(rule, None, after.as_deref());
                 }
             }
         }

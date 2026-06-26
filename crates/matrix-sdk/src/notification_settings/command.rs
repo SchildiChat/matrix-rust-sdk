@@ -26,7 +26,7 @@ pub(crate) enum Command {
     /// Set a list of actions
     SetPushRuleActions { kind: RuleKind, rule_id: String, actions: Vec<Action> },
     /// Sets a custom push rule
-    SetCustomPushRule { rule: NewPushRule },
+    SetCustomPushRule { rule: NewPushRule, after: Option<String> },
 }
 
 fn get_notify_actions(notify: bool) -> Vec<Action> {
@@ -76,7 +76,7 @@ impl Command {
                 "cannot create a push rule from this command.".to_owned(),
             )),
 
-            Self::SetCustomPushRule { rule } => Ok(rule.clone()),
+            Self::SetCustomPushRule { rule, .. } => Ok(rule.clone()),
         }
     }
 }
