@@ -27,7 +27,6 @@ use ruma::{
         GlobalAccountDataEvent as RumaGlobalAccountDataEvent,
         GlobalAccountDataEventType as RumaGlobalAccountDataEventType,
         RoomAccountDataEvent as RumaRoomAccountDataEvent,
-        RoomAccountDataEventType as RumaRoomAccountDataEventType,
         direct::DirectEventContent,
         fully_read::FullyReadEventContent,
         identity_server::IdentityServerEventContent,
@@ -79,6 +78,7 @@ use ruma::{
         },
     },
     matrix_uri::MatrixId as RumaMatrixId,
+    presence::PresenceState as RumaPresenceState,
     push::{
         ConditionalPushRule as RumaConditionalPushRule, PatternedPushRule as RumaPatternedPushRule,
         Ruleset as RumaRuleset, SimplePushRule as RumaSimplePushRule,
@@ -192,6 +192,35 @@ impl From<&RumaMatrixId> for MatrixId {
                 }
             }
             _ => panic!("Unexpected MatrixId type: {value:?}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum, Default)]
+pub enum PresenceState {
+    Online,
+    Offline,
+    #[default]
+    Unavailable,
+}
+
+impl From<PresenceState> for RumaPresenceState {
+    fn from(value: PresenceState) -> Self {
+        match value {
+            PresenceState::Online => Self::Online,
+            PresenceState::Offline => Self::Offline,
+            PresenceState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl From<RumaPresenceState> for PresenceState {
+    fn from(value: RumaPresenceState) -> Self {
+        match value {
+            RumaPresenceState::Online => Self::Online,
+            RumaPresenceState::Offline => Self::Offline,
+            RumaPresenceState::Unavailable => Self::Unavailable,
+            _ => Self::default(),
         }
     }
 }
@@ -797,26 +826,22 @@ impl TryFrom<&ImageInfo> for BaseImageInfo {
     type Error = MediaInfoError;
 
     fn try_from(value: &ImageInfo) -> Result<Self, MediaInfoError> {
-        let height = value
-            .height
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-        let width = value
-            .width
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-        let size = value
-            .size
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-
         Ok(BaseImageInfo {
-            height,
-            width,
-            size,
+            height: value
+                .height
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
+            width: value
+                .width
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
+            size: value
+                .size
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
             blurhash: value.blurhash.clone(),
             is_animated: value.is_animated,
         })
@@ -844,13 +869,15 @@ impl TryFrom<&AudioInfo> for BaseAudioInfo {
     type Error = MediaInfoError;
 
     fn try_from(value: &AudioInfo) -> Result<Self, MediaInfoError> {
-        let size = value
-            .size
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-
-        Ok(BaseAudioInfo { duration: value.duration, size, waveform: None })
+        Ok(BaseAudioInfo {
+            duration: value.duration,
+            size: value
+                .size
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
+            waveform: None,
+        })
     }
 }
 
@@ -928,27 +955,23 @@ impl TryFrom<&VideoInfo> for BaseVideoInfo {
     type Error = MediaInfoError;
 
     fn try_from(value: &VideoInfo) -> Result<Self, MediaInfoError> {
-        let height = value
-            .height
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-        let width = value
-            .width
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-        let size = value
-            .size
-            .map(UInt::try_from)
-            .transpose()
-            .map_err(|_| MediaInfoError::InvalidField)?;
-
         Ok(BaseVideoInfo {
             duration: value.duration,
-            height,
-            width,
-            size,
+            height: value
+                .height
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
+            width: value
+                .width
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
+            size: value
+                .size
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
             blurhash: value.blurhash.clone(),
         })
     }
@@ -977,10 +1000,13 @@ impl TryFrom<&FileInfo> for BaseFileInfo {
     type Error = MediaInfoError;
 
     fn try_from(value: &FileInfo) -> Result<Self, MediaInfoError> {
-        let size = UInt::try_from(value.size.ok_or(MediaInfoError::MissingField)?)
-            .map_err(|_| MediaInfoError::InvalidField)?;
-
-        Ok(BaseFileInfo { size: Some(size) })
+        Ok(BaseFileInfo {
+            size: value
+                .size
+                .map(UInt::try_from)
+                .transpose()
+                .map_err(|_| MediaInfoError::InvalidField)?,
+        })
     }
 }
 
@@ -1765,33 +1791,6 @@ impl TryFrom<RumaGlobalAccountDataEvent<SecretStorageKeyEventContent>> for Accou
             algorithm: value.content.algorithm.try_into()?,
             passphrase: value.content.passphrase.map(TryInto::try_into).transpose()?,
         })
-    }
-}
-
-/// Types of room account data events.
-#[derive(Clone, uniffi::Enum)]
-pub enum RoomAccountDataEventType {
-    /// m.fully_read
-    FullyRead,
-    /// m.marked_unread
-    MarkedUnread,
-    /// m.tag
-    Tag,
-    /// com.famedly.marked_unread
-    UnstableMarkedUnread,
-}
-
-impl TryFrom<RumaRoomAccountDataEventType> for RoomAccountDataEventType {
-    type Error = String;
-
-    fn try_from(value: RumaRoomAccountDataEventType) -> Result<Self, Self::Error> {
-        match value {
-            RumaRoomAccountDataEventType::FullyRead => Ok(Self::FullyRead),
-            RumaRoomAccountDataEventType::MarkedUnread => Ok(Self::MarkedUnread),
-            RumaRoomAccountDataEventType::Tag => Ok(Self::Tag),
-            RumaRoomAccountDataEventType::UnstableMarkedUnread => Ok(Self::UnstableMarkedUnread),
-            _ => Err("Unsupported account data event type".to_owned()),
-        }
     }
 }
 

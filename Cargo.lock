@@ -262,12 +262,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-once-cell"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288f83726785267c6f2ef073a3d83dc3f9b81464e9f99898240cced85fce35a"
-
-[[package]]
 name = "async-rx"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3321,7 +3315,6 @@ dependencies = [
  "assert_matches",
  "assert_matches2",
  "async-channel",
- "async-once-cell",
  "async-stream",
  "async-trait",
  "axum",
@@ -3364,9 +3357,6 @@ dependencies = [
  "rand 0.10.1",
  "reqwest",
  "ruma",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
  "serde",
  "serde_html_form",
  "serde_json",
@@ -3389,7 +3379,6 @@ dependencies = [
  "uuid",
  "vodozemac",
  "wasm-bindgen-test",
- "webpki-roots",
  "wiremock",
  "zeroize",
 ]
@@ -3465,6 +3454,22 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+]
+
+[[package]]
+name = "matrix-sdk-contentscanner"
+version = "0.18.0"
+dependencies = [
+ "assert_matches2",
+ "matrix-sdk",
+ "matrix-sdk-crypto",
+ "matrix-sdk-test",
+ "ruma",
+ "serde",
+ "tokio",
+ "tracing",
+ "uniffi",
+ "wiremock",
 ]
 
 [[package]]
@@ -3568,6 +3573,7 @@ dependencies = [
  "matrix-sdk",
  "matrix-sdk-base",
  "matrix-sdk-common",
+ "matrix-sdk-contentscanner",
  "matrix-sdk-ffi-macros",
  "matrix-sdk-ui",
  "mime",
@@ -5112,7 +5118,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.16.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "assign",
  "js_int",
@@ -5130,7 +5136,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.24.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "assign",
@@ -5152,7 +5158,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.19.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "base64",
@@ -5185,7 +5191,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.34.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -5200,6 +5206,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "uniffi",
  "web-time",
  "wildmatch",
  "zeroize",
@@ -5208,7 +5215,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.15.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "headers",
  "http",
@@ -5229,7 +5236,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.8.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -5240,7 +5247,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.12.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "js_int",
  "thiserror 2.0.18",
@@ -5249,7 +5256,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.19.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "as_variant",
  "cfg-if",
@@ -5265,7 +5272,7 @@ dependencies = [
 [[package]]
 name = "ruma-signatures"
 version = "0.21.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=9ff7fdb1a#9ff7fdb1a133ac994ae5204939a0537222a15e7b"
+source = "git+https://github.com/SchildiChat/ruma?rev=462ac3659#462ac36598b190024d4fe22eda2196d27bf1322e"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -5342,7 +5349,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "aws-lc-rs",
- "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
@@ -6835,8 +6841,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 [[package]]
 name = "uniffi"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8c6dec3fc6645f71a16a3fa9ff57991028153bd194ca97f4b55e610c73ce66a"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "camino",
@@ -6859,8 +6864,7 @@ dependencies = [
 [[package]]
 name = "uniffi_bindgen"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ed0150801958d4825da56a41c71f000a457ac3a4613fa9647df78ac4b6b6881"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "askama",
@@ -6885,8 +6889,7 @@ dependencies = [
 [[package]]
 name = "uniffi_build"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b78fd9271a4c2e85bd2c266c5a9ede1fac676eb39fd77f636c27eaf67426fd5f"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "camino",
@@ -6896,8 +6899,7 @@ dependencies = [
 [[package]]
 name = "uniffi_core"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0ef62e69762fbb9386dcb6c87cd3dd05d525fa8a3a579a290892e60ddbda47e"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "async-compat",
@@ -6909,8 +6911,7 @@ dependencies = [
 [[package]]
 name = "uniffi_internal_macros"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98f51ebca0d9a4b2aa6c644d5ede45c56f73906b96403c08a1985e75ccb64a01"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -6922,8 +6923,7 @@ dependencies = [
 [[package]]
 name = "uniffi_macros"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db9d12529f1223d014fd501e5f29ca0884d15d6ed5ddddd9f506e55350327dc3"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "camino",
  "fs-err",
@@ -6939,8 +6939,7 @@ dependencies = [
 [[package]]
 name = "uniffi_meta"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9df6d413db2827c68588f8149d30d49b71d540d46539e435b23a7f7dbd4d4f86"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "siphasher",
@@ -6951,8 +6950,7 @@ dependencies = [
 [[package]]
 name = "uniffi_pipeline"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a806dddc8208f22efd7e95a5cdf88ed43d0f3271e8f63b47e757a8bbdb43b63a"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "heck",
@@ -6964,8 +6962,7 @@ dependencies = [
 [[package]]
 name = "uniffi_udl"
 version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d1a7339539bf6f6fa3e9b534dece13f778bda2d54b1a6d4e40b4d6090ac26e7"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "anyhow",
  "textwrap",
@@ -7394,19 +7391,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "webpki-roots"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "weedle2"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998d2c24ec099a87daf9467808859f9d82b61f1d9c9701251aea037f514eae0e"
+source = "git+https://github.com/mozilla/uniffi-rs.git?rev=e5f4821410bea19e71984ea5e06a7bc8b11ed9e5#e5f4821410bea19e71984ea5e06a7bc8b11ed9e5"
 dependencies = [
  "nom",
 ]

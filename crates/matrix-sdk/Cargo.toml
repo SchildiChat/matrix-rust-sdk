@@ -100,7 +100,6 @@ assert_matches2 = { workspace = true, optional = true }
 async-channel = "2.5.0"
 async-stream.workspace = true
 async-trait.workspace = true
-async-once-cell.workspace = true
 axum = { version = "0.8.4", optional = true }
 bytes = { version = "1.11.1", default-features = false, features = ["std"] }
 bytesize = { version = "2.3.0", default-features = false, features = ["std"] }
@@ -194,12 +193,6 @@ wiremock.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
-
-[target.'cfg(target_os = "android")'.dependencies]
-rustls = "0.23.38"
-rustls-pki-types = "1.14.0"
-rustls-native-certs = "0.8.3"
-webpki-roots = "1.0.6"
 
 [[test]]
 name = "integration"

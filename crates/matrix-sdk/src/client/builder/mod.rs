@@ -21,7 +21,11 @@ use std::collections::HashMap;
 use std::path::Path;
 #[cfg(any(feature = "experimental-search", feature = "sqlite"))]
 use std::path::PathBuf;
-use std::{collections::BTreeSet, fmt, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{Arc, RwLock as StdRwLock},
+};
 
 #[cfg(feature = "sqlite")]
 use futures_util::try_join;
@@ -41,6 +45,7 @@ use reqwest::Certificate;
 use ruma::{
     OwnedServerName, ServerName,
     api::{MatrixVersion, SupportedVersions, error::FromHttpResponseError},
+    presence::PresenceState,
 };
 use thiserror::Error;
 #[cfg(feature = "experimental-search")]
@@ -64,6 +69,7 @@ use crate::{
     config::RequestConfig,
     error::RumaApiError,
     http_client::HttpClient,
+    media::{DefaultMediaFetcher, MediaFetcher},
     send_queue::SendQueueData,
     sliding_sync::VersionBuilder as SlidingSyncVersionBuilder,
 };
@@ -131,6 +137,7 @@ pub struct ClientBuilder {
     #[cfg(feature = "experimental-search")]
     search_index_store_kind: SearchIndexStoreKind,
     dm_room_definition: DmRoomDefinition,
+    media_fetcher: Arc<dyn MediaFetcher>,
 }
 
 impl ClientBuilder {
@@ -168,7 +175,15 @@ impl ClientBuilder {
             #[cfg(feature = "experimental-search")]
             search_index_store_kind: SearchIndexStoreKind::InMemory,
             dm_room_definition: DmRoomDefinition::MatrixSpec,
+            media_fetcher: Arc::new(DefaultMediaFetcher),
         }
+    }
+
+    /// Sets a [`MediaFetcher`] that will be used to get media from the media
+    /// server.
+    pub fn media_fetcher(mut self, media_fetcher: Arc<dyn MediaFetcher>) -> Self {
+        self.media_fetcher = media_fetcher.clone();
+        self
     }
 
     /// Sets the definition the [`Client`] will use to check if a room is a DM.
@@ -391,16 +406,6 @@ impl ClientBuilder {
     #[cfg(not(target_family = "wasm"))]
     pub fn add_root_certificates(mut self, certificates: Vec<Certificate>) -> Self {
         self.http_settings().additional_root_certificates = certificates;
-        self
-    }
-
-    /// Add the given list of certificates in a raw byte format to the
-    /// certificate store of the HTTP client.
-    ///
-    /// Not this will only be used in Android for the webkpi workaround.
-    #[cfg(target_os = "android")]
-    pub fn add_raw_root_certificates(mut self, raw_certificates: Vec<Vec<u8>>) -> Self {
-        self.http_settings().additional_raw_root_certificates = raw_certificates;
         self
     }
 
@@ -648,6 +653,7 @@ impl ClientBuilder {
             server,
             homeserver,
             sliding_sync_version,
+            Arc::new(StdRwLock::new(PresenceState::Online)),
             http_client,
             base_client,
             supported_versions,
@@ -664,6 +670,7 @@ impl ClientBuilder {
             #[cfg(feature = "experimental-search")]
             search_index,
             thread_subscriptions_catchup,
+            self.media_fetcher.clone(),
         )
         .await;
 
