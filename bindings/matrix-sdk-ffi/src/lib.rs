@@ -27,6 +27,7 @@ mod ruma;
 mod runtime;
 // SC start
 mod sc_image_pack_observer;
+mod sc_mutual_rooms;
 // SC end
 #[cfg(feature = "experimental-search")]
 mod search;
