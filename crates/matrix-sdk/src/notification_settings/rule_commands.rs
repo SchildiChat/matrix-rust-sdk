@@ -67,9 +67,18 @@ impl RuleCommands {
         &mut self,
         rule: NewPushRule,
     ) -> Result<(), NotificationSettingsError> {
-        let command = Command::SetCustomPushRule { rule: rule.clone() };
+        self.insert_custom_rule_after(rule, None)
+    }
 
-        self.rules.insert(rule, None, None)?;
+    /// Insert a new custom rule after another rule in the same kind.
+    pub(crate) fn insert_custom_rule_after(
+        &mut self,
+        rule: NewPushRule,
+        after: Option<String>,
+    ) -> Result<(), NotificationSettingsError> {
+        let command = Command::SetCustomPushRule { rule: rule.clone(), after: after.clone() };
+
+        self.rules.insert(rule, None, after.as_deref())?;
         self.commands.push(command);
 
         Ok(())
