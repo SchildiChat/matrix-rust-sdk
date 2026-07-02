@@ -29,8 +29,8 @@ use crate::{
 };
 
 // SC start
+use ruma::events::StateEventType;
 use crate::{
-    event::StateEventType,
     space_catch_all_info::{SpaceCatchAllInfo, space_catch_all_info},
     space_child_info::{SpaceChildInfo, space_children_info},
 };

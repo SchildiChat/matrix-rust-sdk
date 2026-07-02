@@ -215,7 +215,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                     for event in events {
                         let recycled_timeline_id = event
                             .event_id()
-                            .and_then(|event_id| recycled_timeline_ids.remove(&event_id));
+                            .and_then(|event_id| recycled_timeline_ids.remove(event_id));
                         self.handle_remote_event(
                             event,
                             TimelineItemPosition::End { origin },
@@ -232,7 +232,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 VectorDiff::PushFront { value: event } => {
                     let recycled_timeline_id = event
                         .event_id()
-                        .and_then(|event_id| recycled_timeline_ids.remove(&event_id));
+                        .and_then(|event_id| recycled_timeline_ids.remove(event_id));
                     self.handle_remote_event(
                         event,
                         TimelineItemPosition::Start { origin },
@@ -248,7 +248,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 VectorDiff::PushBack { value: event } => {
                     let recycled_timeline_id = event
                         .event_id()
-                        .and_then(|event_id| recycled_timeline_ids.remove(&event_id));
+                        .and_then(|event_id| recycled_timeline_ids.remove(event_id));
                     self.handle_remote_event(
                         event,
                         TimelineItemPosition::End { origin },
@@ -264,7 +264,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 VectorDiff::Insert { index: event_index, value: event } => {
                     let recycled_timeline_id = event
                         .event_id()
-                        .and_then(|event_id| recycled_timeline_ids.remove(&event_id));
+                        .and_then(|event_id| recycled_timeline_ids.remove(event_id));
                     self.handle_remote_event(
                         event,
                         TimelineItemPosition::At { event_index, origin },
@@ -483,8 +483,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                         )
                         .await;
                     } else if let Some(event_id) = event.event_id()
-                        && let Some(meta) =
-                            self.items.all_remote_events().get_by_event_id(&event_id)
+                        && let Some(meta) = self.items.all_remote_events().get_by_event_id(event_id)
                         && let Some(timeline_item_index) = meta.timeline_item_index
                     {
                         // FIXME: This branch is a complete hackjob.
@@ -617,7 +616,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         }
 
         match &self.focus {
-            TimelineFocusKind::PinnedEvents => {
+            TimelineFocusKind::PinnedEvents { .. } => {
                 // The pinned events timeline only receives updates for, well, pinned events.
                 true
             }
@@ -646,7 +645,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 }
             }
 
-            TimelineFocusKind::Live { hide_threaded_events } => {
+            TimelineFocusKind::Live { hide_threaded_events, .. } => {
                 // If the timeline's filtering out in-thread events, don't add items for
                 // threaded events.
                 thread_root.is_none() || !hide_threaded_events
@@ -852,7 +851,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             room_data_provider
                 .load_user_receipt(
                     ReceiptType::Read,
-                    ReceiptThread::Thread(event_id),
+                    ReceiptThread::Thread(event_id.to_owned()),
                     &self.meta.own_user_id,
                 )
                 .await
@@ -865,7 +864,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             room_data_provider
                 .load_user_receipt(
                     ReceiptType::ReadPrivate,
-                    ReceiptThread::Thread(event_id),
+                    ReceiptThread::Thread(event_id.to_owned()),
                     &self.meta.own_user_id,
                 )
                 .await
@@ -1320,11 +1319,12 @@ async fn get_forwarder_info<P: RoomDataProvider>(
 mod tests {
     use std::sync::Arc;
 
-    use matrix_sdk::Room;
+    use matrix_sdk::{Room, test_utils::mocks::MatrixMockServer};
+    use matrix_sdk_test::async_test;
     use ruma::{
         MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
         events::receipt::{Receipt, ReceiptThread},
-        owned_event_id, owned_user_id,
+        owned_event_id, owned_user_id, room_id,
         room_version_rules::RoomVersionRules,
     };
 
@@ -1337,8 +1337,17 @@ mod tests {
         event_item::{EventTimelineItemKind, RemoteEventOrigin, RemoteEventTimelineItem},
     };
 
-    #[test]
-    fn detects_duplicate_read_receipts_in_same_receipt_thread() {
+    #[async_test]
+    async fn test_detects_duplicate_read_receipts_in_same_receipt_thread() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!r0");
+
+        let _ = server.sync_joined_room(&client, room_id).await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
         // Given a timeline with clashing receipts
         let mut items = create_items_with_receipts(vec![
             (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
@@ -1348,7 +1357,10 @@ mod tests {
         // When we check for duplicates
         let user_id = owned_user_id!("@foo:s.co");
         let mut meta = TimelineMetadata::new(user_id, RoomVersionRules::V12, None, None, true);
-        let focus = TimelineFocusKind::PinnedEvents;
+        let focus = TimelineFocusKind::Live {
+            hide_threaded_events: false,
+            event_cache: event_cache.room(room_id).await.unwrap().0,
+        };
         let transaction: TimelineStateTransaction<'_, Room> =
             TimelineStateTransaction::new(&mut items, &mut meta, &focus);
 
@@ -1358,8 +1370,17 @@ mod tests {
         assert!(dups);
     }
 
-    #[test]
-    fn if_there_are_no_duplicate_receipts_we_report_no_duplicates() {
+    #[async_test]
+    async fn test_if_there_are_no_duplicate_receipts_we_report_no_duplicates() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!r0");
+
+        let _ = server.sync_joined_room(&client, room_id).await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
         // Given a timeline with receipts, but no clashes (users are different)
         let mut items = create_items_with_receipts(vec![
             (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
@@ -1369,7 +1390,10 @@ mod tests {
         // When we check for duplicates
         let user_id = owned_user_id!("@foo:s.co");
         let mut meta = TimelineMetadata::new(user_id, RoomVersionRules::V12, None, None, true);
-        let focus = TimelineFocusKind::PinnedEvents;
+        let focus = TimelineFocusKind::Live {
+            hide_threaded_events: false,
+            event_cache: event_cache.room(room_id).await.unwrap().0,
+        };
         let transaction: TimelineStateTransaction<'_, Room> =
             TimelineStateTransaction::new(&mut items, &mut meta, &focus);
 
@@ -1379,8 +1403,17 @@ mod tests {
         assert!(!dups);
     }
 
-    #[test]
-    fn if_there_are_receipts_for_different_receipt_threads_we_report_no_duplicates() {
+    #[async_test]
+    async fn test_if_there_are_receipts_for_different_receipt_threads_we_report_no_duplicates() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!r0");
+
+        let _ = server.sync_joined_room(&client, room_id).await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
         // Given a timeline with receipts, but no clashes (users are different)
         let mut items = create_items_with_receipts(vec![
             (owned_user_id!("@user1:s.co"), create_receipt(ReceiptThread::Unthreaded)),
@@ -1393,7 +1426,10 @@ mod tests {
         // When we check for duplicates
         let user_id = owned_user_id!("@foo:s.co");
         let mut meta = TimelineMetadata::new(user_id, RoomVersionRules::V12, None, None, true);
-        let focus = TimelineFocusKind::PinnedEvents;
+        let focus = TimelineFocusKind::Live {
+            hide_threaded_events: false,
+            event_cache: event_cache.room(room_id).await.unwrap().0,
+        };
         let transaction: TimelineStateTransaction<'_, Room> =
             TimelineStateTransaction::new(&mut items, &mut meta, &focus);
 
