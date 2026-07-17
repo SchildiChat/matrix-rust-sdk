@@ -2869,6 +2869,8 @@ impl From<PowerLevels> for RoomPowerLevelsContentOverride {
 pub struct CreateRoomParameters {
     pub name: Option<String>,
     #[uniffi(default = None)]
+    pub room_version: Option<String>, // SC
+    #[uniffi(default = None)]
     pub topic: Option<String>,
     pub is_encrypted: bool,
     #[uniffi(default = false)]
@@ -2897,6 +2899,10 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
     fn try_from(value: CreateRoomParameters) -> Result<create_room::v3::Request, Self::Error> {
         let mut request = create_room::v3::Request::new();
         request.name = value.name;
+        request.room_version = value // SC
+            .room_version
+            .map(|version| version.parse())
+            .transpose()?;
         request.topic = value.topic;
         request.is_direct = value.is_direct;
         request.visibility = value.visibility.into();
@@ -3531,6 +3537,20 @@ impl HomeserverCapabilities {
         Ok(self.inner.can_get_login_token().await?)
     }
 
+    // SC
+    pub async fn room_versions(&self) -> Result<RoomVersions, ClientError> {
+        let room_versions = self.inner.room_versions().await?;
+
+        Ok(RoomVersions {
+            default: room_versions.default.to_string(),
+            available: room_versions
+                .available
+                .into_iter()
+                .map(|(version, stability)| (version.to_string(), stability.to_string()))
+                .collect(),
+        })
+    }
+
     pub async fn extended_profile_fields(&self) -> Result<ExtendedProfileFields, ClientError> {
         let profile_fields = self.inner.extended_profile_fields().await?;
         Ok(ExtendedProfileFields {
@@ -3554,6 +3574,14 @@ impl HomeserverCapabilities {
         Ok(self.inner.forgets_room_when_leaving().await?)
     }
 }
+
+// SC start
+#[derive(uniffi::Record)]
+pub struct RoomVersions {
+    pub default: String,
+    pub available: HashMap<String, String>,
+}
+// SC end
 
 #[derive(uniffi::Record)]
 pub struct ExtendedProfileFields {
@@ -3583,6 +3611,7 @@ mod tests {
     fn test_create_room_parameters_mapping() {
         let params = CreateRoomParameters {
             name: Some("A room".to_owned()),
+            room_version: None, // SC
             topic: Some("A topic".to_owned()),
             is_encrypted: true,
             is_direct: true,
