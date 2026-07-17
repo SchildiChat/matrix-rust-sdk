@@ -24,6 +24,10 @@ use thiserror::Error;
 use tracing::{error, info};
 use zeroize::Zeroize;
 
+// SC start
+use ruma::{OwnedDeviceId, UserId};
+// SC end
+
 use crate::{
     client::Client, error::ClientError, ruma::AuthData, runtime::get_runtime_handle,
     task_handle::TaskHandle,
@@ -68,6 +72,34 @@ pub enum BackupUploadState {
     Error,
     Done,
 }
+
+// SC start
+#[derive(uniffi::Enum)]
+pub enum DeviceLocalTrust {
+    Verified,
+    Blacklisted,
+    Ignored,
+    Unset,
+}
+
+impl From<matrix_sdk::encryption::LocalTrust> for DeviceLocalTrust {
+    fn from(value: matrix_sdk::encryption::LocalTrust) -> Self {
+        match value {
+            matrix_sdk::encryption::LocalTrust::Verified => Self::Verified,
+            matrix_sdk::encryption::LocalTrust::BlackListed => Self::Blacklisted,
+            matrix_sdk::encryption::LocalTrust::Ignored => Self::Ignored,
+            matrix_sdk::encryption::LocalTrust::Unset => Self::Unset,
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct DeviceTrustInfo {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub local_trust: DeviceLocalTrust,
+}
+// SC end
 
 #[derive(Debug, Error, uniffi::Error)]
 #[uniffi(flat_error)]
@@ -459,6 +491,42 @@ pub async fn database_contains_secrets_bundle(
 
 #[matrix_sdk_ffi_macros::export]
 impl Encryption {
+    // SC start
+    pub async fn get_user_devices(
+        &self,
+        user_id: String,
+    ) -> Result<Vec<DeviceTrustInfo>, ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        let devices = self.inner.get_user_devices(&user_id).await?;
+
+        Ok(devices
+            .devices()
+            .map(|device| DeviceTrustInfo {
+                device_id: device.device_id().to_string(),
+                display_name: device.display_name().map(ToOwned::to_owned),
+                local_trust: device.local_trust_state().into(),
+            })
+            .collect())
+    }
+
+    /// Reset a device trust exception created by ignoring its verification state.
+    /// Returns false if the device is not known locally.
+    pub async fn reset_device_local_trust(
+        &self,
+        user_id: String,
+        device_id: String,
+    ) -> Result<bool, ClientError> {
+        let user_id = UserId::parse(user_id)?;
+        let device_id: OwnedDeviceId = device_id.into();
+        let Some(device) = self.inner.get_device(&user_id, &device_id).await? else {
+            return Ok(false);
+        };
+
+        device.set_local_trust(matrix_sdk::encryption::LocalTrust::Unset).await?;
+        Ok(true)
+    }
+    // SC end
+
     /// Get the public ed25519 key of our own device. This is usually what is
     /// called the fingerprint of the device.
     pub async fn ed25519_key(&self) -> Option<String> {
