@@ -53,6 +53,7 @@ use ruma::{
     html::RemoveReplyFallback,
     room_version_rules::RedactionRules,
 };
+use tracing::warn;
 
 mod live_location;
 mod message;
@@ -79,7 +80,10 @@ pub use self::{
     reply::{EmbeddedEvent, InReplyToDetails},
 };
 use super::ReactionsByKeyBySender;
-use crate::timeline::event_handler::{HandleAggregationKind, TimelineAction};
+use crate::timeline::{
+    controller::ActiveCallInfo,
+    event_handler::{HandleAggregationKind, TimelineAction},
+};
 
 /// The content of an [`EventTimelineItem`][super::EventTimelineItem].
 #[allow(clippy::large_enum_variant)]
@@ -126,6 +130,9 @@ pub enum TimelineItemContent {
         call_intent: Option<CallIntent>,
         /// Users who have declined this call notification
         declined_by: Vec<OwnedUserId>,
+        /// Information about the active call, if this notification is about an
+        /// active call.
+        active_call_info: Option<ActiveCallInfo>,
     },
 }
 
@@ -162,7 +169,7 @@ impl TimelineItemContent {
         let raw_event = timeline_event.into_raw();
         let deserialized_event = raw_event.deserialize().ok()?;
 
-        match TimelineAction::from_event(
+        let actions = TimelineAction::from_event(
             deserialized_event,
             &raw_event,
             room,
@@ -171,30 +178,50 @@ impl TimelineItemContent {
             None,
             None,
         )
-        .await
-        {
-            Some(TimelineAction::AddItem { content }) => Some(content),
-
+        .await;
+        match actions.as_slice() {
+            [TimelineAction::AddItem { content }] => Some(content.clone()),
+            [
+                TimelineAction::AddItem { content },
+                TimelineAction::HandleAggregation {
+                    kind: HandleAggregationKind::BeaconStop { .. },
+                    ..
+                },
+            ] => {
+                if content.is_live_location_state() {
+                    Some(content.clone())
+                } else {
+                    warn!(
+                        "Unexpected [AddItem, BeaconStop] actions with a non-live-location \
+                         AddItem; ignoring event"
+                    );
+                    None
+                }
+            }
             // Aggregated event: only edits and beacon stop are supported at the moment.
-            Some(TimelineAction::HandleAggregation {
-                kind: HandleAggregationKind::BeaconStop { content },
-                ..
-            }) => Some(TimelineItemContent::MsgLike(MsgLikeContent {
-                kind: MsgLikeKind::LiveLocation(LiveLocationState::new(content)),
+            [
+                TimelineAction::HandleAggregation {
+                    kind: HandleAggregationKind::BeaconStop { content, .. },
+                    ..
+                },
+            ] => Some(TimelineItemContent::MsgLike(MsgLikeContent {
+                kind: MsgLikeKind::LiveLocation(LiveLocationState::new(content.clone())),
                 reactions: Default::default(),
                 thread_root: None,
                 in_reply_to: None,
                 thread_summary: None,
             })),
-
-            Some(TimelineAction::HandleAggregation {
-                kind: HandleAggregationKind::Edit { replacement: Replacement { new_content, .. } },
-                ..
-            }) => {
+            [
+                TimelineAction::HandleAggregation {
+                    kind:
+                        HandleAggregationKind::Edit { replacement: Replacement { new_content, .. } },
+                    ..
+                },
+            ] => {
                 // Map the edit to a regular message.
                 match TimelineAction::from_content(
                     AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::new(
-                        new_content.msgtype,
+                        new_content.msgtype.clone(),
                     )),
                     None,
                     None,
@@ -204,7 +231,15 @@ impl TimelineItemContent {
                     _ => None,
                 }
             }
-
+            [] => {
+                warn!("No action for event content processing");
+                None
+            }
+            [_, _, ..] => {
+                // There is no meaningful single content to extract in that case.
+                warn!("Ignoring event that produced multiple timeline actions");
+                None
+            }
             _ => None,
         }
     }
@@ -221,6 +256,12 @@ impl TimelineItemContent {
             kind: MsgLikeKind::LiveLocation(state),
             ..
         }) => state)
+    }
+
+    /// Check whether this item's content is a
+    /// [`LiveLocation`][MsgLikeKind::LiveLocation].
+    pub fn is_live_location_state(&self) -> bool {
+        matches!(self, Self::MsgLike(MsgLikeContent { kind: MsgLikeKind::LiveLocation(_), .. }))
     }
 
     /// If `self` is of the [`MsgLike`][Self::MsgLike] variant, return the

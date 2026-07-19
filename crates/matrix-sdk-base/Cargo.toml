@@ -68,6 +68,9 @@ testing = [
 # Add support for inline media galleries via msgtypes
 unstable-msc4274 = []
 
+# Add support for user status profile fields (m.status, m.call).
+unstable-msc4426 = ["ruma/unstable-msc4426"]
+
 experimental-element-recent-emojis = []
 
 [dependencies]
@@ -91,6 +94,7 @@ ruma = { workspace = true, features = [
     "unstable-msc2867",
     "unstable-msc3381",
     "unstable-msc4186",
+    "unstable-msc4262",
     "rand",
 ] }
 serde = { workspace = true, features = ["rc"] }

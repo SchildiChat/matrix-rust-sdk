@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 
+use eyeball::Subscriber as EyeballSubscriber;
 use matrix_sdk::{
     event_cache::{
         EventFocusThreadMode, EventFocusedCache, EventsOrigin, PinnedEventsCache, RoomEventCache,
@@ -23,11 +24,17 @@ use matrix_sdk::{
     },
     send_queue::RoomSendQueueUpdate,
 };
+use matrix_sdk_base::RoomInfo;
 use ruma::OwnedEventId;
+#[cfg(feature = "unstable-msc4426")]
+use ruma::{OwnedUserId, UserId};
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 use tracing::{error, instrument, trace, warn};
 
-use crate::timeline::{TimelineController, TimelineFocus, event_item::RemoteEventOrigin};
+use crate::timeline::{
+    TimelineController, TimelineFocus, controller::ActiveCallInfo, event_item::RemoteEventOrigin,
+    traits::RoomDataProvider,
+};
 
 /// Long-lived task, in the pinned events focus mode, that updates the timeline
 /// after any changes in the pinned events.
@@ -286,6 +293,35 @@ pub(in crate::timeline) async fn room_event_cache_updates_task(
     }
 }
 
+/// Long-lived task that refreshes displayed sender profiles when the users'
+/// global profiles change. The controller filters to the senders it shows.
+#[cfg(feature = "unstable-msc4426")]
+pub(in crate::timeline) async fn global_profile_updates_task(
+    mut global_profile_updates_stream: Receiver<BTreeSet<OwnedUserId>>,
+    timeline_controller: TimelineController,
+) {
+    trace!("spawned the global profile updates task!");
+
+    loop {
+        match global_profile_updates_stream.recv().await {
+            Ok(user_ids) => {
+                let sender_ids: BTreeSet<&UserId> =
+                    user_ids.iter().map(|user_id| user_id.as_ref()).collect();
+                timeline_controller.force_update_sender_profiles(&sender_ids).await;
+            }
+
+            Err(RecvError::Lagged(num_missed)) => {
+                warn!("missed {num_missed} global profile updates, ignoring those missed");
+            }
+
+            Err(RecvError::Closed) => {
+                trace!("channel closed, exiting the global profile updates handler");
+                break;
+            }
+        }
+    }
+}
+
 /// Long-lived task that forwards [`RoomSendQueueUpdate`]s (local echoes) to the
 /// timeline.
 pub(in crate::timeline) async fn room_send_queue_update_task(
@@ -306,6 +342,26 @@ pub(in crate::timeline) async fn room_send_queue_update_task(
                 trace!("channel closed, exiting the local echo handler");
                 break;
             }
+        }
+    }
+}
+
+/// Long-lived task that watches RoomInfo for RTC membership changes
+/// and updates the active RtcNotification timeline item.
+pub(in crate::timeline) async fn rtc_membership_update_task(
+    mut room_info: EyeballSubscriber<RoomInfo>,
+    timeline_controller: TimelineController,
+) {
+    let mut prev_info = None;
+    let own_user = timeline_controller.room().own_user_id().to_owned();
+
+    while let Some(info) = room_info.next().await {
+        let active_call = ActiveCallInfo::from_info(info, own_user.clone());
+        // RoomInfo fires for many reasons; only act when the participant
+        // list actually changed.
+        if active_call != prev_info {
+            prev_info = active_call.clone();
+            timeline_controller.handle_active_call_update(active_call).await;
         }
     }
 }

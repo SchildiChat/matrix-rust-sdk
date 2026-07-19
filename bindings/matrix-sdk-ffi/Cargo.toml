@@ -24,8 +24,8 @@ crate-type = [
 ]
 
 [features]
-default = ["bundled-sqlite", "unstable-msc4274", "experimental-element-recent-emojis", "experimental-push-secrets", "experimental-search"]
-experimental-search = ["matrix-sdk/experimental-search"]
+default = ["bundled-sqlite", "unstable-msc4274", "unstable-msc4426", "experimental-element-recent-emojis", "experimental-push-secrets", "experimental-search", "rustls-aws-lc-rs"]
+experimental-search = ["matrix-sdk/experimental-search", "matrix-sdk-ui/experimental-search"]
 # Use SQLite for the session storage.
 sqlite = ["matrix-sdk/sqlite"]
 # Use an embedded version of SQLite.
@@ -33,6 +33,7 @@ bundled-sqlite = ["sqlite", "matrix-sdk/bundled-sqlite"]
 # Use IndexedDB for the session storage.
 indexeddb = ["matrix-sdk/indexeddb"]
 unstable-msc4274 = ["matrix-sdk-ui/unstable-msc4274"]
+unstable-msc4426 = ["matrix-sdk-ui/unstable-msc4426"]
 # Required when targeting a Javascript environment, like Wasm in a browser.
 js = ["matrix-sdk-ui/js"]
 # Enable sentry error monitoring, not compatible with Wasm platforms.
@@ -40,6 +41,8 @@ sentry = ["dep:sentry", "dep:sentry-tracing"]
 
 experimental-element-recent-emojis = ["matrix-sdk/experimental-element-recent-emojis"]
 experimental-push-secrets = ["matrix-sdk/experimental-push-secrets"]
+
+rustls-aws-lc-rs = ["matrix-sdk/rustls-aws-lc-rs", "matrix-sdk-ui/rustls-aws-lc-rs", "matrix-sdk-contentscanner/rustls-aws-lc-rs"]
 
 [dependencies]
 anyhow.workspace = true
@@ -88,6 +91,8 @@ ruma = { workspace = true, features = [
     "unstable-msc2545",
     # Room language event type
     "unstable-msc4334",
+    # User status profile fields (m.status, m.call).
+    "unstable-msc4426",
     "unstable-uniffi",
 ] }
 serde.workspace = true
@@ -99,6 +104,7 @@ sentry = { workspace = true, optional = true, features = [
   "debug-images",
   "panic",
   "reqwest",
+  "rustls",
   "sentry-debug-images",
 ] }
 sentry-tracing = { workspace = true, optional = true }
@@ -110,6 +116,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url.workspace = true
 uuid = { version = "1.4.1", default-features = false, features = ["std", "v4"] }
 zeroize.workspace = true
+zxcvbn.workspace = true
 oauth2.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
@@ -135,7 +142,7 @@ once_cell = "1.21.4"
 jvm-getter = "0.1.0"
 
 [dev-dependencies]
-matrix-sdk = { workspace = true, features = ["testing"] }
+matrix-sdk = { workspace = true, features = ["testing", "rustls-aws-lc-rs"] }
 similar-asserts.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
