@@ -527,8 +527,25 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.state.read().await.items.clone_items()
     }
 
+    /// SC
     pub(super) async fn fully_read_event_id(&self) -> Option<OwnedEventId> {
         self.state.read().await.meta.fully_read_event.clone()
+    }
+
+    /// SC: Resolve a loaded but possibly hidden event to a rendered one.
+    pub(super) async fn resolve_event_to_rendered(
+        &self,
+        event_id: &EventId,
+    ) -> Option<OwnedEventId> {
+        let state = self.state.read().await;
+        let all_remote_events = state.items.all_remote_events();
+        let event_index = all_remote_events.position_by_event_id(event_id)?;
+
+        all_remote_events
+            .range(..=event_index)
+            .rev()
+            .find(|event| event.timeline_item_index.is_some())
+            .map(|event| event.event_id.clone())
     }
 
     #[cfg(test)]
