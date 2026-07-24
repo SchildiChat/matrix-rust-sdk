@@ -797,6 +797,14 @@ impl Timeline {
         Ok(true)
     }
 
+    /// SC: Resolve a loaded but possibly hidden event to a rendered one.
+    pub async fn resolve_event_to_rendered(
+        &self,
+        event_id: &EventId,
+    ) -> Option<OwnedEventId> {
+        self.controller.resolve_event_to_rendered(event_id).await
+    }
+
     /// Send the given receipts.
     ///
     /// This uses [`Room::send_multiple_receipts`] internally, but

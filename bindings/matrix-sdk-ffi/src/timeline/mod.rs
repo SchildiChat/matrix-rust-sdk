@@ -396,6 +396,19 @@ impl Timeline {
         Ok(())
     }
 
+    /// SC: Resolve a loaded but possibly hidden event to a rendered one.
+    pub async fn resolve_event_to_rendered(
+        &self,
+        event_id: String,
+    ) -> Result<Option<String>, ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        Ok(self
+            .inner
+            .resolve_event_to_rendered(&event_id)
+            .await
+            .map(Into::into))
+    }
+
     /// Mark the timeline as read by attempting to send a read receipt on the
     /// latest visible event.
     ///
