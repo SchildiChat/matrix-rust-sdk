@@ -29,7 +29,10 @@ use crate::{
 };
 
 // SC start
-use ruma::events::StateEventType;
+use ruma::events::{
+    space::parent::SpaceParentEventContent, StateEventType, SyncStateEvent,
+};
+use matrix_sdk_base::deserialized_responses::SyncOrStrippedState;
 use crate::{
     space_catch_all_info::{SpaceCatchAllInfo, space_catch_all_info},
     space_child_info::{SpaceChildInfo, space_children_info},
@@ -109,6 +112,7 @@ pub struct RoomInfo {
     private_room_name: Option<String>,
     /// Space-specific fields
     space_children: Vec<SpaceChildInfo>,
+    canonical_space_parent: Option<String>,
     space_catch_all: Option<SpaceCatchAllInfo>,
     can_user_manage_spaces: bool,
     has_incomplete_unread_count: bool,
@@ -265,6 +269,21 @@ impl RoomInfo {
             // SC start
             private_room_name: room.private_room_name(),
             space_children: space_children_info(&room),
+            canonical_space_parent: room
+                .get_state_events_static::<SpaceParentEventContent>()
+                .await?
+                .into_iter()
+                .find_map(|parent_event| match parent_event.deserialize() {
+                    Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(event)))
+                        if event.content.canonical =>
+                    {
+                        Some(event.state_key.to_string())
+                    }
+                    Ok(SyncOrStrippedState::Stripped(event)) if event.content.canonical => {
+                        Some(event.state_key.to_string())
+                    }
+                    _ => None,
+                }),
             space_catch_all: space_catch_all_info(&room),
             can_user_manage_spaces,
             has_incomplete_unread_count: room.has_incomplete_unread_count(),
