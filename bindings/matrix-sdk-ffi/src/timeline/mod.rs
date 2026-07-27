@@ -122,8 +122,11 @@ impl Timeline {
             .map_err(|_| RoomError::InvalidRepliedToEventId)?;
 
         let caption = params.caption.map(|caption| {
-            let formatted =
-                formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
+            let formatted = if params.skip_caption_autoformat && params.formatted_caption.is_none() {
+                None
+            } else {
+                formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into))
+            };
             assign!(TextMessageEventContent::plain(caption), { formatted })
         });
 
@@ -205,6 +208,8 @@ pub struct UploadParameters {
     caption: Option<String>,
     /// Optional HTML-formatted caption, for clients that support it.
     formatted_caption: Option<FormattedBody>,
+    /// SC: Explicit opt-in to send caption without formatting.
+    skip_caption_autoformat: bool,
     /// Optional intentional mentions to be sent with the media.
     mentions: Option<Mentions>,
     /// Optional Event ID to reply to.
@@ -1384,10 +1389,14 @@ impl TryFrom<EditedContent> for SdkEditedContent {
 fn create_caption_edit(
     caption: Option<String>,
     formatted_caption: Option<FormattedBody>,
+    skip_caption_autoformat: bool, // SC
     mentions: Option<Mentions>,
 ) -> EditedContent {
-    let formatted_caption =
-        formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into));
+    let formatted_caption = if skip_caption_autoformat && formatted_caption.is_none() {
+        None
+    } else {
+        formatted_body_from(caption.as_deref(), formatted_caption.map(Into::into))
+    };
     EditedContent::MediaCaption {
         caption,
         formatted_caption: formatted_caption.as_ref().map(Into::into),
