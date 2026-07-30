@@ -9,7 +9,8 @@ use matrix_sdk::{
         OwnedRoomId, RoomId,
         events::{
             GlobalAccountDataEvent, SyncStateEvent,
-            image_pack::{ImagePackRoomsEventContent, RoomImagePackEventContent},
+            image_pack::rooms::ImagePackRoomsEventContent,
+            room::image_pack::RoomImagePackEventContent,
         },
     },
 };

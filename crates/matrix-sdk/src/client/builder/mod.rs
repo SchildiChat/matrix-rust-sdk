@@ -32,6 +32,8 @@ use futures_util::try_join;
 use homeserver_config::*;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::DecryptionSettings;
+#[cfg(feature = "experimental-x509-identity-verification")]
+use matrix_sdk_base::crypto::x509::{RawX509Signer, RawX509Verifier};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{CollectStrategy, TrustRequirement};
 use matrix_sdk_base::{
@@ -136,6 +138,10 @@ pub struct ClientBuilder {
     threading_support: ThreadingSupport,
     #[cfg(feature = "experimental-search")]
     search_index_store_kind: SearchIndexStoreKind,
+    #[cfg(feature = "experimental-x509-identity-verification")]
+    x509_signer: Option<Arc<dyn RawX509Signer>>,
+    #[cfg(feature = "experimental-x509-identity-verification")]
+    x509_verifier: Option<Arc<dyn RawX509Verifier>>,
     dm_room_definition: DmRoomDefinition,
     media_fetcher: Arc<dyn MediaFetcher>,
 }
@@ -174,6 +180,10 @@ impl ClientBuilder {
             threading_support: ThreadingSupport::Disabled,
             #[cfg(feature = "experimental-search")]
             search_index_store_kind: SearchIndexStoreKind::InMemory,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            x509_signer: None,
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            x509_verifier: None,
             dm_room_definition: DmRoomDefinition::MatrixSpec,
             media_fetcher: Arc::new(DefaultMediaFetcher),
         }
@@ -550,6 +560,22 @@ impl ClientBuilder {
         self
     }
 
+    /// The signer we will use to sign master signing keys and outgoing secret
+    /// requests.
+    #[cfg(feature = "experimental-x509-identity-verification")]
+    pub fn with_x509_signer(mut self, x509_signer: Option<Arc<dyn RawX509Signer>>) -> Self {
+        self.x509_signer = x509_signer;
+        self
+    }
+
+    /// The verifier we will use to verify master signing keys and incoming
+    /// secret requests.
+    #[cfg(feature = "experimental-x509-identity-verification")]
+    pub fn with_x509_verifier(mut self, x509_verifier: Option<Arc<dyn RawX509Verifier>>) -> Self {
+        self.x509_verifier = x509_verifier;
+        self
+    }
+
     /// Create a [`Client`] with the options set on this builder.
     ///
     /// # Errors
@@ -594,6 +620,11 @@ impl ClientBuilder {
                 client.room_key_recipient_strategy = self.room_key_recipient_strategy;
                 client.decryption_settings = self.decryption_settings;
             }
+
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            client.set_x509_signer(self.x509_signer);
+            #[cfg(feature = "experimental-x509-identity-verification")]
+            client.set_x509_verifier(self.x509_verifier);
 
             client
         };
@@ -856,7 +887,7 @@ pub enum ClientBuildError {
 
     /// Error looking up the .well-known endpoint on auto-discovery
     #[error("Error looking up the .well-known endpoint on auto-discovery")]
-    AutoDiscovery(FromHttpResponseError<RumaApiError>),
+    AutoDiscovery(Box<FromHttpResponseError<RumaApiError>>),
 
     /// Error when building the sliding sync version.
     #[error(transparent)]
@@ -961,7 +992,8 @@ pub(crate) mod tests {
         let error = builder.build().await.unwrap_err();
 
         // Then the operation should fail with a server discovery error.
-        assert_matches!(error, ClientBuildError::AutoDiscovery(FromHttpResponseError::Server(_)));
+        assert_let!(ClientBuildError::AutoDiscovery(e) = error);
+        assert_matches!(*e, FromHttpResponseError::Server(_));
     }
 
     #[async_test]
@@ -998,10 +1030,8 @@ pub(crate) mod tests {
         let error = builder.build().await.unwrap_err();
 
         // Then the operation should fail due to the well-known file's contents.
-        assert_matches!(
-            error,
-            ClientBuildError::AutoDiscovery(FromHttpResponseError::Deserialization(_))
-        );
+        assert_let!(ClientBuildError::AutoDiscovery(e) = error);
+        assert_matches!(*e, FromHttpResponseError::Deserialization(_));
     }
 
     #[async_test]

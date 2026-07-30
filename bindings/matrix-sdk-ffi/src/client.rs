@@ -62,6 +62,8 @@ use matrix_sdk::{
     sync::Notification,
     task_monitor::BackgroundTaskFailureReason,
 };
+#[cfg(feature = "experimental-x509-identity-verification")]
+use matrix_sdk_base::crypto::x509::RawX509Signature;
 use matrix_sdk_common::{
     SendOutsideWasm, SyncOutsideWasm, cross_process_lock::CrossProcessLockConfig, stream::StreamExt,
 };
@@ -75,17 +77,17 @@ use matrix_sdk_ui::{
 };
 use mime::Mime;
 use oauth2::Scope;
-#[cfg(feature = "unstable-msc4426")]
-use ruma::api::client::profile::{Call, Status};
 use ruma::{
-    OwnedDeviceId, OwnedMxcUri, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
+    OwnedDeviceId, OwnedMxcUri, OwnedServerName, RoomAliasId, RoomOrAliasId, SecondsSinceUnixEpoch,
+    ServerName,
     api::{
+        FeatureFlag,
         client::{
             alias::get_alias,
             discovery::get_authorization_server_metadata::v1::{
                 AccountManagementActionData, DeviceDeleteData, DeviceViewData,
             },
-            profile::{AvatarUrl, DisplayName},
+            profile::{AvatarUrl, Call, DisplayName, ProfileFieldName, Status},
             room::create_room::{RoomPowerLevelsContentOverride, v3::CreationContent},
             uiaa::{EmailUserIdentifier, UserIdentifier},
         },
@@ -127,8 +129,6 @@ use super::{
     room::{Room, room_info::RoomInfo},
     session_verification::SessionVerificationController,
 };
-#[cfg(feature = "unstable-msc4426")]
-use crate::ruma::{UserCall, UserStatus};
 use crate::{
     ClientError,
     authentication::{
@@ -149,7 +149,7 @@ use crate::{
     room_preview::RoomPreview,
     ruma::{
         AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
-        MediaPreviews, MediaSource, PresenceState, RoomAccountDataEvent,
+        MediaPreviews, MediaSource, PresenceState, RoomAccountDataEvent, UserCall, UserStatus,
     },
     runtime::get_runtime_handle,
     spaces::SpaceService,
@@ -285,6 +285,13 @@ pub trait BeaconInfoListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, update: BeaconInfoUpdate);
 }
 
+/// A listener for the current user's global profile.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait ProfileListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called whenever the current user's global profile changes.
+    fn on_update(&self, profile: UserProfile);
+}
+
 /// Information about the old and new key that caused a duplicate key upload
 /// error in /keys/upload.
 #[derive(uniffi::Record)]
@@ -318,6 +325,30 @@ pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
 pub trait SyncNotificationListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a notifying event is received during sync.
     fn on_notification(&self, notification: NotificationItem, room_id: String);
+}
+
+/// A foreign trait for low-level types which can sign messages using an
+/// X.509-certified key pair.
+#[cfg(feature = "experimental-x509-identity-verification")]
+#[matrix_sdk_ffi_macros::export(with_foreign)]
+pub trait RawX509Signer: SyncOutsideWasm + SendOutsideWasm + Debug {
+    /// Create a signature for the given message using our private key
+    ///
+    /// Returns (key ID, signature)
+    fn sign(&self, message: Vec<u8>) -> Result<RawX509Signature, ClientError>;
+}
+
+/// A foreign trait for low-level types which can verify messages which were
+/// signed using an X.509-certified key pair.
+#[cfg(feature = "experimental-x509-identity-verification")]
+#[matrix_sdk_ffi_macros::export(with_foreign)]
+pub trait RawX509Verifier: SyncOutsideWasm + SendOutsideWasm + Debug {
+    /// Check if the given signature is a valid X.509 signature for the given
+    /// message.
+    ///
+    /// Also validates that the certificate used for the signature is issued via
+    /// one of our trusted CAs.
+    fn verify(&self, message: Vec<u8>, sig: RawX509Signature) -> bool;
 }
 
 #[derive(Clone, Copy, uniffi::Record)]
@@ -434,7 +465,7 @@ impl Client {
         match store_mode {
             CrossProcessLockConfig::MultiProcess { holder_name } => {
                 if session_delegate.is_none() {
-                    return Err(anyhow::anyhow!(
+                    Err(anyhow::anyhow!(
                         "missing session delegates with multi-process lock configuration"
                     ))?;
                 }
@@ -1370,6 +1401,32 @@ impl Client {
         Ok(self.inner.account().get_cached_avatar_url().await?.map(Into::into))
     }
 
+    /// Subscribe to the current user's profile.
+    ///
+    /// Emits the current value immediately, if present, then again whenever the
+    /// user's profile changes during sync.
+    ///
+    /// **Note:** Without the Profiles sliding sync extension enabled only an
+    /// empty profile will be emitted and no updates will be published.
+    pub fn subscribe_to_own_profile(
+        &self,
+        listener: Box<dyn ProfileListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let user_id = self.inner.user_id().context("No user ID found")?.to_owned();
+        let stream = self.inner.subscribe_to_own_profile()?;
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            pin_mut!(stream);
+
+            while let Some(profile) = stream.next().await {
+                match UserProfile::from_profile(&user_id, &profile) {
+                    Ok(profile) => listener.on_update(profile),
+                    Err(error) => error!("Failed to convert global profile update: {error}"),
+                }
+            }
+        }))))
+    }
+
     pub fn device_id(&self) -> Result<String, ClientError> {
         let device_id = self.inner.device_id().context("No Device ID found")?;
         Ok(device_id.to_string())
@@ -2149,12 +2206,30 @@ impl Client {
 
     /// Checks if the server supports the LiveKit RTC focus for placing calls.
     pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
-        Ok(self
+        let transports = match self.inner.rtc_transports().await? {
+            Some(transports) => transports,
+            // discovery not supported, fallback to well-known
+            None => self.inner.well_known_rtc_transports().await?,
+        };
+        Ok(transports.iter().any(|focus| matches!(focus, RtcTransport::LiveKit(_))))
+    }
+
+    /// Checks if the server supports user status.
+    pub async fn is_user_status_supported(&self) -> Result<bool, ClientError> {
+        let supports_profiles_sync_extension = self
             .inner
-            .rtc_foci()
+            .unstable_features()
             .await?
-            .iter()
-            .any(|focus| matches!(focus, RtcTransport::LiveKit(_))))
+            .contains(&FeatureFlag::from("org.matrix.msc4262"));
+
+        let can_set_status_field = self
+            .inner
+            .homeserver_capabilities()
+            .extended_profile_fields()
+            .await?
+            .can_set_field(&ProfileFieldName::Status);
+
+        Ok(supports_profiles_sync_extension && can_set_status_field)
     }
 
     /// Get information about the homeserver's advertised map tile server, if
@@ -2564,14 +2639,12 @@ pub struct UserProfile {
     pub avatar_url: Option<String>,
 
     /// The user's status (MSC4426 `m.status` profile field), if set.
-    #[cfg(feature = "unstable-msc4426")]
     pub status: Option<UserStatus>,
 
     /// Set when the user is in a call (MSC4426 `m.call` profile field).
     ///
     /// `None` means the user is not in a call. `Some(UserCall { call_joined_ts:
     /// None })` means the user is in a call but the join time wasn't recorded.
-    #[cfg(feature = "unstable-msc4426")]
     pub call: Option<UserCall>,
 }
 
@@ -2580,23 +2653,20 @@ impl UserProfile {
     /// API.
     pub(crate) async fn fetch(account: &Account, user_id: &UserId) -> Result<Self, ClientError> {
         let response = account.fetch_user_profile_of(user_id).await?;
-        let display_name = response.get_static::<DisplayName>()?;
-        let avatar_url = response.get_static::<AvatarUrl>()?.map(|url| url.to_string());
+        Self::from_profile(user_id, &response.data)
+    }
 
-        #[cfg(feature = "unstable-msc4426")]
-        let status = response.get_static::<Status>()?.map(UserStatus::from);
-        #[cfg(feature = "unstable-msc4426")]
-        let call = response.get_static::<Call>()?.map(UserCall::from);
+    /// Build a [`UserProfile`] from a [`ruma::profile::UserProfile`].
+    fn from_profile(
+        user_id: &UserId,
+        profile: &ruma::profile::UserProfile,
+    ) -> Result<Self, ClientError> {
+        let display_name = profile.get_static::<DisplayName>()?;
+        let avatar_url = profile.get_static::<AvatarUrl>()?.map(|url| url.to_string());
+        let status = profile.get_static::<Status>()?.map(UserStatus::from);
+        let call = profile.get_static::<Call>()?.map(UserCall::from);
 
-        Ok(UserProfile {
-            user_id: user_id.to_string(),
-            display_name,
-            avatar_url,
-            #[cfg(feature = "unstable-msc4426")]
-            status,
-            #[cfg(feature = "unstable-msc4426")]
-            call,
-        })
+        Ok(UserProfile { user_id: user_id.to_string(), display_name, avatar_url, status, call })
     }
 }
 
@@ -2606,15 +2676,12 @@ impl From<&search_users::v3::User> for UserProfile {
             user_id: value.user_id.to_string(),
             display_name: value.display_name.clone(),
             avatar_url: value.avatar_url.as_ref().map(|url| url.to_string()),
-            #[cfg(feature = "unstable-msc4426")]
             status: None,
-            #[cfg(feature = "unstable-msc4426")]
             call: None,
         }
     }
 }
 
-#[cfg(feature = "unstable-msc4426")]
 #[matrix_sdk_ffi_macros::export]
 impl Client {
     /// Set the current user's status (MSC4426 `m.status` profile field).
@@ -2636,6 +2703,27 @@ impl Client {
         let (status_res, call_res) = tokio::join!(account.clear_status(), account.clear_call());
         status_res?;
         call_res?;
+        Ok(())
+    }
+
+    /// Set the current user's call indicator (MSC4426 `m.call` profile field).
+    ///
+    /// Presence of a value indicates the user is in a call. The optional
+    /// `call_joined_ts` on [`UserCall`] carries the Unix-epoch seconds when
+    /// the user joined the call, if known. Use [`Self::clear_call_status`] to
+    /// remove it when the call ends.
+    pub async fn set_call_status(&self, call: UserCall) -> Result<(), ClientError> {
+        let call_joined_ts = call
+            .call_joined_ts
+            .map(|secs| SecondsSinceUnixEpoch(UInt::try_from(secs).unwrap_or_default()));
+        self.inner.account().set_call(call_joined_ts).await?;
+        Ok(())
+    }
+
+    /// Clear the current user's call indicator (MSC4426 `m.call` profile
+    /// field).
+    pub async fn clear_call_status(&self) -> Result<(), ClientError> {
+        self.inner.account().clear_call().await?;
         Ok(())
     }
 }
@@ -3298,15 +3386,7 @@ impl TryFrom<JoinRule> for RumaJoinRule {
 }
 
 fn ruma_allow_rules_from_ffi(value: Vec<AllowRule>) -> Result<Vec<RumaAllowRule>, ClientError> {
-    let mut ret = Vec::with_capacity(value.len());
-    for rule in value {
-        let rule: Result<RumaAllowRule, ClientError> = rule.try_into();
-        match rule {
-            Ok(rule) => ret.push(rule),
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(ret)
+    value.into_iter().map(TryInto::try_into).collect()
 }
 
 impl TryFrom<AllowRule> for RumaAllowRule {

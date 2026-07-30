@@ -207,7 +207,7 @@ impl BaseClient {
         context.state_changes.ambiguity_maps = ambiguity_cache.cache;
 
         // Persist any global profile updates received through the profiles extension.
-        context.state_changes.global_profiles = extensions.profiles.clone();
+        context.state_changes.global_profiles = extensions.profiles.users.clone();
 
         // Save the changes and apply them.
         processors::changes::save_and_apply(
@@ -219,12 +219,29 @@ impl BaseClient {
         )
         .await?;
 
-        // Notify subscribers (e.g. open timelines) about global profile updates, which
-        // don't otherwise touch any room and so trigger no other broadcast.
+        // Profile-only updates don't modify any rooms, so nothing else broadcasts
+        // them. Surface the change so subscribers can react accordingly.
         if !extensions.profiles.is_empty() {
             let _ = self
                 .global_profile_updates_sender
-                .send(extensions.profiles.keys().cloned().collect());
+                .send(extensions.profiles.users.keys().cloned().collect());
+
+            // Nudge `RoomInfo` so hero status/call fields are re-read.
+            #[cfg(feature = "unstable-msc4426")]
+            for room in self.state_store.rooms() {
+                if room
+                    .hero_user_ids()
+                    .iter()
+                    .any(|user_id| extensions.profiles.users.contains_key(user_id))
+                {
+                    let _ = self.state_store.room_info_notable_update_sender.send(
+                        crate::RoomInfoNotableUpdate {
+                            room_id: room.room_id().to_owned(),
+                            reasons: crate::RoomInfoNotableUpdateReasons::HEROES,
+                        },
+                    );
+                }
+            }
         }
 
         let mut context = processors::Context::default();
@@ -310,7 +327,7 @@ mod tests {
             },
         },
         mxc_uri, owned_event_id, owned_mxc_uri, owned_user_id,
-        profile::UserProfileUpdate,
+        profile::{ProfileFieldName, UserProfileChanges, UserProfileUpdate},
         room_alias_id, room_id,
         serde::Raw,
         uint, user_id,
@@ -456,13 +473,13 @@ mod tests {
         // Given a sliding sync response carrying the profiles extension (MSC4262)
         // for two users, and no rooms.
         let mut response = http::Response::new("0".to_owned());
-        response.extensions.profiles.insert(
+        response.extensions.profiles.users.insert(
             alice.to_owned(),
-            UserProfileUpdate::from_iter([("displayname".to_owned(), json!("Alice"))]),
+            make_profile_update(ProfileFieldName::DisplayName, json!("Alice")),
         );
-        response.extensions.profiles.insert(
+        response.extensions.profiles.users.insert(
             bob.to_owned(),
-            UserProfileUpdate::from_iter([("displayname".to_owned(), json!("Bob"))]),
+            make_profile_update(ProfileFieldName::DisplayName, json!("Bob")),
         );
 
         // When the response is processed.
@@ -496,9 +513,9 @@ mod tests {
 
         // When a subsequent response only carries an update for Alice.
         let mut response = http::Response::new("1".to_owned());
-        response.extensions.profiles.insert(
+        response.extensions.profiles.users.insert(
             alice.to_owned(),
-            UserProfileUpdate::from_iter([("displayname".to_owned(), json!("Alice Updated"))]),
+            make_profile_update(ProfileFieldName::DisplayName, json!("Alice Updated")),
         );
 
         client
@@ -540,13 +557,13 @@ mod tests {
 
         // When a sliding sync response carries the profiles extension for two users.
         let mut response = http::Response::new("0".to_owned());
-        response.extensions.profiles.insert(
+        response.extensions.profiles.users.insert(
             alice.to_owned(),
-            UserProfileUpdate::from_iter([("displayname".to_owned(), json!("Alice"))]),
+            make_profile_update(ProfileFieldName::DisplayName, json!("Alice")),
         );
-        response.extensions.profiles.insert(
+        response.extensions.profiles.users.insert(
             bob.to_owned(),
-            UserProfileUpdate::from_iter([("displayname".to_owned(), json!("Bob"))]),
+            make_profile_update(ProfileFieldName::DisplayName, json!("Bob")),
         );
         client
             .process_sliding_sync(
@@ -566,9 +583,9 @@ mod tests {
 
         // When a subsequent response only carries an update for Alice.
         let mut response = http::Response::new("1".to_owned());
-        response.extensions.profiles.insert(
+        response.extensions.profiles.users.insert(
             alice.to_owned(),
-            UserProfileUpdate::from_iter([("displayname".to_owned(), json!("Alice Updated"))]),
+            make_profile_update(ProfileFieldName::DisplayName, json!("Alice Updated")),
         );
         client
             .process_sliding_sync(
@@ -1641,6 +1658,57 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[cfg(feature = "unstable-msc4426")]
+    #[async_test]
+    async fn test_hero_global_profile_update_triggers_notable_update() {
+        let client = logged_in_base_client(None).await;
+        let room_id = room_id!("!r:e.uk");
+        let alice = owned_user_id!("@alice:e.uk");
+
+        // Given a room where Alice is a hero.
+        let mut room = http::response::Room::new();
+        room.heroes = Some(vec![assign!(http::response::Hero::new(alice.clone()), {
+            name: Some("Alice".to_owned()),
+        })]);
+        let response = response_with_room(room_id, room);
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        let mut room_info_notable_update = client.room_info_notable_update_receiver();
+
+        // When a subsequent sync carries only a profiles-extension update for Alice.
+        let mut response = http::Response::new("1".to_owned());
+        response.extensions.profiles.users.insert(
+            alice.clone(),
+            make_profile_update(ProfileFieldName::Status, json!({ "text": "Away", "emoji": "🌴" })),
+        );
+        client
+            .process_sliding_sync(
+                &response,
+                &RequestedRequiredStates::default(),
+                &client.state_store_lock().lock().await,
+            )
+            .await
+            .expect("Failed to process sync");
+
+        // Then a `HEROES` notable update is emitted for the room, so consumers
+        // re-read the hero profiles.
+        assert_matches!(
+            room_info_notable_update.recv().await,
+            Ok(RoomInfoNotableUpdate { room_id: received_room_id, reasons }) => {
+                assert_eq!(received_room_id, room_id);
+                assert!(reasons.contains(RoomInfoNotableUpdateReasons::HEROES));
+            }
+        );
+        assert!(room_info_notable_update.is_empty());
     }
 
     #[async_test]
@@ -2848,5 +2916,11 @@ mod tests {
         }))
         .expect("Failed to create state event")
         .cast_unchecked()
+    }
+
+    fn make_profile_update(field: ProfileFieldName, value: serde_json::Value) -> UserProfileUpdate {
+        let mut changes = UserProfileChanges::new();
+        changes.updated.insert(field, value);
+        UserProfileUpdate::Updated(changes)
     }
 }

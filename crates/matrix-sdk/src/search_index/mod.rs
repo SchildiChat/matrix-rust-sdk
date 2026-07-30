@@ -19,19 +19,26 @@
 use std::{collections::hash_map::HashMap, path::PathBuf, sync::Arc};
 
 use futures_util::future::join_all;
-use matrix_sdk_base::deserialized_responses::TimelineEvent;
+use matrix_sdk_base::{
+    check_validity_of_replacement_events, deserialized_responses::TimelineEvent,
+};
 use matrix_sdk_search::{
     error::IndexError,
-    index::{RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
+    index::{IndexableEvent, RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
 };
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, RoomId,
     events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+        poll::{
+            start::SyncPollStartEvent,
+            unstable_start::{SyncUnstablePollStartEvent, UnstablePollStartEventContent},
+        },
         room::{
-            message::{OriginalSyncRoomMessageEvent, Relation, SyncRoomMessageEvent},
+            message::{MessageType, OriginalSyncRoomMessageEvent, Relation, SyncRoomMessageEvent},
             redaction::SyncRoomRedactionEvent,
         },
+        sticker::SyncStickerEvent,
     },
     room_version_rules::RedactionRules,
 };
@@ -225,12 +232,71 @@ async fn get_most_recent_edit(
         return None;
     };
 
-    match related.last().unwrap_or(&original_ev).raw().deserialize() {
+    // Only index valid replacements (matching sender, type, etc.); otherwise
+    // anyone could rewrite another user's indexed message. Fall back to the
+    // original event when there is no valid edit.
+    let latest = related
+        .iter()
+        .rev()
+        .find(|edit| {
+            check_validity_of_replacement_events(
+                original_ev.raw(),
+                original_ev.encryption_info().map(|info| &**info),
+                edit.raw(),
+                edit.encryption_info().map(|info| &**info),
+            )
+            .is_ok()
+        })
+        .unwrap_or(&original_ev);
+
+    match latest.raw().deserialize() {
         Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(latest))) => {
             latest.as_original().cloned()
         }
         _ => None,
     }
+}
+
+/// Indexable text for a media message: its filename plus any caption.
+fn media_body(filename: &str, caption: Option<&str>) -> String {
+    match caption {
+        Some(caption) => format!("{filename} {caption}"),
+        None => filename.to_owned(),
+    }
+}
+
+/// Extract the searchable text from a room message, or `None` if its type
+/// carries no text to index.
+fn room_message_body(msgtype: &MessageType) -> Option<String> {
+    match msgtype {
+        MessageType::Text(content) => Some(content.body.clone()),
+        MessageType::Emote(content) => Some(content.body.clone()),
+        MessageType::Notice(content) => Some(content.body.clone()),
+        MessageType::ServerNotice(content) => Some(content.body.clone()),
+        MessageType::Location(content) => Some(content.body.clone()),
+        MessageType::Image(content) => Some(media_body(content.filename(), content.caption())),
+        MessageType::Video(content) => Some(media_body(content.filename(), content.caption())),
+        MessageType::Audio(content) => Some(media_body(content.filename(), content.caption())),
+        MessageType::File(content) => Some(media_body(content.filename(), content.caption())),
+        _ => None,
+    }
+}
+
+/// Build an [`IndexableEvent`] from a room message, or `None` if its type
+/// carries no searchable text.
+fn indexable_from_room_message(event: &OriginalSyncRoomMessageEvent) -> Option<IndexableEvent> {
+    let body = room_message_body(&event.content.msgtype)?;
+    let original_event_id = match &event.content.relates_to {
+        Some(Relation::Replacement(replacement)) => replacement.event_id.clone(),
+        _ => event.event_id.clone(),
+    };
+    Some(IndexableEvent {
+        event_id: event.event_id.clone(),
+        original_event_id,
+        sender: event.sender.clone(),
+        timestamp: event.origin_server_ts,
+        body,
+    })
 }
 
 /// If the given [`OriginalSyncRoomMessageEvent`] is an edit we make an
@@ -242,7 +308,14 @@ async fn handle_possible_edit(
 ) -> Option<RoomIndexOperation> {
     if let Some(Relation::Replacement(replacement_data)) = &event.content.relates_to {
         if let Some(recent) = get_most_recent_edit(cache, &replacement_data.event_id).await {
-            return Some(RoomIndexOperation::Edit(replacement_data.event_id.clone(), recent));
+            return Some(
+                indexable_from_room_message(&recent).map_or(
+                    RoomIndexOperation::Noop,
+                    |indexable| {
+                        RoomIndexOperation::Edit(replacement_data.event_id.clone(), indexable)
+                    },
+                ),
+            );
         } else {
             return Some(RoomIndexOperation::Noop);
         }
@@ -262,30 +335,107 @@ async fn handle_room_message(
             &event.event_id,
         )
         .await
-        .map(RoomIndexOperation::Add));
+        .and_then(|recent| indexable_from_room_message(&recent).map(RoomIndexOperation::Add)));
     }
     None
 }
 
-/// Return a [`RoomIndexOperation::Edit`] or [`RoomIndexOperation::Remove`]
-/// depending on the message.
+/// Return a [`RoomIndexOperation`] removing a redacted event from the index, or
+/// re-adding the most recent remaining version if an edit was redacted.
 async fn handle_room_redaction(
     event: SyncRoomRedactionEvent,
     cache: &RoomEventCache,
     rules: &RedactionRules,
 ) -> Option<RoomIndexOperation> {
-    if let Some(redacted_event_id) = event.redacts(rules)
-        && let Ok(Some(redacted_event)) = cache.find_event(redacted_event_id).await
+    let redacted_event_id = event.redacts(rules)?;
+
+    // If the redacted event was a room message edit, re-add the most recent
+    // remaining version instead of just removing it.
+    if let Ok(Some(redacted_event)) = cache.find_event(redacted_event_id).await
         && let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             redacted_event,
         ))) = redacted_event.raw().deserialize()
         && let Some(redacted_event) = redacted_event.as_original()
+        && let Some(operation) = handle_possible_edit(redacted_event, cache).await
     {
-        return handle_possible_edit(redacted_event, cache)
-            .await
-            .or(Some(RoomIndexOperation::Remove(redacted_event.event_id.clone())));
+        return Some(operation);
     }
-    None
+
+    // Otherwise remove the redacted event from the index. This covers plain
+    // messages, stickers and polls.
+    Some(RoomIndexOperation::Remove(redacted_event_id.to_owned()))
+}
+
+/// Return a [`RoomIndexOperation::Add`] indexing a sticker's descriptive text.
+fn handle_sticker(event: SyncStickerEvent) -> Option<RoomIndexOperation> {
+    let event = event.as_original()?;
+    Some(RoomIndexOperation::Add(IndexableEvent {
+        event_id: event.event_id.clone(),
+        original_event_id: event.event_id.clone(),
+        sender: event.sender.clone(),
+        timestamp: event.origin_server_ts,
+        body: event.content.body.clone(),
+    }))
+}
+
+/// Return a [`RoomIndexOperation::Add`] indexing an unstable poll's question
+/// and answers.
+///
+/// ponytail: only indexes the initial `New` poll — edits (`Replacement`) and
+/// poll ends are ignored. Add edit handling if editing a poll needs to update
+/// search results.
+fn handle_unstable_poll_start(event: SyncUnstablePollStartEvent) -> Option<RoomIndexOperation> {
+    let event = event.as_original()?;
+
+    let UnstablePollStartEventContent::New(content) = &event.content else {
+        return None;
+    };
+
+    let block = &content.poll_start;
+    let mut body = block.question.text.clone();
+    for answer in block.answers.iter() {
+        body.push(' ');
+        body.push_str(&answer.text);
+    }
+
+    Some(RoomIndexOperation::Add(IndexableEvent {
+        event_id: event.event_id.clone(),
+        original_event_id: event.event_id.clone(),
+        sender: event.sender.clone(),
+        timestamp: event.origin_server_ts,
+        body,
+    }))
+}
+
+/// Return a [`RoomIndexOperation::Add`] indexing a stable poll's question and
+/// answers.
+///
+/// ponytail: like [`handle_unstable_poll_start`], edits and poll ends are
+/// ignored — only the initial poll is indexed.
+fn handle_poll_start(event: SyncPollStartEvent) -> Option<RoomIndexOperation> {
+    let event = event.as_original()?;
+
+    // Skip poll edits, matching the unstable poll handling.
+    if let Some(Relation::Replacement(_)) = &event.content.relates_to {
+        return None;
+    }
+
+    let block = &event.content.poll;
+    let mut body = block.question.text.find_plain()?.to_owned();
+    for answer in block.answers.iter() {
+        if let Some(text) = answer.text.find_plain() {
+            body.push(' ');
+            body.push_str(text);
+        }
+    }
+
+    Some(RoomIndexOperation::Add(IndexableEvent {
+        event_id: event.event_id.clone(),
+        original_event_id: event.event_id.clone(),
+        sender: event.sender.clone(),
+        timestamp: event.origin_server_ts,
+        body,
+    }))
 }
 
 /// Prepare a [`TimelineEvent`] into a [`RoomIndexOperation`] for search
@@ -309,6 +459,11 @@ async fn parse_timeline_event(
                 }
                 AnySyncMessageLikeEvent::RoomRedaction(event) => {
                     handle_room_redaction(event, cache, redaction_rules).await
+                }
+                AnySyncMessageLikeEvent::Sticker(event) => handle_sticker(event),
+                AnySyncMessageLikeEvent::PollStart(event) => handle_poll_start(event),
+                AnySyncMessageLikeEvent::UnstablePollStart(event) => {
+                    handle_unstable_poll_start(event)
                 }
                 _ => None,
             },
@@ -361,6 +516,151 @@ mod tests {
 
         assert_eq!(response.len(), 1, "unexpected numbers of responses: {response:?}");
         assert_eq!(response[0].1, event_id, "event id doesn't match: {response:?}");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_sync_media_message_is_indexed() {
+        use ruma::owned_mxc_uri;
+
+        let mock_server = MatrixMockServer::new().await;
+        let client = mock_server.client_builder().build().await;
+
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!room_id:localhost");
+        let image_id = event_id!("$image_id:localhost");
+        let file_id = event_id!("$file_id:localhost");
+        let user_id = user_id!("@user_id:localhost");
+
+        let f = EventFactory::new();
+        let room = mock_server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                    f.image("holiday_beach.jpg".to_owned(), owned_mxc_uri!("mxc://localhost/1"))
+                        .caption(Some("sunset over the ocean".to_owned()), None)
+                        .event_id(image_id)
+                        .sender(user_id)
+                        .into_raw_sync(),
+                    f.image("quarterly_report.pdf".to_owned(), owned_mxc_uri!("mxc://localhost/2"))
+                        .event_id(file_id)
+                        .sender(user_id)
+                        .into_raw_sync(),
+                ]),
+            )
+            .await;
+
+        // The caption is indexed.
+        let response = room.search("sunset", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for caption search: {response:?}");
+        assert_eq!(response[0].1, image_id, "event id doesn't match: {response:?}");
+
+        // The filename is indexed.
+        let response = room.search("holiday_beach", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for filename search: {response:?}");
+        assert_eq!(response[0].1, image_id, "event id doesn't match: {response:?}");
+
+        // A media message without a caption still indexes its filename.
+        let response = room.search("quarterly_report", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for filename search: {response:?}");
+        assert_eq!(response[0].1, file_id, "event id doesn't match: {response:?}");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_sync_sticker_and_poll_are_indexed() {
+        use ruma::{events::room::ImageInfo, owned_mxc_uri};
+
+        let mock_server = MatrixMockServer::new().await;
+        let client = mock_server.client_builder().build().await;
+
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!room_id:localhost");
+        let sticker_id = event_id!("$sticker_id:localhost");
+        let poll_id = event_id!("$poll_id:localhost");
+        let user_id = user_id!("@user_id:localhost");
+
+        let f = EventFactory::new().room(room_id).sender(user_id);
+        let room = mock_server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
+                    f.sticker(
+                        "a waving cat",
+                        ImageInfo::new(),
+                        owned_mxc_uri!("mxc://localhost/1"),
+                    )
+                    .event_id(sticker_id)
+                    .into_raw_sync(),
+                    f.poll_start("fallback", "favourite cheese?", vec!["comté", "gruyère"])
+                        .event_id(poll_id)
+                        .into_raw_sync(),
+                ]),
+            )
+            .await;
+
+        // The sticker's description is indexed.
+        let response = room.search("waving", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for sticker search: {response:?}");
+        assert_eq!(response[0].1, sticker_id, "event id doesn't match: {response:?}");
+
+        // The poll question is indexed.
+        let response = room.search("cheese", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for poll question search: {response:?}");
+        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+
+        // The poll answers are indexed.
+        let response = room.search("gruyère", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for poll answer search: {response:?}");
+        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_sync_stable_poll_is_indexed() {
+        use ruma::events::{
+            message::TextContentBlock,
+            poll::start::{PollAnswer, PollAnswers, PollContentBlock, PollStartEventContent},
+        };
+
+        let mock_server = MatrixMockServer::new().await;
+        let client = mock_server.client_builder().build().await;
+
+        client.event_cache().subscribe().unwrap();
+
+        let room_id = room_id!("!room_id:localhost");
+        let poll_id = event_id!("$stable_poll_id:localhost");
+        let user_id = user_id!("@user_id:localhost");
+
+        let answers: PollAnswers = vec![
+            PollAnswer::new("0".to_owned(), TextContentBlock::plain("comté")),
+            PollAnswer::new("1".to_owned(), TextContentBlock::plain("gruyère")),
+        ]
+        .try_into()
+        .unwrap();
+        let poll = PollContentBlock::new(TextContentBlock::plain("favourite cheese?"), answers);
+        let content = PollStartEventContent::new(TextContentBlock::plain("fallback"), poll);
+
+        let f = EventFactory::new().room(room_id).sender(user_id);
+        let room = mock_server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_timeline_bulk(vec![f.event(content).event_id(poll_id).into_raw_sync()]),
+            )
+            .await;
+
+        // The poll question is indexed.
+        let response = room.search("cheese", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for poll question search: {response:?}");
+        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+
+        // The poll answers are indexed.
+        let response = room.search("gruyère", 5, None).await.unwrap();
+        assert_eq!(response.len(), 1, "unexpected results for poll answer search: {response:?}");
+        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
     }
 
     #[cfg(feature = "experimental-search")]
@@ -450,5 +750,56 @@ mod tests {
             "Search should return latest edit, got {:?}",
             results[0].1
         );
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_search_index_ignores_cross_sender_edit() {
+        let room_id = room_id!("!room_id:localhost");
+        let original_id = event_id!("$original");
+        let edit_id = event_id!("$edit");
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let event_cache = client.event_cache();
+        event_cache.subscribe().unwrap();
+
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        let f = EventFactory::new().room(room_id);
+
+        let original =
+            f.text_msg("original alpha").sender(user_id!("@alice:localhost")).event_id(original_id);
+
+        // An edit from a different user than the original sender is not a valid
+        // replacement and must be ignored.
+        let malicious_edit = f
+            .text_msg("* malicious beta")
+            .edit(original_id, RoomMessageEventContentWithoutRelation::text_plain("malicious beta"))
+            .sender(user_id!("@bob:localhost"))
+            .event_id(edit_id);
+
+        server
+            .sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(original))
+            .await;
+
+        // The original message is indexed.
+        let results = room.search("alpha", 3, None).await.unwrap();
+        assert_eq!(results.len(), 1, "Original should be indexed, got {results:?}");
+        assert_eq!(results[0].1, original_id, "unexpected event id: {results:?}");
+
+        server
+            .sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(malicious_edit))
+            .await;
+
+        // The forged edit's content must not be indexed.
+        let results = room.search("beta", 3, None).await.unwrap();
+        assert_eq!(results.len(), 0, "Cross-sender edit should be ignored, got {results:?}");
+
+        // The original message stays indexed.
+        let results = room.search("alpha", 3, None).await.unwrap();
+        assert_eq!(results.len(), 1, "Original should stay indexed, got {results:?}");
+        assert_eq!(results[0].1, original_id, "unexpected event id: {results:?}");
     }
 }

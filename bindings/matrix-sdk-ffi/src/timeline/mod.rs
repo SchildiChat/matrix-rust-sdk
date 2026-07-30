@@ -61,14 +61,12 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 pub use self::{content::TimelineItemContent, msg_like::MessageContent};
-#[cfg(feature = "unstable-msc4426")]
-use crate::ruma::{UserCall, UserStatus};
 use crate::{
     error::{ClientError, RoomError},
     event::EventOrTransactionId,
     ruma::{
         AssetType, AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, PollKind,
-        ThumbnailInfo, VideoInfo,
+        ThumbnailInfo, UserCall, UserStatus, VideoInfo,
     },
     runtime::get_runtime_handle,
     task_handle::TaskHandle,
@@ -77,7 +75,6 @@ use crate::{
 
 // SC start
 use crate::ruma::StickerEventContent;
-use ruma::events::receipt::ReceiptThread;
 use ruma::UserId;
 // SC end
 
@@ -386,7 +383,7 @@ impl Timeline {
         let should_update_local_unreads = matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         self.inner
-            .force_send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id.clone())
+            .force_send_single_receipt(receipt_type.into(), ruma::events::receipt::ReceiptThread::Unthreaded, event_id.clone())
             .await?;
         if should_update_local_unreads {
             if let Ok((room_event_cache, _drop_handles)) = self.inner.room().event_cache().await {
@@ -1138,6 +1135,15 @@ impl From<ruma::events::receipt::Receipt> for Receipt {
     }
 }
 
+/// A receipt of a user in a room, as read from the local store.
+#[derive(uniffi::Record)]
+pub struct UserReceipt {
+    /// The ID of the event the receipt is attached to.
+    pub event_id: String,
+    /// The receipt itself.
+    pub receipt: Receipt,
+}
+
 #[derive(Clone, uniffi::Record)]
 pub struct EventTimelineItemDebugInfo {
     model: String,
@@ -1153,9 +1159,7 @@ pub enum ProfileDetails {
         display_name: Option<String>,
         display_name_ambiguous: bool,
         avatar_url: Option<String>,
-        #[cfg(feature = "unstable-msc4426")]
         status: Option<UserStatus>,
-        #[cfg(feature = "unstable-msc4426")]
         call: Option<UserCall>,
     },
     Error {
@@ -1172,9 +1176,7 @@ impl From<TimelineDetails<Profile>> for ProfileDetails {
                 display_name: profile.display_name,
                 display_name_ambiguous: profile.display_name_ambiguous,
                 avatar_url: profile.avatar_url.as_ref().map(ToString::to_string),
-                #[cfg(feature = "unstable-msc4426")]
                 status: profile.status.map(UserStatus::from),
-                #[cfg(feature = "unstable-msc4426")]
                 call: profile.call.map(UserCall::from),
             },
             TimelineDetails::Error(e) => Self::Error { message: e.to_string() },
@@ -1191,9 +1193,7 @@ impl From<&TimelineDetails<Profile>> for ProfileDetails {
                 display_name: profile.display_name.clone(),
                 display_name_ambiguous: profile.display_name_ambiguous,
                 avatar_url: profile.avatar_url.as_ref().map(ToString::to_string),
-                #[cfg(feature = "unstable-msc4426")]
                 status: profile.status.clone().map(UserStatus::from),
-                #[cfg(feature = "unstable-msc4426")]
                 call: profile.call.clone().map(UserCall::from),
             },
             TimelineDetails::Error(e) => Self::Error { message: e.to_string() },
@@ -1319,6 +1319,53 @@ impl From<ReceiptType> for ruma::api::client::receipt::create_receipt::v3::Recei
             ReceiptType::ReadPrivate => Self::ReadPrivate,
             ReceiptType::FullyRead => Self::FullyRead,
         }
+    }
+}
+
+impl TryFrom<ReceiptType> for ruma::events::receipt::ReceiptType {
+    type Error = ClientError;
+
+    fn try_from(value: ReceiptType) -> Result<Self, Self::Error> {
+        Ok(match value {
+            ReceiptType::Read => Self::Read,
+            ReceiptType::ReadPrivate => Self::ReadPrivate,
+            // `m.fully_read` is a marker, not an event receipt: it has no
+            // counterpart in `ruma::events::receipt::ReceiptType`.
+            ReceiptType::FullyRead => {
+                return Err(ClientError::Generic {
+                    msg: "FullyRead is a marker, not an event receipt".to_owned(),
+                    details: None,
+                });
+            }
+        })
+    }
+}
+
+/// The thread scope of a read receipt.
+#[derive(Clone, uniffi::Enum)]
+pub enum ReceiptThread {
+    /// The receipt applies to the room, regardless of threads.
+    Unthreaded,
+    /// The receipt applies to the un-threaded main timeline only.
+    Main,
+    /// The receipt applies to the thread with the given root event.
+    Thread {
+        /// The ID of the thread's root event.
+        thread_root_event_id: String,
+    },
+}
+
+impl TryFrom<ReceiptThread> for ruma::events::receipt::ReceiptThread {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ReceiptThread) -> Result<Self, Self::Error> {
+        Ok(match value {
+            ReceiptThread::Unthreaded => Self::Unthreaded,
+            ReceiptThread::Main => Self::Main,
+            ReceiptThread::Thread { thread_root_event_id } => {
+                Self::Thread(EventId::parse(thread_root_event_id)?)
+            }
+        })
     }
 }
 
@@ -1730,5 +1777,37 @@ mod galleries {
 
             Ok(handle)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruma::{event_id, events::receipt::ReceiptThread as RumaReceiptThread};
+
+    use super::ReceiptThread;
+
+    #[test]
+    fn test_receipt_thread_conversion() {
+        assert_eq!(
+            RumaReceiptThread::try_from(ReceiptThread::Unthreaded),
+            Ok(RumaReceiptThread::Unthreaded)
+        );
+        assert_eq!(RumaReceiptThread::try_from(ReceiptThread::Main), Ok(RumaReceiptThread::Main));
+
+        let thread_root = event_id!("$root:example.org");
+        assert_eq!(
+            RumaReceiptThread::try_from(ReceiptThread::Thread {
+                thread_root_event_id: thread_root.to_string(),
+            }),
+            Ok(RumaReceiptThread::Thread(thread_root.to_owned()))
+        );
+
+        // An invalid thread root event ID is rejected.
+        assert!(
+            RumaReceiptThread::try_from(ReceiptThread::Thread {
+                thread_root_event_id: "not an event id".to_owned(),
+            })
+            .is_err()
+        );
     }
 }
