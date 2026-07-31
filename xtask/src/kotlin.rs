@@ -7,6 +7,9 @@ use xshell::cmd;
 
 use crate::{Result, sh, workspace};
 
+// SC
+use crate::sc_android_kotlin_bindings::generate_android_bindings;
+
 struct PackageValues {
     name: &'static str,
     features: &'static str,
@@ -150,6 +153,13 @@ fn build_android_library(
 
 fn generate_uniffi_bindings(library_path: &Utf8Path, ffi_generated_dir: &Utf8Path) -> Result<()> {
     println!("-- library_path = {library_path}");
+
+    // SC
+    if true {
+        generate_android_bindings(library_path, ffi_generated_dir)?;
+        return Ok(());
+    }
+
     generate(GenerateOptions {
         languages: vec![TargetLanguage::Kotlin],
         source: library_path.to_path_buf(),

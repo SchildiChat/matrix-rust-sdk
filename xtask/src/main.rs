@@ -5,6 +5,8 @@ mod fixup;
 mod kotlin;
 mod log;
 mod release;
+mod sc_android_kotlin_bindings;
+
 mod swift;
 mod workspace;
 
