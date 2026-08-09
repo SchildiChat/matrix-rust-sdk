@@ -318,7 +318,7 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
                                 | MessageType::VerificationRequest(_) => true,
                                 #[cfg(feature = "unstable-msc4274")]
                                 MessageType::Gallery(_) => true,
-                                _ => false,
+                                _ => true, // SC: don't hide unknown message types
                             }
                         }
 
