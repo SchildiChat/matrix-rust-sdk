@@ -30,12 +30,21 @@ use crate::{
     utils::Timestamp,
 };
 
+// SC start
+use ruma::events::room::message::PerMessageProfile as RumaPerMessageProfile;
+// SC end
+
 #[derive(Clone, uniffi::Enum)]
 pub enum MsgLikeKind {
     /// An `m.room.message` event or extensible event, including edits.
     Message { content: MessageContent },
     /// An `m.sticker` event.
-    Sticker { body: String, info: ImageInfo, source: Arc<MediaSource> },
+    Sticker {
+        body: String,
+        info: ImageInfo,
+        source: Arc<MediaSource>,
+        per_message_profile: Option<PerMessageProfile>, // SC
+    },
     /// An `m.poll.start` event.
     Poll {
         question: String,
@@ -84,6 +93,32 @@ pub struct MessageContent {
     pub body: String,
     pub is_edited: bool,
     pub mentions: Option<Mentions>,
+    pub per_message_profile: Option<PerMessageProfile>, // SC
+}
+
+/// SC: Profile metadata attached to an individual message.
+#[derive(Clone, uniffi::Record)]
+pub struct PerMessageProfile {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub avatar_file: Option<Arc<MediaSource>>,
+    pub has_fallback: bool,
+}
+
+// SC
+impl From<RumaPerMessageProfile> for PerMessageProfile {
+    fn from(value: RumaPerMessageProfile) -> Self {
+        Self {
+            id: value.id,
+            display_name: value.displayname,
+            avatar_url: value.avatar_url,
+            avatar_file: value.avatar_file.map(|file| {
+                Arc::new(MediaSource { media_source: RumaMediaSource::Encrypted(file) })
+            }),
+            has_fallback: value.has_fallback,
+        }
+    }
 }
 
 impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
@@ -126,6 +161,10 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                             body: message.body().to_owned(),
                             is_edited: message.is_edited(),
                             mentions: message.mentions().cloned().map(|m| m.into()),
+                            per_message_profile: message // SC
+                                .per_message_profile()
+                                .cloned()
+                                .map(Into::into),
                         },
                     },
                     reactions,
@@ -150,6 +189,10 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                         body: content.body.clone(),
                         info: image_info,
                         source: Arc::new(MediaSource { media_source }),
+                        per_message_profile: content // SC
+                            .per_message_profile
+                            .clone()
+                            .map(Into::into),
                     },
                     reactions,
                     in_reply_to,

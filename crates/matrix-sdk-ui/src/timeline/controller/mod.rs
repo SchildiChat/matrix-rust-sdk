@@ -1082,6 +1082,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
             prev_item.with_kind(ti_kind).with_content(TimelineItemContent::message(
                 content.msgtype,
                 content.mentions,
+                content.per_message_profile, // SC
                 prev_item.content().reactions().cloned().unwrap_or_default(),
                 prev_item.content().thread_root(),
                 prev_item.content().in_reply_to(),

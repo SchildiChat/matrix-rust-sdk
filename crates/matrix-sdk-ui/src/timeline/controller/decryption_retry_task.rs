@@ -324,6 +324,7 @@ mod tests {
                 TimelineItemContent::message(
                     content.msgtype,
                     content.mentions,
+                    content.per_message_profile, // SC
                     ReactionsByKeyBySender::default(),
                     None,
                     None,

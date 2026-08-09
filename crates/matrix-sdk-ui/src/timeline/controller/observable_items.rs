@@ -742,6 +742,7 @@ mod observable_items_tests {
                         msgtype: MessageType::Text(TextMessageEventContent::plain("hello")),
                         edited: false,
                         mentions: None,
+                        per_message_profile: None, // SC
                     }),
                     reactions: Default::default(),
                     thread_root: None,
@@ -778,6 +779,7 @@ mod observable_items_tests {
                         msgtype: MessageType::Text(TextMessageEventContent::plain("hello")),
                         edited: false,
                         mentions: None,
+                        per_message_profile: None, // SC
                     }),
                     reactions: Default::default(),
                     thread_root: None,

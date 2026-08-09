@@ -35,12 +35,17 @@ use tracing::{error, trace};
 
 use crate::DEFAULT_SANITIZER_MODE;
 
+// SC start
+use ruma::events::room::message::PerMessageProfile;
+// SC end
+
 /// An `m.room.message` event or extensible event, including edits.
 #[derive(Clone)]
 pub struct Message {
     pub(in crate::timeline) msgtype: MessageType,
     pub(in crate::timeline) edited: bool,
     pub(in crate::timeline) mentions: Option<Mentions>,
+    pub(in crate::timeline) per_message_profile: Option<PerMessageProfile>, // SC
 }
 
 impl Message {
@@ -48,12 +53,13 @@ impl Message {
     pub(in crate::timeline) fn from_event(
         mut msgtype: MessageType,
         mentions: Option<Mentions>,
+        per_message_profile: Option<PerMessageProfile>, // SC
         edit: Option<RoomMessageEventContentWithoutRelation>,
         remove_reply_fallback: RemoveReplyFallback,
     ) -> Self {
         msgtype.sanitize(DEFAULT_SANITIZER_MODE, remove_reply_fallback);
 
-        let mut ret = Self { msgtype, edited: false, mentions };
+        let mut ret = Self { msgtype, edited: false, mentions, per_message_profile };
 
         if let Some(edit) = edit {
             ret.apply_edit(edit);
@@ -69,6 +75,7 @@ impl Message {
         new_content.msgtype.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::No);
         self.msgtype = new_content.msgtype;
         self.mentions = new_content.mentions;
+        self.per_message_profile = new_content.per_message_profile; // SC
         self.edited = true;
     }
 
@@ -93,6 +100,11 @@ impl Message {
     /// Get the mentions of this message.
     pub fn mentions(&self) -> Option<&Mentions> {
         self.mentions.as_ref()
+    }
+
+    /// SC: Get the profile metadata attached to this message.
+    pub fn per_message_profile(&self) -> Option<&PerMessageProfile> {
+        self.per_message_profile.as_ref()
     }
 }
 
@@ -170,7 +182,7 @@ pub(crate) fn extract_poll_edit_content(
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { msgtype: _, edited, mentions: _ } = self;
+        let Self { msgtype: _, edited, mentions: _, per_message_profile: _ } = self;
         // since timeline items are logged, don't include all fields here so
         // people don't leak personal data in bug reports
         f.debug_struct("Message").field("edited", edited).finish_non_exhaustive()

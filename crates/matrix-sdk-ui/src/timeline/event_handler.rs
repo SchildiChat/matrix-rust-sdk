@@ -494,6 +494,7 @@ impl TimelineAction {
                 content: TimelineItemContent::message(
                     msg.msgtype,
                     msg.mentions,
+                    msg.per_message_profile, // SC
                     Default::default(),
                     thread_root,
                     in_reply_to,
