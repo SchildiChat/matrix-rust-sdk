@@ -248,7 +248,7 @@ impl SqliteStateStore {
                             "SELECT stripped, data FROM state_event
                              WHERE room_id = ? AND event_type = ?",
                         )?
-                        .query_row([room_id, event_type], |row| {
+                        .query_one([room_id, event_type], |row| {
                             Ok((row.get::<_, bool>(0)?, row.get::<_, Vec<u8>>(1)?))
                         })
                         .optional()?;
@@ -749,7 +749,7 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
     }
 
     fn get_room_info(&self, room_id: &[u8]) -> rusqlite::Result<Option<Vec<u8>>> {
-        self.query_row("SELECT data FROM room_info WHERE room_id = ?", (room_id,), |row| row.get(0))
+        self.query_one("SELECT data FROM room_info WHERE room_id = ?", (room_id,), |row| row.get(0))
             .optional()
     }
 
@@ -782,7 +782,7 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
         room_id: &[u8],
         event_id: &[u8],
     ) -> rusqlite::Result<Option<Vec<u8>>> {
-        self.query_row(
+        self.query_one(
             "SELECT data FROM state_event WHERE room_id = ? AND event_id = ?",
             (room_id, event_id),
             |row| row.get(0),
@@ -922,7 +922,7 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
 trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
     async fn get_kv_blob(&self, key: Key) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .query_row("SELECT value FROM kv_blob WHERE key = ?", (key,), |row| row.get(0))
+            .query_one("SELECT value FROM kv_blob WHERE key = ?", (key,), |row| row.get(0))
             .await
             .optional()?)
     }
@@ -1088,7 +1088,7 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
 
     async fn get_global_account_data(&self, event_type: Key) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .query_row(
+            .query_one(
                 "SELECT data FROM global_account_data WHERE event_type = ?",
                 (event_type,),
                 |row| row.get(0),
@@ -1103,7 +1103,7 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
         event_type: Key,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .query_row(
+            .query_one(
                 "SELECT data FROM room_account_data WHERE room_id = ? AND event_type = ?",
                 (room_id, event_type),
                 |row| row.get(0),
@@ -1158,14 +1158,14 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
         &self,
         room_id: Key,
         receipt_type: Key,
-        thread: Key,
+        receipt_thread: Key,
         user_id: Key,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .query_row(
+            .query_one(
                 "SELECT data FROM receipt
                  WHERE room_id = ? AND receipt_type = ? AND thread = ? and user_id = ?",
-                (room_id, receipt_type, thread, user_id),
+                (room_id, receipt_type, receipt_thread, user_id),
                 |row| row.get(0),
             )
             .await
@@ -1628,7 +1628,7 @@ impl StateStore for SqliteStateStore {
                                 .prepare_cached(
                                     "SELECT profile_data FROM global_profiles WHERE user_id = ?",
                                 )?
-                                .query_row([&user_id], |row| row.get(0))
+                                .query_one([&user_id], |row| row.get(0))
                                 .optional()?;
 
                             let mut profile: UserProfile = existing_data
@@ -1966,19 +1966,20 @@ impl StateStore for SqliteStateStore {
         &self,
         room_id: &RoomId,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         user_id: &UserId,
     ) -> Result<Option<(OwnedEventId, Receipt)>> {
         let room_id = self.encode_key(keys::RECEIPT, room_id);
         let receipt_type = self.encode_key(keys::RECEIPT, receipt_type.to_string());
         // We cannot have a NULL primary key so we rely on serialization instead of the
         // string representation.
-        let thread = self.encode_key(keys::RECEIPT, rmp_serde::to_vec_named(&thread)?);
+        let receipt_thread =
+            self.encode_key(keys::RECEIPT, rmp_serde::to_vec_named(receipt_thread)?);
         let user_id = self.encode_key(keys::RECEIPT, user_id);
 
         self.read()
             .await?
-            .get_user_receipt(room_id, receipt_type, thread, user_id)
+            .get_user_receipt(room_id, receipt_type, receipt_thread, user_id)
             .await?
             .map(|value| {
                 self.deserialize_json::<ReceiptData>(&value).map(|d| (d.event_id, d.receipt))
@@ -1990,19 +1991,20 @@ impl StateStore for SqliteStateStore {
         &self,
         room_id: &RoomId,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         event_id: &EventId,
     ) -> Result<Vec<(OwnedUserId, Receipt)>> {
         let room_id = self.encode_key(keys::RECEIPT, room_id);
         let receipt_type = self.encode_key(keys::RECEIPT, receipt_type.to_string());
         // We cannot have a NULL primary key so we rely on serialization instead of the
         // string representation.
-        let thread = self.encode_key(keys::RECEIPT, rmp_serde::to_vec_named(&thread)?);
+        let receipt_thread =
+            self.encode_key(keys::RECEIPT, rmp_serde::to_vec_named(receipt_thread)?);
         let event_id = self.encode_key(keys::RECEIPT, event_id);
 
         self.read()
             .await?
-            .get_event_receipts(room_id, receipt_type, thread, event_id)
+            .get_event_receipts(room_id, receipt_type, receipt_thread, event_id)
             .await?
             .iter()
             .map(|value| {
@@ -2469,7 +2471,7 @@ impl StateStore for SqliteStateStore {
         Ok(self
             .read()
             .await?
-            .query_row(
+            .query_one(
                 "SELECT status, bump_stamp FROM thread_subscriptions WHERE room_id = ? AND event_id = ?",
                 (room_id, thread_id),
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<u64>>(1)?))

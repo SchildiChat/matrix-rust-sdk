@@ -48,6 +48,7 @@ use ruma::{
                 PossiblyRedactedRoomPinnedEventsEventContent, RoomPinnedEventsEventContent,
             },
             redaction::SyncRoomRedactionEvent,
+            retention::RoomRetentionEventContent,
             tombstone::PossiblyRedactedRoomTombstoneEventContent,
             topic::PossiblyRedactedRoomTopicEventContent,
         },
@@ -71,7 +72,7 @@ use crate::{
     deserialized_responses::RawSyncOrStrippedState,
     latest_event::LatestEventValue,
     notification_settings::RoomNotificationMode,
-    read_receipts::RoomReadReceipts,
+    read_receipts::ReadReceipts,
     room::call::CallIntentConsensus,
     store::{IncorrectMutexGuardError, SaveLockedStateStore, StateStoreExt},
     sync::UnreadNotificationsCount,
@@ -208,6 +209,8 @@ pub struct BaseRoomInfo {
     pub(crate) member_hints: Option<MinimalStateEvent<PossiblyRedactedMemberHintsEventContent>>,
     /// The `m.room.name` of this room.
     pub(crate) name: Option<MinimalStateEvent<PossiblyRedactedRoomNameEventContent>>,
+    /// The message retention policy of this room.
+    pub(crate) retention: Option<MinimalStateEvent<RoomRetentionEventContent>>,
     /// The `m.room.tombstone` event content of this room.
     pub(crate) tombstone: Option<MinimalStateEvent<PossiblyRedactedRoomTombstoneEventContent>>,
     /// The topic of this room.
@@ -339,6 +342,17 @@ impl BaseRoomInfo {
                 } else {
                     // Remove the previous content if the new content is unknown.
                     self.history_visibility.take().is_some()
+                }
+            }
+            (StateEventType::RoomRetention, "") => {
+                if let Some(event) = raw_event.deserialize_as_minimal_event(|any_event| {
+                    as_variant!(any_event, AnyPossiblyRedactedStateEventContent::RoomRetention)
+                }) {
+                    self.retention = Some(event);
+                    true
+                } else {
+                    // Remove the previous content if the new content is unknown.
+                    self.retention.take().is_some()
                 }
             }
             (StateEventType::RoomGuestAccess, "") => {
@@ -576,6 +590,10 @@ impl BaseRoomInfo {
             && ev.event_id.as_deref() == Some(redacts)
         {
             ev.redact(&redaction_rules);
+        } else if let Some(ev) = &mut self.retention
+            && ev.event_id.as_deref() == Some(redacts)
+        {
+            ev.redact(&redaction_rules);
         } else if let Some(ev) = &mut self.tombstone
             && ev.event_id.as_deref() == Some(redacts)
         {
@@ -632,6 +650,7 @@ impl Default for BaseRoomInfo {
             join_rules: None,
             max_power_level: DEFAULT_MAX_POWER_LEVEL,
             name: None,
+            retention: None,
             tombstone: None,
             topic: None,
             // SC start
@@ -696,7 +715,7 @@ pub struct RoomInfo {
 
     /// Information about read receipts for this room.
     #[serde(default)]
-    pub(crate) read_receipts: RoomReadReceipts,
+    pub(crate) read_receipts: ReadReceipts,
 
     /// Base room info which holds some basic event contents important for the
     /// room state.
@@ -1171,6 +1190,13 @@ impl RoomInfo {
         self.history_visibility().unwrap_or(&HistoryVisibility::Shared)
     }
 
+    /// Returns the message retention policy for this room.
+    ///
+    /// Returns `None` if the event was never seen during sync.
+    pub fn retention(&self) -> Option<&RoomRetentionEventContent> {
+        self.base_info.retention.as_ref().map(|e| &e.content)
+    }
+
     /// Return the join rule for this room, if the `m.room.join_rules` event is
     /// available.
     pub fn join_rule(&self) -> Option<&JoinRule> {
@@ -1246,6 +1272,22 @@ impl RoomInfo {
     /// "m.room" in this room.
     pub fn has_active_room_call(&self) -> bool {
         !self.active_room_call_memberships().is_empty()
+    }
+
+    /// Whether the given `(user_id, device_id)` tuple is currently a
+    /// participant in this room's active MatrixRTC call.
+    ///
+    /// Distinct from [`Self::active_room_call_participants`] which returns
+    /// only user IDs. Callers that must not conflate multiple devices of
+    /// the same user (e.g. profile-field mirroring) should use this.
+    pub fn is_device_in_active_room_call(
+        &self,
+        user_id: &ruma::UserId,
+        device_id: &ruma::DeviceId,
+    ) -> bool {
+        self.active_room_call_memberships().iter().any(|(state_key, membership)| {
+            state_key.user_id() == user_id && membership.device_id() == device_id
+        })
     }
 
     /// Get the call intent consensus for the current call, based on what
@@ -1360,12 +1402,12 @@ impl RoomInfo {
     }
 
     /// Returns the computed read receipts for this room.
-    pub fn read_receipts(&self) -> &RoomReadReceipts {
+    pub fn read_receipts(&self) -> &ReadReceipts {
         &self.read_receipts
     }
 
     /// Set the computed read receipts for this room.
-    pub fn set_read_receipts(&mut self, read_receipts: RoomReadReceipts) {
+    pub fn set_read_receipts(&mut self, read_receipts: ReadReceipts) {
         self.read_receipts = read_receipts;
     }
 
@@ -1595,7 +1637,9 @@ mod tests {
         assign,
         events::{
             AnyRoomAccountDataEvent,
-            room::pinned_events::RoomPinnedEventsEventContent,
+            room::{
+                pinned_events::RoomPinnedEventsEventContent, retention::RoomRetentionEventContent,
+            },
             tag::{TagInfo, TagName, Tags, UserTagName},
         },
         owned_event_id, owned_mxc_uri, owned_user_id, room_id,
@@ -1693,6 +1737,7 @@ mod tests {
                 "max_power_level": 100,
                 "member_hints": null,
                 "name": null,
+                "retention": null,
                 "tombstone": null,
                 "topic": null,
                 "pinned_events": {
@@ -1704,7 +1749,10 @@ mod tests {
                 "num_mentions": 0,
                 "num_notifications": 0,
                 "latest_active": null,
-                "pending": [],
+                "pending": {
+                    "items": [],
+                    "capacity": 10,
+                },
             },
             "recency_stamp": 42,
         });
@@ -2294,5 +2342,29 @@ mod tests {
                 .expect("task completes successfully")
                 .expect("update and save room info");
         });
+    }
+
+    #[test]
+    fn test_retention_stored_on_handle_state_event() {
+        let mut info = RoomInfo::new(room_id!("!gda78o:server.tld"), RoomState::Joined);
+        assert!(info.retention().is_none(), "retention should be absent before any event");
+
+        let max_lifetime = Duration::from_secs(86_400); // 1 day
+        let content = RoomRetentionEventContent::new().at_most(max_lifetime).unwrap();
+
+        let mut raw = RawStateEventWithKeys::try_from_raw_state_event(
+            EventFactory::new()
+                .sender(user_id!("@alice:example.org"))
+                .event(content)
+                .state_key("")
+                .into_raw_sync_state(),
+        )
+        .expect("retention state event should be constructable");
+
+        info.handle_state_event(&mut raw);
+
+        let retention = info.retention().expect("retention should be set after event");
+        assert_eq!(retention.max_lifetime(), Some(max_lifetime));
+        assert!(retention.min_lifetime().is_none());
     }
 }

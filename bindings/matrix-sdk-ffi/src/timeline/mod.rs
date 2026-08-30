@@ -41,7 +41,7 @@ use ruma::{
     EventId, UInt, assign,
     events::{
         AnyMessageLikeEventContent,
-        location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
+        location::{AssetType as RumaAssetType, ZoomLevel},
         poll::{
             unstable_end::UnstablePollEndEventContent,
             unstable_response::UnstablePollResponseEventContent,
@@ -51,8 +51,7 @@ use ruma::{
             },
         },
         room::message::{
-            LocationMessageEventContent, MessageType, RoomMessageEventContentWithoutRelation,
-            TextMessageEventContent,
+            MessageType, RoomMessageEventContentWithoutRelation, TextMessageEventContent,
         },
     },
 };
@@ -127,12 +126,19 @@ impl Timeline {
             assign!(TextMessageEventContent::plain(caption), { formatted })
         });
 
+        let extra_content: Option<serde_json::Map<String, serde_json::Value>> = params
+            .extra_content_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|_| RoomError::InvalidAttachmentData)?;
+
         let attachment_config = AttachmentConfig {
             info: Some(attachment_info),
             thumbnail,
             caption,
             mentions: params.mentions.map(Into::into),
             in_reply_to: in_reply_to_event_id,
+            extra_content,
             ..Default::default()
         };
 
@@ -211,6 +217,10 @@ pub struct UploadParameters {
     mentions: Option<Mentions>,
     /// Optional Event ID to reply to.
     in_reply_to: Option<String>,
+    /// Optional additional top-level fields for the media event's content,
+    /// as a serialized JSON object.
+    #[uniffi(default = None)]
+    extra_content_json: Option<String>,
 }
 
 /// A source for uploading a file
@@ -445,7 +455,23 @@ impl Timeline {
         self: Arc<Self>,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
     ) -> Result<Arc<SendHandle>, ClientError> {
-        match self.inner.send((*msg).to_owned().with_relation(None).into()).await {
+        self.send_with_extra_content(msg, None).await
+    }
+
+    /// Like [`Self::send`], but merges the given additional top-level fields
+    /// (a JSON object, encoded as a string) into the outgoing event's content.
+    pub async fn send_with_extra_content(
+        self: Arc<Self>,
+        msg: Arc<RoomMessageEventContentWithoutRelation>,
+        extra_content_json: Option<String>,
+    ) -> Result<Arc<SendHandle>, ClientError> {
+        let extra_content: Option<serde_json::Map<String, serde_json::Value>> =
+            extra_content_json.map(|json| serde_json::from_str(&json)).transpose()?;
+        match self
+            .inner
+            .send_with_extra_content((*msg).to_owned().with_relation(None).into(), extra_content)
+            .await
+        {
             Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
             Err(err) => {
                 error!("error when sending a message: {err}");
@@ -611,15 +637,15 @@ impl Timeline {
     ///
     /// If the replied to event has a thread relation, it is forwarded on the
     /// reply so that clients that support threads can render the reply
-    /// inside the thread.
+    /// inside the thread. Returns a handle to abort the pending send.
     pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
         event_id: String,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Arc<SendHandle>, ClientError> {
         let event_id = EventId::parse(&event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
-        self.inner.send_reply((*msg).clone(), event_id).await?;
-        Ok(())
+        let handle = self.inner.send_reply((*msg).clone(), event_id).await?;
+        Ok(Arc::new(SendHandle::new(handle)))
     }
 
     /// Edits an event from the timeline.
@@ -674,29 +700,37 @@ impl Timeline {
         asset_type: Option<AssetType>,
         replied_to_event_id: Option<String>,
     ) -> Result<(), ClientError> {
-        let mut location_event_message_content =
-            LocationMessageEventContent::new(body, geo_uri.clone());
-
-        if let Some(asset_type) = asset_type {
-            location_event_message_content =
-                location_event_message_content.with_asset_type(RumaAssetType::from(asset_type));
+        if matches!(asset_type, Some(AssetType::Unknown)) {
+            return Err(ClientError::Generic {
+                msg: "cannot send a location with an unknown asset type".to_owned(),
+                details: None,
+            });
         }
 
-        let mut location_content = LocationContent::new(geo_uri);
-        location_content.description = description;
-        location_content.zoom_level = zoom_level.and_then(ZoomLevel::new);
-        location_event_message_content.location = Some(location_content);
+        let zoom_level = zoom_level
+            .map(|zoom| {
+                ZoomLevel::new(zoom).ok_or_else(|| ClientError::Generic {
+                    msg: format!("zoom level {zoom} is out of range"),
+                    details: None,
+                })
+            })
+            .transpose()?;
 
-        let room_message_event_content = RoomMessageEventContentWithoutRelation::new(
-            MessageType::Location(location_event_message_content),
-        );
+        let in_reply_to = replied_to_event_id
+            .map(|id| EventId::parse(id).map_err(|_| RoomError::InvalidRepliedToEventId))
+            .transpose()?;
 
-        if let Some(replied_to_event_id) = replied_to_event_id {
-            self.send_reply(Arc::new(room_message_event_content), replied_to_event_id).await
-        } else {
-            self.send(Arc::new(room_message_event_content)).await?;
-            Ok(())
-        }
+        self.inner
+            .send_location(
+                body,
+                geo_uri,
+                description,
+                zoom_level,
+                asset_type.map(RumaAssetType::from),
+                in_reply_to,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Toggle a reaction on an event.
@@ -718,6 +752,26 @@ impl Timeline {
         key: String,
     ) -> Result<bool, ClientError> {
         Ok(self.inner.toggle_reaction(&item_id.try_into()?, &key).await?)
+    }
+
+    /// Like [`Self::toggle_reaction`], but merges the given additional
+    /// top-level fields (a JSON object, encoded as a string) into the
+    /// reaction's content when one is added.
+    ///
+    /// Removing a reaction is a redaction, which carries no content, so the
+    /// extra fields are only used when adding one.
+    pub async fn toggle_reaction_with_extra_content(
+        &self,
+        item_id: EventOrTransactionId,
+        key: String,
+        extra_content_json: Option<String>,
+    ) -> Result<bool, ClientError> {
+        let extra_content: Option<serde_json::Map<String, serde_json::Value>> =
+            extra_content_json.map(|json| serde_json::from_str(&json)).transpose()?;
+        Ok(self
+            .inner
+            .toggle_reaction_with_extra_content(&item_id.try_into()?, &key, extra_content)
+            .await?)
     }
 
     pub async fn fetch_details_for_event(&self, event_id: String) -> Result<(), ClientError> {

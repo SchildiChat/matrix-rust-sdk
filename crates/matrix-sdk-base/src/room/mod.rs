@@ -57,6 +57,7 @@ use ruma::{
             join_rules::JoinRule,
             member::MembershipState,
             power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, RoomPowerLevelsSource},
+            retention::RoomRetentionEventContent,
         },
     },
     room::RoomType,
@@ -72,7 +73,7 @@ use crate::{
     DmRoomDefinition, Error, StateStore,
     deserialized_responses::MemberEvent,
     notification_settings::RoomNotificationMode,
-    read_receipts::RoomReadReceipts,
+    read_receipts::ReadReceipts,
     store::{Result as StoreResult, SaveLockedStateStore, StateStoreExt},
     sync::UnreadNotificationsCount,
 };
@@ -241,7 +242,7 @@ impl Room {
     }
 
     /// Get the detailed information about read receipts for the room.
-    pub fn read_receipts(&self) -> RoomReadReceipts {
+    pub fn read_receipts(&self) -> ReadReceipts {
         self.info.read().read_receipts.clone()
     }
 
@@ -412,6 +413,11 @@ impl Room {
         self.info.read().base_info.max_power_level
     }
 
+    /// Get the message retention policy of this room, if set.
+    pub fn retention(&self) -> Option<RoomRetentionEventContent> {
+        self.info.read().retention().cloned()
+    }
+
     /// Get the service members in this room, if available.
     pub fn service_members(&self) -> Option<BTreeSet<OwnedUserId>> {
         self.info.read().service_members().cloned()
@@ -542,6 +548,11 @@ impl Room {
             }
         };
 
+        // Short-circuiting if there is no heroes: we can't do anything.
+        if heroes.is_empty() {
+            return Vec::new();
+        }
+
         // Return with empty profile fields when the user status feature is disabled.
         #[cfg(not(feature = "unstable-msc4426"))]
         {
@@ -589,10 +600,12 @@ impl Room {
     pub async fn load_user_receipt(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         user_id: &UserId,
     ) -> StoreResult<Option<(OwnedEventId, Receipt)>> {
-        self.store.get_user_room_receipt_event(self.room_id(), receipt_type, thread, user_id).await
+        self.store
+            .get_user_room_receipt_event(self.room_id(), receipt_type, receipt_thread, user_id)
+            .await
     }
 
     /// Load from storage the receipts as a list of `OwnedUserId` and `Receipt`
@@ -601,11 +614,11 @@ impl Room {
     pub async fn load_event_receipts(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        receipt_thread: &ReceiptThread,
         event_id: &EventId,
     ) -> StoreResult<Vec<(OwnedUserId, Receipt)>> {
         self.store
-            .get_event_room_receipt_events(self.room_id(), receipt_type, thread, event_id)
+            .get_event_room_receipt_events(self.room_id(), receipt_type, receipt_thread, event_id)
             .await
     }
 

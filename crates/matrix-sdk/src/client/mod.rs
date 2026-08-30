@@ -61,6 +61,7 @@ use ruma::{
             media,
             membership::{join_room_by_id, join_room_by_id_or_alias},
             presence::set_presence as set_presence_status,
+            retention::get_retention_configuration,
             room::create_room,
             rtc::{RtcTransport, transports},
             session::login::v3::DiscoveryInfo,
@@ -299,7 +300,7 @@ pub(crate) struct ClientInner {
     /// If it's been built from a homeserver URL directly, we don't know the
     /// server. However, if the `Client` has been built from a server URL or
     /// name, then the homeserver has been discovered, and we know both.
-    server: Option<Url>,
+    server: StdRwLock<Option<Url>>,
 
     /// The URL of the homeserver to connect to.
     ///
@@ -360,6 +361,11 @@ pub(crate) struct ClientInner {
     /// information present in the login response.
     respect_login_well_known: bool,
 
+    /// Whether all the `.well-known/matrix/client` lookups are disabled.
+    ///
+    /// See [`ClientBuilder::disable_well_known_lookup`].
+    well_known_lookup_disabled: StdRwLock<bool>,
+
     /// An event that can be listened on to wait for a successful sync. The
     /// event will only be fired if a sync loop is running. Can be used for
     /// synchronization, e.g. if we send out a request to create a room, we can
@@ -419,6 +425,18 @@ pub(crate) struct ClientInner {
         broadcast::Sender<Option<DuplicateOneTimeKeyErrorMessage>>,
 
     pub(crate) media_fetcher: RwLock<Arc<dyn MediaFetcher>>,
+
+    /// When `Some`, `m.call` auto-sync is enabled and the held
+    /// [`AutomaticCallStatus`] owns the event handler registration.
+    /// Dropping the `Option` (via
+    /// [`Client::enable_automatic_call_status`]) drops the syncer,
+    /// which drops its `EventHandlerDropGuard`, which deregisters the
+    /// handler.
+    ///
+    /// [`AutomaticCallStatus`]: crate::automatic_call_status::AutomaticCallStatus
+    #[cfg(feature = "unstable-msc4426")]
+    pub(crate) automatic_call_status:
+        StdMutex<Option<crate::automatic_call_status::AutomaticCallStatus>>,
 }
 
 impl ClientInner {
@@ -439,6 +457,7 @@ impl ClientInner {
         supported_versions: CachedValue<TtlValue<SupportedVersions>>,
         well_known: CachedValue<TtlValue<Option<WellKnownResponse>>>,
         respect_login_well_known: bool,
+        well_known_lookup_disabled: bool,
         event_cache: OnceCell<EventCache>,
         send_queue: Arc<SendQueueData>,
         latest_events: OnceCell<LatestEvents>,
@@ -458,7 +477,7 @@ impl ClientInner {
         };
 
         let client = Self {
-            server,
+            server: StdRwLock::new(server),
             homeserver: StdRwLock::new(homeserver),
             auth_ctx,
             sliding_sync_version: StdRwLock::new(sliding_sync_version),
@@ -476,6 +495,7 @@ impl ClientInner {
             // ballast for all observers to catch up.
             room_updates_sender: broadcast::Sender::new(32),
             respect_login_well_known,
+            well_known_lookup_disabled: StdRwLock::new(well_known_lookup_disabled),
             sync_beat: event_listener::Event::new(),
             event_cache,
             send_queue_data: send_queue,
@@ -494,6 +514,8 @@ impl ClientInner {
             #[cfg(feature = "e2e-encryption")]
             duplicate_key_upload_error_sender: broadcast::channel(1).0,
             media_fetcher: RwLock::new(media_fetcher),
+            #[cfg(feature = "unstable-msc4426")]
+            automatic_call_status: StdMutex::new(None),
         };
 
         #[allow(clippy::let_and_return)]
@@ -574,11 +596,17 @@ impl Client {
 
     /// Change the homeserver URL used by this client.
     ///
+    /// Note that this will reset [`Client::server`] to `None`.
+    ///
     /// # Arguments
     ///
     /// * `homeserver_url` - The new URL to use.
     fn set_homeserver(&self, homeserver_url: Url) {
-        *self.inner.homeserver.write().unwrap() = homeserver_url;
+        let mut homeserver = self.inner.homeserver.write().unwrap();
+        let mut server = self.inner.server.write().unwrap();
+
+        *homeserver = homeserver_url;
+        *server = None;
     }
 
     /// Change to a different homeserver and re-resolve well-known.
@@ -670,8 +698,8 @@ impl Client {
     /// The server used by the client.
     ///
     /// See `Self::server` to learn more.
-    pub fn server(&self) -> Option<&Url> {
-        self.inner.server.as_ref()
+    pub fn server(&self) -> Option<Url> {
+        self.inner.server.read().unwrap().clone()
     }
 
     /// The homeserver of the client.
@@ -2207,7 +2235,14 @@ impl Client {
     /// 3. If we couldn't get the well-known contents with either the explicit
     ///    server name or the implicit extracted one, we try the homeserver URL
     ///    as a last resort.
+    ///
+    /// Always returns `None` if well-known lookups were disabled with
+    /// [`ClientBuilder::disable_well_known_lookup`].
     pub async fn fetch_client_well_known(&self) -> Option<discover_homeserver::Response> {
+        if self.well_known_lookup_disabled() {
+            return None;
+        }
+
         let homeserver = self.homeserver();
         let scheme = homeserver.scheme();
 
@@ -2631,9 +2666,28 @@ impl Client {
         well_known.into_data()
     }
 
+    /// Whether this client is allowed to look up the homeserver's
+    /// /.well-known/matrix/client file.
+    fn well_known_lookup_disabled(&self) -> bool {
+        *self.inner.well_known_lookup_disabled.read().unwrap()
+    }
+
+    /// Change whether this client is allowed to look up the homeserver's
+    /// /.well-known/matrix/client file.
+    pub fn disable_well_known_lookup(&self, disable: bool) {
+        *self.inner.well_known_lookup_disabled.write().unwrap() = disable;
+    }
+
     /// Get the well-known file of the homeserver by fetching it from the server
     /// or the cache.
+    ///
+    /// Always returns `None` if well-known discovery was disabled with
+    /// [`ClientBuilder::disable_well_known_lookup`].
     async fn well_known(&self) -> Option<WellKnownResponse> {
+        if self.well_known_lookup_disabled() {
+            return None;
+        }
+
         match self.well_known_cached().await {
             Ok(CachedValue::Cached(value)) => {
                 return value;
@@ -2652,7 +2706,10 @@ impl Client {
 
     /// Get information about the homeserver's advertised RTC transports by
     /// fetching the well-known file from the server or the cache.
-    #[deprecated = "Use `Client::rtc_transports` instead"]
+    ///
+    /// Returns an empty list if well-known discovery was disabled with
+    /// [`ClientBuilder::disable_well_known_lookup`].
+    #[deprecated = "Use `Client::discover_rtc_transports` instead"]
     pub async fn rtc_foci(&self) -> HttpResult<Vec<RtcTransport>> {
         self.well_known_rtc_transports().await
     }
@@ -2660,10 +2717,13 @@ impl Client {
     /// Get information about the homeserver's advertised RTC foci by fetching
     /// the well-known file from the server or the cache.
     ///
-    /// This will be soon deprecated in favor of [`Client::rtc_transports`],
-    /// which fetches the RTC transports advertised by the homeserver
-    /// through the authenticated `GET /_matrix/client/v1/rtc/transports`
-    /// endpoint.
+    /// This will be soon deprecated in favor of
+    /// [`Client::discover_rtc_transports`], which fetches the RTC
+    /// transports advertised by the homeserver through the authenticated
+    /// `GET /_matrix/client/v1/rtc/transports` endpoint.
+    ///
+    /// Returns an empty list if well-known discovery was disabled with
+    /// [`ClientBuilder::disable_well_known_lookup`].
     ///
     /// # Examples
     /// ```no_run
@@ -2694,42 +2754,7 @@ impl Client {
     /// The transports are discovered through the authenticated
     /// `GET /_matrix/client/v1/rtc/transports` endpoint
     /// ([MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143)).
-    ///
-    /// The result is cached in memory for a day. Use
-    /// [`Client::fetch_rtc_transports`] to bypass the cache, or
-    /// [`Client::reset_rtc_transports`] to clear it.
-    ///
-    /// Returns:
-    /// - `Ok(Some(transports))` if the homeserver supports the endpoint (the
-    ///   list may be empty if the homeserver advertises no transports),
-    /// - `Ok(None)` if the homeserver doesn't implement the endpoint (this is
-    ///   also cached, so the endpoint isn't hit on every call). Callers may
-    ///   want to fall back to [`Client::well_known_rtc_transports`] (the
-    ///   well-known foci) in this case,
-    /// - `Err(_)` on a transient error (not cached).
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use matrix_sdk::{Client, ruma::api::client::rtc::RtcTransport};
-    /// # use url::Url;
-    /// # async {
-    /// # let homeserver = Url::parse("http://localhost:8080")?;
-    /// let client = Client::new(homeserver).await?;
-    /// // The endpoint is authenticated, so the client must be logged in.
-    /// client.matrix_auth().login_username("example", "password").send().await?;
-    ///
-    /// let transports = match client.rtc_transports().await? {
-    ///     Some(transports) => transports,
-    ///     // The homeserver doesn't support the discovery endpoint; fall back
-    ///     // to the RTC foci advertised in the well-known.
-    ///     None => client.well_known_rtc_transports().await?,
-    /// };
-    /// for transport in transports {
-    ///     println!("transport type: {}", transport.transport_type());
-    /// }
-    /// # anyhow::Ok(()) };
-    /// ```
-    pub async fn rtc_transports(&self) -> HttpResult<Option<Vec<RtcTransport>>> {
+    async fn rtc_transports(&self) -> HttpResult<Option<Vec<RtcTransport>>> {
         match self.rtc_transports_cached() {
             CachedValue::Cached(value) => Ok(value),
             // The cache is empty, make a request.
@@ -2836,11 +2861,52 @@ impl Client {
         self.inner.caches.rtc_transports.reset();
     }
 
+    /// Discover the RTC transports advertised by the homeserver.
+    ///
+    /// The transports are first looked up through the authenticated
+    /// `GET /_matrix/client/v1/rtc/transports` endpoint
+    /// ([MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143)).
+    /// If the homeserver doesn't implement that endpoint, this falls back to
+    /// the `m.rtc_foci` field of the well-known, see
+    /// [`Client::well_known_rtc_transports`] — unless well-known discovery
+    /// was disabled with [`ClientBuilder::disable_well_known_lookup`].
+    ///
+    /// Returns `None` if neither source could provide transports, which is
+    /// kept distinct from `Some(vec![])`, i.e. a homeserver that advertises no
+    /// transports at all.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://localhost:8080")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// for transport in client.discover_rtc_transports().await?.unwrap_or_default()
+    /// {
+    ///     println!("transport type: {}", transport.transport_type());
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn discover_rtc_transports(&self) -> HttpResult<Option<Vec<RtcTransport>>> {
+        if let Some(transports) = self.rtc_transports().await? {
+            return Ok(Some(transports));
+        }
+
+        // The homeserver doesn't implement the discovery endpoint or does not expose
+        // any transports, fall back to the well-known foci.
+        // `well_known` returns `None` when well-known discovery is
+        // disabled, which correctly collapses into "nothing was discovered".
+        Ok(self.well_known().await.map(|well_known| well_known.rtc_foci))
+    }
+
     /// Get information about the homeserver's advertised map tile server, if
     /// any, by fetching the well-known file from the server or the cache.
     ///
     /// Returns `None` if the homeserver has not advertised a tile server in its
-    /// well-known, or if the well-known is otherwise unavailable.
+    /// well-known, or if the well-known is otherwise unavailable — including
+    /// when well-known discovery was disabled with
+    /// [`ClientBuilder::disable_well_known_lookup`].
     pub async fn tile_server(&self) -> Option<TileServerInfo> {
         self.well_known().await.and_then(|well_known| well_known.tile_server).map(Into::into)
     }
@@ -2900,6 +2966,18 @@ impl Client {
         let request = get_devices::v3::Request::new();
 
         self.send(request).await
+    }
+
+    /// Get the server's message retention policy configuration.
+    ///
+    /// Returns the server-level retention policy limits and any per-room
+    /// overrides defined by the server.
+    ///
+    /// See [MSC1763](https://github.com/matrix-org/matrix-spec-proposals/pull/1763) for more info.
+    pub async fn get_retention_configuration(
+        &self,
+    ) -> HttpResult<get_retention_configuration::unstable::Response> {
+        self.send(get_retention_configuration::unstable::Request::default()).await
     }
 
     /// Delete the given devices from the server.
@@ -3502,7 +3580,7 @@ impl Client {
         let client = Client {
             inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
-                self.server().cloned(),
+                self.server(),
                 self.homeserver(),
                 self.sliding_sync_version(),
                 self.inner.sync_presence.clone(),
@@ -3514,6 +3592,7 @@ impl Client {
                 self.inner.caches.supported_versions.value(),
                 self.inner.caches.well_known.value(),
                 self.inner.respect_login_well_known,
+                self.well_known_lookup_disabled(),
                 self.inner.event_cache.clone(),
                 self.inner.send_queue_data.clone(),
                 self.inner.latest_events.clone(),
@@ -4153,9 +4232,40 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(client.server().unwrap(), &Url::parse(&server_url).unwrap());
+        assert_eq!(client.server().unwrap(), Url::parse(&server_url).unwrap());
         assert_eq!(client.homeserver(), Url::parse(&homeserver_url).unwrap());
         client.server_versions().await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_homeserver_swap_resets_server_field() {
+        let homeserver = MatrixMockServer::new().await;
+        let homeserver_url = homeserver.uri();
+
+        let domain = homeserver_url.strip_prefix("http://").unwrap();
+        let alice = UserId::parse("@alice:".to_owned() + domain).unwrap();
+
+        homeserver.mock_well_known().ok().mock_once().named("well-known").mount().await;
+
+        let client = Client::builder()
+            .insecure_server_name_no_tls(alice.server_name())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(client.server().unwrap(), Url::parse(&homeserver_url).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(&homeserver_url).unwrap());
+
+        let new_server = Url::parse("http://example.org").unwrap();
+        // Since we're explicitly setting the server to something else, like we might do
+        // during QR code login...
+        client.set_homeserver(new_server.clone());
+
+        // The new URL should be set in the homeserver field.
+        assert_eq!(client.homeserver(), new_server);
+        // But the server field should be set to empty, since we didn't do any discovery
+        // now.
+        assert!(client.server().is_none())
     }
 
     #[async_test]
@@ -4689,6 +4799,137 @@ pub(crate) mod tests {
         // Subsequent call hits the in-memory cache, without re-hitting the endpoint.
         assert_eq!(client.rtc_transports().await.unwrap(), None);
         assert_matches!(client.inner.caches.rtc_transports.value(), CachedValue::Cached(value) if !value.has_expired());
+    }
+
+    /// Mounts a scoped mock for the MSC4143 RTC transports endpoint, either
+    /// advertising a single LiveKit transport, or responding with the
+    /// `M_UNRECOGNIZED` error of a homeserver that doesn't implement it.
+    async fn mock_rtc_transports_endpoint(
+        server: &MatrixMockServer,
+        supported: bool,
+    ) -> wiremock::MockGuard {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path_regex},
+        };
+
+        let response = if supported {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "rtc_transports": [
+                    { "type": "livekit", "livekit_service_url": "https://livekit.example.com" }
+                ]
+            }))
+        } else {
+            ResponseTemplate::new(404).set_body_json(json!({
+                "errcode": "M_UNRECOGNIZED",
+                "error": "Unrecognized request",
+            }))
+        };
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/unstable/org.matrix.msc4143/rtc/transports"))
+            .respond_with(response)
+            .named("transports mock")
+            .expect(1)
+            .mount_as_scoped(server.server())
+            .await
+    }
+
+    #[async_test]
+    async fn test_discover_rtc_transports_prefers_the_endpoint() {
+        let server = MatrixMockServer::new().await;
+        let transports = vec![RtcTransport::livekit("https://livekit.example.com".to_owned())];
+
+        let _transports_mock = mock_rtc_transports_endpoint(&server, true).await;
+
+        // The homeserver implements the discovery endpoint, so the well-known must not
+        // be queried at all.
+        let _well_known_mock = server
+            .mock_well_known()
+            .ok()
+            .named("well-known mock")
+            .expect(0)
+            .mount_as_scoped()
+            .await;
+
+        let client = server.client_builder().build().await;
+
+        assert_eq!(client.discover_rtc_transports().await.unwrap(), Some(transports));
+    }
+
+    #[async_test]
+    async fn test_discover_rtc_transports_falls_back_to_well_known() {
+        let server = MatrixMockServer::new().await;
+        // The `m.rtc_foci` advertised by `WellKnownEndpoint::ok`.
+        let rtc_foci = vec![RtcTransport::livekit("https://livekit.example.com".to_owned())];
+
+        let _transports_mock = mock_rtc_transports_endpoint(&server, false).await;
+
+        let _well_known_mock = server
+            .mock_well_known()
+            .ok()
+            .named("well-known mock")
+            .expect(1)
+            .mount_as_scoped()
+            .await;
+
+        let client = server.client_builder().build().await;
+
+        // The homeserver doesn't implement the discovery endpoint, so the well-known
+        // foci are used instead.
+        assert_eq!(client.discover_rtc_transports().await.unwrap(), Some(rtc_foci));
+    }
+
+    /// Mounts a well-known mock that must never be hit.
+    async fn mock_well_known_never_called(server: &MatrixMockServer) -> wiremock::MockGuard {
+        server.mock_well_known().ok().named("well-known mock").expect(0).mount_as_scoped().await
+    }
+
+    #[async_test]
+    async fn test_well_known_lookup_disabled() {
+        let server = MatrixMockServer::new().await;
+
+        let _transports_mock = mock_rtc_transports_endpoint(&server, false).await;
+
+        // There should be no requests to fetch the well-known.
+        let _well_known_mock = mock_well_known_never_called(&server).await;
+
+        // Disable well-known lookups at client build time.
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.disable_well_known_lookup(true))
+            .build()
+            .await;
+
+        // The homeserver doesn't implement the discovery endpoint, and falling back to
+        // the well-known isn't allowed, so nothing could be discovered.
+        assert_eq!(client.discover_rtc_transports().await.unwrap(), None);
+        // The other well-known consumers are disabled too.
+        assert!(client.well_known_rtc_transports().await.unwrap().is_empty());
+        assert!(client.tile_server().await.is_none());
+        assert!(client.fetch_client_well_known().await.is_none());
+    }
+
+    #[async_test]
+    async fn test_well_known_lookup_disabled_after_build() {
+        let server = MatrixMockServer::new().await;
+
+        let _transports_mock = mock_rtc_transports_endpoint(&server, false).await;
+
+        // There should be no requests to fetch the well-known.
+        let _well_known_mock = mock_well_known_never_called(&server).await;
+
+        // Disable well-known lookups after building the client.
+        let client = server.client_builder().build().await;
+        client.disable_well_known_lookup(true);
+
+        // The homeserver doesn't implement the discovery endpoint, and falling back to
+        // the well-known isn't allowed, so nothing could be discovered.
+        assert_eq!(client.discover_rtc_transports().await.unwrap(), None);
+        // The other well-known consumers are disabled too.
+        assert!(client.well_known_rtc_transports().await.unwrap().is_empty());
+        assert!(client.tile_server().await.is_none());
+        assert!(client.fetch_client_well_known().await.is_none());
     }
 
     #[async_test]
@@ -5515,5 +5756,33 @@ pub(crate) mod tests {
         assert_key_count!(client, 0);
 
         Ok(())
+    }
+
+    #[async_test]
+    async fn test_get_retention_configuration() {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/unstable/org.matrix.msc1763/retention/configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "policies": {},
+                "limits": {},
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let response = client.get_retention_configuration().await;
+        assert!(response.is_ok());
+        let response = response.unwrap();
+        assert!(response.policies.is_empty());
+        assert!(response.limits.max_lifetime.is_none());
+        assert!(response.limits.min_lifetime.is_none());
     }
 }

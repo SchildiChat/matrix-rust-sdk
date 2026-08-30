@@ -2,9 +2,9 @@ use matrix_sdk::RumaApiError;
 use ruma::{
     UserId,
     api::{
-        EmptyBody, EndpointError, IncomingResponse, Metadata, OutgoingRequest,
+        EmptyBody, IncomingResponse, Metadata, OutgoingRequest,
         auth_scheme::AccessToken,
-        error::{FromHttpResponseError, IntoHttpError},
+        error::{DeserializationError, IntoHttpError},
         path_builder::PathBuilder,
     },
     exports::{
@@ -72,14 +72,10 @@ pub struct MutualRoomsResponse {
 impl IncomingResponse for MutualRoomsResponse {
     type EndpointError = RumaApiError;
 
-    fn try_from_http_response<T: AsRef<[u8]>>(
-        response: Response<T>,
-    ) -> Result<Self, FromHttpResponseError<Self::EndpointError>> {
-        if response.status().is_success() {
-            Ok(serde_json::from_slice::<Self>(response.body().as_ref())?)
-        } else {
-            Err(FromHttpResponseError::Server(Self::EndpointError::from_http_response(response)))
-        }
+    fn try_from_http_response_inner(
+        response: Response<&[u8]>,
+    ) -> Result<Self, DeserializationError> {
+        Ok(serde_json::from_slice(response.body())?)
     }
 }
 
