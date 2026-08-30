@@ -330,7 +330,7 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
                                 | MessageType::VerificationRequest(_) => true,
                                 #[cfg(feature = "unstable-msc4274")]
                                 MessageType::Gallery(_) => true,
-                                _ => false,
+                                _ => true, // SC: don't hide unknown message types
                             }
                         }
 
@@ -1095,6 +1095,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
             prev_item.with_kind(ti_kind).with_content(TimelineItemContent::message(
                 content.msgtype,
                 content.mentions,
+                content.per_message_profile, // SC
                 prev_item.content().reactions().cloned().unwrap_or_default(),
                 prev_item.content().thread_root(),
                 prev_item.content().in_reply_to(),

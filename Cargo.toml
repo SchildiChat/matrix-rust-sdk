@@ -88,6 +88,7 @@ ruma = { git = "https://github.com/SchildiChat/ruma", rev = "f239178db", feature
     "unstable-msc4075",
     "unstable-msc4140",
     "unstable-msc4143",
+    "unstable-msc4144",
     "unstable-msc4171",
     "unstable-msc4195",
     "unstable-msc4278",

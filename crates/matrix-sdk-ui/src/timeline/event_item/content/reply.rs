@@ -158,6 +158,7 @@ impl EmbeddedEvent {
                         Some(TimelineItemContent::message(
                             msg.msgtype.clone(),
                             msg.mentions.clone(),
+                            msg.per_message_profile.clone(), // SC
                             reactions,
                             thread_root,
                             in_reply_to,

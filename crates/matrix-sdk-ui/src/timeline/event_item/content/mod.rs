@@ -337,6 +337,7 @@ impl TimelineItemContent {
     pub(crate) fn message(
         msgtype: MessageType,
         mentions: Option<Mentions>,
+        per_message_profile: Option<ruma::events::room::message::PerMessageProfile>, // SC
         reactions: ReactionsByKeyBySender,
         thread_root: Option<OwnedEventId>,
         in_reply_to: Option<InReplyToDetails>,
@@ -349,6 +350,7 @@ impl TimelineItemContent {
             kind: MsgLikeKind::Message(Message::from_event(
                 msgtype,
                 mentions,
+                per_message_profile, // SC
                 None,
                 remove_reply_fallback,
             )),
