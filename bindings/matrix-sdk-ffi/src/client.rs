@@ -159,6 +159,10 @@ use crate::{
     utils::AsyncRuntimeDropped,
 };
 
+// SC start
+use matrix_sdk::ruma::api::client::config::get_room_account_data;
+// SC end
+
 #[derive(Clone, uniffi::Record)]
 pub struct PusherIdentifiers {
     pub pushkey: String,
@@ -1475,6 +1479,29 @@ impl Client {
         let room_id = RoomId::parse(room_id)?;
         let event = self.inner.account().room_account_data_raw((&room_id).into(), event_type.into()).await?;
         Ok(event.map(|e| e.json().get().to_owned()))
+    }
+
+    /// SC: Fetch the content of a room account data event from the homeserver, bypassing cache.
+    pub async fn fetch_room_account_data(
+        &self,
+        room_id: String,
+        event_type: String,
+    ) -> Result<Option<String>, ClientError> {
+        let own_user = self.inner.user_id().ok_or(Error::AuthenticationRequired)?;
+        let room_id = RoomId::parse(room_id)?;
+        let request = get_room_account_data::v3::Request::new(
+            own_user.to_owned(),
+            room_id,
+            event_type.into(),
+        );
+
+        match self.inner.send(request).await {
+            Ok(response) => Ok(Some(response.account_data.json().get().to_owned())),
+            Err(error) => match error.client_api_error_kind() {
+                Some(ErrorKind::NotFound) => Ok(None),
+                _ => Err(error.into()),
+            },
+        }
     }
 
     /// SC: get all account data for a room
