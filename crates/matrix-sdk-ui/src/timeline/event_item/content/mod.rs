@@ -15,7 +15,10 @@
 use std::sync::Arc;
 
 use as_variant::as_variant;
-use matrix_sdk::{Room, deserialized_responses::TimelineEvent};
+use matrix_sdk::{
+    Room,
+    deserialized_responses::{TimelineEvent, TimelineEventKind},
+};
 use matrix_sdk_base::crypto::types::events::UtdCause;
 use ruma::{
     OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
@@ -26,7 +29,7 @@ use ruma::{
             room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
             user::PolicyRuleUserEventContent,
         },
-        relation::Replacement,
+        relation::{Replacement, Reply, Thread},
         room::{
             avatar::RoomAvatarEventContent,
             canonical_alias::RoomCanonicalAliasEventContent,
@@ -37,7 +40,10 @@ use ruma::{
             history_visibility::RoomHistoryVisibilityEventContent,
             join_rules::RoomJoinRulesEventContent,
             member::{Change, RoomMemberEventContent},
-            message::{MessageType, RoomMessageEventContent},
+            message::{
+                MessageType, Relation, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
+            },
             name::RoomNameEventContent,
             pinned_events::RoomPinnedEventsEventContent,
             power_levels::RoomPowerLevelsEventContent,
@@ -164,16 +170,20 @@ impl TimelineItemContent {
 
     /// Create a raw [`TimelineItemContent`] for a given [`TimelineEvent`],
     /// without providing extra information (about thread root, replied-to
-    /// information, UTD info, and so on).
+    /// information, and so on).
     pub async fn from_event(room: &Room, timeline_event: TimelineEvent) -> Option<Self> {
-        let raw_event = timeline_event.into_raw();
+        let (utd_info, raw_event) = match timeline_event.kind {
+            TimelineEventKind::UnableToDecrypt { utd_info, event } => (Some(utd_info), event),
+            _ => (None, timeline_event.into_raw()),
+        };
+
         let deserialized_event = raw_event.deserialize().ok()?;
 
         let actions = TimelineAction::from_event(
             deserialized_event,
             &raw_event,
             room,
-            None,
+            utd_info.map(|utd_info| (utd_info, None)),
             None,
             None,
             None,
@@ -466,6 +476,20 @@ impl TimelineItemContent {
     /// Get the event this message is replying to, if any.
     pub fn in_reply_to(&self) -> Option<InReplyToDetails> {
         as_variant!(self, Self::MsgLike)?.in_reply_to.clone()
+    }
+
+    /// The thread or reply relation of this item, rebuilt from its thread root
+    /// and reply target, if any.
+    pub(crate) fn relation(&self) -> Option<Relation<RoomMessageEventContentWithoutRelation>> {
+        if let Some(thread_root) = self.thread_root() {
+            Some(Relation::Thread(match self.in_reply_to() {
+                Some(details) => Thread::reply(thread_root, details.event_id),
+                None => Thread::plain(thread_root.clone(), thread_root),
+            }))
+        } else {
+            self.in_reply_to()
+                .map(|details| Relation::Reply(Reply::with_event_id(details.event_id)))
+        }
     }
 
     /// Return the reactions, grouped by key and then by sender, for a given

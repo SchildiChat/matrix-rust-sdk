@@ -20,10 +20,7 @@ mod updates;
 
 use std::{fmt, sync::Arc};
 
-use matrix_sdk_base::{
-    event_cache::Event,
-    sync::{JoinedRoomUpdate, LeftRoomUpdate, Timeline},
-};
+use matrix_sdk_base::{event_cache::Event, read_receipts::ReadReceipts, sync::Timeline};
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, events::relation::RelationType,
     room_version_rules::RoomVersionRules,
@@ -31,9 +28,9 @@ use ruma::{
 use tokio::sync::{Notify, broadcast::Sender, mpsc};
 use tracing::{instrument, trace};
 
-use self::pagination::ThreadPagination;
 pub(in super::super) use self::state::ThreadEventCacheState;
 pub(super) use self::updates::ThreadEventCacheUpdateSender;
+pub use self::{pagination::ThreadPagination, updates::ThreadEventCacheUpdate};
 #[cfg(feature = "e2e-encryption")]
 use super::super::redecryptor::MaybeResolvedEvent;
 use super::{
@@ -42,6 +39,7 @@ use super::{
         states::{CacheStateLock, StateLock, selectors::ThreadStateSelector},
     },
     EventsOrigin, TimelineVectorDiffs,
+    read_receipts::MaybeReceiptEventContent,
     room::{RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate},
     subscriber::{AutoShrinkMessage, Subscriber},
 };
@@ -111,6 +109,7 @@ impl ThreadEventCache {
                     ThreadEventCacheState::new(
                         room_id.clone(),
                         thread_id.clone(),
+                        weak_room.clone(),
                         own_user_id,
                         room_version_rules,
                         store_guard,
@@ -156,12 +155,42 @@ impl ThreadEventCache {
         &self.inner.thread_id
     }
 
+    /// Get the number of unread messages.
+    ///
+    /// To get multiple information about the read receipts, use
+    /// [`Self::read_receipts`] as it involves a single lock.
+    pub async fn num_unread_messages(&self) -> Result<u64> {
+        Ok(self.inner.state.read().await?.thread_info.read_receipts.num_unread)
+    }
+
+    /// Get the number of unread notifications.
+    ///
+    /// To get multiple information about the read receipts, use
+    /// [`Self::read_receipts`] as it involves a single lock.
+    pub async fn num_unread_notifications(&self) -> Result<u64> {
+        Ok(self.inner.state.read().await?.thread_info.read_receipts.num_notifications)
+    }
+
+    /// Get the number of unread mentions, that is, messages causing a highlight
+    /// in a room.
+    ///
+    /// To get multiple information about the read receipts, use
+    /// [`Self::read_receipts`] as it involves a single lock.
+    pub async fn num_unread_mentions(&self) -> Result<u64> {
+        Ok(self.inner.state.read().await?.thread_info.read_receipts.num_mentions)
+    }
+
+    /// Get the detailed information about read receipts for this thread.
+    pub async fn read_receipts(&self) -> Result<ReadReceipts> {
+        Ok(self.inner.state.read().await?.thread_info.read_receipts.clone())
+    }
+
     /// Subscribe to this thread updates, after getting the initial list of
     /// events.
     ///
     /// Creating, and especially dropping, a [`Subscriber`] isn't free, as it
     /// triggers side-effects.
-    pub async fn subscribe(&self) -> Result<(Vec<Event>, Subscriber<TimelineVectorDiffs>)> {
+    pub async fn subscribe(&self) -> Result<(Vec<Event>, Subscriber<ThreadEventCacheUpdate>)> {
         let state = self.inner.state.read().await?;
         let events =
             state.thread_linked_chunk().events().map(|(_position, item)| item.clone()).collect();
@@ -194,26 +223,30 @@ impl ThreadEventCache {
         &self.inner.state
     }
 
-    /// Handle a [`JoinedRoomUpdate`].
+    /// Handle an update from a joined room.
     #[instrument(skip_all, fields(room_id = %self.inner.room_id, thread_root = %self.inner.thread_id))]
-    pub(super) async fn handle_joined_room_update(&self, updates: JoinedRoomUpdate) -> Result<()> {
-        self.handle_timeline(updates.timeline).await?;
-
-        Ok(())
+    pub(super) async fn handle_joined_room_update(
+        &self,
+        timeline: Timeline,
+        read_receipts: MaybeReceiptEventContent,
+    ) -> Result<()> {
+        self.handle_timeline(timeline, read_receipts).await
     }
 
-    /// Handle a [`LeftRoomUpdate`].
+    /// Handle an update from a left room.
     #[instrument(skip_all, fields(room_id = %self.inner.room_id, thread_root = %self.inner.thread_id))]
-    pub(super) async fn handle_left_room_update(&self, updates: LeftRoomUpdate) -> Result<()> {
-        self.handle_timeline(updates.timeline).await?;
-
-        Ok(())
+    pub(super) async fn handle_left_room_update(&self, timeline: Timeline) -> Result<()> {
+        self.handle_timeline(timeline, MaybeReceiptEventContent::none()).await
     }
 
     /// Handle a [`Timeline`], i.e. new events received by a sync for this
     /// thread.
-    async fn handle_timeline(&self, timeline: Timeline) -> Result<()> {
-        if timeline.events.is_empty() && timeline.prev_batch.is_none() {
+    async fn handle_timeline(
+        &self,
+        timeline: Timeline,
+        read_receipts: MaybeReceiptEventContent,
+    ) -> Result<()> {
+        if timeline.events.is_empty() && timeline.prev_batch.is_none() && read_receipts.is_none() {
             return Ok(());
         }
 
@@ -221,7 +254,8 @@ impl ThreadEventCache {
 
         let mut state = self.inner.state.write().await?;
 
-        let (stored_prev_batch_token, timeline_event_diffs) = state.handle_sync(timeline).await?;
+        let (stored_prev_batch_token, timeline_event_diffs) =
+            state.handle_sync(timeline, &read_receipts).await?;
 
         // Now that all events have been added, we can trigger the
         // `pagination_token_notifier`.
@@ -231,11 +265,20 @@ impl ThreadEventCache {
 
         if !timeline_event_diffs.is_empty() {
             state.update_sender.send(
-                TimelineVectorDiffs { diffs: timeline_event_diffs, origin: EventsOrigin::Sync },
+                ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs: timeline_event_diffs,
+                    origin: EventsOrigin::Sync,
+                }),
                 // This function is part of the `RoomEventCache` flow. The generic update is
                 // handled by it.
                 None,
             );
+        }
+
+        if let Some(read_receipts) = read_receipts.into_inner() {
+            state
+                .update_sender
+                .send(ThreadEventCacheUpdate::AddReadReceiptEvent { event: read_receipts }, None);
         }
 
         Ok(())
@@ -302,6 +345,14 @@ impl ThreadEventCache {
         state
             .post_process_upserted_events(
                 resolved_events.iter().filter_map(|resolved_event| resolved_event.as_resolved()),
+                // Read receipt events aren't encrypted, so we can't have decrypted a new
+                // one here. As a result, we don't have any new receipt events to
+                // post-process, so we can just pass `None` here.
+                //
+                // Note: read receipts may be updated anyhow in the post-processing step,
+                // as the redecryption may have decrypted some events that don't count as
+                // unreads.
+                None,
             )
             .await?;
 
@@ -313,7 +364,10 @@ impl ThreadEventCache {
 
         Ok(if !timeline_event_diffs.is_empty() {
             state.update_sender.send(
-                TimelineVectorDiffs { diffs: timeline_event_diffs, origin: EventsOrigin::Cache },
+                ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs {
+                    diffs: timeline_event_diffs,
+                    origin: EventsOrigin::Cache,
+                }),
                 Some(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() }),
             );
 
@@ -344,7 +398,7 @@ mod timed_tests {
             lazy_loader::from_all_chunks,
         },
         store::StoreConfig,
-        sync::{JoinedRoomUpdate, Timeline},
+        sync::Timeline,
     };
     use matrix_sdk_test::{ALICE, async_test, event_factory::EventFactory};
     use ruma::{
@@ -354,7 +408,10 @@ mod timed_tests {
     };
     use tokio::task::yield_now;
 
-    use super::super::{super::RoomEventCacheGenericUpdate, TimelineVectorDiffs};
+    use super::{
+        super::{super::RoomEventCacheGenericUpdate, TimelineVectorDiffs},
+        MaybeReceiptEventContent, ThreadEventCacheUpdate,
+    };
     use crate::{assert_let_timeout, test_utils::client::MockClientBuilder};
 
     #[async_test]
@@ -403,13 +460,13 @@ mod timed_tests {
         };
 
         thread_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { timeline, ..Default::default() })
+            .handle_joined_room_update(timeline, MaybeReceiptEventContent::none())
             .await
             .unwrap();
 
         assert_matches!(
             thread_stream.recv().await,
-            Ok(TimelineVectorDiffs { diffs, .. }) => {
+            Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) => {
                 assert_eq!(diffs.len(), 2);
                 assert_matches!(&diffs[0], VectorDiff::Clear);
                 assert_matches!(&diffs[1], VectorDiff::Append { values: events } => {
@@ -494,7 +551,7 @@ mod timed_tests {
         };
 
         thread_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { timeline, ..Default::default() })
+            .handle_joined_room_update(timeline, MaybeReceiptEventContent::none())
             .await
             .unwrap();
 
@@ -651,7 +708,7 @@ mod timed_tests {
 
             assert_matches!(
                 thread_stream.recv().await,
-                Ok(TimelineVectorDiffs { diffs, .. }) => {
+                Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) => {
                     assert_eq!(diffs.len(), 1);
                     assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value: event } => {
                         // Here you are `thread_event_0`!
@@ -676,7 +733,7 @@ mod timed_tests {
         //… we get an update that the content has been cleared.
         assert_matches!(
             thread_stream.recv().await,
-            Ok(TimelineVectorDiffs { diffs, .. }) => {
+            Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) => {
                 assert_eq!(diffs.len(), 1);
                 assert_matches!(&diffs[0], VectorDiff::Clear);
             }
@@ -835,7 +892,7 @@ mod timed_tests {
 
         assert_matches!(
             thread_stream.recv().await,
-            Ok(TimelineVectorDiffs { diffs, .. }) => {
+            Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) => {
                 assert_eq!(diffs.len(), 1);
                 assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value: event } => {
                     assert_eq!(event.event_id(), Some(thread_event_id_0));
@@ -857,7 +914,7 @@ mod timed_tests {
         let timeline = Timeline { limited: false, prev_batch: None, events: vec![thread_event_1] };
 
         thread_event_cache
-            .handle_joined_room_update(JoinedRoomUpdate { timeline, ..Default::default() })
+            .handle_joined_room_update(timeline, MaybeReceiptEventContent::none())
             .await
             .unwrap();
 
@@ -1074,7 +1131,7 @@ mod timed_tests {
             // A new update for `ev_id_0` must be present.
             assert_matches!(
                 updates_stream.recv().await.unwrap(),
-                TimelineVectorDiffs { diffs, .. } => {
+                ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
                     assert_eq!(diffs.len(), 1, "{diffs:#?}");
                     assert_matches!(
                         &diffs[0],
@@ -1105,7 +1162,7 @@ mod timed_tests {
             // A new update for `thread_event_id_0` must be present.
             assert_matches!(
                 updates_stream.recv().await.unwrap(),
-                TimelineVectorDiffs { diffs, .. } => {
+                ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
                     assert_eq!(diffs.len(), 1, "{diffs:#?}");
                     assert_matches!(
                         &diffs[0],
@@ -1139,7 +1196,7 @@ mod timed_tests {
                 // The reload can be observed via the updates too.
                 assert_matches!(
                     updates_stream.recv().await.unwrap(),
-                    TimelineVectorDiffs { diffs, .. } => {
+                    ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
                         assert_eq!(diffs.len(), 2, "{diffs:#?}");
                         assert_matches!(&diffs[0], VectorDiff::Clear);
                         assert_matches!(
@@ -1159,7 +1216,7 @@ mod timed_tests {
                 // The pagination can be observed via the updates.
                 assert_matches!(
                     updates_stream.recv().await.unwrap(),
-                    TimelineVectorDiffs { diffs, .. } => {
+                    ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
                         assert_eq!(diffs.len(), 1, "{diffs:#?}");
                         assert_matches!(
                             &diffs[0],
@@ -1189,7 +1246,7 @@ mod timed_tests {
                 // The reload can be observed via the updates too.
                 assert_matches!(
                     updates_stream.recv().await.unwrap(),
-                    TimelineVectorDiffs { diffs, .. } => {
+                    ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
                         assert_eq!(diffs.len(), 2, "{diffs:#?}");
                         assert_matches!(&diffs[0], VectorDiff::Clear);
                         assert_matches!(
@@ -1209,7 +1266,7 @@ mod timed_tests {
                 // The pagination can be observed via the updates.
                 assert_matches!(
                     updates_stream.recv().await.unwrap(),
-                    TimelineVectorDiffs { diffs, .. } => {
+                    ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. }) => {
                         assert_eq!(diffs.len(), 1, "{diffs:#?}");
                         assert_matches!(
                             &diffs[0],
@@ -1303,7 +1360,10 @@ mod timed_tests {
 
         // We also get an update about the loading from the store. Ignore it, for this
         // test's sake.
-        assert_let_timeout!(Ok(TimelineVectorDiffs { diffs, .. }) = stream1.recv());
+        assert_let_timeout!(
+            Ok(ThreadEventCacheUpdate::UpdateTimelineEvents(TimelineVectorDiffs { diffs, .. })) =
+                stream1.recv()
+        );
         assert_eq!(diffs.len(), 2);
         assert_matches!(&diffs[0], VectorDiff::Insert { index: 0, value } => {
             assert_eq!(value.event_id(), Some(thread_id));

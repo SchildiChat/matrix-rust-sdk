@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::empty;
+
 use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
@@ -28,13 +30,10 @@ use matrix_sdk_common::executor::spawn;
 use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId,
     events::{
-        AnySyncEphemeralRoomEvent,
-        receipt::{ReceiptEventContent, SyncReceiptEvent},
-        relation::RelationType,
+        receipt::ReceiptEventContent, relation::RelationType,
         room::redaction::SyncRoomRedactionEvent,
     },
     room_version_rules::RoomVersionRules,
-    serde::Raw,
 };
 use tokio::sync::broadcast::Sender;
 use tracing::{debug, error, instrument, trace};
@@ -45,7 +44,7 @@ use super::{
     super::{
         super::{
             EventCacheError,
-            automatic_pagination::AutomaticPagination,
+            back_pagination_queue::BackPaginationQueue,
             deduplicator::{DeduplicationOutcome, filter_duplicate_events},
             persistence::{
                 find_event, find_event_relations, find_event_with_relations,
@@ -56,7 +55,9 @@ use super::{
         EventLocation,
         event_linked_chunk::EventLinkedChunk,
         pagination::SharedPaginationStatus,
-        read_receipts::compute_unread_counts,
+        read_receipts::{
+            MaybeReceiptEventContent, RoomReadReceiptEventFilter, compute_unread_counts,
+        },
         subscriber::SubscribersHandle,
     },
     RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdateSender, sort_positions_descending,
@@ -65,7 +66,7 @@ use crate::room::WeakRoom;
 
 pub struct RoomEventCacheState {
     /// Whether thread support has been enabled for the event cache.
-    enabled_thread_support: bool,
+    pub enabled_thread_support: bool,
 
     /// The room this state relates to.
     pub room_id: OwnedRoomId,
@@ -104,8 +105,8 @@ pub struct RoomEventCacheState {
     /// A handle for subscribers.
     subscribers_handle: SubscribersHandle,
 
-    /// A copy of the automatic pagination API object.
-    automatic_pagination: Option<AutomaticPagination>,
+    /// A handle to the shared back-pagination queue.
+    back_pagination_queue: Option<BackPaginationQueue>,
 }
 
 impl RoomEventCacheState {
@@ -130,7 +131,7 @@ impl RoomEventCacheState {
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
         store_guard: EventCacheStoreLockGuard,
         pagination_status: SharedObservable<SharedPaginationStatus>,
-        automatic_pagination: Option<AutomaticPagination>,
+        back_pagination_queue: Option<BackPaginationQueue>,
     ) -> Result<Self, EventCacheError> {
         let linked_chunk_id = LinkedChunkId::Room(&room_id);
 
@@ -190,7 +191,7 @@ impl RoomEventCacheState {
             room_version_rules,
             waited_for_initial_prev_token: false,
             subscribers_handle: Default::default(),
-            automatic_pagination,
+            back_pagination_queue,
         })
     }
 
@@ -517,7 +518,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     pub async fn handle_sync(
         &mut self,
         mut timeline: Timeline,
-        ephemeral_events: &[Raw<AnySyncEphemeralRoomEvent>],
+        read_receipt_event: &MaybeReceiptEventContent,
     ) -> Result<(bool, Vec<VectorDiff<Event>>), EventCacheError> {
         let mut prev_batch_token = timeline.prev_batch.take();
 
@@ -556,12 +557,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         if all_duplicates {
             // No new events and no gap (per the previous check), thus no need to change the
             // room state. We're done!
-
+            //
             // We might have a new read receipt, though! If that's the case, handle it for
             // unread counts tracking.
-            if let Some(new_receipt) = extract_read_receipt(ephemeral_events) {
-                self.update_read_receipts(Some(&new_receipt)).await?;
-            }
+            //
+            // Post-process the ephemeral events.
+            self.post_process_upserted_events(empty(), read_receipt_event.as_ref()).await?;
 
             return Ok((false, Vec::new()));
         }
@@ -589,8 +590,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         self.propagate_changes().await?;
 
         // Post-process newly inserted events.
-        self.post_process_upserted_events(events.iter(), extract_read_receipt(ephemeral_events))
-            .await?;
+        self.post_process_upserted_events(events.iter(), read_receipt_event.as_ref()).await?;
 
         if timeline.limited && has_new_gap {
             // If there was a previous batch token for a limited timeline, unload the chunks
@@ -614,7 +614,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     pub(super) async fn post_process_upserted_events<'i, I>(
         &mut self,
         events: I,
-        receipt_event: Option<ReceiptEventContent>,
+        receipt_event: Option<&ReceiptEventContent>,
     ) -> Result<(), EventCacheError>
     where
         I: Iterator<Item = &'i Event>,
@@ -628,7 +628,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             }
         }
 
-        self.update_read_receipts(receipt_event.as_ref()).await?;
+        self.update_read_receipts(receipt_event).await?;
 
         Ok(())
     }
@@ -644,21 +644,19 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             return Ok(());
         };
 
-        let user_id = &self.state.own_user_id;
-        let room_id = &self.state.room_id;
-
         let prev_read_receipts = room.read_receipts().clone();
         let mut read_receipts = prev_read_receipts.clone();
 
+        let client = room.client();
+        let event_filter = RoomReadReceiptEventFilter::new(&self.state, client.state_store());
+
         compute_unread_counts(
-            user_id,
-            room_id,
+            &self.state.own_user_id,
             receipt_event,
             &self.state.room_linked_chunk,
+            &event_filter,
             &mut read_receipts,
-            self.state.enabled_thread_support,
-            self.state.automatic_pagination.as_ref(),
-            room.client().state_store(),
+            self.state.back_pagination_queue.as_ref(),
         )
         .await;
 
@@ -672,6 +670,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                     (room_info, RoomInfoNotableUpdateReasons::READ_RECEIPT)
                 })
                 .await;
+
             if let Err(error) = result {
                 error!(room_id = ?room.room_id(), ?error, "Failed to save the changes");
             }
@@ -877,31 +876,6 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
     pub fn is_dirty(&self) -> bool {
         EventCacheStoreLockGuard::is_dirty(&self.store)
     }
-}
-
-/// Extract a valid read receipt event from the ephemeral events, if
-/// available.
-fn extract_read_receipt(
-    ephemeral_events: &[Raw<AnySyncEphemeralRoomEvent>],
-) -> Option<ReceiptEventContent> {
-    let mut receipt_event = None;
-
-    for raw_ephemeral in ephemeral_events {
-        match raw_ephemeral.deserialize() {
-            Ok(AnySyncEphemeralRoomEvent::Receipt(SyncReceiptEvent { content, .. })) => {
-                receipt_event = Some(content);
-                break;
-            }
-
-            Ok(_) => {}
-
-            Err(err) => {
-                error!("error when deserializing an ephemeral event from sync: {err}");
-            }
-        }
-    }
-
-    receipt_event
 }
 
 #[cfg(test)]

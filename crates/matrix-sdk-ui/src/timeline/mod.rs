@@ -16,7 +16,7 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, iter, path::PathBuf, sync::Arc};
 
 use algorithms::rfind_event_by_item_id;
 use event_item::TimelineItemHandle;
@@ -47,7 +47,7 @@ use ruma::{
         location::{AssetType, LocationContent, ZoomLevel},
         poll::unstable_start::{NewUnstablePollStartEventContent, UnstablePollStartEventContent},
         receipt::{Receipt, ReceiptThread},
-        relation::Thread,
+        relation::{RelationType, Thread},
         room::message::{
             AddMentions, LocationMessageEventContent, MessageType, Relation,
             RelationWithoutReplacement, ReplyWithinThread, RoomMessageEventContent,
@@ -95,7 +95,7 @@ pub use self::{
     error::*,
     event_filter::{TimelineEventCondition, TimelineEventFilter},
     event_item::{
-        AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
+        AnyOtherStateEventContentChange, BeaconInfo, EditRevision, EmbeddedEvent, EncryptedMessage,
         EventItemOrigin, EventSendState, EventTimelineItem, InReplyToDetails, LiveLocationState,
         MediaUploadProgress, MemberProfileChange, MembershipChange, Message, MsgLikeContent,
         MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState, Profile, ReactionInfo,
@@ -288,6 +288,38 @@ impl Timeline {
         let items = self.controller.items().await;
         let (_, item) = rfind_event_by_id(&items, event_id)?;
         Some(item.to_owned())
+    }
+
+    /// Get the edit history for the given event.
+    ///
+    /// Returns all revisions of the event, in chronological order.
+    /// The first entry is the original event content, followed by each
+    /// edit in the order they were applied.
+    ///
+    /// This looks up the event and all `m.replace` relations targeting it,
+    /// first in the event cache and falling back to the homeserver if needed.
+    /// This works regardless of the timeline's focus kind (live, thread,
+    /// permalink, or pinned events).
+    pub async fn edit_revisions(&self, event_id: &EventId) -> Result<Vec<EditRevision>, Error> {
+        let Ok((original_event, edit_events)) = self
+            .controller
+            .find_event_with_relations(event_id, Some(vec![RelationType::Replacement]))
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+
+        let room = self.room();
+        let mut revisions = Vec::with_capacity(edit_events.len() + 1);
+
+        for event in iter::once(original_event).chain(edit_events) {
+            let timestamp = event.timestamp();
+            if let Some(content) = TimelineItemContent::from_event(room, event).await {
+                revisions.push(EditRevision { content, timestamp });
+            }
+        }
+
+        Ok(revisions)
     }
 
     /// Get the latest of the timeline's remote event ids.
@@ -566,11 +598,14 @@ impl Timeline {
             }
 
             TimelineItemHandle::Local(handle) => {
-                // Relations are filled by the editing code itself.
                 let new_content: AnyMessageLikeEventContent = match new_content {
                     EditedContent::RoomMessage(message) => {
                         if item.content.is_message() {
-                            AnyMessageLikeEventContent::RoomMessage(message.into())
+                            // The replacement becomes the pending event itself, so restore its
+                            // relations, which the payload can't carry by type.
+                            AnyMessageLikeEventContent::RoomMessage(
+                                message.with_relation(item.content.relation()),
+                            )
                         } else {
                             return Err(EditError::ContentMismatch {
                                 original: item.content.debug_string().to_owned(),
@@ -721,16 +756,26 @@ impl Timeline {
 
         match event.handle() {
             TimelineItemHandle::Remote(event_id) => {
-                self.room().redact(event_id, reason, None).await.map_err(RedactError::HttpError)?;
+                self.room()
+                    .send_queue()
+                    .redact(event_id.to_owned(), reason)
+                    .await
+                    .map_err(|_| Error::FailedSendingRedaction)?;
+                Ok(())
             }
             TimelineItemHandle::Local(handle) => {
-                if !handle.abort().await.map_err(RoomSendQueueError::StorageError)? {
+                // Forward the reason: if the local echo was being sent and the send wins the
+                // race, the server-side redaction that materializes the abort carries it.
+                if !handle
+                    .abort_with_reason(reason.map(ToOwned::to_owned))
+                    .await
+                    .map_err(RoomSendQueueError::StorageError)?
+                {
                     return Err(RedactError::InvalidLocalEchoState.into());
                 }
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     /// Fetch unavailable details about the event with the given ID.

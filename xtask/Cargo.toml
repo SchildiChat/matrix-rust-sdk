@@ -31,3 +31,6 @@ xshell = "0.2.2"
 anyhow.workspace = true
 toml = "0.9.7"
 # SC end
+
+[lints]
+workspace = true

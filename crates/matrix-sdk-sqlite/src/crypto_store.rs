@@ -58,7 +58,7 @@ use crate::{
     error::{Error, Result},
     utils::{
         EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
-        SqliteKeyValueStoreConnExt, repeat_vars,
+        SqliteKeyValueStoreConnExt,
     },
 };
 
@@ -249,7 +249,7 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 15;
+const DATABASE_VERSION: u8 = 19;
 
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
@@ -524,6 +524,22 @@ pub(crate) async fn run_migrations(
                 update_query.execute((info, row.get::<_, Vec<u8>>(0)?))?;
             }
             txn.set_db_version(18)
+        })
+        .await?;
+    }
+
+    if version < 19 {
+        debug!("Upgrading database to version 19");
+        // Remove the sliding sync `pos` value stored in the crypto store.
+        // There was recently an event cache migration that emptied the cache but never
+        // reset the `pos` value, this fixes it.
+        let user_id = store.load_account().await?.map(|account| account.user_id.clone());
+
+        conn.with_transaction(move |txn| {
+            if let Some(user_id) = user_id {
+                txn.clear_kv(&format!("sliding_sync_store::room-list::{user_id}::instance"))?;
+            }
+            txn.set_db_version(19)
         })
         .await?;
     }
@@ -892,16 +908,17 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             return Ok(());
         }
 
-        let session_ids_len = session_ids.len();
-
         self.chunk_large_query_over(session_ids, None, move |txn, session_ids| {
-            // Safety: placeholders is not generated using any user input except the number
-            // of session IDs, so it is safe from injection.
-            let sql_params = repeat_vars(session_ids_len);
-            let query = format!("UPDATE inbound_group_session SET backed_up = TRUE where session_id IN ({sql_params})");
-            txn.prepare(&query)?.execute(params_from_iter(session_ids.iter()))?;
+            // Safety: host parameters are not generated using any user input except the
+            // number of session IDs, so it is safe from injection.
+            let query = format!(
+                "UPDATE inbound_group_session SET backed_up = TRUE where session_id IN ({})",
+                session_ids.host_parameters()
+            );
+            txn.prepare(&query)?.execute(params_from_iter(session_ids))?;
             Ok(Vec::<()>::new())
-        }).await?;
+        })
+        .await?;
 
         Ok(())
     }

@@ -454,6 +454,11 @@ pub struct RoomListItem {
 }
 
 impl RoomListItem {
+    #[cfg(test)]
+    pub(super) fn inner(&self) -> &Room {
+        &self.inner
+    }
+
     /// Deconstruct to the inner room value.
     pub fn into_inner(self) -> Room {
         self.inner

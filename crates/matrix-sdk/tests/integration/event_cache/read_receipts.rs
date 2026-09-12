@@ -253,7 +253,7 @@ async fn test_unread_count_pending_receipt() {
         Ok(RoomEventCacheUpdate::UpdateTimelineEvents(..)) = room_cache_updates.recv()
     );
     assert_let_timeout!(
-        Ok(RoomEventCacheUpdate::AddEphemeralEvents { .. }) = room_cache_updates.recv()
+        Ok(RoomEventCacheUpdate::AddReadReceiptEvent { .. }) = room_cache_updates.recv()
     );
 
     // All three events are unread because the receipt target is unknown.
@@ -712,7 +712,7 @@ async fn test_unread_counts_updated_after_duplicate_only_sync_response() {
 
     // We get an update only for the read receipt.
     assert_let_timeout!(
-        Ok(RoomEventCacheUpdate::AddEphemeralEvents { .. }) = room_cache_updates.recv()
+        Ok(RoomEventCacheUpdate::AddReadReceiptEvent { .. }) = room_cache_updates.recv()
     );
 
     // The message counts are properly updated (zero new message unread after $2).
@@ -724,10 +724,13 @@ async fn test_unread_counts_updated_after_duplicate_only_sync_response() {
 #[async_test]
 async fn test_compute_unread_counts_triggers_backpaginations() {
     let server = MatrixMockServer::new().await;
-    let client = server.client_builder().build().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.with_enable_automatic_back_pagination(true))
+        .build()
+        .await;
     let own_user_id = client.user_id().unwrap();
 
-    client.event_cache().config_mut().experimental_auto_backpagination = true;
     client.event_cache().subscribe().unwrap();
 
     let room_id = room_id!("!omelette:fromage.fr");

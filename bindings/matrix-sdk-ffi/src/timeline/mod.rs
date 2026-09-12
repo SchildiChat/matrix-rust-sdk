@@ -804,6 +804,26 @@ impl Timeline {
         Ok(item.into())
     }
 
+    /// Get the edit history for the given event.
+    ///
+    /// Returns all revisions of the event, in chronological order.
+    /// The first entry is the original event content, followed by each
+    /// edit in the order they were applied.
+    pub async fn edit_revisions(
+        &self,
+        event_id: String,
+    ) -> Result<Vec<EditRevisionRecord>, ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let revisions = self.inner.edit_revisions(&event_id).await?;
+        Ok(revisions
+            .into_iter()
+            .map(|r| EditRevisionRecord {
+                content: r.content.into(),
+                timestamp: r.timestamp.map(|ts| ts.0.into()),
+            })
+            .collect())
+    }
+
     /// Redacts an event from the timeline.
     ///
     /// Only works for events that exist as timeline items.
@@ -903,7 +923,8 @@ impl SendHandle {
 
 #[matrix_sdk_ffi_macros::export]
 impl SendHandle {
-    /// Try to abort the sending of the current event.
+    /// Try to abort the sending of the current event, with an optional
+    /// `reason` applied to the redaction when the event went out anyway.
     ///
     /// If this returns `true`, then the sending could be aborted, because the
     /// event hasn't been sent yet. Otherwise, if this returns `false`, the
@@ -911,10 +932,11 @@ impl SendHandle {
     ///
     /// This has an effect only on the first call; subsequent calls will always
     /// return `false`.
-    async fn abort(self: Arc<Self>) -> Result<bool, ClientError> {
+    #[uniffi::method(default(reason = None))]
+    async fn abort(self: Arc<Self>, reason: Option<String>) -> Result<bool, ClientError> {
         if let Some(inner) = self.inner.lock().await.take() {
             Ok(inner
-                .abort()
+                .abort_with_reason(reason)
                 .await
                 .map_err(|err| anyhow::anyhow!("error when saving in store: {err}"))?)
         } else {
@@ -1214,6 +1236,12 @@ pub struct UserReceipt {
     pub event_id: String,
     /// The receipt itself.
     pub receipt: Receipt,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct EditRevisionRecord {
+    content: TimelineItemContent,
+    timestamp: Option<u64>,
 }
 
 #[derive(Clone, uniffi::Record)]

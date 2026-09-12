@@ -459,6 +459,7 @@ impl ClientInner {
         respect_login_well_known: bool,
         well_known_lookup_disabled: bool,
         event_cache: OnceCell<EventCache>,
+        enable_automatic_back_pagination: bool,
         send_queue: Arc<SendQueueData>,
         latest_events: OnceCell<LatestEvents>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
@@ -525,7 +526,11 @@ impl ClientInner {
         client.e2ee.initialize_tasks(&client);
 
         let init_event_cache = client.event_cache.get_or_init(|| async {
-            EventCache::new(&client, client.base_client.event_cache_store().clone())
+            EventCache::new(
+                &client,
+                client.base_client.event_cache_store().clone(),
+                enable_automatic_back_pagination,
+            )
         });
 
         let init_thread_subscription_catchup = client
@@ -1470,6 +1475,17 @@ impl Client {
             .into_iter()
             .flat_map(|room| room.is_space().then_some(Room::new(self.clone(), room)))
             .collect()
+    }
+
+    /// The total number of client-side computed unread notifications across all
+    /// joined rooms. Rooms the user marked as unread by hand count as one
+    /// each.
+    pub fn total_unread_notifications(&self) -> u64 {
+        self.base_client()
+            .rooms_filtered(RoomStateFilter::JOINED)
+            .iter()
+            .map(|room| room.num_unread_notifications().max(room.is_marked_unread().into()))
+            .sum()
     }
 
     /// Get a room with the given room id.
@@ -3594,6 +3610,7 @@ impl Client {
                 self.inner.respect_login_well_known,
                 self.well_known_lookup_disabled(),
                 self.inner.event_cache.clone(),
+                false,
                 self.inner.send_queue_data.clone(),
                 self.inner.latest_events.clone(),
                 #[cfg(feature = "e2e-encryption")]
@@ -3745,6 +3762,22 @@ impl Client {
             .contains(&FeatureFlag::from("org.matrix.msc4306"));
 
         Ok(server_enabled)
+    }
+
+    /// Whether global user profiles are included in the sync response.
+    ///
+    /// Requires [MSC4262](https://github.com/matrix-org/matrix-spec-proposals/pull/4262)
+    /// for sliding sync. Not implemented for sync v2.
+    pub async fn is_global_profile_sync_enabled(&self) -> Result<bool> {
+        if matches!(self.sliding_sync_version(), SlidingSyncVersion::None) {
+            return Ok(false);
+        }
+
+        Ok(self
+            .supported_versions()
+            .await?
+            .features
+            .contains(&FeatureFlag::from("org.matrix.msc4262")))
     }
 
     /// Fetch thread subscriptions changes between `from` and up to `to`.

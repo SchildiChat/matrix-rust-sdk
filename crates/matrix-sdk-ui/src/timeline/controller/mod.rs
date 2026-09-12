@@ -23,35 +23,34 @@ use as_variant::as_variant;
 use eyeball_im::{VectorDiff, VectorSubscriberStream};
 use eyeball_im_util::vector::{FilterMap, VectorObserverExt};
 use futures_core::Stream;
+use futures_util::future::try_join_all;
 use imbl::{HashSet, Vector};
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         DecryptionRetryRequest, EventCache, EventFocusedCache, PaginationStatus, PinnedEventsCache,
-        RoomEventCache, Subscriber as EventCacheSubscriber, ThreadEventCache, TimelineVectorDiffs,
+        RoomEventCache, Subscriber as EventCacheSubscriber, ThreadEventCache,
+        ThreadEventCacheUpdate,
     },
     send_queue::{
         LocalEcho, LocalEchoContent, RoomSendQueueUpdate, SendHandle, SendReactionHandle,
     },
     task_monitor::BackgroundTaskHandle,
 };
-#[cfg(test)]
-use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
     TransactionId, UserId,
     api::client::receipt::create_receipt::v3::ReceiptType as SendReceiptType,
     events::{
-        AnyMessageLikeEventContent, AnySyncEphemeralRoomEvent, AnySyncMessageLikeEvent,
-        AnySyncTimelineEvent, MessageLikeEventType,
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+        MessageLikeEventType,
         poll::unstable_start::UnstablePollStartEventContent,
         reaction::ReactionEventContent,
-        receipt::{Receipt, ReceiptThread, ReceiptType},
-        relation::Annotation,
+        receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
+        relation::{Annotation, RelationType},
         room::message::{MessageType, Relation},
     },
     room_version_rules::RoomVersionRules,
-    serde::Raw,
 };
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use tracing::{
@@ -874,16 +873,14 @@ impl<P: RoomDataProvider> TimelineController<P> {
         txn.commit();
     }
 
-    pub(super) async fn handle_ephemeral_events(
-        &self,
-        events: Vec<Raw<AnySyncEphemeralRoomEvent>>,
-    ) {
+    pub(super) async fn handle_read_receipt_event(&self, event: ReceiptEventContent) {
         // Don't even take the lock if there are no events to process.
-        if events.is_empty() {
+        if event.is_empty() {
             return;
         }
+
         let mut state = self.state.write().await;
-        state.handle_ephemeral_events(events, &self.room_data_provider).await;
+        state.handle_read_receipt(event, &self.room_data_provider).await;
     }
 
     /// Creates the local echo for an event we're sending.
@@ -1604,20 +1601,26 @@ impl TimelineController {
     pub(super) async fn init_with_thread_root(
         &self,
         event_cache: &ThreadEventCache,
-    ) -> Result<(bool, EventCacheSubscriber<TimelineVectorDiffs>), Error> {
+    ) -> Result<(bool, EventCacheSubscriber<ThreadEventCacheUpdate>), Error> {
         let (events, subscriber) = event_cache.subscribe().await?;
         let has_events = !events.is_empty();
 
         // For each event, we also need to find the related events, as they don't
         // include the thread relationship, they won't be included in
         // the initial list of events.
+        //
+        // The lookups are independent store queries, so run them together
+        // rather than awaiting them one after the other. `try_join_all`
+        // keeps the input order, so the related events are collected in the
+        // same order as before.
+        let lookups = events
+            .iter()
+            .filter_map(|event| event.event_id())
+            .map(|event_id| event_cache.find_event_with_relations(event_id, None));
+
         let mut related_events = Vector::new();
-        for event_id in events.iter().filter_map(|event| event.event_id()) {
-            if let Some((_original, related)) =
-                event_cache.find_event_with_relations(event_id, None).await?
-            {
-                related_events.extend(related);
-            }
+        for (_original, related) in try_join_all(lookups).await?.into_iter().flatten() {
+            related_events.extend(related);
         }
 
         self.replace_with_initial_remote_events(events, RemoteEventOrigin::Cache).await;
@@ -1972,6 +1975,20 @@ impl<P: RoomDataProvider> TimelineController<P> {
     /// Returns the timeline focus of the [`TimelineController`].
     pub(super) fn focus(&self) -> &TimelineFocusKind {
         &self.focus
+    }
+
+    /// Find an event by ID in this timeline, along with its related events.
+    ///
+    /// The related events can be filtered by relation type.
+    pub(in crate::timeline) async fn find_event_with_relations(
+        &self,
+        event_id: &EventId,
+        filter: Option<Vec<RelationType>>,
+    ) -> Result<(TimelineEvent, Vec<TimelineEvent>), Error> {
+        self.room_data_provider
+            .load_or_fetch_event_with_relations(event_id, filter)
+            .await
+            .map_err(Into::into)
     }
 }
 

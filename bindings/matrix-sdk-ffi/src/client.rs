@@ -77,9 +77,9 @@ use matrix_sdk_ui::{
 use mime::Mime;
 use oauth2::Scope;
 use ruma::{
-    OwnedDeviceId, OwnedMxcUri, OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
+    MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedMxcUri, OwnedServerName, RoomAliasId,
+    RoomOrAliasId, ServerName,
     api::{
-        FeatureFlag,
         client::{
             alias::get_alias,
             discovery::get_authorization_server_metadata::v1::{
@@ -342,7 +342,7 @@ pub trait RawX509Signer: SyncOutsideWasm + SendOutsideWasm + Debug {
     fn sign(&self, message: Vec<u8>) -> Result<RawX509Signature, ClientError>;
 
     /// Return the "not after" time for the certificate's validity period as a
-    /// UNIX timestamp.
+    /// number of milliseconds since the UNIX epoch.
     fn validity_not_after(&self) -> Result<u64, ClientError>;
 }
 
@@ -1622,6 +1622,32 @@ impl Client {
             .await?)
     }
 
+    /// Get the homeserver-generated preview for a URL, as OpenGraph JSON.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The URL to generate a preview for.
+    ///
+    /// * `ts` - The preferred point in time to return a preview for, as a Unix
+    ///   timestamp in milliseconds. Deprecated since Matrix 1.11; pass `None`.
+    pub async fn get_url_preview(
+        &self,
+        url: String,
+        ts: Option<u64>,
+    ) -> Result<Option<String>, ClientError> {
+        // Saturating rather than unwrapping: this comes from a foreign-language
+        // caller and must not panic across the FFI boundary.
+        let ts = ts.map(|ts| MilliSecondsSinceUnixEpoch(UInt::new_saturating(ts)));
+
+        debug!("requesting URL preview");
+        Ok(self
+            .inner
+            .media()
+            .get_media_preview(&url, ts)
+            .await?
+            .map(|preview| preview.get().to_owned()))
+    }
+
     pub async fn get_session_verification_controller(
         &self,
     ) -> Result<Arc<SessionVerificationController>, ClientError> {
@@ -1719,6 +1745,12 @@ impl Client {
             .into_iter()
             .map(|room| Arc::new(Room::new(room, self.utd_hook_manager.get().cloned())))
             .collect()
+    }
+
+    /// The total number of client-side computed unread notifications across all
+    /// joined rooms.
+    pub fn total_unread_notifications(&self) -> u64 {
+        self.inner.total_unread_notifications()
     }
 
     /// Mark all joined rooms as read by sending public, private and fully-read
@@ -2265,7 +2297,7 @@ impl Client {
 
     /// Checks if the server supports the Profiles sliding sync extension.
     pub async fn is_profiles_sliding_sync_extension_supported(&self) -> Result<bool, ClientError> {
-        Ok(self.inner.unstable_features().await?.contains(&FeatureFlag::from("org.matrix.msc4262")))
+        Ok(self.inner.is_global_profile_sync_enabled().await?)
     }
 
     /// Checks if the server supports user status.
@@ -2423,18 +2455,6 @@ impl Client {
                 }
             }
         }))))
-    }
-
-    /// Whether to enable automatic backpagination under certain conditions
-    /// (e.g. when processing read receipts).
-    ///
-    /// This is an experimental feature, and might cause performance issues on
-    /// large accounts. Use with caution.
-    ///
-    /// This must be called after creating a client, but before subscribing to
-    /// the event cache (so, before spawning a sync service or a timeline).
-    pub fn enable_automatic_backpagination(&self) {
-        self.inner.event_cache().config_mut().experimental_auto_backpagination = true;
     }
 
     pub fn homeserver_capabilities(&self) -> HomeserverCapabilities {

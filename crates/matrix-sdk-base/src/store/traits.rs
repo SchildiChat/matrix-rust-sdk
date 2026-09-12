@@ -2363,6 +2363,7 @@ pub enum DraftAttachmentContent {
     /// Image attachment.
     Image {
         /// The image file data.
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         /// MIME type.
         mimetype: Option<String>,
@@ -2380,6 +2381,7 @@ pub enum DraftAttachmentContent {
     /// Video attachment.
     Video {
         /// The video file data.
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         /// MIME type.
         mimetype: Option<String>,
@@ -2399,6 +2401,7 @@ pub enum DraftAttachmentContent {
     /// Audio attachment.
     Audio {
         /// The audio file data.
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         /// MIME type.
         mimetype: Option<String>,
@@ -2410,6 +2413,7 @@ pub enum DraftAttachmentContent {
     /// Generic file attachment.
     File {
         /// The file data.
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         /// MIME type.
         mimetype: Option<String>,
@@ -2424,6 +2428,7 @@ pub struct DraftThumbnail {
     /// The filename of the thumbnail.
     pub filename: String,
     /// The thumbnail image data.
+    #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
     /// MIME type of the thumbnail.
     pub mimetype: Option<String>,

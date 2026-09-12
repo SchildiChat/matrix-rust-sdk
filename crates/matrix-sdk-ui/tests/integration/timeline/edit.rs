@@ -41,8 +41,9 @@ use ruma::{
             UnstablePollAnswer, UnstablePollAnswers, UnstablePollStartContentBlock,
             UnstablePollStartEventContent,
         },
+        relation::Thread,
         room::message::{
-            MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+            MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             TextMessageEventContent,
         },
     },
@@ -268,6 +269,88 @@ async fn test_edit_local_echo() {
 
     // No new updates.
     assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_edit_local_echo_keeps_thread_relation() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    // The first send attempt fails unrecoverably, so the local echo stays editable.
+    let mounted_send =
+        server.mock_room_send().error_too_large().mock_once().mount_as_scoped().await;
+
+    // Send a threaded reply.
+    let thread_root = owned_event_id!("$thread_root");
+    let mut reply = RoomMessageEventContent::text_plain("reply");
+    reply.relates_to =
+        Some(Relation::Thread(Thread::plain(thread_root.clone(), thread_root.clone())));
+    timeline.send(reply.into()).await.unwrap();
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 2);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    let item = item.as_event().unwrap();
+    let item_identifier = item.identifier();
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
+
+    // The send fails.
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
+    assert_matches!(
+        item.as_event().unwrap().send_state(),
+        Some(EventSendState::SendingFailed { .. })
+    );
+
+    // Editing with bare, relation-free content works, and the retried send keeps
+    // the thread relation.
+    drop(mounted_send);
+    server.mock_room_send().ok(event_id!("$1")).mock_once().mount().await;
+
+    timeline
+        .edit(
+            &item_identifier,
+            EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::text_plain(
+                "edited reply",
+            )),
+        )
+        .await
+        .unwrap();
+
+    // Observe the local echo being replaced, with its send state reset.
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
+    let item = item.as_event().unwrap();
+    assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
+    assert_eq!(item.content().as_message().unwrap().body(), "edited reply");
+
+    // The unrecoverable failure disabled the room's queue; re-enable it so the
+    // edited echo is sent.
+    timeline.room().send_queue().set_enabled(true);
+
+    sleep(Duration::from_millis(500)).await;
+
+    // The event went out with the edited body *and* its original thread relation.
+    let requests = server.server().received_requests().await.unwrap();
+    let sent = requests
+        .iter()
+        .rfind(|req| req.url.path().contains("/send/"))
+        .expect("the edited reply must have been sent");
+    let body: serde_json::Value = sent.body_json().unwrap();
+    assert_eq!(body["body"], "edited reply");
+    assert_eq!(body["m.relates_to"]["rel_type"], "m.thread");
+    assert_eq!(body["m.relates_to"]["event_id"], "$thread_root");
 }
 
 #[async_test]
@@ -1111,4 +1194,160 @@ async fn test_send_edit_non_existing_item() {
         .err()
         .unwrap();
     assert_matches!(error, Error::EventNotInTimeline(_));
+}
+
+#[async_test]
+async fn test_edit_revisions_unknown_event() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    let revisions = timeline.edit_revisions(event_id!("$nonexistent")).await.unwrap();
+    assert!(revisions.is_empty());
+}
+
+#[async_test]
+async fn test_edit_revisions_no_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    let f = EventFactory::new();
+    let original_event_id = event_id!("$original");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("Hello, World!").sender(&ALICE).event_id(original_event_id),
+            ),
+        )
+        .await;
+
+    let revisions = timeline.edit_revisions(original_event_id).await.unwrap();
+    assert_eq!(revisions.len(), 1);
+
+    assert_let!(Some(msg) = revisions[0].content.as_message());
+    assert_eq!(msg.body(), "Hello, World!");
+}
+
+#[async_test]
+async fn test_edit_revisions_with_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    let f = EventFactory::new();
+    let original_event_id = event_id!("$original");
+    let edit_event_id = event_id!("$edit");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("Hello, World!").sender(&ALICE).event_id(original_event_id),
+            ),
+        )
+        .await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("* Hello, Room!").sender(&ALICE).event_id(edit_event_id).edit(
+                    original_event_id,
+                    RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"),
+                ),
+            ),
+        )
+        .await;
+
+    let revisions = timeline.edit_revisions(original_event_id).await.unwrap();
+    assert_eq!(revisions.len(), 2);
+
+    assert_let!(Some(msg) = revisions[0].content.as_message());
+    assert_eq!(msg.body(), "Hello, World!");
+
+    assert_let!(Some(msg) = revisions[1].content.as_message());
+    assert_eq!(msg.body(), "Hello, Room!");
+}
+
+#[async_test]
+async fn test_edit_revisions_multiple_edits() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    let f = EventFactory::new();
+    let original_event_id = event_id!("$original");
+    let edit1_event_id = event_id!("$edit1");
+    let edit2_event_id = event_id!("$edit2");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("Hello, World!").sender(&ALICE).event_id(original_event_id),
+            ),
+        )
+        .await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("* Hello, Room!").sender(&ALICE).event_id(edit1_event_id).edit(
+                    original_event_id,
+                    RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"),
+                ),
+            ),
+        )
+        .await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("* Hello, Everyone!").sender(&ALICE).event_id(edit2_event_id).edit(
+                    original_event_id,
+                    RoomMessageEventContentWithoutRelation::text_plain("Hello, Everyone!"),
+                ),
+            ),
+        )
+        .await;
+
+    let revisions = timeline.edit_revisions(original_event_id).await.unwrap();
+    assert_eq!(revisions.len(), 3);
+
+    assert_let!(Some(msg) = revisions[0].content.as_message());
+    assert_eq!(msg.body(), "Hello, World!");
+
+    assert_let!(Some(msg) = revisions[1].content.as_message());
+    assert_eq!(msg.body(), "Hello, Room!");
+
+    assert_let!(Some(msg) = revisions[2].content.as_message());
+    assert_eq!(msg.body(), "Hello, Everyone!");
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Not, sync::Arc};
 
 use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
@@ -29,7 +29,7 @@ use tokio::sync::{
 
 use self::subscriber::AutoShrinkMessage;
 use super::{
-    EventCacheError, EventsOrigin, Result, automatic_pagination::AutomaticPagination, states,
+    EventCacheError, EventsOrigin, Result, back_pagination_queue::BackPaginationQueue, states,
 };
 use crate::{client::WeakClient, room::WeakRoom};
 
@@ -90,7 +90,7 @@ impl Caches {
         linked_chunk_update_sender: Sender<room::RoomEventCacheLinkedChunkUpdate>,
         auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
         state: &states::StateLock,
-        automatic_pagination: Option<AutomaticPagination>,
+        back_pagination_queue: Option<BackPaginationQueue>,
     ) -> Result<Self> {
         let Some(client) = weak_client.get() else {
             return Err(EventCacheError::ClientDropped);
@@ -129,7 +129,7 @@ impl Caches {
                         linked_chunk_update_sender.clone(),
                         store_guard,
                         pagination_status.clone(),
-                        automatic_pagination,
+                        back_pagination_queue,
                     )
                 },
             )
@@ -291,21 +291,54 @@ impl Caches {
     pub(super) async fn handle_joined_room_update(&self, updates: JoinedRoomUpdate) -> Result<()> {
         let Self { room, threads: _, pinned_events, event_focused, internals } = &self;
 
+        // This method will compute a `JoinedRoomUpdate` for each cache. The game is to
+        // avoid cloning useless data or to clone as few data as possible. That's a fun
+        // game.
+        let JoinedRoomUpdate {
+            // Read receipts are computed by the Event Cache, see [`read_receipts`], we
+            // don't need the server value.
+            unread_notifications: _,
+            // State-events are not stored in the Event Cache.
+            state: _,
+
+            // Extract the original timeline and ephemeral events as timeline will be used by all
+            // caches, and ephemeral events by the room and thread caches.
+            timeline: original_timeline,
+            ephemeral: original_ephemeral,
+
+            // Extract other data, only useful for the room cache.
+            account_data,
+            ambiguity_changes,
+            avatar_changes,
+        } = updates;
+
+        // Filter ephemeral events.
+        let original_ephemeral = original_ephemeral
+            .into_iter()
+            .filter_map(|ephemeral_event| ephemeral_event.deserialize().ok())
+            .collect::<Vec<_>>();
+
         // Room.
         {
-            let mut updates = updates.clone();
-            updates.timeline = aggregator::aggregate_timeline_for_room(updates.timeline);
+            let (timeline, read_receipts) =
+                aggregator::aggregate_timeline_and_read_receipts_for_room(
+                    &original_timeline,
+                    &original_ephemeral,
+                );
 
-            room.handle_joined_room_update(updates).await?;
+            room.handle_joined_room_update(
+                timeline,
+                read_receipts,
+                account_data,
+                ambiguity_changes,
+                avatar_changes,
+            )
+            .await?;
         }
 
         // Threads.
         {
-            let mut updates = updates.clone();
-            updates.account_data.clear();
-            updates.ambiguity_changes.clear();
-
-            let timeline_for_threads = {
+            let timeline_and_read_receipts_for_threads = {
                 // To aggregate the timelines for threads, we need to lookup in the room cache
                 // and the thread caches. We acquire a read lock over all the caches, and select
                 // the room cache and thread cache' states.
@@ -315,8 +348,9 @@ impl Caches {
                 );
                 let all_states = all_states_lock.read().await?;
 
-                aggregator::aggregate_timeline_for_threads(
-                    &updates.timeline,
+                aggregator::aggregate_timeline_and_read_receipts_for_threads(
+                    &original_timeline,
+                    &original_ephemeral,
                     all_states.threads(),
                     all_states.room(),
                     &internals.room_version_rules.redaction,
@@ -324,30 +358,31 @@ impl Caches {
                 .await?
             };
 
-            for (thread_id, timeline) in timeline_for_threads {
-                let mut updates = updates.clone();
-                updates.timeline = timeline;
+            for (thread_id, (timeline, read_receipts)) in timeline_and_read_receipts_for_threads {
+                // Update the thread summary if and only if there are new events.
+                let update_thread_summary = timeline.events.is_empty().not();
 
                 let thread = self.thread(thread_id).await?;
-                thread.handle_joined_room_update(updates).await?;
+                thread.handle_joined_room_update(timeline, read_receipts).await?;
 
-                let new_thread_summary =
-                    thread.state().read().await?.compute_thread_summary().await?;
+                if update_thread_summary {
+                    let new_thread_summary =
+                        thread.state().read().await?.compute_thread_summary().await?;
 
-                room.update_thread_summary(thread.thread_id(), new_thread_summary).await?;
+                    room.update_thread_summary(thread.thread_id(), new_thread_summary).await?;
+                }
             }
         }
 
         // Pinned-events.
         if let Some(pinned_events) = pinned_events.get() {
-            let mut updates = updates.clone();
-            updates.timeline = aggregator::aggregate_timeline_for_pinned_events(
-                &updates.timeline,
+            let timeline = aggregator::aggregate_timeline_for_pinned_events(
+                &original_timeline,
                 &pinned_events.state().read().await?.current_event_ids(),
                 &internals.room_version_rules.redaction,
             );
 
-            pinned_events.handle_joined_room_update(updates).await?;
+            pinned_events.handle_joined_room_update(timeline).await?;
         }
 
         // Event-focused.
@@ -364,21 +399,33 @@ impl Caches {
     pub(super) async fn handle_left_room_update(&self, updates: LeftRoomUpdate) -> Result<()> {
         let Self { room, threads: _, pinned_events, event_focused, internals } = &self;
 
+        // This method will compute a `JoinedRoomUpdate` for each cache. The game is to
+        // avoid cloning useless data or to clone as few data as possible. That's a fun
+        // game.
+        let LeftRoomUpdate {
+            // State-events are not stored in the Event Cache.
+            state: _,
+            // Account data are not used by any cache.
+            account_data: _,
+
+            // Extract the original timeline as it's going to be used by all caches.
+            timeline: original_timeline,
+
+            // Extract other data, only useful for the room cache.
+            ambiguity_changes,
+        } = updates;
+
         // Room.
         {
-            let mut updates = updates.clone();
-            updates.timeline = aggregator::aggregate_timeline_for_room(updates.timeline);
+            let (timeline, _read_receipts) =
+                aggregator::aggregate_timeline_and_read_receipts_for_room(&original_timeline, &[]);
 
-            room.handle_left_room_update(updates).await?;
+            room.handle_left_room_update(timeline, ambiguity_changes).await?;
         }
 
         // Threads.
         {
-            let mut updates = updates.clone();
-            updates.account_data.clear();
-            updates.ambiguity_changes.clear();
-
-            let timeline_for_threads = {
+            let timeline_and_read_receipts_for_threads = {
                 // To aggregate the timelines for threads, we need to lookup in the room cache
                 // and the thread caches. We acquire a read lock over all the caches, and select
                 // the room cache and thread cache' states.
@@ -388,8 +435,9 @@ impl Caches {
                 );
                 let all_caches_states = all_caches_states_lock.read().await?;
 
-                aggregator::aggregate_timeline_for_threads(
-                    &updates.timeline,
+                aggregator::aggregate_timeline_and_read_receipts_for_threads(
+                    &original_timeline,
+                    &[],
                     all_caches_states.threads(),
                     all_caches_states.room(),
                     &internals.room_version_rules.redaction,
@@ -397,30 +445,21 @@ impl Caches {
                 .await?
             };
 
-            for (thread_id, timeline) in timeline_for_threads {
-                let mut updates = updates.clone();
-                updates.timeline = timeline;
-
+            for (thread_id, (timeline, _read_receipts)) in timeline_and_read_receipts_for_threads {
                 let thread = self.thread(thread_id).await?;
-                thread.handle_left_room_update(updates).await?;
-
-                let new_thread_summary =
-                    thread.state().read().await?.compute_thread_summary().await?;
-
-                room.update_thread_summary(thread.thread_id(), new_thread_summary).await?;
+                thread.handle_left_room_update(timeline).await?;
             }
         }
 
         // Pinned-events.
         if let Some(pinned_events) = pinned_events.get() {
-            let mut updates = updates.clone();
-            updates.timeline = aggregator::aggregate_timeline_for_pinned_events(
-                &updates.timeline,
+            let timeline = aggregator::aggregate_timeline_for_pinned_events(
+                &original_timeline,
                 &pinned_events.state().read().await?.current_event_ids(),
                 &internals.room_version_rules.redaction,
             );
 
-            pinned_events.handle_left_room_update(updates).await?;
+            pinned_events.handle_left_room_update(timeline).await?;
         }
 
         // Event-focused.
