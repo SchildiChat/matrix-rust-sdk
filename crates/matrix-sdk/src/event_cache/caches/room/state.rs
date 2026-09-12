@@ -691,21 +691,21 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         };
 
         let user_id = &self.state.own_user_id;
-        let room_id = &self.state.room_id;
 
         let prev_read_receipts = room.read_receipts().clone();
         let mut read_receipts = prev_read_receipts.clone();
         read_receipts.latest_active = Some(matrix_sdk_base::read_receipts::LatestReadReceipt { event_id });
 
+        let client = room.client();
+        let event_filter = RoomReadReceiptEventFilter::new(&self.state, client.state_store());
+
         compute_unread_counts(
             user_id,
-            room_id,
             None,
             &self.state.room_linked_chunk,
+            &event_filter,
             &mut read_receipts,
-            self.state.enabled_thread_support,
-            self.state.automatic_pagination.as_ref(),
-            room.client().state_store(),
+            self.state.back_pagination_queue.as_ref(),
         )
         .await;
 

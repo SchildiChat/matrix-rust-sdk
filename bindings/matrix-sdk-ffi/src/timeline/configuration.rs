@@ -98,7 +98,7 @@ pub enum TimelineFilter {
     /// SC: custom settings, e.g. hide redacted messages
     ScSettings {
         show_redactions: bool,
-        filter: Option<Arc<TimelineEventFilter>>,
+        filter: Option<TimelineEventFilter>,
     },
     /// Show only `m.room.messages` of the given room message types.
     OnlyMessage {

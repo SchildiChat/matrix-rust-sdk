@@ -1517,7 +1517,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         //
         // We must get an empty `ThreadInfo`.
         let ThreadInfo { read_receipts } = self.load_thread_info(room_id, thread_id).await.unwrap();
-        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
+        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending, .. } =
             read_receipts;
         assert_eq!(num_unread, 0);
         assert_eq!(num_notifications, 0);
@@ -1530,7 +1530,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         // We must get the same empty `ThreadInfo`.
         let mut thread_info = self.load_thread_info(room_id, thread_id).await.unwrap();
         let ThreadInfo { read_receipts } = &thread_info;
-        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
+        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending, .. } =
             read_receipts;
         assert_eq!(*num_unread, 0);
         assert_eq!(*num_notifications, 0);
@@ -1547,7 +1547,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         //
         // We must get the updated `ThreadInfo`.
         let ThreadInfo { read_receipts } = self.load_thread_info(room_id, thread_id).await.unwrap();
-        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
+        let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending, .. } =
             read_receipts;
         assert_eq!(num_unread, 1);
         assert_eq!(num_notifications, 2);

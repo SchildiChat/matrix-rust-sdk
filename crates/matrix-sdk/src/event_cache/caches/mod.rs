@@ -298,6 +298,7 @@ impl Caches {
             // Read receipts are computed by the Event Cache, see [`read_receipts`], we
             // don't need the server value.
             unread_notifications: _,
+            unread_count: _, // SC
             // State-events are not stored in the Event Cache.
             state: _,
 
