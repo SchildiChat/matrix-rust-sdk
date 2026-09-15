@@ -973,6 +973,9 @@ impl Room {
     pub async fn set_user_displayname(&self, displayname: Option<String>) -> Result<(), ClientError> {
         self.inner.set_user_displayname(displayname).await.map_err(ClientError::from)
     }
+    pub async fn set_user_avatar_mxc(&self, avatar_url: Option<String>) -> Result<(), ClientError> {
+        self.inner.set_user_avatar_mxc(avatar_url).await.map_err(ClientError::from)
+    }
     /// SC end
 
     /// Returns whether the send queue for that particular room is enabled or
