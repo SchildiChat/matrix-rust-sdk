@@ -226,6 +226,15 @@ impl ReadReceiptsExt for ReadReceipts {
     /// Returns whether a new event triggered a new unread/notification/mention.
     #[inline(always)]
     fn process_event(&mut self, event: &TimelineEvent, user_id: &UserId) {
+        // SC
+        if is_redaction_or_redacted(event.raw()) {
+            tracing::trace!(
+                event_id = ?event.event_id(),
+                "skipping event because it is a redaction or has been redacted"
+            );
+            return;
+        }
+
         if marks_as_unread(event.raw(), user_id) {
             self.num_unread += 1;
         }
@@ -704,7 +713,7 @@ fn has_incomplete_unread_count<'a>(
 fn find_event_position(linked_chunk: &EventLinkedChunk, event_id: &EventId) -> Option<Position> {
     linked_chunk
         .events()
-        .find_map(|(position, event)| (event.event_id().as_deref() == Some(event_id)).then_some(position))
+        .find_map(|(position, event)| (event.event_id() == Some(event_id)).then_some(position))
 }
 
 fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -> bool {
@@ -752,6 +761,25 @@ fn has_pending_receipt_after_position<'a>(
     false
 }
 // SC end
+
+// SC
+fn is_redaction_or_redacted(event: &Raw<AnySyncTimelineEvent>) -> bool {
+    #[derive(serde::Deserialize)]
+    struct UnsignedContent {
+        redacted_because: Option<serde::de::IgnoredAny>,
+    }
+
+    if let Ok(Some(UnsignedContent { redacted_because: Some(_) })) =
+        event.get_field::<UnsignedContent>("unsigned")
+    {
+        return true;
+    }
+
+    matches!(
+        event.get_field::<MessageLikeEventType>("type").ok().flatten(),
+        Some(MessageLikeEventType::RoomRedaction)
+    )
+}
 
 /// Is the event worth marking a timeline as unread?
 fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool {
