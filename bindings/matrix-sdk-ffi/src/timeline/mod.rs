@@ -69,6 +69,7 @@ use crate::{
     },
     runtime::get_runtime_handle,
     task_handle::TaskHandle,
+    timeline::content::{Reaction, ReactionSenderData},
     utils::Timestamp,
 };
 
@@ -1178,6 +1179,7 @@ pub struct EventTimelineItem {
     is_own: bool,
     is_editable: bool,
     content: TimelineItemContent,
+    reactions: Vec<Reaction>,
     /// The raw Matrix event type string (e.g. `"m.room.message"`), or `None`
     /// when the original type is not available (e.g. redacted events).
     event_type_raw: Option<String>,
@@ -1206,6 +1208,21 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
             is_own: item.is_own(),
             is_editable: item.is_editable(),
             content: item.content().clone().into(),
+            reactions: item
+                .reactions()
+                .iter()
+                .map(|(key, senders)| Reaction {
+                    key: key.to_owned(),
+                    shortcode: senders.first().map(|r| r.1.shortcode.clone()).flatten(), // SC
+                    senders: senders
+                        .iter()
+                        .map(|(sender_id, info)| ReactionSenderData {
+                            sender_id: sender_id.to_string(),
+                            timestamp: info.timestamp.into(),
+                        })
+                        .collect(),
+                })
+                .collect(),
             event_type_raw: item.content().event_type_str(),
             timestamp: item.timestamp().into(),
             local_send_state: item.send_state().map(|s| s.into()),

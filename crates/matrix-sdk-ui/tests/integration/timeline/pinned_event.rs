@@ -167,12 +167,7 @@ async fn test_pinned_event_with_reaction() {
     assert_eq!(items.len(), 1 + 1); // event item + a date divider
     assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "in the end");
-    let reactions = items[1]
-        .as_event()
-        .unwrap()
-        .content()
-        .reactions()
-        .expect("pinned event should have reactions");
+    let reactions = items[1].as_event().unwrap().reactions();
     assert_eq!(reactions.len(), 1);
     assert!(reactions.get("👀").is_some());
     assert_pending!(timeline_stream);
@@ -246,12 +241,7 @@ async fn test_pinned_event_with_paginated_reactions() {
     assert_eq!(items.len(), 1 + 1); // event item + a date divider
     assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "in the end");
-    let reactions = items[1]
-        .as_event()
-        .unwrap()
-        .content()
-        .reactions()
-        .expect("pinned event should have reactions");
+    let reactions = items[1].as_event().unwrap().reactions();
     assert_eq!(reactions.len(), 2);
     assert!(reactions.get("👀").is_some());
     assert!(reactions.get("🤔").is_some());
@@ -349,10 +339,10 @@ async fn test_new_pinned_event_ids_reload_the_timeline() {
     assert_let!(VectorDiff::Clear = &timeline_updates[0]);
 
     assert_let!(VectorDiff::PushBack { value } = &timeline_updates[1]);
-    assert_eq!(value.as_event().unwrap().event_id().unwrap(), event_id!("$1"));
+    assert_eq!(value.as_event().unwrap().event_id().unwrap(), "$1");
 
     assert_let!(VectorDiff::PushBack { value } = &timeline_updates[2]);
-    assert_eq!(value.as_event().unwrap().event_id().unwrap(), event_id!("$2"));
+    assert_eq!(value.as_event().unwrap().event_id().unwrap(), "$2");
 
     assert_let!(VectorDiff::PushFront { value } = &timeline_updates[3]);
     assert!(value.is_date_divider());
@@ -757,7 +747,7 @@ async fn test_edited_events_are_reflected_in_sync() {
     // The edit does replace the original event.
     assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[0]);
     let event = value.as_event().unwrap();
-    assert_eq!(event.event_id().unwrap(), event_id!("$1"));
+    assert_eq!(event.event_id().unwrap(), "$1");
     assert_eq!(event.content().as_message().unwrap().body(), "edited message!");
 
     // That's all, folks!

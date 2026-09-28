@@ -97,7 +97,6 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 kind: MsgLikeKind::Other(OtherMessageLike::from_event_type(
                     event_type.as_deref().unwrap_or_default().into(),
                 )),
-                reactions: Default::default(),
                 thread_root: None,
                 in_reply_to: None,
                 thread_summary: None,

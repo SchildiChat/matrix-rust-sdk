@@ -20,13 +20,12 @@ use ruma::events::{
 };
 
 use super::{
-    content::{BeaconInfo, LiveLocationContent, Reaction},
+    content::{BeaconInfo, LiveLocationContent},
     reply::{EmbeddedEventDetails, InReplyToDetails},
 };
 use crate::{
     error::ClientError,
     ruma::{ImageInfo, MediaSource, MediaSourceExt, Mentions, MessageType, PollKind},
-    timeline::content::ReactionSenderData,
     utils::Timestamp,
 };
 
@@ -73,12 +72,10 @@ pub enum MsgLikeKind {
 }
 
 /// A special kind of [`super::TimelineItemContent`] that groups together
-/// different room message types with their respective reactions and thread
-/// information.
+/// different room message types with their thread information.
 #[derive(Clone, uniffi::Record)]
 pub struct MsgLikeContent {
     pub kind: MsgLikeKind,
-    pub reactions: Vec<Reaction>,
     /// The event this message is replying to, if any.
     pub in_reply_to: Option<Arc<InReplyToDetails>>,
     /// Event ID of the thread root, if this is a message in a thread.
@@ -127,22 +124,6 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
     fn try_from(value: matrix_sdk_ui::timeline::MsgLikeContent) -> Result<Self, Self::Error> {
         use matrix_sdk_ui::timeline::MsgLikeKind as Kind;
 
-        let reactions = value
-            .reactions
-            .iter()
-            .map(|(k, v)| Reaction {
-                key: k.to_owned(),
-                shortcode: v.first().map(|r| r.1.shortcode.clone()).flatten(), // SC
-                senders: v
-                    .into_iter()
-                    .map(|(sender_id, info)| ReactionSenderData {
-                        sender_id: sender_id.to_string(),
-                        timestamp: info.timestamp.into(),
-                    })
-                    .collect(),
-            })
-            .collect();
-
         let in_reply_to = value.in_reply_to.map(|r| Arc::new(r.into()));
 
         let thread_root = value.thread_root.map(|id| id.to_string());
@@ -167,7 +148,6 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                                 .map(Into::into),
                         },
                     },
-                    reactions,
                     in_reply_to,
                     thread_root,
                     thread_summary,
@@ -194,7 +174,6 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                             .clone()
                             .map(Into::into),
                     },
-                    reactions,
                     in_reply_to,
                     thread_root,
                     thread_summary,
@@ -217,22 +196,16 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                         end_time: results.end_time.map(|t| t.into()),
                         has_been_edited: results.has_been_edited,
                     },
-                    reactions,
                     in_reply_to,
                     thread_root,
                     thread_summary,
                 }
             }
-            Kind::Redacted => Self {
-                kind: MsgLikeKind::Redacted,
-                reactions,
-                in_reply_to,
-                thread_root,
-                thread_summary,
-            },
+            Kind::Redacted => {
+                Self { kind: MsgLikeKind::Redacted, in_reply_to, thread_root, thread_summary }
+            }
             Kind::UnableToDecrypt(msg) => Self {
                 kind: MsgLikeKind::UnableToDecrypt { msg: EncryptedMessage::new(&msg) },
-                reactions,
                 in_reply_to,
                 thread_root,
                 thread_summary,
@@ -241,7 +214,6 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                 kind: MsgLikeKind::Other {
                     event_type: MessageLikeEventType::from(other.event_type().to_string()),
                 },
-                reactions,
                 in_reply_to,
                 thread_root,
                 thread_summary,
@@ -268,7 +240,6 @@ impl TryFrom<matrix_sdk_ui::timeline::MsgLikeContent> for MsgLikeContent {
                             locations,
                         },
                     },
-                    reactions,
                     in_reply_to,
                     thread_root,
                     thread_summary,
