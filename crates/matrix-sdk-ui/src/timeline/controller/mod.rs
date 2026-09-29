@@ -191,6 +191,7 @@ impl TimelineFocusKind {
                 matches!(
                     thread_mode,
                     TimelineEventFocusThreadMode::Automatic { hide_threaded_events: true }
+                    | TimelineEventFocusThreadMode::ForceMain { hide_threaded_events: true } // SC
                 )
             }
             TimelineFocusKind::Thread { .. } | TimelineFocusKind::PinnedEvents { .. } => false,

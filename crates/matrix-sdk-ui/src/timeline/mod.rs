@@ -181,6 +181,14 @@ pub enum TimelineEventFocusThreadMode {
         /// themselves and doesn't use the [`Self::ForceThread`] mode.
         hide_threaded_events: bool,
     },
+    /// SC: Stay in the main timeline, even when the target event is part of a
+    /// thread. The target event itself is always shown, while other in-thread
+    /// replies are shown or hidden according to the flag.
+    ForceMain {
+        /// Whether to hide in-thread replies (other than the target event) from
+        /// the timeline.
+        hide_threaded_events: bool,
+    },
 }
 
 impl From<TimelineEventFocusThreadMode> for EventFocusThreadMode {
@@ -188,6 +196,9 @@ impl From<TimelineEventFocusThreadMode> for EventFocusThreadMode {
         match val {
             TimelineEventFocusThreadMode::ForceThread => EventFocusThreadMode::ForceThread,
             TimelineEventFocusThreadMode::Automatic { .. } => EventFocusThreadMode::Automatic,
+            TimelineEventFocusThreadMode::ForceMain { hide_threaded_events } => { // SC
+                EventFocusThreadMode::ForceMain { hide_threaded_events }
+            }
         }
     }
 }

@@ -78,6 +78,14 @@ pub enum EventFocusThreadMode {
     /// If the event is part of a thread, the linked chunk will be filtered to
     /// on-thread events.
     Automatic,
+
+    /// SC: Stay in the main (room) timeline, even when the target event is part
+    /// of a thread. The target event itself is always shown, while other
+    /// in-thread replies are shown or hidden according to the flag.
+    ForceMain {
+        /// Whether to hide in-thread replies (other than the target event).
+        hide_threaded_events: bool,
+    },
 }
 
 /// The mode of pagination for an event-focused linked chunk.
@@ -218,6 +226,9 @@ impl EventFocusedCacheState {
                     .find(|event| event.event_id() == Some(&self.focused_event_id))
                     .and_then(|event| extract_thread_root(event.raw()))
             }
+
+            // SC
+            EventFocusThreadMode::ForceMain { .. } => None,
         };
 
         // Get pagination tokens from the paginator.
@@ -264,8 +275,11 @@ impl EventFocusedCacheState {
             let backward_token = tokens.previous.into_token();
             let forward_token = tokens.next.into_token();
 
-            let hide_thread_events =
-                matches!(thread_mode, EventFocusThreadMode::Automatic) && thread_root.is_none();
+            // SC: ForceMain added
+            let hide_thread_events = match thread_mode {
+                EventFocusThreadMode::ForceMain { hide_threaded_events } => hide_threaded_events,
+                _ => matches!(thread_mode, EventFocusThreadMode::Automatic) && thread_root.is_none(),
+            };
 
             self.pagination_mode = EventFocusedPaginationMode::Room { hide_thread_events };
 
@@ -273,7 +287,11 @@ impl EventFocusedCacheState {
                 result
                     .events
                     .iter()
-                    .filter(|event| extract_thread_root(event.raw()).is_none())
+                    // SC: check for focused_event_id match added
+                    .filter(|event| {
+                        extract_thread_root(event.raw()).is_none()
+                            || event.event_id() == Some(&self.focused_event_id)
+                    })
                     .cloned()
                     .collect()
             } else {
