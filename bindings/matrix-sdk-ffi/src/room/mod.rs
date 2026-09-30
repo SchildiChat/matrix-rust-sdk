@@ -57,6 +57,7 @@ use crate::{
     space_catch_all_info::{SpaceCatchAllInfo, space_catch_all_info},
     space_child_info::{SpaceChildInfo, space_children_info},
 };
+use matrix_sdk::room::Receipts as SdkReceipts;
 use ruma::RoomId;
 // SC end
 
@@ -110,6 +111,15 @@ impl From<RoomState> for Membership {
         }
     }
 }
+
+// SC start
+#[derive(uniffi::Record)]
+pub struct Receipts {
+    pub fully_read: Option<String>,
+    pub public_read_receipt: Option<String>,
+    pub private_read_receipt: Option<String>,
+}
+// SC end
 
 #[derive(uniffi::Object)]
 pub struct Room {
@@ -1029,7 +1039,16 @@ impl Room {
         self.inner.set_user_displayname(displayname).await.map_err(ClientError::from)
     }
     pub async fn set_user_avatar_mxc(&self, avatar_url: Option<String>) -> Result<(), ClientError> {
-        self.inner.set_user_avatar_mxc(avatar_url).await.map_err(ClientError::from)
+        self.inner.set_user_avatar_mxc(avatar_url).await.map_err(ClientError::from_err)
+    }
+    pub async fn send_multiple_receipts(&self, receipts: Receipts) -> Result<(), ClientError> {
+        self.inner.send_multiple_receipts(
+            SdkReceipts::new()
+                .fully_read_marker(receipts.fully_read.as_deref().map(|id| EventId::parse(id)).transpose()?)
+                .public_read_receipt(receipts.public_read_receipt.as_deref().map(|id| EventId::parse(id)).transpose()?)
+                .private_read_receipt(receipts.private_read_receipt.as_deref().map(|id| EventId::parse(id)).transpose()?),
+        ).await?;
+        Ok(())
     }
     /// SC end
 
