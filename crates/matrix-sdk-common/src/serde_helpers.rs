@@ -40,6 +40,8 @@ struct RelatesTo {
 struct SimplifiedContent {
     #[serde(rename = "m.relates_to")]
     relates_to: Option<RelatesTo>,
+    #[serde(rename = "com.beeper.broadcast_outside_thread")]
+    broadcast_outside_thread: Option<bool>, // SC
 }
 
 /// Try to extract the thread root from an event's content, if provided.
@@ -68,6 +70,16 @@ pub fn extract_thread_root_from_content(
 /// during deserialization.
 pub fn extract_thread_root(event: &Raw<AnySyncTimelineEvent>) -> Option<OwnedEventId> {
     extract_thread_root_from_content(event.get_field("content").ok().flatten()?)
+}
+
+/// SC: extract `com.beeper.broadcast_outside_thread` or false
+pub fn extract_broadcast_outside_thread(event: &Raw<AnySyncTimelineEvent>) -> bool {
+    event
+        .get_field::<SimplifiedContent>("content")
+        .ok()
+        .flatten()
+        .and_then(|content| content.broadcast_outside_thread)
+        .unwrap_or(false)
 }
 
 /// Try to extract the type and target of a relation, from a raw timeline event,

@@ -46,6 +46,7 @@ use crate::timeline::{
 // SC start
 use crate::timeline::event_item::AnyOtherStateEventContentChange;
 use crate::timeline::{MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState};
+use matrix_sdk_common::serde_helpers::extract_broadcast_outside_thread;
 // SC end
 
 pub(in crate::timeline) struct TimelineStateTransaction<'a, P: RoomDataProvider> {
@@ -597,6 +598,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         room_data_provider: &P,
         settings: &TimelineSettings,
         event: &AnySyncTimelineEvent,
+        raw: &Raw<AnySyncTimelineEvent>, // SC
         thread_root: Option<&EventId>,
         position: TimelineItemPosition,
     ) -> bool {
@@ -641,6 +643,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 // If the timeline's filtering out in-thread events, don't add items for
                 // threaded events.
                 thread_root.is_none() || !hide_threaded_events
+                    || extract_broadcast_outside_thread(raw) // SC
             }
 
             TimelineFocusKind::Thread { root_event_id, .. } => {
@@ -869,6 +872,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                     room_data_provider,
                     settings,
                     &event,
+                    &raw, // SC
                     thread_root.as_deref(),
                     position,
                 );

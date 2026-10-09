@@ -42,6 +42,10 @@ use ruma::{OwnedEventId, UInt, api::Direction};
 use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{instrument, trace};
 
+// SC start
+use matrix_sdk_common::serde_helpers::extract_broadcast_outside_thread;
+// SC end
+
 #[cfg(feature = "e2e-encryption")]
 use super::super::redecryptor::{MaybeResolvedEvent, TryResolveEvents};
 use super::{
@@ -287,9 +291,10 @@ impl EventFocusedCacheState {
                 result
                     .events
                     .iter()
-                    // SC: check for focused_event_id match added
+                    // SC: check for focused_event_id match added + broadcast flag
                     .filter(|event| {
                         extract_thread_root(event.raw()).is_none()
+                            || extract_broadcast_outside_thread(event.raw())
                             || event.event_id() == Some(&self.focused_event_id)
                     })
                     .cloned()
@@ -402,7 +407,13 @@ impl EventFocusedCacheState {
         };
 
         let events = if hide_thread_events {
-            events.into_iter().filter(|event| extract_thread_root(event.raw()).is_none()).collect()
+            events
+                .into_iter()
+                .filter(|event| {
+                    extract_thread_root(event.raw()).is_none()
+                        || extract_broadcast_outside_thread(event.raw()) // SC
+                })
+                .collect()
         } else {
             events
         };
@@ -510,7 +521,13 @@ impl EventFocusedCacheState {
         };
 
         let events = if hide_thread_events {
-            events.into_iter().filter(|event| extract_thread_root(event.raw()).is_none()).collect()
+            events
+                .into_iter()
+                .filter(|event| {
+                    extract_thread_root(event.raw()).is_none()
+                        || extract_broadcast_outside_thread(event.raw()) // SC
+                })
+                .collect()
         } else {
             events
         };
