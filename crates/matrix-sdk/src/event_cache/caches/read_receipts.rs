@@ -695,10 +695,7 @@ fn has_incomplete_unread_count<'a>(
     pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
 ) -> bool {
     match active_receipt_event_id.and_then(|event_id| find_event_position(linked_chunk, event_id)) {
-        Some(position) => {
-            has_gap_after_position(linked_chunk, position)
-                || has_pending_receipt_after_position(linked_chunk, position, pending_receipts)
-        }
+        Some(position) => has_gap_after_position(linked_chunk, position),
         None => {
             if pending_receipts.into_iter().next().is_some() {
                 return true;
@@ -723,37 +720,6 @@ fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -
         }
 
         if chunk.is_gap() {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn has_pending_receipt_after_position<'a>(
-    linked_chunk: &EventLinkedChunk,
-    position: Position,
-    pending_receipts: impl Iterator<Item = &'a OwnedEventId>,
-) -> bool {
-    let pending_receipts = pending_receipts.collect::<Vec<_>>();
-    let mut seen_active_receipt = false;
-
-    for (current_position, event) in linked_chunk.events() {
-        if current_position == position {
-            seen_active_receipt = true;
-            continue;
-        }
-
-        if seen_active_receipt
-            && event
-                .event_id()
-                .is_some_and(|event_id| {
-                    pending_receipts.iter().any(|pending| {
-                        let pending: &EventId = pending.as_ref();
-                        pending == event_id
-                    })
-                })
-        {
             return true;
         }
     }
