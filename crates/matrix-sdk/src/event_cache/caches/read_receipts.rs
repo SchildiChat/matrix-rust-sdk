@@ -197,8 +197,10 @@ fn stop_on_event_ids(
     }
 }
 
-// SC
+// SC start
 use matrix_sdk_common::linked_chunk::Position;
+use matrix_sdk_common::serde_helpers::extract_broadcast_outside_thread;
+// SC end
 
 trait ReadReceiptsExt {
     /// Update the [`ReadReceipts`] unread counts according to the new
@@ -354,6 +356,7 @@ impl<'cache> EventFilter for RoomReadReceiptEventFilter<'cache> {
         // This type is built from a `RoomEventCacheState`. The room event cache
         // contains all events, including in-thread events. We need to filter them!
         (self.with_threading_support && extract_thread_root(event.raw()).is_some()).not()
+            || extract_broadcast_outside_thread(event.raw()) // SC
     }
 
     fn receipt_thread_matches(&self, receipt_thread: &ReceiptThread) -> bool {
