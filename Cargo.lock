@@ -5489,7 +5489,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.17.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "assign",
  "js_int",
@@ -5507,7 +5507,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.25.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "as_variant",
  "assign",
@@ -5529,7 +5529,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.20.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "as_variant",
  "base64 0.23.1",
@@ -5562,7 +5562,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.35.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -5586,7 +5586,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.16.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "http",
  "http-auth",
@@ -5606,7 +5606,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.9.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -5617,7 +5617,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.12.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "js_int",
  "thiserror 2.0.20",
@@ -5626,7 +5626,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.20.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "as_variant",
  "cfg-if",
@@ -5642,7 +5642,7 @@ dependencies = [
 [[package]]
 name = "ruma-signatures"
 version = "0.22.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=3fe459d8d#3fe459d8d0a30b3e023c43a69a8ebca7e83678e3"
+source = "git+https://github.com/SchildiChat/ruma?rev=8c2b02802#8c2b02802f63e4afd66b5ba6f9f28fe035376858"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",

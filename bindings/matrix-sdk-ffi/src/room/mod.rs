@@ -1035,6 +1035,15 @@ impl Room {
     pub async fn fetch_full_room_state(&self) -> Result<Vec<String>, ClientError> {
         self.inner.fetch_full_room_state().await.map_err(ClientError::from_err)
     }
+    pub async fn fetch_event_raw(&self, event_id: String, include_unredacted_content: bool) -> Result<String, ClientError> {
+        let mut request = ruma::api::client::room::get_room_event::v3::Request::new(
+            self.inner.room_id().to_owned(),
+            EventId::parse(event_id)?,
+        );
+        request.include_unredacted_content = include_unredacted_content;
+        let response = self.inner.client().send(request).await?;
+        Ok(response.event.json().get().to_owned())
+    }
     pub async fn set_user_displayname(&self, displayname: Option<String>) -> Result<(), ClientError> {
         self.inner.set_user_displayname(displayname).await.map_err(ClientError::from)
     }
