@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{pin::Pin, sync::Arc};
+use std::{
+    pin::{Pin, pin},
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::{Vector, VectorDiff};
-use futures_util::{Stream, StreamExt, pin_mut};
+use futures_util::{Stream, StreamExt};
 use matrix_sdk::{
     Client, SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode, UpdateSummary,
     assert_let_timeout, test_utils::mocks::MatrixMockServer,
@@ -29,6 +31,7 @@ use matrix_sdk_ui::timeline::{
 };
 use ruma::{RoomId, room_id, user_id};
 use serde_json::json;
+use strass::assert_let;
 use wiremock::{Match, Mock, Request, ResponseTemplate, http::Method};
 
 macro_rules! receive_response {
@@ -433,7 +436,7 @@ async fn test_timeline_basic() -> Result<()> {
     .await?;
 
     let stream = sliding_sync.sync();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     let room_id = room_id!("!foo:bar.org");
 
@@ -483,7 +486,7 @@ async fn test_timeline_duplicated_events() -> Result<()> {
     .await?;
 
     let stream = sliding_sync.sync();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     let room_id = room_id!("!foo:bar.org");
 
@@ -563,7 +566,7 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
     .await?;
 
     let stream = sliding_sync.sync();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     let room_id = room_id!("!foo:bar.org");
 
@@ -663,7 +666,7 @@ async fn test_timeline_refreshes_sender_profile_on_global_profile_update() -> Re
     .await?;
 
     let stream = sliding_sync.sync();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     let room_id = room_id!("!foo:bar.org");
 
@@ -719,7 +722,8 @@ async fn test_timeline_refreshes_sender_profile_on_global_profile_update() -> Re
     assert_let!(TimelineDetails::Ready(profile) = alice_message.sender_profile());
     assert!(profile.status.is_none(), "The status should be unset before the profile update.");
 
-    // A sync carrying only a global profiles update for Alice with a new status.
+    // A sync carrying only a global profiles update for Alice with a new
+    // status.
     receive_response! {
         [server.server(), stream]
         {

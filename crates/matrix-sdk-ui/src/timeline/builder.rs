@@ -94,8 +94,8 @@ impl TimelineBuilder {
         self
     }
 
-    /// Choose when to insert the date separators, either in between each day
-    /// or each month.
+    /// Choose when to insert the date separators, either in between each day or
+    /// each month.
     pub fn with_date_divider_mode(mut self, mode: DateDividerMode) -> Self {
         self.settings.date_divider_mode = mode;
         self
@@ -112,20 +112,18 @@ impl TimelineBuilder {
     ///
     /// # Arguments
     ///
-    /// * `filter` - A function that takes a deserialized event, and should
+    /// - `filter` - A function that takes a deserialized event, and should
     ///   return `true` if the event should be added to the `Timeline`.
     ///
     /// If this is not overridden, the timeline uses the default filter that
     /// only allows events that are materialized into a `Timeline` item. For
-    /// instance, reactions and edits don't get their own timeline item (as
-    /// they affect another existing one), so they're "filtered out" to
-    /// reflect that.
+    /// instance, reactions and edits don't get their own timeline item (as they
+    /// affect another existing one), so they're "filtered out" to reflect that.
     ///
     /// You can use the default event filter with
-    /// [`crate::timeline::default_event_filter`] so as to chain it with
-    /// your own event filter, if you want to avoid situations where a read
-    /// receipt would be attached to an event that doesn't get its own
-    /// timeline item.
+    /// [`crate::timeline::default_event_filter`] so as to chain it with your
+    /// own event filter, if you want to avoid situations where a read receipt
+    /// would be attached to an event that doesn't get its own timeline item.
     ///
     /// Note that currently:
     ///
@@ -170,14 +168,15 @@ impl TimelineBuilder {
     pub async fn build(self) -> Result<Timeline, Error> {
         let Self { room, settings, unable_to_decrypt_hook, focus, internal_id_prefix } = self;
 
-        // Subscribe the event cache to sync responses, in case we hadn't done it yet.
         let client = room.client();
-        let event_cache = client.event_cache();
-        event_cache.subscribe()?;
+        let event_cache = client.event_cache().ok_or(Error::EventCacheIsDisabled)?;
 
         let room_id = room.room_id();
         let (room_event_cache, event_cache_drop) = event_cache.room(room_id).await?;
-        let (_, event_subscriber) = room_event_cache.subscribe().await?;
+        // We should use the initial events returned here, since fetching them
+        // separately later would race with the updates sent to
+        // the subscriber, and events could be received twice.
+        let (initial_events, event_subscriber) = room_event_cache.subscribe().await?;
 
         let is_room_encrypted = room
             .latest_encryption_state()
@@ -205,7 +204,8 @@ impl TimelineBuilder {
             controller.handle_active_call_update(initial_active_call_info.clone()).await;
         }
 
-        let InitFocusResult { focus_task, has_events } = controller.init_focus().await?;
+        let InitFocusResult { focus_task, has_events } =
+            controller.init_focus(initial_events).await?;
 
         let room_update_join_handle = room
             .client()
@@ -309,9 +309,9 @@ impl TimelineBuilder {
         };
 
         if has_events {
-            // The events we're injecting might be encrypted events, but we might
-            // have received the room key to decrypt them while nobody was listening to the
-            // `m.room_key` event, let's retry now.
+            // The events we're injecting might be encrypted events, but we
+            // might have received the room key to decrypt them while nobody was
+            // listening to the `m.room_key` event, let's retry now.
             timeline.retry_decryption_for_all_events().await;
         }
 

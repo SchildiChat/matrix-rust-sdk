@@ -1,8 +1,7 @@
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{assert_let_timeout, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_test::{
-    ALICE, BOB, CAROL, JoinedRoomBuilder, async_test, event_factory::EventFactory,
+    ALICE, BOB, CAROL, JoinedRoomBuilder, User, async_test, event_factory::EventFactory,
 };
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItemContent};
 use ruma::{
@@ -10,6 +9,7 @@ use ruma::{
     events::rtc::notification::{CallIntent, NotificationType},
     room_id,
 };
+use strass::assert_let;
 use tokio_stream::StreamExt;
 
 #[async_test]
@@ -36,12 +36,12 @@ async fn test_decline_call() {
                 .add_timeline_event(
                     f.rtc_notification(NotificationType::Ring)
                         .call_intent(CallIntent::Audio)
-                        .sender(&ALICE)
+                        .sender(User::Alice)
                         .event_id(notification_event_id),
                 )
                 .add_timeline_event(
                     f.call_decline(notification_event_id)
-                        .sender(&BOB)
+                        .sender(User::Bob)
                         .event_id(declination_event_id),
                 ),
         )
@@ -59,8 +59,8 @@ async fn test_decline_call() {
     );
     assert_eq!(declined_by.len(), 0);
 
-    // Ignore update 1 (implicit read receipt following the declination)
-    // Then the decline is taken into account.
+    // Ignore update 1 (implicit read receipt following the declination) Then
+    // the decline is taken into account.
     assert_let!(VectorDiff::Set { index: 0, value: updated_message } = &timeline_updates[2]);
     let event_item = updated_message.as_event().unwrap();
 
@@ -97,17 +97,17 @@ async fn test_multiple_decline_call() {
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
                     f.rtc_notification(NotificationType::Ring)
-                        .sender(&ALICE)
+                        .sender(User::Alice)
                         .event_id(notification_event_id),
                 )
                 .add_timeline_event(
                     f.call_decline(notification_event_id)
-                        .sender(&BOB)
+                        .sender(User::Bob)
                         .event_id(declination_event_id_bob),
                 )
                 .add_timeline_event(
                     f.call_decline(notification_event_id)
-                        .sender(&CAROL)
+                        .sender(User::Carol)
                         .event_id(declination_event_id_carol),
                 ),
         )
@@ -125,8 +125,8 @@ async fn test_multiple_decline_call() {
     );
     assert_eq!(declined_by.len(), 0);
 
-    // Ignore update 1 (implicit read receipt following the declination)
-    // Then the first decline is taken into account.
+    // Ignore update 1 (implicit read receipt following the declination) Then
+    // the first decline is taken into account.
     assert_let!(VectorDiff::Set { index: 0, value: updated_message } = &timeline_updates[2]);
     let event_item = updated_message.as_event().unwrap();
 
@@ -137,8 +137,8 @@ async fn test_multiple_decline_call() {
     assert_eq!(declined_by.len(), 1);
     assert_eq!(declined_by[0], *BOB);
 
-    // Ignore update 3 (implicit read receipt following the declination)
-    // Then the second decline is taken into account.
+    // Ignore update 3 (implicit read receipt following the declination) Then
+    // the second decline is taken into account.
     assert_let!(VectorDiff::Set { index: 0, value: updated_message } = &timeline_updates[4]);
     let event_item = updated_message.as_event().unwrap();
 
@@ -177,7 +177,7 @@ async fn test_active_call_info() {
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
                     f.rtc_notification(NotificationType::Ring)
-                        .sender(&ALICE)
+                        .sender(User::Alice)
                         .server_ts(notification_timestamp)
                         .event_id(notification_event_id),
                 )
@@ -252,7 +252,7 @@ async fn test_active_call_info() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.rtc_notification(NotificationType::Ring)
-                    .sender(&ALICE)
+                    .sender(User::Alice)
                     .event_id(new_notification_event_id),
             ),
         )
@@ -326,7 +326,7 @@ async fn test_active_call_info_is_restored_when_the_timeline_is_rebuilt() {
                     )
                     .add_timeline_event(
                         f.rtc_notification(NotificationType::Ring)
-                            .sender(&BOB)
+                            .sender(User::Bob)
                             .server_ts(notification_timestamp)
                             .event_id(notification_event_id),
                     ),
@@ -385,13 +385,13 @@ async fn test_active_call_info_is_restored_when_the_timeline_is_rebuilt() {
 }
 
 // There is an order in which the initial events are sent, first the membership
-// event is sent, then the notification event is sent.
-// When the membership event is received this will trigger an active call info
-// update and we don't want that this first update is attached to the current
-// last notification in the timeline as it is not the correct one, the correct
-// one will come after. If this is not done then there will be a visual glitch
-// in the timeline where the last rtc_notification will be updated and then
-// replaced by the correct one (it will "jump")
+// event is sent, then the notification event is sent. When the membership event
+// is received this will trigger an active call info update and we don't want
+// that this first update is attached to the current last notification in the
+// timeline as it is not the correct one, the correct one will come after. If
+// this is not done then there will be a visual glitch in the timeline where the
+// last rtc_notification will be updated and then replaced by the correct one
+// (it will "jump")
 #[async_test]
 async fn test_only_update_notification_after_it_has_been_marked_as_last() {
     let server = MatrixMockServer::new().await;
@@ -411,7 +411,7 @@ async fn test_only_update_notification_after_it_has_been_marked_as_last() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.rtc_notification(NotificationType::Ring)
-                    .sender(&ALICE)
+                    .sender(User::Alice)
                     .event_id(event_id!("$pre-existing-notification")),
             ),
         )
@@ -429,8 +429,8 @@ async fn test_only_update_notification_after_it_has_been_marked_as_last() {
         )
         .await;
 
-    // Ensure that the existing notification timeline item has no info about the new
-    // call
+    // Ensure that the existing notification timeline item has no info about the
+    // new call
     assert_let_timeout!(Some(_timeline_updates) = timeline_stream.next());
 
     let items = timeline.items().await;
@@ -450,7 +450,7 @@ async fn test_only_update_notification_after_it_has_been_marked_as_last() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.rtc_notification(NotificationType::Ring)
-                    .sender(&ALICE)
+                    .sender(User::Alice)
                     .event_id(event_id!("$call-notification")),
             ),
         )
@@ -470,8 +470,7 @@ async fn test_only_update_notification_after_it_has_been_marked_as_last() {
     );
     assert!(active_call_info.active_members.contains(&BOB.to_owned()));
 
-    // Simulate call ending
-    // A call is started, so first the membership is added
+    // Simulate call ending A call is started, so first the membership is added
     server
         .sync_room(
             &client,
@@ -493,8 +492,8 @@ async fn test_only_update_notification_after_it_has_been_marked_as_last() {
             notification.content()
     );
 
-    // If there is a new membership, then this is a new call, should not update the
-    // old notification
+    // If there is a new membership, then this is a new call, should not update
+    // the old notification
 
     server
         .sync_room(

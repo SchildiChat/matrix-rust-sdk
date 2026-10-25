@@ -14,10 +14,10 @@
 
 //! Named futures for the recovery support.
 
-use std::future::IntoFuture;
+use std::{future::IntoFuture, pin::pin};
 
 use futures_core::Stream;
-use futures_util::{StreamExt, pin_mut};
+use futures_util::StreamExt;
 use matrix_sdk_common::boxed_into_future;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{Instrument, Span, warn};
@@ -56,13 +56,13 @@ impl<'a> Enable<'a> {
         self.progress.subscribe()
     }
 
-    /// Should the enabling of the recovery also wait for *all* room keys to be
+    /// Should the enabling of the recovery also wait for _all_ room keys to be
     /// uploaded to the server-side key backup?
     ///
     /// This is useful if the user is enabling recovery and the room key backup
-    /// just before logging out. Otherwise the logout might finish before
-    /// all room keys have been backed up and thus historic messages will
-    /// fail to decrypt once the user logs back in again.
+    /// just before logging out. Otherwise the logout might finish before all
+    /// room keys have been backed up and thus historic messages will fail to
+    /// decrypt once the user logs back in again.
     pub fn wait_for_backups_to_upload(mut self) -> Self {
         self.wait_for_backups_upload = true;
 
@@ -118,7 +118,7 @@ impl<'a> IntoFuture for Enable<'a> {
                 let progress_task = matrix_sdk_common::executor::spawn({
                     let progress = progress.clone();
                     async move {
-                        pin_mut!(upload_progress);
+                        let mut upload_progress = pin!(upload_progress);
 
                         while let Some(update) = upload_progress.next().await {
                             match update {
@@ -219,8 +219,8 @@ impl<'a> RecoverAndReset<'a> {
     }
 
     /// In addition to the new recovery key the
-    /// [`Recovery::recover_and_reset()`] method returns, allow this
-    /// passphrase to be used for the [`Recovery::recover()`] method.
+    /// [`Recovery::recover_and_reset()`] method returns, allow this passphrase
+    /// to be used for the [`Recovery::recover()`] method.
     pub fn with_passphrase(mut self, passphrase: &'a str) -> Self {
         self.passphrase = Some(passphrase);
 

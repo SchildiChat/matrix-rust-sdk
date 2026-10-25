@@ -15,12 +15,11 @@
 use std::time::Duration;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{assert_let_timeout, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_common::executor::spawn;
-use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{RoomExt, TimelineDetails};
 use ruma::{
     event_id,
@@ -30,6 +29,7 @@ use ruma::{
     },
     room_id, user_id,
 };
+use strass::assert_let;
 use stream_assert::assert_pending;
 
 #[async_test]
@@ -47,8 +47,8 @@ async fn test_batched() {
 
     let hdl = spawn(async move {
         let next_batch = timeline_stream.next().await.unwrap();
-        // There can be more than three updates because we add things like
-        // date dividers and implicit read receipts
+        // There can be more than three updates because we add things like date
+        // dividers and implicit read receipts
         assert!(next_batch.len() >= 3);
     });
 
@@ -56,13 +56,13 @@ async fn test_batched() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id)
-                .add_timeline_event(f.text_msg("text message event").sender(&ALICE))
+                .add_timeline_event(f.text_msg("text message event").sender(User::Alice))
                 .add_timeline_event(
-                    f.member(&BOB)
+                    f.member(User::Bob)
                         .membership(MembershipState::Join)
                         .previous(MembershipState::Invite),
                 )
-                .add_timeline_event(f.notice("notice message event").sender(&BOB)),
+                .add_timeline_event(f.notice("notice message event").sender(User::Bob)),
         )
         .await;
 
@@ -136,7 +136,8 @@ async fn test_event_filter() {
     // The implicit read receipt of Alice is moving from Alice's message...
     assert_let!(VectorDiff::Set { index: 1, value: first } = &timeline_updates[1]);
     assert_eq!(first.as_event().unwrap().read_receipts().len(), 0, "no more implicit read receipt");
-    // … to Alice's edit. But since this item isn't visible, it's lost in the weeds!
+    // … to Alice's edit. But since this item isn't visible, it's lost in the
+    // weeds!
 
     // The edit is applied to the first event.
     assert_let!(VectorDiff::Set { index: 1, value: first } = &timeline_updates[2]);

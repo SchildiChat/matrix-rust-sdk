@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
+// Allow UniFFI to use methods marked as `#[deprecated]`.
+#![allow(deprecated)]
+
+use std::{collections::HashMap, fmt::Write as _, fs, panic, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
 use eyeball_im::VectorDiff;
-use futures_util::pin_mut;
 use matrix_sdk::{
     attachment::{
         AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo, Thumbnail,
@@ -99,60 +101,52 @@ impl Timeline {
     pub(crate) fn new(inner: matrix_sdk_ui::timeline::Timeline) -> Arc<Self> {
         Arc::new(Self { inner })
     }
+}
 
-    fn send_attachment(
-        self: Arc<Self>,
-        params: UploadParameters,
-        attachment_info: AttachmentInfo,
-        mime_type: Option<String>,
-        thumbnail: Option<Thumbnail>,
-    ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let mime_str = mime_type.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+/// Builds the configuration shared by the methods sending or editing an
+/// attachment.
+fn build_attachment_config(
+    params: UploadParameters,
+    attachment: AttachmentKind,
+) -> Result<(UploadSource, Mime, AttachmentConfig), RoomError> {
+    let (attachment_info, mime_type, thumbnail) = attachment.into_parts()?;
 
-        let mime_type =
-            mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+    let mime_str = mime_type.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
 
-        let in_reply_to_event_id = params
-            .in_reply_to
-            .map(EventId::parse)
-            .transpose()
-            .map_err(|_| RoomError::InvalidRepliedToEventId)?;
+    let mime_type = mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
 
-        let caption = params.caption.map(|caption| {
-            let formatted = if params.skip_caption_autoformat && params.formatted_caption.is_none() {
-                None
-            } else {
-                formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into))
-            };
-            assign!(TextMessageEventContent::plain(caption), { formatted })
-        });
+    let in_reply_to_event_id = params
+        .in_reply_to
+        .map(EventId::parse)
+        .transpose()
+        .map_err(|_| RoomError::InvalidRepliedToEventId)?;
 
-        let extra_content: Option<serde_json::Map<String, serde_json::Value>> = params
-            .extra_content_json
-            .map(|json| serde_json::from_str(&json))
-            .transpose()
-            .map_err(|_| RoomError::InvalidAttachmentData)?;
-
-        let attachment_config = AttachmentConfig {
-            info: Some(attachment_info),
-            thumbnail,
-            caption,
-            mentions: params.mentions.map(Into::into),
-            in_reply_to: in_reply_to_event_id,
-            extra_content,
-            ..Default::default()
+    let caption = params.caption.map(|caption| {
+        let formatted = if params.skip_caption_autoformat && params.formatted_caption.is_none() {
+            None
+        } else {
+            formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into))
         };
+        assign!(TextMessageEventContent::plain(caption), { formatted })
+    });
 
-        let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
-            self.inner
-                .send_attachment(params.source, mime_type, attachment_config)
-                .use_send_queue()
-                .await
-                .map_err(|_| RoomError::FailedSendingAttachment)
-        }));
+    let extra_content: Option<serde_json::Map<String, serde_json::Value>> = params
+        .extra_content_json
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|_| RoomError::InvalidAttachmentData)?;
 
-        Ok(handle)
-    }
+    let attachment_config = AttachmentConfig {
+        info: Some(attachment_info),
+        thumbnail,
+        caption,
+        mentions: params.mentions.map(Into::into),
+        in_reply_to: in_reply_to_event_id,
+        extra_content,
+        ..Default::default()
+    };
+
+    Ok((params.source, mime_type, attachment_config))
 }
 
 fn build_thumbnail_info(
@@ -218,8 +212,8 @@ pub struct UploadParameters {
     mentions: Option<Mentions>,
     /// Optional Event ID to reply to.
     in_reply_to: Option<String>,
-    /// Optional additional top-level fields for the media event's content,
-    /// as a serialized JSON object.
+    /// Optional additional top-level fields for the media event's content, as a
+    /// serialized JSON object.
     #[uniffi(default = None)]
     extra_content_json: Option<String>,
 }
@@ -241,6 +235,62 @@ pub enum UploadSource {
     },
 }
 
+/// What kind of attachment is being sent or edited in, with the metadata that
+/// kind needs.
+#[derive(uniffi::Enum)]
+pub enum AttachmentKind {
+    Image { image_info: ImageInfo, thumbnail_source: Option<UploadSource> },
+    Video { video_info: VideoInfo, thumbnail_source: Option<UploadSource> },
+    Audio { audio_info: AudioInfo },
+    Voice { audio_info: AudioInfo, waveform: Vec<f32> },
+    File { file_info: FileInfo },
+}
+
+impl AttachmentKind {
+    fn into_parts(self) -> Result<(AttachmentInfo, Option<String>, Option<Thumbnail>), RoomError> {
+        Ok(match self {
+            Self::Image { image_info, thumbnail_source } => (
+                AttachmentInfo::Image(
+                    BaseImageInfo::try_from(&image_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                image_info.mimetype,
+                build_thumbnail_info(thumbnail_source, image_info.thumbnail_info)?,
+            ),
+            Self::Video { video_info, thumbnail_source } => (
+                AttachmentInfo::Video(
+                    BaseVideoInfo::try_from(&video_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                video_info.mimetype,
+                build_thumbnail_info(thumbnail_source, video_info.thumbnail_info)?,
+            ),
+            Self::Audio { audio_info } => (
+                AttachmentInfo::Audio(
+                    BaseAudioInfo::try_from(&audio_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                audio_info.mimetype,
+                None,
+            ),
+            Self::Voice { audio_info, waveform } => {
+                let mut info = BaseAudioInfo::try_from(&audio_info)
+                    .map_err(|_| RoomError::InvalidAttachmentData)?;
+                info.waveform = Some(waveform);
+                (AttachmentInfo::Voice(info), audio_info.mimetype, None)
+            }
+            Self::File { file_info } => (
+                AttachmentInfo::File(
+                    BaseFileInfo::try_from(&file_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                ),
+                file_info.mimetype,
+                None,
+            ),
+        })
+    }
+}
+
 impl From<UploadSource> for AttachmentSource {
     fn from(value: UploadSource) -> Self {
         match value {
@@ -254,13 +304,12 @@ impl From<UploadSource> for AttachmentSource {
 /// possibly a thumbnail) being uploaded.
 #[derive(Clone, Copy, uniffi::Record)]
 pub struct MediaUploadProgress {
-    /// The index of the media within the transaction. A file and its
-    /// thumbnail share the same index. Will always be 0 for non-gallery
-    /// media uploads.
+    /// The index of the media within the transaction. A file and its thumbnail
+    /// share the same index. Will always be 0 for non-gallery media uploads.
     pub index: u64,
 
-    /// The current combined upload progress for both the file and,
-    /// if it exists, its thumbnail.
+    /// The current combined upload progress for both the file and, if it
+    /// exists, its thumbnail.
     pub progress: AbstractProgress,
 }
 
@@ -272,8 +321,8 @@ impl From<SdkMediaUploadProgress> for MediaUploadProgress {
 
 /// Progress of an operation in abstract units.
 ///
-/// Contrary to [`TransmissionProgress`], this allows tracking the progress
-/// of sending or receiving a payload in estimated pseudo units representing a
+/// Contrary to [`TransmissionProgress`], this allows tracking the progress of
+/// sending or receiving a payload in estimated pseudo units representing a
 /// percentage. This is helpful in cases where the exact progress in bytes isn't
 /// known, for instance, because encryption (which changes the size) happens on
 /// the fly.
@@ -299,18 +348,19 @@ impl Timeline {
     pub async fn add_listener(&self, listener: Box<dyn TimelineListener>) -> Arc<TaskHandle> {
         let (timeline_items, timeline_stream) = self.inner.subscribe().await;
 
-        // It's important that the initial items are passed *before* we forward the
-        // stream updates, with a guaranteed ordering. Otherwise, it could
+        // It's important that the initial items are passed _before_ we forward
+        // the stream updates, with a guaranteed ordering. Otherwise, it could
         // be that the listener be called before the initial items have been
         // handled by the caller. See #3535 for details.
 
-        // Note we pass initial items as a reset update, as a way to give the callers a
-        // unified way to handle the initial batch of items as well as other
-        // batches, instead of having a separate callback for the initial items.
+        // Note we pass initial items as a reset update, as a way to give the
+        // callers a unified way to handle the initial batch of items as well as
+        // other batches, instead of having a separate callback for the initial
+        // items.
         listener.on_update(vec![TimelineDiff::new(VectorDiff::Reset { values: timeline_items })]);
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
-            pin_mut!(timeline_stream);
+            let mut timeline_stream = pin!(timeline_stream);
 
             // Then forward new items.
             while let Some(diffs) = timeline_stream.next().await {
@@ -341,9 +391,9 @@ impl Timeline {
 
         // Send the current state even if it hasn't changed right away.
         //
-        // Note: don't do it in the spawned function, so that the caller is immediately
-        // aware of the current state, and this doesn't depend on the async runtime
-        // having an available worker
+        // Note: don't do it in the spawned function, so that the caller is
+        // immediately aware of the current state, and this doesn't depend on
+        // the async runtime having an available worker
         listener.on_update(initial);
 
         Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
@@ -396,16 +446,10 @@ impl Timeline {
         event_id: String,
     ) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
-        let should_update_local_unreads = matches!(receipt_type, ReceiptType::Read | ReceiptType::ReadPrivate);
 
         self.inner
-            .force_send_single_receipt(receipt_type.into(), ruma::events::receipt::ReceiptThread::Unthreaded, event_id.clone())
+            .force_send_single_receipt(receipt_type.into(), ruma::events::receipt::ReceiptThread::Unthreaded, event_id)
             .await?;
-        if should_update_local_unreads {
-            if let Ok((room_event_cache, _drop_handles)) = self.inner.room().event_cache().await {
-                let _ = room_event_cache.update_unreads_with_local_receipt(event_id).await;
-            }
-        }
         Ok(())
     }
 
@@ -426,13 +470,13 @@ impl Timeline {
     /// latest visible event.
     ///
     /// The latest visible event is determined from the timeline's focus kind
-    /// and whether or not it hides threaded events. If no latest event can
-    /// be determined and the timeline is live, the room's unread marker is
-    /// unset instead.
+    /// and whether or not it hides threaded events. If no latest event can be
+    /// determined and the timeline is live, the room's unread marker is unset
+    /// instead.
     ///
     /// # Arguments
     ///
-    /// * `receipt_type` - The type of receipt to send. When using
+    /// - `receipt_type` - The type of receipt to send. When using
     ///   [`ReceiptType::FullyRead`], an unthreaded receipt will be sent. This
     ///   works even if the latest event belongs to a thread, as a threaded
     ///   reply also belongs to the unthreaded timeline. Otherwise the receipt
@@ -447,8 +491,8 @@ impl Timeline {
         self.inner.latest_event_id().await.as_deref().map(ToString::to_string)
     }
 
-    /// Queues an event in the room's send queue so it's processed for
-    /// sending later.
+    /// Queues an event in the room's send queue so it's processed for sending
+    /// later.
     ///
     /// Returns an abort handle that allows to abort sending, if it hasn't
     /// happened yet.
@@ -459,8 +503,8 @@ impl Timeline {
         self.send_with_extra_content(msg, None).await
     }
 
-    /// Like [`Self::send`], but merges the given additional top-level fields
-    /// (a JSON object, encoded as a string) into the outgoing event's content.
+    /// Like [`Self::send`], but merges the given additional top-level fields (a
+    /// JSON object, encoded as a string) into the outgoing event's content.
     pub async fn send_with_extra_content(
         self: Arc<Self>,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
@@ -515,64 +559,94 @@ impl Timeline {
         }
     }
 
+    /// Sends an attachment, uploaded through the send queue.
+    pub fn send_attachment(
+        self: Arc<Self>,
+        params: UploadParameters,
+        attachment: AttachmentKind,
+    ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
+        let (source, mime_type, attachment_config) = build_attachment_config(params, attachment)?;
+
+        let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
+            self.inner
+                .send_attachment(source, mime_type, attachment_config)
+                .use_send_queue()
+                .await
+                .map_err(|_| RoomError::FailedSendingAttachment)
+        }));
+
+        Ok(handle)
+    }
+
+    /// Edits a message the current user sent into one with the given
+    /// attachment, replacing its attachment if it had one. The caption in
+    /// `params` is the whole new text: nothing of the original content is
+    /// kept, and `in_reply_to` is ignored.
+    pub async fn edit_with_attachment(
+        &self,
+        event_id: String,
+        params: UploadParameters,
+        attachment: AttachmentKind,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let (source, mime_type, attachment_config) = build_attachment_config(params, attachment)?;
+
+        self.inner.edit_with_attachment(&event_id, source, mime_type, attachment_config).await?;
+
+        Ok(())
+    }
+
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Image`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_image(
         self: Arc<Self>,
         params: UploadParameters,
         thumbnail_source: Option<UploadSource>,
         image_info: ImageInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Image(
-            BaseImageInfo::try_from(&image_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        let thumbnail = build_thumbnail_info(thumbnail_source, image_info.thumbnail_info)?;
-        self.send_attachment(params, attachment_info, image_info.mimetype, thumbnail)
+        self.send_attachment(params, AttachmentKind::Image { image_info, thumbnail_source })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Video`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_video(
         self: Arc<Self>,
         params: UploadParameters,
         thumbnail_source: Option<UploadSource>,
         video_info: VideoInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Video(
-            BaseVideoInfo::try_from(&video_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        let thumbnail = build_thumbnail_info(thumbnail_source, video_info.thumbnail_info)?;
-        self.send_attachment(params, attachment_info, video_info.mimetype, thumbnail)
+        self.send_attachment(params, AttachmentKind::Video { video_info, thumbnail_source })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Audio`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_audio(
         self: Arc<Self>,
         params: UploadParameters,
         audio_info: AudioInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::Audio(
-            BaseAudioInfo::try_from(&audio_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        self.send_attachment(params, attachment_info, audio_info.mimetype, None)
+        self.send_attachment(params, AttachmentKind::Audio { audio_info })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::Voice`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_voice_message(
         self: Arc<Self>,
         params: UploadParameters,
         audio_info: AudioInfo,
         waveform: Vec<f32>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let mut info =
-            BaseAudioInfo::try_from(&audio_info).map_err(|_| RoomError::InvalidAttachmentData)?;
-        info.waveform = Some(waveform);
-        self.send_attachment(params, AttachmentInfo::Voice(info), audio_info.mimetype, None)
+        self.send_attachment(params, AttachmentKind::Voice { audio_info, waveform })
     }
 
+    /// Deprecated: use [`Self::send_attachment`] with `AttachmentKind::File`.
+    #[deprecated = "Use `Timeline::send_attachment` instead"]
     pub fn send_file(
         self: Arc<Self>,
         params: UploadParameters,
         file_info: FileInfo,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
-        let attachment_info = AttachmentInfo::File(
-            BaseFileInfo::try_from(&file_info).map_err(|_| RoomError::InvalidAttachmentData)?,
-        );
-        self.send_attachment(params, attachment_info, file_info.mimetype, None)
+        self.send_attachment(params, AttachmentKind::File { file_info })
     }
 
     pub async fn create_poll(
@@ -637,8 +711,8 @@ impl Timeline {
     /// Send a reply.
     ///
     /// If the replied to event has a thread relation, it is forwarded on the
-    /// reply so that clients that support threads can render the reply
-    /// inside the thread. Returns a handle to abort the pending send.
+    /// reply so that clients that support threads can render the reply inside
+    /// the thread. Returns a handle to abort the pending send.
     pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
@@ -651,12 +725,12 @@ impl Timeline {
 
     /// Edits an event from the timeline.
     ///
-    /// If it was a local event, this will *try* to edit it, if it was not
-    /// being sent already. If the event was a remote event, then it will be
-    /// redacted by sending an edit request to the server.
+    /// If it was a local event, this will _try_ to edit it, if it was not being
+    /// sent already. If the event was a remote event, then it will be redacted
+    /// by sending an edit request to the server.
     ///
-    /// Returns whether the edit did happen. It can only return false for
-    /// local events that are being processed.
+    /// Returns whether the edit did happen. It can only return false for local
+    /// events that are being processed.
     pub async fn edit(
         &self,
         event_or_transaction_id: EventOrTransactionId,
@@ -670,8 +744,9 @@ impl Timeline {
             Ok(()) => Ok(()),
 
             Err(timeline::Error::EventNotInTimeline(_)) => {
-                // If we couldn't edit, assume it was an (remote) event that wasn't in the
-                // timeline, and try to edit it via the room itself.
+                // If we couldn't edit, assume it was an (remote) event that
+                // wasn't in the timeline, and try to edit it via the room
+                // itself.
                 let event_id = match event_or_transaction_id {
                     EventOrTransactionId::EventId { event_id } => EventId::parse(event_id)?,
                     EventOrTransactionId::TransactionId { .. } => {
@@ -786,7 +861,7 @@ impl Timeline {
 
     /// Get the current timeline item for the given event ID, if any.
     ///
-    /// Will return a remote event, *or* a local echo that has been sent but not
+    /// Will return a remote event, _or_ a local echo that has been sent but not
     /// yet replaced by a remote echo.
     ///
     /// It's preferable to store the timeline items in the model for your UI, if
@@ -807,9 +882,9 @@ impl Timeline {
 
     /// Get the edit history for the given event.
     ///
-    /// Returns all revisions of the event, in chronological order.
-    /// The first entry is the original event content, followed by each
-    /// edit in the order they were applied.
+    /// Returns all revisions of the event, in chronological order. The first
+    /// entry is the original event content, followed by each edit in the order
+    /// they were applied.
     pub async fn edit_revisions(
         &self,
         event_id: String,
@@ -829,7 +904,7 @@ impl Timeline {
     ///
     /// Only works for events that exist as timeline items.
     ///
-    /// If it was a local event, this will *try* to cancel it, if it was not
+    /// If it was a local event, this will _try_ to cancel it, if it was not
     /// being sent already. If the event was a remote event, then it will be
     /// redacted by sending a redaction request to the server.
     ///
@@ -840,6 +915,35 @@ impl Timeline {
         reason: Option<String>,
     ) -> Result<(), ClientError> {
         Ok(self.inner.redact(&(event_or_transaction_id.try_into()?), reason.as_deref()).await?)
+    }
+
+    /// Retry sending something on this item that failed, see [`SendTarget`].
+    ///
+    /// Only needed after an unrecoverable failure, which parks the request
+    /// until it's retried or aborted; a recoverable one goes out again when the
+    /// room's send queue is re-enabled.
+    ///
+    /// Returns `false` if there was nothing of that kind left to retry, e.g.
+    /// because it went out in the meantime.
+    pub async fn retry_send(
+        &self,
+        item_id: EventOrTransactionId,
+        target: SendTarget,
+    ) -> Result<bool, ClientError> {
+        Ok(self.inner.retry_send(&item_id.try_into()?, target.into()).await?)
+    }
+
+    /// Abort sending something on this item that hasn't gone out yet, see
+    /// [`SendTarget`].
+    ///
+    /// Returns `false` if there was nothing of that kind left to abort, e.g.
+    /// because it went out in the meantime.
+    pub async fn abort_send(
+        &self,
+        item_id: EventOrTransactionId,
+        target: SendTarget,
+    ) -> Result<bool, ClientError> {
+        Ok(self.inner.abort_send(&item_id.try_into()?, target.into()).await?)
     }
 
     /// Load the reply details for the given event id.
@@ -924,8 +1028,8 @@ impl SendHandle {
 
 #[matrix_sdk_ffi_macros::export]
 impl SendHandle {
-    /// Try to abort the sending of the current event, with an optional
-    /// `reason` applied to the redaction when the event went out anyway.
+    /// Try to abort the sending of the current event, with an optional `reason`
+    /// applied to the redaction when the event went out anyway.
     ///
     /// If this returns `true`, then the sending could be aborted, because the
     /// event hasn't been sent yet. Otherwise, if this returns `false`, the
@@ -951,12 +1055,12 @@ impl SendHandle {
     ///
     /// This is useful for example, when there's a
     /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity` error;
-    /// the user may have re-verified on a different device and would now
-    /// like to send the failed message that's waiting on this device.
+    /// the user may have re-verified on a different device and would now like
+    /// to send the failed message that's waiting on this device.
     ///
     /// # Arguments
     ///
-    /// * `transaction_id` - The send queue transaction identifier of the local
+    /// - `transaction_id` - The send queue transaction identifier of the local
     ///   echo that should be unwedged.
     pub async fn try_resend(self: Arc<Self>) -> Result<(), ClientError> {
         let locked = self.inner.lock().await;
@@ -1064,7 +1168,7 @@ pub struct TimelineItem(pub(crate) matrix_sdk_ui::timeline::TimelineItem);
 impl TimelineItem {
     pub(crate) fn from_arc(arc: Arc<matrix_sdk_ui::timeline::TimelineItem>) -> Arc<Self> {
         // SAFETY: This is valid because Self is a repr(transparent) wrapper
-        //         around the other Timeline type.
+        // around the other Timeline type.
         unsafe { Arc::from_raw(Arc::into_raw(arc) as _) }
     }
 }
@@ -1095,6 +1199,34 @@ impl TimelineItem {
     }
 }
 
+/// Which pending send on an item [`Timeline::retry_send`] and
+/// [`Timeline::abort_send`] act on.
+#[derive(Clone, uniffi::Enum)]
+pub enum SendTarget {
+    /// The item itself, while it's a local echo.
+    ///
+    /// Note that aborting one that's already in flight queues a redaction for
+    /// it, without a reason; use `SendHandle::abort` if one is needed.
+    Event,
+    /// Our pending edit of the item.
+    Edit,
+    /// Our pending redaction of the item.
+    Redaction,
+    /// Our pending reaction to the item with this key.
+    Reaction { key: String },
+}
+
+impl From<SendTarget> for matrix_sdk_ui::timeline::SendTarget {
+    fn from(value: SendTarget) -> Self {
+        match value {
+            SendTarget::Event => Self::Event,
+            SendTarget::Edit => Self::Edit,
+            SendTarget::Redaction => Self::Redaction,
+            SendTarget::Reaction { key } => Self::Reaction { key },
+        }
+    }
+}
+
 /// This type represents the “send state” of a local event timeline item.
 #[derive(Clone, uniffi::Enum)]
 pub enum EventSendState {
@@ -1114,8 +1246,8 @@ pub enum EventSendState {
         /// Whether the error is considered recoverable or not.
         ///
         /// An error that's recoverable will disable the room's send queue,
-        /// while an unrecoverable error will be parked, until the user
-        /// decides to cancel sending it.
+        /// while an unrecoverable error will be parked, until it's retried or
+        /// aborted.
         is_recoverable: bool,
     },
 
@@ -1185,6 +1317,10 @@ pub struct EventTimelineItem {
     event_type_raw: Option<String>,
     timestamp: Timestamp,
     local_send_state: Option<EventSendState>,
+    /// Send state of our pending edit of this event, if any.
+    edit_send_state: Option<EventSendState>,
+    /// Send state of our pending redaction of this event, if any.
+    redaction_send_state: Option<EventSendState>,
     local_created_at: Option<u64>,
     read_receipts: HashMap<String, Receipt>,
     origin: Option<EventItemOrigin>,
@@ -1219,6 +1355,7 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
                         .map(|(sender_id, info)| ReactionSenderData {
                             sender_id: sender_id.to_string(),
                             timestamp: info.timestamp.into(),
+                            send_state: info.send_state.as_ref().map(|s| s.into()),
                         })
                         .collect(),
                 })
@@ -1226,6 +1363,8 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
             event_type_raw: item.content().event_type_str(),
             timestamp: item.timestamp().into(),
             local_send_state: item.send_state().map(|s| s.into()),
+            edit_send_state: item.edit_send_state().map(|s| s.into()),
+            redaction_send_state: item.redaction_send_state().map(|s| s.into()),
             local_created_at: item.local_created_at().map(|t| t.0.into()),
             read_receipts,
             origin: item.origin(),
@@ -1680,6 +1819,41 @@ mod galleries {
         mentions: Option<Mentions>,
         /// Optional Event ID to reply to.
         in_reply_to: Option<String>,
+        /// Additional top-level fields for the gallery, as a JSON object.
+        /// The gallery's own fields take precedence on conflicts.
+        #[uniffi(default = None)]
+        extra_content_json: Option<String>,
+    }
+
+    impl TryFrom<GalleryUploadParameters> for GalleryConfig {
+        type Error = RoomError;
+
+        fn try_from(params: GalleryUploadParameters) -> Result<Self, Self::Error> {
+            let caption = params.caption.map(|caption| {
+                let formatted =
+                    formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
+                assign!(TextMessageEventContent::plain(caption), { formatted })
+            });
+
+            let in_reply_to = params
+                .in_reply_to
+                .as_ref()
+                .map(EventId::parse)
+                .transpose()
+                .map_err(|_| RoomError::InvalidRepliedToEventId)?;
+
+            let extra_content = params
+                .extra_content_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|_| RoomError::InvalidAttachmentData)?;
+
+            Ok(GalleryConfig::new()
+                .caption(caption)
+                .mentions(params.mentions.map(Into::into))
+                .in_reply_to(in_reply_to)
+                .extra_content(extra_content))
+        }
     }
 
     #[derive(uniffi::Enum)]
@@ -1689,18 +1863,24 @@ mod galleries {
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
         },
         File {
             file_info: FileInfo,
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
         },
         Image {
             image_info: ImageInfo,
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
             thumbnail_source: Option<UploadSource>,
         },
         Video {
@@ -1708,11 +1888,22 @@ mod galleries {
             source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
+            #[uniffi(default = None)]
+            extra_content_json: Option<String>,
             thumbnail_source: Option<UploadSource>,
         },
     }
 
     impl GalleryItemInfo {
+        fn extra_content_json(&self) -> &Option<String> {
+            match self {
+                GalleryItemInfo::Audio { extra_content_json, .. }
+                | GalleryItemInfo::File { extra_content_json, .. }
+                | GalleryItemInfo::Image { extra_content_json, .. }
+                | GalleryItemInfo::Video { extra_content_json, .. } => extra_content_json,
+            }
+        }
+
         fn mimetype(&self) -> &Option<String> {
             match self {
                 GalleryItemInfo::Audio { audio_info, .. } => &audio_info.mimetype,
@@ -1811,6 +2002,12 @@ mod galleries {
                 attachment_info: self.attachment_info()?,
                 caption,
                 thumbnail: self.thumbnail()?,
+                extra_content: self
+                    .extra_content_json()
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| RoomError::InvalidAttachmentData)?,
             })
         }
     }
@@ -1868,23 +2065,7 @@ mod galleries {
             params: GalleryUploadParameters,
             item_infos: Vec<GalleryItemInfo>,
         ) -> Result<Arc<SendGalleryJoinHandle>, RoomError> {
-            let caption = params.caption.map(|caption| {
-                let formatted =
-                    formatted_body_from(Some(&caption), params.formatted_caption.map(Into::into));
-                assign!(TextMessageEventContent::plain(caption), { formatted })
-            });
-
-            let in_reply_to = params
-                .in_reply_to
-                .as_ref()
-                .map(EventId::parse)
-                .transpose()
-                .map_err(|_| RoomError::InvalidRepliedToEventId)?;
-
-            let mut gallery_config = GalleryConfig::new()
-                .caption(caption)
-                .mentions(params.mentions.map(Into::into))
-                .in_reply_to(in_reply_to);
+            let mut gallery_config: GalleryConfig = params.try_into()?;
 
             for item_info in item_infos {
                 gallery_config = gallery_config.add_item(item_info.try_into()?);
@@ -1897,6 +2078,69 @@ mod galleries {
             }));
 
             Ok(handle)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn gallery_params(extra_content_json: Option<&str>) -> GalleryUploadParameters {
+            GalleryUploadParameters {
+                caption: Some("gallery caption".to_owned()),
+                formatted_caption: None,
+                mentions: None,
+                in_reply_to: None,
+                extra_content_json: extra_content_json.map(str::to_owned),
+            }
+        }
+
+        fn image_item(extra_content_json: Option<&str>) -> GalleryItemInfo {
+            GalleryItemInfo::Image {
+                image_info: ImageInfo {
+                    height: None,
+                    width: None,
+                    mimetype: Some("image/jpeg".to_owned()),
+                    size: None,
+                    thumbnail_info: None,
+                    thumbnail_source: None,
+                    blurhash: None,
+                    is_animated: None,
+                },
+                source: UploadSource::Data {
+                    bytes: b"image".to_vec(),
+                    filename: "image.jpg".to_owned(),
+                },
+                caption: None,
+                formatted_caption: None,
+                thumbnail_source: None,
+                extra_content_json: extra_content_json.map(str::to_owned),
+            }
+        }
+
+        #[test]
+        fn test_gallery_extra_content_conversion() {
+            for json in [None, Some("{}"), Some(r#"{"com.example.gallery":true}"#)] {
+                assert!(GalleryConfig::try_from(gallery_params(json)).is_ok());
+            }
+
+            let item: matrix_sdk_ui::timeline::GalleryItemInfo =
+                image_item(Some(r#"{"org.matrix.msc2448.is_spoiler":true}"#)).try_into().unwrap();
+            let item: matrix_sdk::attachment::GalleryItemInfo = item.try_into().unwrap();
+            assert_eq!(item.extra_content.unwrap()["org.matrix.msc2448.is_spoiler"], true);
+        }
+
+        #[test]
+        fn test_gallery_extra_content_rejects_non_objects() {
+            for json in ["not JSON", "[]", "null", "true", "42", r#""text""#] {
+                assert!(matches!(
+                    GalleryConfig::try_from(gallery_params(Some(json))),
+                    Err(RoomError::InvalidAttachmentData)
+                ));
+                let item: Result<matrix_sdk_ui::timeline::GalleryItemInfo, _> =
+                    image_item(Some(json)).try_into();
+                assert!(matches!(item, Err(RoomError::InvalidAttachmentData)));
+            }
         }
     }
 }

@@ -8,7 +8,7 @@ use matrix_sdk::{
     test_utils::mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
     timeout::timeout,
 };
-use matrix_sdk_base::event_cache::store::MemoryStore;
+use matrix_sdk_base::event_cache::store::{EventCacheStore, MemoryStore};
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
 use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
 use ruma::{EventId, event_id, owned_event_id, room_id, user_id};
@@ -37,8 +37,8 @@ impl PinningTestSetup<'_> {
 
         server.mock_room_state_encryption().plain().mount().await;
 
-        // This is necessary to get an empty list of pinned events when there are no
-        // pinned events state event in the required state.
+        // This is necessary to get an empty list of pinned events when there
+        // are no pinned events state event in the required state.
         Mock::given(method("GET"))
             .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.room.pinned_events/.*"))
             .and(header("authorization", "Bearer 1234"))
@@ -171,16 +171,13 @@ async fn test_pinned_events_are_loaded_from_network_then_are_reloaded_from_stora
             .build()
             .await;
 
-        let event_cache = client.event_cache();
-
-        // Subscribe the event cache to sync updates.
-        event_cache.subscribe().unwrap();
+        let event_cache = client.event_cache().unwrap();
 
         // Sync the room with the pinned event ID in the room state.
         //
         // This is important: the pinned events list must include our event ID,
-        // otherwise the initial reload from network will clear the storage-loaded
-        // events.
+        // otherwise the initial reload from network will clear the
+        // storage-loaded events.
         let pinned_events_state = f.room_pinned_events(vec![pinned_event_id.to_owned()]);
 
         let _room = server
@@ -194,8 +191,8 @@ async fn test_pinned_events_are_loaded_from_network_then_are_reloaded_from_stora
         let (pinned_events_cache, _drop_handles) =
             event_cache.pinned_events(room_id).await.unwrap();
 
-        // Getting the pinned events cache triggers `PinnedEventsCache::new()` which
-        // spawns a task that calls `reload_from_storage()` first.
+        // Getting the pinned events cache triggers `PinnedEventsCache::new()`
+        // which spawns a task that calls `reload_from_storage()` first.
         let (events, mut subscriber) = pinned_events_cache.subscribe().await.unwrap();
         let mut events = events.into();
 
@@ -232,10 +229,7 @@ async fn test_pinned_events_are_loaded_from_network_then_are_reloaded_from_stora
         .build()
         .await;
 
-    let event_cache = client.event_cache();
-
-    // Subscribe the event cache to sync updates.
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let _room = client.get_room(room_id).unwrap();
 
@@ -278,21 +272,9 @@ async fn test_pinned_events_are_reloaded_from_storage_from_many_chunks() {
     let pinned_event_0 = f.text_msg("I'm pinned!").event_id(pinned_event_id_0).into_event();
     let pinned_event_1 = f.text_msg("I'm pinned too!").event_id(pinned_event_id_1).into_event();
 
-    // Create a client.
-    let server = MatrixMockServer::new().await;
-    let client = server.client_builder().build().await;
-
-    let event_cache = client.event_cache();
-
     // Create a non empty Event Cache store containing two chunks.
-    event_cache.subscribe().unwrap();
-    client
-        .event_cache_store()
-        .lock()
-        .await
-        .unwrap()
-        .as_clean()
-        .unwrap()
+    let event_cache_store = MemoryStore::new();
+    event_cache_store
         .handle_linked_chunk_updates(
             LinkedChunkId::PinnedEvents(room_id),
             vec![
@@ -314,6 +296,23 @@ async fn test_pinned_events_are_reloaded_from_storage_from_many_chunks() {
         )
         .await
         .unwrap();
+
+    // Create a client.
+    let server = MatrixMockServer::new().await;
+    let client = server
+        .client_builder()
+        .on_builder(move |builder| {
+            builder.store_config(
+                StoreConfig::new(CrossProcessLockConfig::MultiProcess {
+                    holder_name: "foo".to_owned(),
+                })
+                .event_cache_store(event_cache_store),
+            )
+        })
+        .build()
+        .await;
+
+    let event_cache = client.event_cache().unwrap();
 
     let _room = server.sync_room(&client, JoinedRoomBuilder::new(room_id)).await;
 
@@ -362,8 +361,8 @@ async fn test_pinned_events_dont_include_thread_responses() {
 
     server.mock_room_event().match_event_id().ok(pinned_event.clone()).mock_once().mount().await;
 
-    // Serve a thread relation over network; it should NOT be included in the pinned
-    // event cache for that room.
+    // Serve a thread relation over network; it should NOT be included in the
+    // pinned event cache for that room.
     server
         .mock_room_relations()
         .match_subrequest(IncludeRelations::AllRelations)
@@ -375,10 +374,7 @@ async fn test_pinned_events_dont_include_thread_responses() {
         .await;
 
     let client = server.client_builder().build().await;
-    let event_cache = client.event_cache();
-
-    // Subscribe the event cache to sync updates.
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     // Sync the room with the pinned event ID in the room state.
     //
@@ -412,9 +408,9 @@ async fn test_pinned_events_dont_include_thread_responses() {
         }
     }
 
-    // Verify the pinned event was loaded from the network, and that there wasn't
-    // any other event loaded (in particular, the thread response shouldn't be
-    // included in the pinned events).
+    // Verify the pinned event was loaded from the network, and that there
+    // wasn't any other event loaded (in particular, the thread response
+    // shouldn't be included in the pinned events).
     assert_eq!(events.len(), 1, "Expected pinned events to be loaded from network");
     assert_eq!(
         events[0].event_id().unwrap(),

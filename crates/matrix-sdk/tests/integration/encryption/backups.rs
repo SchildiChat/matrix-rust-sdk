@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fs::File, io::Write, sync::Arc, time::Duration};
+use std::{fs::File, io::Write, pin::pin, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use assert_matches::assert_matches;
-use futures_util::{FutureExt, StreamExt, pin_mut};
+use futures_util::{FutureExt, StreamExt};
 use matrix_sdk::{
     Client, SessionMeta,
     authentication::matrix::MatrixSession,
@@ -209,7 +209,7 @@ async fn test_creation_failure() -> TestResult {
     let states = client.encryption().backups().state_stream();
 
     let task = spawn(async move {
-        pin_mut!(states);
+        let mut states = pin!(states);
 
         let mut counter = 0;
         let mut unknown_counter = 0;
@@ -300,7 +300,7 @@ async fn test_disabling() -> TestResult {
     client.encryption().backups().disable().await.expect("We should be able to disable our backup");
 
     let task = spawn(async move {
-        pin_mut!(states);
+        let mut states = pin!(states);
 
         let mut counter = 0;
 
@@ -635,10 +635,9 @@ async fn setup_create_room_and_send_message_mocks(server: &wiremock::MockServer)
 
 /// Test that new room keys are uploaded to backup when they are known/imported.
 /// Current implementation of the backup module will try to trigger a backup
-/// upload at the end of a sync.
-/// For simplicity we are testing here that the upload is triggered when a new
-/// outbound room key is created. But it would work for a key received via a to
-/// device event as well.
+/// upload at the end of a sync. For simplicity we are testing here that the
+/// upload is triggered when a new outbound room key is created. But it would
+/// work for a key received via a to device event as well.
 #[async_test]
 async fn test_incremental_upload_of_keys() -> TestResult {
     let session = matrix_session_example();
@@ -647,8 +646,8 @@ async fn test_incremental_upload_of_keys() -> TestResult {
 
     let backups = client.encryption().backups();
 
-    // This is the call we want to check. The newly created outbound session should
-    // be uploaded to backup.
+    // This is the call we want to check. The newly created outbound session
+    // should be uploaded to backup.
     mount_and_assert_called_once(
         &server,
         "PUT",
@@ -722,8 +721,8 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> TestResult {
 
     let backups = client.encryption().backups();
 
-    // This is the call we want to check. The newly created outbound session should
-    // be uploaded to backup.
+    // This is the call we want to check. The newly created outbound session
+    // should be uploaded to backup.
     let (endpoint_called_sender, endpoint_called_receiver) = std::sync::mpsc::channel();
     Mock::given(method("PUT"))
         .and(path("_matrix/client/unstable/room_keys/keys"))
@@ -776,7 +775,7 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> TestResult {
 
     let sync_task = spawn(async move {
         let stream = sliding.sync();
-        pin_mut!(stream);
+        let mut stream = pin!(stream);
         while let Some(up) = stream.next().await {
             tracing::warn!("received update: {up:?}");
         }
@@ -806,8 +805,8 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> TestResult {
 
     // Wait for the endpoint to be called, at most for 10 seconds.
     //
-    // Don't plain use `recv_timeout()` on the main task, since this would prevent
-    // forward progress of the wiremock code.
+    // Don't plain use `recv_timeout()` on the main task, since this would
+    // prevent forward progress of the wiremock code.
     timeout(
         spawn_blocking(move || endpoint_called_receiver.recv().unwrap()),
         Duration::from_secs(10),
@@ -1003,7 +1002,7 @@ async fn test_enable_from_secret_storage() -> TestResult {
         .await;
 
     let room_key_stream = client.encryption().backups().room_keys_for_room_stream(room_id);
-    pin_mut!(room_key_stream);
+    let mut room_key_stream = pin!(room_key_stream);
 
     store
         .import_secrets()
@@ -1264,7 +1263,7 @@ async fn test_enable_from_secret_storage_and_manual_download() -> TestResult {
         .await;
 
     let room_key_stream = client.encryption().backups().room_keys_for_room_stream(room_id);
-    pin_mut!(room_key_stream);
+    let mut room_key_stream = pin!(room_key_stream);
 
     client
         .encryption()
@@ -1307,7 +1306,7 @@ async fn test_enable_from_secret_storage_and_manual_download() -> TestResult {
         .await;
 
     let room_key_stream = client.encryption().backups().room_keys_for_room_stream(room_id);
-    pin_mut!(room_key_stream);
+    let mut room_key_stream = pin!(room_key_stream);
 
     client
         .encryption()
@@ -1399,7 +1398,7 @@ async fn test_enable_from_secret_storage_and_download_after_utd() -> TestResult 
         .await;
 
     let room_key_stream = client.encryption().backups().room_keys_for_room_stream(room_id);
-    pin_mut!(room_key_stream);
+    let mut room_key_stream = pin!(room_key_stream);
 
     let room = client.get_room(room_id).expect("We should have access to the room after the sync");
     let event =
@@ -1467,7 +1466,8 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
 
     init_client_secret_storage_and_backup(&client, &server).await;
 
-    // Create an outbound group session which we will use to encrypt a test event.
+    // Create an outbound group session which we will use to encrypt a test
+    // event.
     let sender_identity_keys = IdentityKeys {
         ed25519: Ed25519SecretKey::new().public_key(),
         curve25519: Curve25519PublicKey::from(&Curve25519SecretKey::new()),
@@ -1479,8 +1479,8 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
         matrix_sdk_base::crypto::EncryptionSettings::default(),
     )?;
 
-    // Export the `OutboundGroupSession` to an `InboundGroupSession`, and export it
-    // to the backup. We do this now, at ratchet index 0.
+    // Export the `OutboundGroupSession` to an `InboundGroupSession`, and export
+    // it to the backup. We do this now, at ratchet index 0.
     let inbound_group_session = inbound_session_from_outbound_session(
         sender_identity_keys.ed25519,
         room_id,
@@ -1499,7 +1499,8 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
     )?;
     mock_get_event(room_id, event_id, encrypted_event_content, &server).await;
 
-    // Now, import the megolm session into the client's store, at ratchet index 1.
+    // Now, import the megolm session into the client's store, at ratchet index
+    // 1.
     {
         let inbound_group_session = inbound_session_from_outbound_session(
             sender_identity_keys.ed25519,
@@ -1521,7 +1522,7 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
 
     // Listen out for key downloads
     let room_key_stream = client.encryption().backups().room_keys_for_room_stream(room_id);
-    pin_mut!(room_key_stream);
+    let mut room_key_stream = pin!(room_key_stream);
 
     // Finally, make a request for the event. That should kick off an attempt to
     // fetch from backup.
@@ -1561,8 +1562,8 @@ async fn test_enable_from_secret_storage_and_download_after_utd_from_old_message
     Ok(())
 }
 
-/// Set up secret storage, and allow the client to import the backup
-/// decryption key from 4S.
+/// Set up secret storage, and allow the client to import the backup decryption
+/// key from 4S.
 async fn init_client_secret_storage_and_backup(client: &Client, server: &wiremock::MockServer) {
     let store = init_secret_store(client, server).await;
     mock_query_key_backup(server).await;
@@ -1649,8 +1650,8 @@ async fn mock_query_key_backup(server: &wiremock::MockServer) {
         .await;
 }
 
-/// Encrypt the given session with the backup key, and add a mock for a `GET
-/// /_matrix/client/r0/room_keys/keys/{}/{}` request which will return it.
+/// Encrypt the given session with the backup key, and add a mock for a
+/// `GET /_matrix/client/r0/room_keys/keys/{}/{}` request which will return it.
 async fn mock_download_session_from_key_backup(
     room_id: &RoomId,
     inbound_group_session: InboundGroupSession,

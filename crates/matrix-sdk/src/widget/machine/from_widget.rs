@@ -20,7 +20,7 @@ use ruma::{
     api::{
         client::{
             delayed_events::{delayed_message_event, delayed_state_event, update_delayed_event},
-            rtc::RtcTransport,
+            rtc::{self, RtcTransport},
         },
         error::{ErrorBody, StandardErrorBody},
     },
@@ -38,7 +38,10 @@ use crate::{
     Error, HttpError, RumaApiError,
     widget::{
         StateKeySelector,
-        machine::driver_req::{DownloadFileRequest, FromMatrixDriverResponse},
+        machine::driver_req::{
+            DownloadFileRequest, FromMatrixDriverResponse, RtcLivekitDelegateDelayedLeaveRequest,
+            RtcLivekitGetTokenRequest,
+        },
     },
 };
 
@@ -59,6 +62,10 @@ pub(super) enum FromWidgetRequest {
     DownloadFile(DownloadFileRequest),
     #[serde(rename = "org.matrix.msc4515.get_rtc_transports")]
     GetRtcTransports {},
+    #[serde(rename = "org.matrix.msc4533.rtc_livekit_get_token")]
+    RtcLivekitGetToken(RtcLivekitGetTokenRequest),
+    #[serde(rename = "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave")]
+    RtcLivekitDelegateDelayedLeave(RtcLivekitDelegateDelayedLeaveRequest),
 }
 
 /// The full response a client sends to a [`FromWidgetRequest`] in case of an
@@ -97,8 +104,9 @@ impl FromWidgetErrorResponse {
     pub(crate) fn from_error(error: Error) -> Self {
         match error {
             Error::Http(e) => FromWidgetErrorResponse::from_http_error(*e),
-            // For UnknownError's we do not want to have the `unknown error` bit in the message.
-            // Hence we only convert the inner error to a string.
+            // For UnknownError's we do not want to have the `unknown error` bit
+            // in the message. Hence we only convert the inner error to a
+            // string.
             Error::UnknownError(e) => FromWidgetErrorResponse::from_string(e.to_string()),
             _ => FromWidgetErrorResponse::from_string(error.to_string()),
         }
@@ -110,12 +118,11 @@ impl FromWidgetErrorResponse {
     }
 }
 
-/// Serializable section of an error response send by the client as a
-/// response to a [`FromWidgetRequest`].
+/// Serializable section of an error response send by the client as a response
+/// to a [`FromWidgetRequest`].
 #[derive(Serialize)]
 struct FromWidgetError {
-    /// Unspecified error message text that caused this widget action to
-    /// fail.
+    /// Unspecified error message text that caused this widget action to fail.
     ///
     /// This is useful to prompt the user on an issue but cannot be used to
     /// decide on how to deal with the error.
@@ -133,7 +140,8 @@ struct FromWidgetMatrixErrorBody {
     http_status: u32,
 
     /// Standard error response including the `errorcode` and the `error`
-    /// message as defined in the [spec](https://spec.matrix.org/v1.12/client-server-api/#standard-error-response).
+    /// message as defined in the
+    /// [spec](https://spec.matrix.org/v1.12/client-server-api/#standard-error-response).
     response: StandardErrorBody,
 }
 
@@ -157,6 +165,7 @@ impl SupportedApiVersionsResponse {
                 ApiVersion::MSC3819,
                 ApiVersion::MSC4039,
                 ApiVersion::MSC4515,
+                ApiVersion::MSC4533,
             ],
         }
     }
@@ -211,6 +220,11 @@ pub(super) enum ApiVersion {
     /// Supports discovering the RTC transports advertised by the homeserver.
     #[serde(rename = "org.matrix.msc4515")]
     MSC4515,
+
+    /// Supports the LiveKit client-server endpoints: obtaining a LiveKit SFU
+    /// token and delegating a delayed leave event to the homeserver.
+    #[serde(rename = "org.matrix.msc4533")]
+    MSC4533,
 }
 
 #[derive(Deserialize, Debug)]
@@ -262,9 +276,9 @@ impl From<delayed_state_event::unstable::Response> for SendEventResponse {
 /// A wrapper type for the empty okay response from
 /// [`update_delayed_event`](update_delayed_event::unstable_v1::Response)
 /// which derives Serialize. (The response struct from Ruma does not derive
-/// serialize)
-/// This is intentionally an empty tuple struct (not a unit struct), so that it
-/// serializes to `{}` instead of `Null` when returned to the widget as json.
+/// serialize) This is intentionally an empty tuple struct (not a unit struct),
+/// so that it serializes to `{}` instead of `Null` when returned to the widget
+/// as json.
 #[derive(Serialize, Debug)]
 pub(crate) struct UpdateDelayedEventResponse {}
 impl From<update_delayed_event::unstable_v1::Response> for UpdateDelayedEventResponse {
@@ -273,8 +287,9 @@ impl From<update_delayed_event::unstable_v1::Response> for UpdateDelayedEventRes
     }
 }
 
-/// Response for a send-to-device request.
-/// The failure map contains recipients that didn't receive the content due to:
+/// Response for a send-to-device request. The failure map contains recipients
+/// that didn't receive the content due to:
+///
 /// - Recipient devices not being found
 /// - Encryption failures (e.g., missing one-time keys)
 /// - Network/Server errors during sending
@@ -300,8 +315,8 @@ impl FromMatrixDriverResponse for SendToDeviceEventResponse {
 /// https://github.com/matrix-org/matrix-spec-proposals/pull/4039
 #[derive(Serialize, Debug)]
 pub(crate) struct DownloadFileResponse {
-    // The binary file content in a format that can cross the
-    // widget-driver-api boundary.
+    // The binary file content in a format that can cross the widget-driver-api
+    // boundary.
     #[serde(rename = "file")]
     pub(crate) file_data_base64: Base64,
 }
@@ -321,7 +336,10 @@ impl FromMatrixDriverResponse for DownloadFileResponse {
 }
 
 /// Response for a `get_rtc_transports` request.
-/// <https://github.com/matrix-org/matrix-spec-proposals/pull/4515>
+///
+/// [Specification].
+///
+/// [Specification]: https://github.com/matrix-org/matrix-spec-proposals/pull/4515
 #[derive(Serialize, Debug)]
 pub(crate) struct RtcTransportsResponse {
     /// The RTC transports advertised by the homeserver.
@@ -334,6 +352,67 @@ impl FromMatrixDriverResponse for RtcTransportsResponse {
             MatrixDriverResponse::RtcTransportsReceived(rtc_transports) => {
                 Some(Self { rtc_transports })
             }
+            _ => {
+                error!("bug in MatrixDriver, received wrong event response");
+                None
+            }
+        }
+    }
+}
+
+/// Response for a `rtc_livekit_get_token` request.
+///
+/// [Specification].
+///
+/// [Specification]: https://github.com/matrix-org/matrix-spec-proposals/pull/4533
+#[derive(Serialize, Debug)]
+pub(crate) struct RtcLivekitGetTokenResponse {
+    /// The JWT to authenticate against the LiveKit SFU with.
+    pub(crate) jwt: String,
+}
+
+impl From<rtc::livekit::get_token::v1::Response> for RtcLivekitGetTokenResponse {
+    fn from(response: rtc::livekit::get_token::v1::Response) -> Self {
+        Self { jwt: response.jwt }
+    }
+}
+
+impl FromMatrixDriverResponse for RtcLivekitGetTokenResponse {
+    fn from_response(matrix_driver_response: MatrixDriverResponse) -> Option<Self> {
+        match matrix_driver_response {
+            MatrixDriverResponse::RtcLivekitTokenReceived(response) => Some(response),
+            _ => {
+                error!("bug in MatrixDriver, received wrong event response");
+                None
+            }
+        }
+    }
+}
+
+/// Response for a `rtc_livekit_delegate_delayed_leave` request.
+///
+/// This is intentionally an empty braced struct (not a unit struct), so that
+/// it serializes to `{}` instead of `null` when returned to the widget as
+/// JSON.
+///
+/// [Specification].
+///
+/// [Specification]: https://github.com/matrix-org/matrix-spec-proposals/pull/4533
+#[derive(Serialize, Debug)]
+pub(crate) struct RtcLivekitDelegateDelayedLeaveResponse {}
+
+impl From<rtc::livekit::delegate_delayed_leave::v1::Response>
+    for RtcLivekitDelegateDelayedLeaveResponse
+{
+    fn from(_: rtc::livekit::delegate_delayed_leave::v1::Response) -> Self {
+        Self {}
+    }
+}
+
+impl FromMatrixDriverResponse for RtcLivekitDelegateDelayedLeaveResponse {
+    fn from_response(matrix_driver_response: MatrixDriverResponse) -> Option<Self> {
+        match matrix_driver_response {
+            MatrixDriverResponse::RtcLivekitDelayedLeaveDelegated(response) => Some(response),
             _ => {
                 error!("bug in MatrixDriver, received wrong event response");
                 None

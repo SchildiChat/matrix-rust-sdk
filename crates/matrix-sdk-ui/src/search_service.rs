@@ -132,9 +132,9 @@ impl SearchService {
         }
     }
 
-    /// Set (or update) the search query.
-    /// Clears the current results, restarts pagination from scratch and loads
-    /// the first page. Call [`Self::paginate`] to load any further pages.
+    /// Set (or update) the search query. Clears the current results, restarts
+    /// pagination from scratch and loads the first page. Call
+    /// [`Self::paginate`] to load any further pages.
     pub async fn set_query(&self, query: String) -> Result<(), SearchError> {
         let stream = self.client.search_messages(query).build_events();
         *self.stream.lock().await = Some(Box::pin(stream));
@@ -220,14 +220,13 @@ impl SearchService {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{pin::pin, time::Duration};
 
-    use assert_matches2::assert_let;
     use eyeball_im::VectorDiff;
-    use futures_util::pin_mut;
     use matrix_sdk::test_utils::mocks::MatrixMockServer;
     use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
     use ruma::{event_id, room_id, user_id};
+    use strass::assert_let;
     use stream_assert::{assert_next_matches, assert_pending};
     use tokio::time::sleep;
 
@@ -237,9 +236,6 @@ mod tests {
     async fn test_search_pagination() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
 
         let room_id = room_id!("!room:localhost");
         let event_id = event_id!("$event:localhost");
@@ -275,10 +271,11 @@ mod tests {
         // Subscribing now yields the loaded results as the current state.
         let (initial, results_stream) = search.subscribe_to_results().await;
         assert_eq!(initial.len(), 1);
-        pin_mut!(results_stream);
+        let mut results_stream = pin!(results_stream);
         assert_pending!(results_stream);
 
-        // The next page is empty, so the end is reached and nothing more is emitted.
+        // The next page is empty, so the end is reached and nothing more is
+        // emitted.
         search.paginate().await.unwrap();
 
         assert_pending!(results_stream);
@@ -290,9 +287,6 @@ mod tests {
     async fn test_search_resets_on_query_change() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
 
         let room_id = room_id!("!room:localhost");
         let apple_event = event_id!("$apple:localhost");
@@ -325,13 +319,15 @@ mod tests {
         assert_eq!(initial.len(), 1);
         assert_let!(ResultType::Message(message) = &initial[0]);
         assert_eq!(message.event_id, apple_event);
-        pin_mut!(results_stream);
+        let mut results_stream = pin!(results_stream);
         assert_pending!(results_stream);
 
-        // Changing the query clears the previous results and loads the new ones.
+        // Changing the query clears the previous results and loads the new
+        // ones.
         search.set_query("banana".to_owned()).await.unwrap();
 
-        // The subscriber observes the clear followed by the new page in one batch.
+        // The subscriber observes the clear followed by the new page in one
+        // batch.
         assert_next_matches!(results_stream, diffs => {
             assert_let!([VectorDiff::Clear, VectorDiff::Append { values }] = diffs.as_slice());
             assert_eq!(values.len(), 1);

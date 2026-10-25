@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{iter, sync::Arc};
+use std::{assert_matches, iter, sync::Arc};
 
-use assert_matches2::{assert_let, assert_matches};
 use matrix_sdk_common::deserialized_responses::{
     DeviceLinkProblem, ShieldState, VerificationLevel, VerificationState,
 };
@@ -27,6 +26,7 @@ use ruma::{
     user_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
 use crate::{
@@ -208,8 +208,8 @@ async fn test_decryption_verification_state() {
 
     let encryption_info = bob.get_room_event_encryption_info(&event, room_id).await.unwrap();
 
-    // As soon as the key source is unsafe the verification state (or
-    // existence) of the device is meaningless
+    // As soon as the key source is unsafe the verification state (or existence)
+    // of the device is meaningless
     assert_eq!(
         VerificationState::Unverified(VerificationLevel::None(DeviceLinkProblem::InsecureSource)),
         encryption_info.verification_state
@@ -361,8 +361,8 @@ async fn test_verification_states_spoofed_sender(
         VerificationState::Unverified(VerificationLevel::UnverifiedIdentity)
     );
 
-    // Alice now sends a second message to Bob, using the same room key, but the HS
-    // admin rewrites the 'sender' to Charlie.
+    // Alice now sends a second message to Bob, using the same room key, but the
+    // HS admin rewrites the 'sender' to Charlie.
     let result = alice
         .encrypt_room_event(
             room_id,
@@ -424,9 +424,8 @@ async fn test_verification_states_multiple_device() {
 
     let fake_room_id = room_id!("!roomid:example.com");
 
-    // We just need a fake session to export it
-    // We will use the export to create various inbounds with other claimed
-    // ownership
+    // We just need a fake session to export it We will use the export to create
+    // various inbounds with other claimed ownership
     let id_keys = bob.identity_keys();
     let fake_device_id = bob.device_id().into();
     let olm = OutboundGroupSession::new(
@@ -495,7 +494,7 @@ async fn test_decryption_trust_requirement() {
     let (event, session_id) = encrypt_message(&alice, room_id, &bob, "Secret message").await;
 
     // Set the SenderData on the megolm session used to encrypt `event` to
-    // `DeviceInfo` (ie,  we have the device keys but no cross-signing
+    // `DeviceInfo` (ie, we have the device keys but no cross-signing
     // information). Events sent on such a session should be decryptable only
     // when the trust requirement allows untrusted or legacy sessions.
     let mut session =
@@ -586,6 +585,62 @@ async fn test_decryption_trust_with_identity_change() {
     .await;
 }
 
+/// A session imported from backup is a legacy session, so it should stay
+/// decryptable under `CrossSignedOrLegacy` once we learn about the sender's
+/// device via `/keys/query`.
+#[async_test]
+async fn test_backup_imported_session_stays_legacy_after_keys_query() {
+    // Alice sends an encrypted message to Bob's first device
+    let (alice, bob) = get_machine_pair_with_setup_sessions_test_helper(
+        tests::alice_id(),
+        tests::user_id(),
+        false,
+    )
+    .await;
+    let room_id = room_id!("!test:example.org");
+    let (event, session_id) = encrypt_message(&alice, room_id, &bob, "Secret message").await;
+    let exported = bob
+        .store()
+        .get_inbound_group_session(room_id, &session_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .export()
+        .await;
+
+    // A fresh device of Bob's restores the room key from backup, knowing
+    // nothing about Alice's devices. We simulate a restore from backup via
+    // `import_room_keys`.
+    let bob2 = OlmMachine::new(tests::user_id(), ruma::device_id!("BOB2")).await;
+    bob2.store().import_room_keys(vec![exported], Some("1"), |_, _| {}).await.unwrap();
+    check_decryption_trust_requirement(
+        &bob2,
+        &event,
+        room_id,
+        &[(TrustRequirement::CrossSignedOrLegacy, true)],
+    )
+    .await;
+
+    // Bob's new device then gets Alice's (not cross-signed) device in a
+    // `/keys/query` response.
+    let alice_device = DeviceData::from_machine_test_helper(&alice).await.unwrap();
+    let kq_response = json!({
+        "device_keys": { alice.user_id(): { alice.device_id(): alice_device.as_device_keys() } }
+    });
+    bob2.receive_keys_query_response(&TransactionId::new(), &ruma_response_from_json(&kq_response))
+        .await
+        .unwrap();
+
+    // Check that Bob's new device can still successfully decrypt the event.
+    check_decryption_trust_requirement(
+        &bob2,
+        &event,
+        room_id,
+        &[(TrustRequirement::CrossSignedOrLegacy, true)],
+    )
+    .await;
+}
+
 /// Helper function to set up Alice's cross-signing, and save her keys in Bob's
 /// storage.
 async fn set_up_alice_cross_signing(alice: &OlmMachine, bob: &OlmMachine) {
@@ -626,8 +681,8 @@ async fn set_up_alice_cross_signing(alice: &OlmMachine, bob: &OlmMachine) {
         .unwrap();
 }
 
-/// Helper function that encrypts a message and shares the Megolm session
-/// with a recipient.
+/// Helper function that encrypts a message and shares the Megolm session with a
+/// recipient.
 async fn encrypt_message(
     sender: &OlmMachine,
     room_id: &RoomId,

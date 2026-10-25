@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::pin::pin;
+
 use async_rx::StreamExt as _;
 use async_stream::stream;
 use futures_core::Stream;
-use futures_util::{StreamExt as _, pin_mut};
+use futures_util::StreamExt as _;
 use matrix_sdk::event_cache::{PaginationStatus, RoomPagination};
 use tracing::instrument;
 
@@ -37,12 +39,13 @@ impl super::Timeline {
                         );
                     }
                     None => {
-                        // We could adjust the skip count to a lower value, while passing the
-                        // requested number of events. We *may* have reached the start of the
-                        // timeline, but since we're fulfilling the caller's request, assume it's
-                        // not the case and return false here. A subsequent call will go to the
-                        // `Some()` arm of this match, and cause a call to the event cache's
-                        // pagination.
+                        // We could adjust the skip count to a lower value,
+                        // while passing the requested number of events. We
+                        // _may_ have reached the start of the timeline, but
+                        // since we're fulfilling the caller's request, assume
+                        // it's not the case and return false here. A subsequent
+                        // call will go to the `Some()` arm of this match, and
+                        // cause a call to the event cache's pagination.
                         return Ok(false);
                     }
                 }
@@ -138,7 +141,7 @@ impl super::Timeline {
         let stream = Box::pin(stream! {
             let status_stream = status.dedup();
 
-            pin_mut!(status_stream);
+            let mut status_stream = pin!(status_stream);
 
             while let Some(state) = status_stream.next().await {
                 let state = controller.map_pagination_status(state).await;

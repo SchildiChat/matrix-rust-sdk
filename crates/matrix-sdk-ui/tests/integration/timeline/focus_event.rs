@@ -17,7 +17,6 @@
 use std::time::Duration;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -27,11 +26,14 @@ use matrix_sdk::{
         RoomRelationsResponseTemplate,
     },
 };
-use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{
+    ALICE, BOB, JoinedRoomBuilder, User, async_test, event_factory::EventFactory,
+};
 use matrix_sdk_ui::timeline::{
     EventSendState, TimelineBuilder, TimelineEventFocusThreadMode, TimelineFocus,
 };
 use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id};
+use strass::assert_let;
 use stream_assert::assert_pending;
 use tokio::time::sleep;
 
@@ -48,8 +50,8 @@ async fn test_new_focused() {
         .mock_room_event_context()
         .room(room_id)
         .ok(
-            // events_before are passed in reverse chronological order (newest first),
-            // as required by the /context response format.
+            // events_before are passed in reverse chronological order (newest
+            // first), as required by the /context response format.
             RoomContextResponseTemplate::new(
                 f.text_msg("in the end").event_id(target_event).sender(*BOB).into_event(),
             )
@@ -244,7 +246,7 @@ async fn test_live_aggregations_are_reflected_on_focused_timelines() {
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
     let reactions = event_item.reactions().clone();
     assert_eq!(reactions.len(), 1);
-    let _ = reactions["👍"][*BOB];
+    let _ = reactions["👍"][&User::Bob];
 }
 
 #[async_test]
@@ -292,7 +294,8 @@ async fn test_focused_timeline_local_echoes() {
     sleep(Duration::from_millis(100)).await;
     assert_pending!(timeline_stream);
 
-    // Add a reaction to the focused event, which will cause a local echo to happen.
+    // Add a reaction to the focused event, which will cause a local echo to
+    // happen.
     timeline.toggle_reaction(&event_item.identifier(), "✨").await.unwrap();
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
@@ -460,7 +463,8 @@ async fn test_focused_timeline_handles_threaded_event() {
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
-    // The new item loaded is inserted at the start, just after the date divider.
+    // The new item loaded is inserted at the start, just after the date
+    // divider.
     assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
     assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev");
 
@@ -494,8 +498,8 @@ async fn test_focused_timeline_handles_threaded_event() {
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
-    // Same as before, the previous event is inserted at the front, after the date
-    // divider.
+    // Same as before, the previous event is inserted at the front, after the
+    // date divider.
     assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
     assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Root");
 
@@ -713,8 +717,8 @@ async fn test_focused_timeline_handles_other_thread_event_when_forcing_threaded_
     assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "Ho");
 
-    // We paginate backwards once and hit the start of the thread which will trigger
-    // an /event request for the thread root.
+    // We paginate backwards once and hit the start of the thread which will
+    // trigger an /event request for the thread root.
     server
         .mock_room_relations()
         .match_from("prev_token")
@@ -857,7 +861,6 @@ async fn test_focused_timeline_filters_out_threaded_events() {
             start: "prev_token_1".to_owned(),
             end: Some("prev_token_2".to_owned()),
             state: Vec::new(),
-            delay: None,
         })
         .mock_once()
         .mount()
@@ -870,7 +873,8 @@ async fn test_focused_timeline_filters_out_threaded_events() {
     // Only the non-threaded event is inserted at the start.
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
     assert_eq!(timeline_updates.len(), 1);
-    // The new item loaded is inserted at the start, just after the date divider.
+    // The new item loaded is inserted at the start, just after the date
+    // divider.
     assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
     assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev no thread");
 
@@ -889,7 +893,6 @@ async fn test_focused_timeline_filters_out_threaded_events() {
             start: "next_token_1".to_owned(),
             end: Some("next_token_2".to_owned()),
             state: Vec::new(),
-            delay: None,
         })
         .mock_once()
         .mount()

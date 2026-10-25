@@ -77,7 +77,7 @@ pub use client::homeserver_capabilities::HomeserverCapabilities;
 pub mod search_index;
 pub use client::{
     Client, ClientBuildError, ClientBuilder, LoopCtrl, ServerVendorInfo, SessionChange, StoreSizes,
-    TileServerInfo, ToDeviceMessage, sanitize_server_name,
+    TileServerInfo, ToDeviceMessage, WeakClient, sanitize_server_name,
 };
 pub use error::{
     BeaconError, Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError,
@@ -89,7 +89,7 @@ pub use matrix_sdk_sqlite::SqliteCryptoStore;
 #[cfg(feature = "sqlite")]
 pub use matrix_sdk_sqlite::{
     STATE_STORE_DATABASE_NAME, SqliteEventCacheStore, SqliteMediaStore, SqliteStateStore,
-    SqliteStoreConfig,
+    SqliteStoreConfig, Synchronous,
 };
 pub use media::Media;
 pub use pusher::Pusher;

@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, pin::pin, sync::Arc};
 
-use futures_util::pin_mut;
 use imbl::Vector;
 use itertools::{Either, Itertools as _};
 use matrix_sdk::{event_cache::RedecryptorReport, task_monitor::BackgroundTaskHandle};
@@ -65,10 +64,13 @@ pub(super) fn compute_redecryption_candidates(
 }
 
 async fn redecryption_report_task(timeline_controller: TimelineController) {
-    let client = timeline_controller.room().client();
-    let stream = client.event_cache().subscribe_to_decryption_reports();
+    let stream = {
+        let state = timeline_controller.state.read().await;
 
-    pin_mut!(stream);
+        state.meta.event_cache.subscribe_to_decryption_reports()
+    };
+
+    let mut stream = pin!(stream);
 
     while let Some(report) = stream.next().await {
         match report {
@@ -83,9 +85,9 @@ async fn redecryption_report_task(timeline_controller: TimelineController) {
             }
             Ok(RedecryptorReport::Lagging | RedecryptorReport::BackupAvailable) | Err(_) => {
                 // Since the event cache keeps all the events we are keeping
-                // cached in the timeline in memory as well,
-                // R2D2 will handle the redecryption of these events when any of
-                // those reports come in.
+                // cached in the timeline in memory as well, R2D2 will handle
+                // the redecryption of these events when any of those reports
+                // come in.
             }
         }
     }
@@ -183,7 +185,8 @@ mod tests {
         let timeline = vector![decrypted_event("session1")];
         // When we ask what to retry
         let answer = compute_redecryption_candidates(&timeline);
-        // Then we don't need to decrypt anything, but we do refetch the encryption info
+        // Then we don't need to decrypt anything, but we do refetch the
+        // encryption info
         assert!(answer.0.is_empty());
         assert_eq!(answer.1.first().map(|s| s.as_str()), Some("session1"));
     }

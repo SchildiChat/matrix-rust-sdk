@@ -1,8 +1,6 @@
-use std::sync::Arc;
+use std::{assert_matches, pin::pin, sync::Arc};
 
-use assert_matches2::assert_matches;
 use eyeball_im::VectorDiff;
-use futures_util::pin_mut;
 use matrix_sdk::{
     assert_next_with_timeout, encryption::EncryptionSettings, test_utils::mocks::MatrixMockServer,
 };
@@ -10,6 +8,7 @@ use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItem};
 use ruma::{RoomVersionId, device_id, event_id, room_id, user_id};
 use serde_json::{Value, json};
+use strass::assert_let;
 
 // Helper function to test the redecryption of different event types.
 async fn test_redecryption(
@@ -83,9 +82,9 @@ async fn test_redecryption(
 
     let bob_room = bob.get_room(room_id).expect("Bob should have access to the invited room");
 
-    // Alice will send a single event to the room, but this will trigger a to-device
-    // message containing the room key to be sent as well. We capture both the event
-    // and the to-device message.
+    // Alice will send a single event to the room, but this will trigger a
+    // to-device message containing the room key to be sent as well. We capture
+    // both the event and the to-device message.
 
     let event_id = event_id!("$some_id");
     let (event_receiver, mock) =
@@ -113,7 +112,7 @@ async fn test_redecryption(
         bob_room.timeline().await.expect("We should be able to build a timeline for the room");
     let (initial, stream) = timeline.subscribe().await;
     assert!(initial.is_empty(), "Initially we have an empty timeline");
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     // Let us retrieve the captured event and to-device message.
     let event = event_receiver.await.expect("Alice should have sent the event by now");
@@ -131,7 +130,7 @@ async fn test_redecryption(
     let updates = assert_next_with_timeout!(stream);
     let utd_item = &updates[0];
 
-    assert_matches!(utd_item, VectorDiff::PushBack { value });
+    assert_let!(VectorDiff::PushBack { value } = utd_item);
     assert!(
         value.as_event().unwrap().content().is_unable_to_decrypt(),
         "Initially we should receive a UTD"
@@ -164,7 +163,7 @@ async fn test_redecryption_after_late_to_device() {
         "m.room.message",
         json!({"body": "It's a secret to everybody", "msgtype": "m.text"}),
         |decrypted_item| {
-            assert_matches!(decrypted_item, VectorDiff::Set { index: _, value });
+            assert_let!(VectorDiff::Set { index: _, value } = decrypted_item);
 
             let event = value.as_event().expect("The value should be an event");
 

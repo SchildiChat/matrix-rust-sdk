@@ -307,11 +307,10 @@ pub enum ErrorReason {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Not;
     #[cfg(feature = "e2e-encryption")]
     use std::sync::Arc;
+    use std::{assert_matches, ops::Not};
 
-    use assert_matches2::assert_matches;
     #[cfg(feature = "e2e-encryption")]
     use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
     use matrix_sdk::{HttpError, RumaApiError, test_utils::mocks::MatrixMockServer};
@@ -330,6 +329,7 @@ mod tests {
         serde::Base64,
     };
     use serde::Deserialize;
+    use strass::assert_let;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{header_exists, method, path, path_regex},
@@ -595,7 +595,7 @@ mod tests {
             api_error.to_string(),
             "[403] {\"info\":\"***VIRUS DETECTED***\",\"reason\":\"MCS_MEDIA_NOT_CLEAN\"}"
         );
-        assert_matches!(&api_error.body, ErrorBody::Json(json_body));
+        assert_let!(ErrorBody::Json(json_body) = &api_error.body);
         let content_scanner_error =
             ContentScannerError::deserialize(json_body).expect("deserialize");
         assert_eq!(content_scanner_error.info, "***VIRUS DETECTED***");
@@ -621,7 +621,8 @@ mod tests {
         // The encrypted media content to return
         let encrypted: Vec<u8> = vec![0xEA, 0x10, 0x2D, 0x01, 0x53, 0xB7, 0x87, 0xF0, 0x75, 0xED];
 
-        // Set up the mock server as the content scanner one, with the expected endpoint
+        // Set up the mock server as the content scanner one, with the expected
+        // endpoint
         Mock::given(method("POST"))
             .and(path("/_matrix/media_proxy/unstable/download_encrypted"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(encrypted.clone()))
@@ -649,8 +650,8 @@ mod tests {
             format: MediaFormat::File,
         };
 
-        // If there was a decryption error, we'd be able to check the decryption took
-        // place
+        // If there was a decryption error, we'd be able to check the decryption
+        // took place
         let result = client
             .media()
             .get_media_content(&request, false)

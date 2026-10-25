@@ -1,12 +1,11 @@
 use std::time::Duration;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{assert_let_timeout, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::timeout::timeout;
-use matrix_sdk_test::{BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{BOB, JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{EventSendState, RoomExt};
 use ruma::{
     event_id,
@@ -17,6 +16,7 @@ use ruma::{
     room_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use stream_assert::assert_next_matches;
 use tokio::task::yield_now;
 use wiremock::{Request, ResponseTemplate};
@@ -101,7 +101,7 @@ async fn test_send_location_as_reply() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
-                f.text_msg("Where are you?").sender(&BOB).event_id(event_id_from_bob),
+                f.text_msg("Where are you?").sender(User::Bob).event_id(event_id_from_bob),
             ),
         )
         .await;

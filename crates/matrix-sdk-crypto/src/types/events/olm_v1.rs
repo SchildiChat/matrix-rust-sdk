@@ -83,8 +83,8 @@ impl DecryptedForwardedRoomKeyEvent {
 /// `m.olm.v1.curve25519-aes-sha2` algorithm
 pub type DecryptedSecretSendEvent = DecryptedOlmV1Event<SecretSendContent>;
 
-/// An `m.room_key_bundle` to-device event which has
-/// been decrypted using using the `m.olm.v1.curve25519-aes-sha2` algorithm
+/// An `m.room_key_bundle` to-device event which has been decrypted using using
+/// the `m.olm.v1.curve25519-aes-sha2` algorithm
 pub type DecryptedRoomKeyBundleEvent = DecryptedOlmV1Event<RoomKeyBundleContent>;
 
 /// An `io.element.msc4385.secret.push` event that was decrypted using the
@@ -382,6 +382,7 @@ mod tests {
         DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures,
         events::{
             olm_v1::{DecryptedRoomKeyBundleEvent, DecryptedRoomKeyEvent},
+            room_key::tests::SharedHistoryField,
             room_key_bundle::RoomKeyBundleContent,
         },
     };
@@ -645,8 +646,8 @@ mod tests {
     fn sender_device_keys_are_deserialized_unstable() {
         let (sender_device_keys_json, sender_device_keys) = sender_device_keys();
 
-        // Given JSON for a room key event with sender_device_keys using the unstable
-        // prefix
+        // Given JSON for a room key event with sender_device_keys using the
+        // unstable prefix
         let mut event_json = room_key_event();
         event_json
             .as_object_mut()
@@ -707,9 +708,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&event).unwrap(), room_key_bundle_event_stable());
     }
 
-    #[test]
-    fn test_serialization_cycle() {
-        let event_json = json!({
+    fn room_key_event_json(shared_history: SharedHistoryField) -> Value {
+        json!({
             "sender": "@alice:example.org",
             "keys": {
                 "ed25519": ED25519_KEY,
@@ -721,7 +721,7 @@ mod tests {
             "content": {
                 "algorithm": "m.megolm.v1.aes-sha2",
                 "room_id": "!Cuyf34gef24t:localhost",
-                "m.shared_history": true,
+                shared_history.name(): true,
                 "session_id": "ZFD6+OmV7fVCsJ7Gap8UnORH8EnmiAkes8FAvQuCw/I",
                 "session_key": "AgAAAADNp1EbxXYOGmJtyX4AkD1bvJvAUyPkbIaKxtnGKjv\
                             SQ3E/4mnuqdM4vsmNzpO1EeWzz1rDkUpYhYE9kP7sJhgLXi\
@@ -732,17 +732,36 @@ mod tests {
                             gdHUwHSgMk77vCc2a5KHKLDA"
             },
             "type": "m.room_key"
-        });
+        })
+    }
 
-        let event: DecryptedRoomKeyEvent = serde_json::from_value(event_json.clone())
-            .expect("JSON should deserialize to the right event type");
+    fn check_serialization_cycle(shared_history: SharedHistoryField) {
+        let event: DecryptedRoomKeyEvent =
+            serde_json::from_value(room_key_event_json(shared_history))
+                .expect("JSON should deserialize to the right event type");
 
         let reserialized =
             serde_json::to_value(event).expect("We should be able to serialize the event");
 
         assert_eq!(
-            event_json, reserialized,
-            "The reserialized JSON should match the original value"
+            reserialized,
+            room_key_event_json(SharedHistoryField::Spec),
+            "The reserialized JSON should use the shared_history name from the spec"
         );
+    }
+
+    #[test]
+    fn test_serialization_cycle() {
+        check_serialization_cycle(SharedHistoryField::Spec);
+    }
+
+    #[test]
+    fn test_serialization_cycle_legacy_shared_history() {
+        check_serialization_cycle(SharedHistoryField::Legacy);
+    }
+
+    #[test]
+    fn test_serialization_cycle_unstable_shared_history() {
+        check_serialization_cycle(SharedHistoryField::Unstable);
     }
 }

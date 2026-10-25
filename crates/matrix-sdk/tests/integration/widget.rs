@@ -21,7 +21,6 @@ use std::{
 };
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use futures_util::FutureExt;
 use matrix_sdk::{
     Client,
@@ -36,7 +35,7 @@ use matrix_sdk_base::crypto::CollectStrategy;
 use matrix_sdk_common::{
     deserialized_responses::EncryptionInfo, executor::spawn, locks::Mutex, timeout::timeout,
 };
-use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{BOB, JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use ruma::{
     OwnedRoomId, device_id, event_id,
     events::{
@@ -50,10 +49,11 @@ use ruma::{
 };
 use serde::Serialize;
 use serde_json::{Value as JsonValue, Value, json};
+use strass::assert_let;
 use tracing::error;
 use wiremock::{
     Mock, ResponseTemplate,
-    matchers::{method, path_regex},
+    matchers::{body_json, method, path_regex},
 };
 
 use crate::{recipients_of, record_sent_encrypted_to_device};
@@ -204,9 +204,9 @@ async fn test_negotiate_capabilities_immediately() {
         let data = &msg["data"];
         let request_id = msg["requestId"].as_str().unwrap();
 
-        // Let's send a request to get supported versions in the middle
-        // of a capabilities negotiation to ensure that we're not "deadlocked" by
-        // not processing messages while waiting for a reply from a widget to the
+        // Let's send a request to get supported versions in the middle of a
+        // capabilities negotiation to ensure that we're not "deadlocked" by not
+        // processing messages while waiting for a reply from a widget to the
         // the toWidget request.
         {
             send_request(
@@ -229,7 +229,8 @@ async fn test_negotiate_capabilities_immediately() {
     }
 
     {
-        // Receive a "request" with the capabilities we were actually granted (wtf?)
+        // Receive a "request" with the capabilities we were actually granted
+        // (wtf?)
         let msg = recv_message(&driver_handle).await;
         assert_eq!(msg["api"], "toWidget");
         assert_eq!(msg["action"], "notify_capabilities");
@@ -304,7 +305,7 @@ async fn test_read_messages() {
     mock_server
         .mock_room_messages()
         .match_limit(2)
-        .respond_with(ResponseTemplate::new(200).set_body_json(response_json))
+        .ok_json(response_json)
         .mock_once()
         .mount()
         .await;
@@ -436,7 +437,7 @@ async fn test_read_room_members() {
     mock_server
         .mock_room_messages()
         .match_limit(3)
-        .respond_with(ResponseTemplate::new(200).set_body_json(response_json))
+        .ok_json(response_json)
         .mock_once()
         .mount()
         .await;
@@ -497,26 +498,27 @@ async fn test_receive_live_events() {
             sync_builder.add_joined_room(
                 JoinedRoomBuilder::new(&ROOM_ID)
                     // text message from alice - matches filter #2
-                    .add_timeline_event(f.text_msg("simple text message").sender(&ALICE))
+                    .add_timeline_event(f.text_msg("simple text message").sender(User::Alice))
                     // emote from alice - doesn't match
-                    .add_timeline_event(f.emote("emote message").sender(&ALICE))
+                    .add_timeline_event(f.emote("emote message").sender(User::Alice))
                     // pointless member event - matches filter #4
                     .add_timeline_event(
                         f.member(user_id!("@example:localhost"))
                             .membership(MembershipState::Join)
                             .previous(MembershipState::Join),
                     )
-                    // kick alice - doesn't match because the `#@example:localhost` bit
-                    // is about the state_key, not the sender
+                    // kick alice - doesn't match because the
+                    // `#@example:localhost` bit is about the state_key, not the
+                    // sender
                     .add_timeline_event(
                         f.member(user_id!("@example:localhost"))
-                            .banned(&ALICE)
+                            .banned(User::Alice)
                             .previous(MembershipState::Join),
                     )
                     // set room topic - doesn't match
-                    .add_timeline_event(f.room_topic("new room topic").sender(&BOB))
+                    .add_timeline_event(f.room_topic("new room topic").sender(User::Bob))
                     // set room name - matches filter #3
-                    .add_timeline_event(f.room_name("New Room Name").sender(&BOB)),
+                    .add_timeline_event(f.room_name("New Room Name").sender(User::Bob)),
             );
             // to device message - doesn't match
             sync_builder.add_to_device_event(json!({
@@ -538,8 +540,8 @@ async fn test_receive_live_events() {
         })
         .await;
 
-    // The to device and room events are racing -> we dont know the order and just
-    // need to store them separately.
+    // The to device and room events are racing -> we dont know the order and
+    // just need to store them separately.
     let mut to_device: JsonObject = JsonObject::new();
     let mut events = vec![];
     for _ in 0..4 {
@@ -569,7 +571,7 @@ async fn test_receive_live_events() {
     assert_eq!(events[2]["api"], "toWidget");
     assert_eq!(events[2]["action"], "send_event");
     assert_eq!(events[2]["data"]["type"], "m.room.name");
-    assert_eq!(events[2]["data"]["sender"], BOB.as_str());
+    assert_eq!(events[2]["data"]["sender"], User::Bob);
     assert_eq!(events[2]["data"]["content"]["name"], "New Room Name");
 
     assert_eq!(to_device["api"], "toWidget");
@@ -610,8 +612,8 @@ async fn test_block_clear_to_device_in_e2ee_room() {
         })
         .await;
 
-    // The message should be filtered out because it is not encrypted and the room
-    // is encrypted
+    // The message should be filtered out because it is not encrypted and the
+    // room is encrypted
     assert_matches!(recv_message(&driver_handle).now_or_never(), None);
 }
 
@@ -837,7 +839,7 @@ async fn test_receive_state() {
     let (client, mock_server, driver_handle) = run_test_driver(false, false).await;
 
     let f = EventFactory::new().room(&ROOM_ID);
-    let name_event_1: Raw<AnySyncStateEvent> = f.room_name("room name").sender(&BOB).into();
+    let name_event_1: Raw<AnySyncStateEvent> = f.room_name("room name").sender(User::Bob).into();
 
     mock_server
         .mock_sync()
@@ -862,16 +864,17 @@ async fn test_receive_state() {
     assert_eq!(msg["data"]["state"].as_array().unwrap().len(), 1);
     assert_eq!(msg["data"]["state"][0]["type"], "m.room.name");
     assert_eq!(msg["data"]["state"][0]["room_id"], ROOM_ID.as_str());
-    assert_eq!(msg["data"]["state"][0]["sender"], BOB.as_str());
+    assert_eq!(msg["data"]["state"][0]["sender"], User::Bob);
     assert_eq!(msg["data"]["state"][0]["state_key"], "");
     assert_eq!(msg["data"]["state"][0]["content"]["name"], "room name");
     // No further messages from the driver yet
     assert_matches!(recv_message(&driver_handle).now_or_never(), None);
 
-    let topic_event: Raw<AnySyncStateEvent> = f.room_topic("new room topic").sender(&BOB).into();
-    let name_event_2 = f.room_name("new room name").sender(&BOB);
+    let topic_event: Raw<AnySyncStateEvent> =
+        f.room_topic("new room topic").sender(User::Bob).into();
+    let name_event_2 = f.room_name("new room name").sender(User::Bob);
     let name_event_3: Raw<AnySyncStateEvent> =
-        f.room_name("even newer room name").sender(&BOB).into();
+        f.room_name("even newer room name").sender(User::Bob).into();
 
     mock_server
         .mock_sync()
@@ -879,7 +882,7 @@ async fn test_receive_state() {
             sync_builder.add_joined_room(
                 JoinedRoomBuilder::new(&ROOM_ID)
                     // text message from alice - doesn't match
-                    .add_timeline_event(f.text_msg("simple text message").sender(&ALICE))
+                    .add_timeline_event(f.text_msg("simple text message").sender(User::Alice))
                     // set room topic - doesn't match
                     .add_timeline_event(topic_event.clone().cast())
                     .add_state_event(topic_event)
@@ -908,7 +911,7 @@ async fn test_receive_state() {
     assert_eq!(msg["data"]["state"].as_array().unwrap().len(), 1);
     assert_eq!(msg["data"]["state"][0]["type"], "m.room.name");
     assert_eq!(msg["data"]["state"][0]["room_id"], ROOM_ID.as_str());
-    assert_eq!(msg["data"]["state"][0]["sender"], BOB.as_str());
+    assert_eq!(msg["data"]["state"][0]["sender"], User::Bob);
     assert_eq!(msg["data"]["state"][0]["state_key"], "");
     assert_eq!(msg["data"]["state"][0]["content"]["name"], "even newer room name");
 
@@ -917,7 +920,7 @@ async fn test_receive_state() {
     assert_eq!(msg["action"], "send_event");
     assert_eq!(msg["data"]["type"], "m.room.name");
     assert_eq!(msg["data"]["room_id"], ROOM_ID.as_str());
-    assert_eq!(msg["data"]["sender"], BOB.as_str());
+    assert_eq!(msg["data"]["sender"], User::Bob);
     assert_eq!(msg["data"]["state_key"], "");
     assert_eq!(msg["data"]["content"]["name"], "new room name");
 
@@ -926,7 +929,7 @@ async fn test_receive_state() {
     assert_eq!(msg["action"], "send_event");
     assert_eq!(msg["data"]["type"], "m.room.name");
     assert_eq!(msg["data"]["room_id"], ROOM_ID.as_str());
-    assert_eq!(msg["data"]["sender"], BOB.as_str());
+    assert_eq!(msg["data"]["sender"], User::Bob);
     assert_eq!(msg["data"]["state_key"], "");
     assert_eq!(msg["data"]["content"]["name"], "even newer room name");
 }
@@ -1022,9 +1025,9 @@ async fn test_send_delayed_message_event() {
         .mock_room_send()
         .match_delayed_event(Duration::from_millis(1000))
         .for_type(MessageLikeEventType::RoomMessage)
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .ok_json(json!({
             "delay_id": "1234",
-        })))
+        }))
         .mock_once()
         .mount()
         .await;
@@ -1068,9 +1071,9 @@ async fn test_send_delayed_state_event() {
         .mock_room_send_state()
         .match_delayed_event(Duration::from_millis(1000))
         .for_type(StateEventType::RoomName)
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .ok_json(json!({
             "delay_id": "1234",
-        })))
+        }))
         .mock_once()
         .mount()
         .await;
@@ -1112,10 +1115,13 @@ async fn test_fail_sending_delay_rate_limit() {
 
     mock_server
         .mock_room_send()
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "errcode": "M_LIMIT_EXCEEDED",
-            "error": "Sending too many delay events"
-        })))
+        .respond_with_code_and_json(
+            400,
+            json!({
+                "errcode": "M_LIMIT_EXCEEDED",
+                "error": "Sending too many delay events"
+            }),
+        )
         .mock_once()
         .mount()
         .await;
@@ -1607,9 +1613,9 @@ async fn test_send_encrypted_to_device_wildcard_edge_cases() {
     let sent_messages = sent_messages.lock();
     assert_eq!(sent_messages.len(), 1, "a single to-device request should have been sent");
 
-    // For Bob, the `*` takes precedence and the explicit `OTHER_UNKNOWN` device is
-    // ignored. Carl, of whom we know no device at all, is dropped entirely: only
-    // Bob's two known devices are sent to.
+    // For Bob, the `*` takes precedence and the explicit `OTHER_UNKNOWN` device
+    // is ignored. Carl, of whom we know no device at all, is dropped entirely:
+    // only Bob's two known devices are sent to.
     assert_eq!(
         recipients_of(&sent_messages[0]),
         BTreeMap::from([(
@@ -1763,7 +1769,11 @@ async fn test_send_encrypted_to_device_event_partial_error() {
     // It was sent to bob even though other recipients failed
     let event_as_sent_by_alice = event_as_sent_by_alice.await.deserialize().unwrap();
     drop(guard);
-    assert_eq!(event_as_sent_by_alice.algorithm().as_str(), "m.olm.v1.curve25519-aes-sha2");
+    let algorithm = event_as_sent_by_alice.algorithm();
+    assert!(
+        algorithm.as_str() == "m.olm.v1.curve25519-aes-sha2"
+            || algorithm.as_str() == "m.olm.v2.curve25519-aes-sha2"
+    );
 
     // Receive the response
     let msg = recv_message(&driver_handle).await;
@@ -2071,8 +2081,8 @@ async fn test_get_rtc_transports_endpoint_unsupported() {
         json!({}),
     );
 
-    // The widget receives an error (as opposed to an empty list), so it can tell
-    // the endpoint apart from a homeserver that advertises no transports.
+    // The widget receives an error (as opposed to an empty list), so it can
+    // tell the endpoint apart from a homeserver that advertises no transports.
     let response = recv_message(&driver_handle).await;
     assert_eq!(response["api"], "fromWidget");
     assert_eq!(response["action"], "org.matrix.msc4515.get_rtc_transports");
@@ -2138,6 +2148,278 @@ async fn test_get_rtc_transports_without_permission() {
     assert_eq!(
         response["response"]["error"]["message"].as_str().unwrap(),
         "Not allowed: missing the org.matrix.msc4515.rtc_transports capability."
+    );
+}
+
+#[async_test]
+async fn test_rtc_livekit_get_token() {
+    let (_, mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(&driver_handle, json!(["org.matrix.msc4533.rtc_livekit_get_token"]))
+        .await;
+
+    let request_data = json!({
+        "server_name": "example.org",
+        "url": "wss://livekit.example.org",
+        "room_id": "!1:example.org",
+        "slot_id": "m.call",
+        "member_id": "member-id",
+    });
+
+    // The request data is forwarded verbatim to the homeserver.
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token$"))
+        .and(body_json(&request_data))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "jwt": "the-jwt" })))
+        .expect(1)
+        .mount(mock_server.server())
+        .await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-get-token",
+        "org.matrix.msc4533.rtc_livekit_get_token",
+        request_data,
+    );
+
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["api"], "fromWidget");
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_get_token");
+    assert_eq!(response["requestId"], "rtc-livekit-get-token");
+    assert_eq!(response["response"], json!({ "jwt": "the-jwt" }));
+}
+
+#[async_test]
+async fn test_rtc_livekit_get_token_without_server_name() {
+    let (_, mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(&driver_handle, json!(["org.matrix.msc4533.rtc_livekit_get_token"]))
+        .await;
+
+    let request_data = json!({
+        "url": "wss://livekit.example.org",
+        "room_id": "!1:example.org",
+        "slot_id": "m.call",
+        "member_id": "member-id",
+    });
+
+    // The `server_name` is omitted from the homeserver request as well, so the
+    // homeserver falls back to its own server name.
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token$"))
+        .and(body_json(&request_data))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "jwt": "the-jwt" })))
+        .expect(1)
+        .mount(mock_server.server())
+        .await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-get-token",
+        "org.matrix.msc4533.rtc_livekit_get_token",
+        request_data,
+    );
+
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_get_token");
+    assert_eq!(response["response"], json!({ "jwt": "the-jwt" }));
+}
+
+#[async_test]
+async fn test_rtc_livekit_get_token_propagates_homeserver_errors() {
+    let (_, mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(&driver_handle, json!(["org.matrix.msc4533.rtc_livekit_get_token"]))
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token$"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "errcode": "M_FORBIDDEN",
+            "error": "Not in room",
+        })))
+        .expect(1)
+        .mount(mock_server.server())
+        .await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-get-token",
+        "org.matrix.msc4533.rtc_livekit_get_token",
+        json!({
+            "server_name": "example.org",
+            "url": "wss://livekit.example.org",
+            "room_id": "!1:example.org",
+            "slot_id": "m.call",
+            "member_id": "member-id",
+        }),
+    );
+
+    // The Matrix error reaches the widget as `matrix_api_error` details.
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_get_token");
+    assert!(response["response"]["error"]["message"].is_string());
+    assert_eq!(
+        response["response"]["error"]["matrix_api_error"],
+        json!({
+            "http_status": 403,
+            "response": {
+                "errcode": "M_FORBIDDEN",
+                "error": "Not in room",
+            },
+        })
+    );
+}
+
+#[async_test]
+async fn test_rtc_livekit_get_token_without_permission() {
+    let (_, _mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(&driver_handle, json!([])).await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-get-token",
+        "org.matrix.msc4533.rtc_livekit_get_token",
+        json!({
+            "server_name": "example.org",
+            "url": "wss://livekit.example.org",
+            "room_id": "!1:example.org",
+            "slot_id": "m.call",
+            "member_id": "member-id",
+        }),
+    );
+
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["api"], "fromWidget");
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_get_token");
+    assert_eq!(
+        response["response"]["error"]["message"].as_str().unwrap(),
+        "Not allowed: missing the org.matrix.msc4533.rtc_livekit_get_token capability."
+    );
+}
+
+#[async_test]
+async fn test_rtc_livekit_delegate_delayed_leave() {
+    let (_, mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(
+        &driver_handle,
+        json!(["org.matrix.msc4533.rtc_livekit_delegate_delayed_leave"]),
+    )
+    .await;
+
+    let request_data = json!({
+        "url": "wss://livekit.example.org",
+        "room_id": "!1:example.org",
+        "slot_id": "m.call",
+        "member_id": "member-id",
+        "delay_id": "delay-id",
+    });
+
+    // The request data is forwarded verbatim to the homeserver.
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave$",
+        ))
+        .and(body_json(&request_data))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(mock_server.server())
+        .await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-delegate-delayed-leave",
+        "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave",
+        request_data,
+    );
+
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["api"], "fromWidget");
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave");
+    assert_eq!(response["requestId"], "rtc-livekit-delegate-delayed-leave");
+    assert_eq!(response["response"], json!({}));
+}
+
+#[async_test]
+async fn test_rtc_livekit_delegate_delayed_leave_propagates_homeserver_errors() {
+    let (_, mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(
+        &driver_handle,
+        json!(["org.matrix.msc4533.rtc_livekit_delegate_delayed_leave"]),
+    )
+    .await;
+
+    // The homeserver doesn't implement the endpoint.
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave$",
+        ))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "errcode": "M_UNRECOGNIZED",
+            "error": "Unrecognized request",
+        })))
+        .expect(1)
+        .mount(mock_server.server())
+        .await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-delegate-delayed-leave",
+        "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave",
+        json!({
+            "url": "wss://livekit.example.org",
+            "room_id": "!1:example.org",
+            "slot_id": "m.call",
+            "member_id": "member-id",
+            "delay_id": "delay-id",
+        }),
+    );
+
+    // The Matrix error reaches the widget as `matrix_api_error` details, so it
+    // can detect homeservers without support for the endpoint.
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave");
+    assert!(response["response"]["error"]["message"].is_string());
+    assert_eq!(
+        response["response"]["error"]["matrix_api_error"],
+        json!({
+            "http_status": 404,
+            "response": {
+                "errcode": "M_UNRECOGNIZED",
+                "error": "Unrecognized request",
+            },
+        })
+    );
+}
+
+#[async_test]
+async fn test_rtc_livekit_delegate_delayed_leave_without_permission() {
+    let (_, _mock_server, driver_handle) = run_test_driver(false, false).await;
+
+    negotiate_capabilities(&driver_handle, json!([])).await;
+
+    send_request(
+        &driver_handle,
+        "rtc-livekit-delegate-delayed-leave",
+        "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave",
+        json!({
+            "url": "wss://livekit.example.org",
+            "room_id": "!1:example.org",
+            "slot_id": "m.call",
+            "member_id": "member-id",
+            "delay_id": "delay-id",
+        }),
+    );
+
+    let response = recv_message(&driver_handle).await;
+    assert_eq!(response["api"], "fromWidget");
+    assert_eq!(response["action"], "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave");
+    assert_eq!(
+        response["response"]["error"]["message"].as_str().unwrap(),
+        "Not allowed: missing the org.matrix.msc4533.rtc_livekit_delegate_delayed_leave capability."
     );
 }
 

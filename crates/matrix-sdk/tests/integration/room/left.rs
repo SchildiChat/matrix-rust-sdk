@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use assert_matches2::assert_matches;
 use matrix_sdk::{config::SyncSettings, linked_chunk::LinkedChunkId};
 use matrix_sdk_base::{RoomInfoNotableUpdateReasons, RoomState};
 use matrix_sdk_test::{
@@ -13,6 +12,7 @@ use ruma::{
     user_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use tokio::task::yield_now;
 use wiremock::{
     Mock, ResponseTemplate,
@@ -25,9 +25,6 @@ use crate::{logged_in_client_with_server, mock_sync};
 async fn test_forget_non_direct_room() {
     let (client, server) = logged_in_client_with_server().await;
     let user_id = client.user_id().unwrap();
-
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
 
     Mock::given(method("POST"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/forget$"))
@@ -97,9 +94,6 @@ async fn test_forget_non_direct_room() {
 async fn test_forget_banned_room() {
     let (client, server) = logged_in_client_with_server().await;
     let user_id = client.user_id().unwrap();
-
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
 
     Mock::given(method("POST"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/forget$"))
@@ -183,9 +177,8 @@ async fn test_forget_direct_room() {
     let mut sync_builder = SyncResponseBuilder::new();
     sync_builder.add_left_room(LeftRoomBuilder::default());
 
-    sync_builder.add_global_account_data(
-        f.direct().add_user(invited_user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
-    );
+    sync_builder
+        .add_global_account_data(f.direct().add_user(invited_user_id, *DEFAULT_TEST_ROOM_ID));
 
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
 
@@ -205,9 +198,9 @@ async fn test_forget_direct_room() {
         .expect("no m.direct account data")
         .deserialize()
         .expect("failed to deserialize m.direct account data");
-    assert_matches!(
-        direct_account_data.get(<&DirectUserIdentifier>::from(invited_user_id)),
-        Some(invited_user_dms)
+    assert_let!(
+        Some(invited_user_dms) =
+            direct_account_data.get(<&DirectUserIdentifier>::from(invited_user_id))
     );
     assert_eq!(invited_user_dms, &[DEFAULT_TEST_ROOM_ID.to_owned()]);
 

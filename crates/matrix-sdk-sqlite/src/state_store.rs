@@ -47,7 +47,10 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     OpenStoreError, RuntimeConfig, Secret, SqliteStoreConfig,
-    connection::{self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections},
+    connection::{
+        self, Connection as SqliteAsyncConn, Pool as SqlitePool, SqliteConnections,
+        SqliteConnectionsInner,
+    },
     error::{Error, Result},
     utils::{
         EncryptableStore, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
@@ -81,7 +84,7 @@ pub struct SqliteStateStore {
     store_cipher: Option<Arc<StoreCipher>>,
 
     /// `Some` when active, `None` when closed.
-    connections: Arc<Mutex<Option<SqliteConnections>>>,
+    connections: Arc<SqliteConnections>,
 
     /// Retained so we can rebuild the pool on reopen.
     db_path: PathBuf,
@@ -110,8 +113,8 @@ impl SqliteStateStore {
         Self::open_with_config(&SqliteStoreConfig::new(path).passphrase(passphrase)).await
     }
 
-    /// Open the SQLite-based state store at the given path using the given
-    /// key to encrypt private data.
+    /// Open the SQLite-based state store at the given path using the given key
+    /// to encrypt private data.
     pub async fn open_with_key(
         path: impl AsRef<Path>,
         key: Option<&[u8]>,
@@ -158,10 +161,13 @@ impl SqliteStateStore {
         };
         let this = Self {
             store_cipher,
-            connections: Arc::new(Mutex::new(Some(SqliteConnections {
-                pool,
-                write_connection: Arc::new(Mutex::new(conn)),
-            }))),
+            connections: Arc::new(
+                SqliteConnections::new(SqliteConnectionsInner {
+                    pool,
+                    write_connection: Arc::new(Mutex::new(conn)),
+                })
+                .await,
+            ),
             db_path,
             pool_config,
             runtime_config,
@@ -431,9 +437,9 @@ impl SqliteStateStore {
 
         if from < 12 {
             debug!("Upgrading database to version 12");
-            // Defragment the DB and optimize its size on the filesystem.
-            // This should have been run in the migration for version 7, to reduce the size
-            // of the DB as we removed the media cache.
+            // Defragment the DB and optimize its size on the filesystem. This
+            // should have been run in the migration for version 7, to reduce
+            // the size of the DB as we removed the media cache.
             conn.vacuum().await?;
             conn.set_kv("version", vec![12]).await?;
         }
@@ -565,8 +571,8 @@ impl SqliteStateStore {
         self.encode_key(keys::KV_BLOB, full_key)
     }
 
-    /// Acquire a connection for executing read operations.
-    /// Returns `StoreClosed` if closed.
+    /// Acquire a connection for executing read operations. Returns
+    /// `StoreClosed` if closed.
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
         let pool = {
@@ -577,8 +583,8 @@ impl SqliteStateStore {
         Ok(pool.get().await?)
     }
 
-    /// Acquire a connection for executing write operations.
-    /// Returns `StoreClosed` if closed.
+    /// Acquire a connection for executing write operations. Returns
+    /// `StoreClosed` if closed.
     #[instrument(skip_all)]
     async fn write(&self) -> Result<OwnedMutexGuard<SqliteAsyncConn>> {
         let write_conn = {
@@ -620,8 +626,9 @@ impl EncryptableStore for SqliteStateStore {
 
 /// Initialize the database.
 async fn init(conn: &SqliteAsyncConn) -> Result<()> {
-    // First turn on WAL mode, this can't be done in the transaction, it fails with
-    // the error message: "cannot change into wal mode from within a transaction".
+    // First turn on WAL mode, this can't be done in the transaction, it fails
+    // with the error message: "cannot change into wal mode from within a
+    // transaction".
     conn.execute_batch("PRAGMA journal_mode = wal;").await?;
     conn.with_transaction(|txn| {
         txn.execute_batch(include_str!("../migrations/state_store/001_init.sql"))?;
@@ -1368,9 +1375,19 @@ impl StateStore for SqliteStateStore {
                 }
 
                 for (room_id, room_info) in room_infos {
-                    let stripped = room_info.state() == RoomState::Invited;
-                    // Remove non-stripped data for stripped rooms and vice-versa.
-                    this.remove_maybe_stripped_room_data(txn, &room_id, !stripped)?;
+                    // Invited and knocked rooms only have stripped state.
+                    let stripped = matches!(room_info.state(), RoomState::Invited | RoomState::Knocked);
+
+                    // Once the room state isn't invited or knocking, we can
+                    // drop its stripped state. If we haven't joined it but we
+                    // do have real state, we can replace it with the stripped
+                    // state (only if said stripped state is available).
+                    // Otherwise, we would end up deleting the room's state
+                    // events and members, which is obviously bad and
+                    // undesirable.
+                    if !stripped || stripped_state.contains_key(&room_id) {
+                        this.remove_maybe_stripped_room_data(txn, &room_id, !stripped)?;
+                    }
 
                     let room_id = this.encode_key(keys::ROOM_INFO, room_id);
                     let state = this
@@ -1507,8 +1524,9 @@ impl StateStore for SqliteStateStore {
 
                             for (user_id, receipt) in receipt_users {
                                 let encoded_user_id = this.encode_key(keys::RECEIPT, &user_id);
-                                // We cannot have a NULL primary key so we rely on serialization
-                                // instead of the string representation.
+                                // We cannot have a NULL primary key so we rely
+                                // on serialization instead of the string
+                                // representation.
                                 let thread = this.encode_key(
                                     keys::RECEIPT,
                                     rmp_serde::to_vec_named(&receipt.thread)?,
@@ -1597,20 +1615,24 @@ impl StateStore for SqliteStateStore {
                         if user_ids.is_empty() {
                             txn.remove_display_name(&room_id, &encoded_name)?;
 
-                            // We can't do a migration to merge the previously distinct buckets of
-                            // user IDs since the display names themselves are hashed before they
-                            // are persisted in the store. So the store will always retain two
-                            // buckets: one for raw display names and one for normalised ones.
+                            // We can't do a migration to merge the previously
+                            // distinct buckets of user IDs since the display
+                            // names themselves are hashed before they are
+                            // persisted in the store. So the store will always
+                            // retain two buckets: one for raw display names and
+                            // one for normalised ones.
                             //
-                            // We therefore do the next best thing, which is a sort of a soft
-                            // migration: we fetch both the raw and normalised buckets, then merge
-                            // the user IDs contained in them into a separate, temporary merged
-                            // bucket. The SDK then operates on the merged buckets exclusively. See
-                            // the comment in `get_users_with_display_names` for details.
+                            // We therefore do the next best thing, which is a
+                            // sort of a soft migration: we fetch both the raw
+                            // and normalised buckets, then merge the user IDs
+                            // contained in them into a separate, temporary
+                            // merged bucket. The SDK then operates on the
+                            // merged buckets exclusively. See the comment in
+                            // `get_users_with_display_names` for details.
                             //
-                            // If the merged bucket is empty, that must mean that both the raw and
-                            // normalised buckets were also empty, so we can remove both from the
-                            // store.
+                            // If the merged bucket is empty, that must mean
+                            // that both the raw and normalised buckets were
+                            // also empty, so we can remove both from the store.
                             let raw_name = this.encode_key(keys::DISPLAY_NAME, name.as_raw_str());
                             txn.remove_display_name(&room_id, &raw_name)?;
                         } else {
@@ -1876,15 +1898,18 @@ impl StateStore for SqliteStateStore {
         let mut names_map = display_names
             .iter()
             .flat_map(|display_name| {
-                // We encode the display name as the `raw_str()` and the normalized string.
+                // We encode the display name as the `raw_str()` and the
+                // normalized string.
                 //
                 // This is for compatibility reasons since:
-                //  1. Previously "Alice" and "alice" were considered to be distinct display
-                //     names, while we now consider them to be the same so we need to merge the
-                //     previously distinct buckets of user IDs.
-                //  2. We can't do a migration to merge the previously distinct buckets of user
-                //     IDs since the display names itself are hashed before they are persisted
-                //     in the store.
+                //
+                // 1. Previously "Alice" and "alice" were considered to be
+                //    distinct display names, while we now consider them to be
+                //    the same so we need to merge the previously distinct
+                //    buckets of user IDs.
+                // 2. We can't do a migration to merge the previously distinct
+                //    buckets of user IDs since the display names itself are
+                //    hashed before they are persisted in the store.
                 let raw =
                     (self.encode_key(keys::DISPLAY_NAME, display_name.as_raw_str()), display_name);
                 let normalized = display_name.as_normalized_str().map(|normalized| {
@@ -1971,8 +1996,8 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Option<(OwnedEventId, Receipt)>> {
         let room_id = self.encode_key(keys::RECEIPT, room_id);
         let receipt_type = self.encode_key(keys::RECEIPT, receipt_type.to_string());
-        // We cannot have a NULL primary key so we rely on serialization instead of the
-        // string representation.
+        // We cannot have a NULL primary key so we rely on serialization instead
+        // of the string representation.
         let receipt_thread =
             self.encode_key(keys::RECEIPT, rmp_serde::to_vec_named(receipt_thread)?);
         let user_id = self.encode_key(keys::RECEIPT, user_id);
@@ -1996,8 +2021,8 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Vec<(OwnedUserId, Receipt)>> {
         let room_id = self.encode_key(keys::RECEIPT, room_id);
         let receipt_type = self.encode_key(keys::RECEIPT, receipt_type.to_string());
-        // We cannot have a NULL primary key so we rely on serialization instead of the
-        // string representation.
+        // We cannot have a NULL primary key so we rely on serialization instead
+        // of the string representation.
         let receipt_thread =
             self.encode_key(keys::RECEIPT, rmp_serde::to_vec_named(receipt_thread)?);
         let event_id = self.encode_key(keys::RECEIPT, event_id);
@@ -2103,10 +2128,11 @@ impl StateStore for SqliteStateStore {
         let room_id_value = self.serialize_value(&room_id.to_owned())?;
 
         let content = self.serialize_json(&content)?;
-        // The transaction id is used both as a key (in remove/update) and a value (as
-        // it's useful for the callers), so we keep it as is, and neither hash
-        // it (with encode_key) or encrypt it (through serialize_value). After
-        // all, it carries no personal information, so this is considered fine.
+        // The transaction id is used both as a key (in remove/update) and a
+        // value (as it's useful for the callers), so we keep it as is, and
+        // neither hash it (with encode_key) or encrypt it (through
+        // serialize_value). After all, it carries no personal information, so
+        // this is considered fine.
 
         let created_at_ts: u64 = created_at.0.into();
         self.write()
@@ -2127,8 +2153,8 @@ impl StateStore for SqliteStateStore {
         let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
 
         let content = self.serialize_json(&content)?;
-        // See comment in [`Self::save_send_queue_request`] to understand why the
-        // transaction id is neither encrypted or hashed.
+        // See comment in [`Self::save_send_queue_request`] to understand why
+        // the transaction id is neither encrypted or hashed.
         let transaction_id = transaction_id.to_string();
 
         let num_updated = self.write()
@@ -2171,9 +2197,10 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Vec<QueuedRequest>, Self::Error> {
         let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
 
-        // Note: ROWID is always present and is an auto-incremented integer counter. We
-        // want to maintain the insertion order, so we can sort using it.
-        // Note 2: transaction_id is not encoded, see why in `save_send_queue_request`.
+        // Note: ROWID is always present and is an auto-incremented integer
+        // counter. We want to maintain the insertion order, so we can sort
+        // using it. Note 2: transaction_id is not encoded, see why in
+        // `save_send_queue_request`.
         let res: Vec<(String, Vec<u8>, Option<Vec<u8>>, usize, Option<u64>)> = self
             .read()
             .await?
@@ -2218,7 +2245,8 @@ impl StateStore for SqliteStateStore {
         // See comment in `save_send_queue_request`.
         let transaction_id = transaction_id.to_string();
 
-        // Serialize the error to json bytes (encrypted if option is enabled) if set.
+        // Serialize the error to json bytes (encrypted if option is enabled) if
+        // set.
         let error_value = error.map(|e| self.serialize_value(&e)).transpose()?;
 
         self.write()
@@ -2231,9 +2259,10 @@ impl StateStore for SqliteStateStore {
     }
 
     async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
-        // If the values were not encrypted, we could use `SELECT DISTINCT` here, but we
-        // have to manually do the deduplication: indeed, for all X, encrypt(X)
-        // != encrypted(X), since we use a nonce in the encryption process.
+        // If the values were not encrypted, we could use `SELECT DISTINCT`
+        // here, but we have to manually do the deduplication: indeed, for all
+        // X, encrypt(X) != encrypted(X), since we use a nonce in the encryption
+        // process.
 
         let res: Vec<Vec<u8>> = self
             .read()
@@ -2243,8 +2272,8 @@ impl StateStore for SqliteStateStore {
             })
             .await?;
 
-        // So we collect the results into a `BTreeSet` to perform the deduplication, and
-        // then rejigger that into a vector.
+        // So we collect the results into a `BTreeSet` to perform the
+        // deduplication, and then rejigger that into a vector.
         Ok(res
             .into_iter()
             .map(|entry| self.deserialize_value(&entry))
@@ -2375,7 +2404,8 @@ impl StateStore for SqliteStateStore {
     ) -> Result<Vec<DependentQueuedRequest>> {
         let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
 
-        // Note: transaction_id is not encoded, see why in `save_send_queue_request`.
+        // Note: transaction_id is not encoded, see why in
+        // `save_send_queue_request`.
         let res: Vec<(String, String, Option<Vec<u8>>, Vec<u8>, Option<u64>)> = self
             .read()
             .await?
@@ -2606,6 +2636,68 @@ mod tests {
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), None).await.unwrap())
     }
 
+    /// Specific to this store, which keys stripped storage off the room state,
+    /// so it can't live in `statestore_integration_tests!`.
+    #[matrix_sdk_test::async_test]
+    async fn test_stripped_data_is_dropped_once_the_room_is_joined() {
+        use matrix_sdk_base::{
+            RoomInfo, RoomMemberships, RoomState, StateChanges, store::StateStoreExt,
+        };
+        use ruma::{
+            events::{
+                StateEventType,
+                room::member::{MembershipState, RoomMemberEventContent},
+            },
+            room_id,
+            serde::Raw,
+            user_id,
+        };
+
+        let store = get_store().await.unwrap();
+        let room_id = room_id!("!test_stripped_data_is_dropped:localhost");
+        let user_id = user_id!("@u:localhost");
+
+        // Invited: all we know about the room is its stripped state.
+        let member: Raw<ruma::events::room::member::StrippedRoomMemberEvent> =
+            Raw::new(&serde_json::json!({
+                "type": "m.room.member",
+                "content": RoomMemberEventContent::new(MembershipState::Invite),
+                "sender": "@inviter:localhost",
+                "state_key": user_id,
+            }))
+            .unwrap()
+            .cast_unchecked();
+
+        let mut changes = StateChanges::default();
+        changes.add_stripped_member(room_id, user_id, member);
+        changes.add_room(RoomInfo::new(room_id, RoomState::Invited));
+        store.save_changes(&changes).await.unwrap();
+
+        assert!(store.get_member_event(room_id, user_id).await.unwrap().is_some());
+
+        // Accepting the invite: `BaseClient::room_joined` saves the room info
+        // and nothing else.
+        let mut changes = StateChanges::default();
+        changes.add_room(RoomInfo::new(room_id, RoomState::Joined));
+        store.save_changes(&changes).await.unwrap();
+
+        assert!(
+            store.get_member_event(room_id, user_id).await.unwrap().is_none(),
+            "the stripped member event must be dropped once the room is joined"
+        );
+        assert!(
+            store.get_user_ids(room_id, RoomMemberships::empty()).await.unwrap().is_empty(),
+            "the stripped member must no longer be listed"
+        );
+        assert!(
+            store
+                .get_state_event(room_id, StateEventType::RoomMember, user_id.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     statestore_integration_tests!();
 }
 
@@ -2625,7 +2717,7 @@ mod encrypted_tests {
     use tempfile::{TempDir, tempdir};
 
     use super::SqliteStateStore;
-    use crate::{Base64Variant, SqliteStoreConfig, utils::SqliteAsyncConnExt};
+    use crate::{Base64Variant, SqliteStoreConfig, Synchronous, utils::SqliteAsyncConnExt};
 
     static TMP_DIR: LazyLock<TempDir> = LazyLock::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
@@ -2664,7 +2756,8 @@ mod encrypted_tests {
         // ...which the next open uses.
         drop(SqliteStateStore::open_with_config(&config).await.unwrap());
 
-        // The `cipher` entry was replaced, so the old passphrase can't work anymore.
+        // The `cipher` entry was replaced, so the old passphrase can't work
+        // anymore.
         let config = SqliteStoreConfig::new(&tmpdir_path).passphrase(Some(&passphrase));
         drop(
             SqliteStateStore::open_with_config(&config)
@@ -2672,7 +2765,8 @@ mod encrypted_tests {
                 .expect_err("The old passphrase-only method shouldn't work anymore"),
         );
 
-        // The `cipher` entry was replaced, so now only high entropy or key work.
+        // The `cipher` entry was replaced, so now only high entropy or key
+        // work.
         let config = SqliteStoreConfig::new(&tmpdir_path)
             .high_entropy_passphrase(Some(KEY), Base64Variant::Padded);
         drop(
@@ -2739,6 +2833,38 @@ mod encrypted_tests {
         // The value passed to `SqliteStoreConfig` is in bytes. It stays in
         // bytes in SQLite.
         assert_eq!(journal_size_limit, 1500);
+    }
+
+    #[async_test]
+    async fn test_synchronous() {
+        // The values SQLite reports for `OFF`, `NORMAL`, `FULL` and `EXTRA`.
+        let all = [
+            (Synchronous::Off, 0),
+            (Synchronous::Normal, 1),
+            (Synchronous::Full, 2),
+            (Synchronous::Extra, 3),
+        ];
+
+        for (synchronous, expected) in all {
+            let tmpdir_path = new_state_store_workspace();
+            let store_open_config = SqliteStoreConfig::new(tmpdir_path).synchronous(synchronous);
+
+            let store = SqliteStateStore::open_with_config(&store_open_config).await.unwrap();
+
+            // `PRAGMA synchronous` is per-connection, so every connection must
+            // carry it.
+            let write_conn = store.write().await.unwrap();
+            let read_conn = store.read().await.unwrap();
+
+            for conn in [&*write_conn, &read_conn] {
+                let value = conn
+                    .query_row("PRAGMA synchronous", (), |row| row.get::<_, u8>(0))
+                    .await
+                    .unwrap();
+
+                assert_eq!(value, expected);
+            }
+        }
     }
 
     statestore_integration_tests!();
@@ -2814,10 +2940,13 @@ mod migration_tests {
         ));
         let this = SqliteStateStore {
             store_cipher,
-            connections: Arc::new(Mutex::new(Some(connection::SqliteConnections {
-                pool,
-                write_connection: Arc::new(Mutex::new(conn)),
-            }))),
+            connections: Arc::new(
+                connection::SqliteConnections::new(connection::SqliteConnectionsInner {
+                    pool,
+                    write_connection: Arc::new(Mutex::new(conn)),
+                })
+                .await,
+            ),
             db_path,
             pool_config: deadpool::managed::PoolConfig::default(),
             runtime_config: crate::RuntimeConfig::default(),
@@ -3074,8 +3203,8 @@ mod migration_tests {
             .unwrap();
         }
 
-        // This transparently migrates to the latest version, which clears up all
-        // requests and dependent requests.
+        // This transparently migrates to the latest version, which clears up
+        // all requests and dependent requests.
         let store = SqliteStateStore::open(path, Some(SECRET)).await.unwrap();
 
         let requests = store.load_send_queue_requests(room_id).await.unwrap();

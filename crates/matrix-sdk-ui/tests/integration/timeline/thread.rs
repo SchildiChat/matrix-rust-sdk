@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{ops::Not as _, time::Duration};
+use std::{assert_matches, ops::Not as _, time::Duration};
 
-use assert_matches2::{assert_let, assert_matches};
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt as _;
 use matrix_sdk::{
@@ -24,7 +23,7 @@ use matrix_sdk::{
         MatrixMockServer, RoomContextResponseTemplate, RoomRelationsResponseTemplate,
     },
 };
-use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{
     EventSendState, RoomExt as _, TimelineBuilder, TimelineDetails, TimelineEventFocusThreadMode,
     TimelineEventItemId, TimelineFocus, VirtualTimelineItem,
@@ -51,6 +50,7 @@ use ruma::{
     },
     owned_event_id, owned_mxc_uri, room_id, user_id,
 };
+use strass::assert_let;
 use stream_assert::assert_pending;
 use tokio::task::yield_now;
 
@@ -76,7 +76,7 @@ async fn test_new_empty_thread() {
     let room = server.sync_joined_room(&client, room_id).await;
 
     let timeline = TimelineBuilder::new(&room)
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id })
         .build()
         .await
         .unwrap();
@@ -158,7 +158,7 @@ async fn test_thread_backpagination() {
     let room = server.sync_joined_room(&client, room_id).await;
 
     let timeline = TimelineBuilder::new(&room)
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -180,17 +180,17 @@ async fn test_thread_backpagination() {
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
         let event_item = value.as_event().unwrap();
         assert_eq!(event_item.content().as_message().unwrap().body(), "Threaded event 3");
-        // In a threaded timeline, threads aren't using the reply fallback, unless
-        // they're an actual reply to another thread event.
-        assert_matches!(event_item.content().in_reply_to(), None);
+        // In a threaded timeline, threads aren't using the reply fallback,
+        // unless they're an actual reply to another thread event.
+        assert!(event_item.content().in_reply_to().is_none());
     }
 
     {
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[1]);
         let event_item = value.as_event().unwrap();
         assert_eq!(event_item.content().as_message().unwrap().body(), "Threaded event 4");
-        // But this one is an actual reply to another thread event, so it has the
-        // replied-to event correctly set.
+        // But this one is an actual reply to another thread event, so it has
+        // the replied-to event correctly set.
         assert_eq!(event_item.content().in_reply_to().unwrap().event_id, "$2");
     }
 
@@ -207,17 +207,17 @@ async fn test_thread_backpagination() {
     assert_let!(VectorDiff::Insert { index: 1, value } = &timeline_updates[0]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), thread_root_event_id);
-    assert_matches!(event_item.content().in_reply_to(), None);
+    assert!(event_item.content().in_reply_to().is_none());
 
     assert_let!(VectorDiff::Insert { index: 2, value } = &timeline_updates[1]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), "$1");
-    assert_matches!(event_item.content().in_reply_to(), None);
+    assert!(event_item.content().in_reply_to().is_none());
 
     assert_let!(VectorDiff::Insert { index: 3, value } = &timeline_updates[2]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), "$2");
-    assert_matches!(event_item.content().in_reply_to(), None);
+    assert!(event_item.content().in_reply_to().is_none());
 
     // Check the final items
     let items = timeline.items().await;
@@ -262,7 +262,7 @@ async fn test_extract_bundled_thread_summary() {
     let (initial_items, mut stream) = timeline.subscribe().await;
     assert!(initial_items.is_empty());
 
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
     let thread_event_id = event_id!("$thread_root");
     let latest_event_id = event_id!("$latest_event");
 
@@ -291,7 +291,7 @@ async fn test_extract_bundled_thread_summary() {
     assert!(summary.latest_event.is_ready());
     assert_let!(TimelineDetails::Ready(latest_event) = summary.latest_event);
     assert_eq!(latest_event.content.as_message().unwrap().body(), "the last one!");
-    assert_eq!(latest_event.sender, *ALICE);
+    assert_eq!(latest_event.sender, User::Alice);
     assert!(latest_event.sender_profile.is_unavailable());
 
     // We get the count from the bundled thread summary.
@@ -305,8 +305,8 @@ async fn test_extract_bundled_thread_summary() {
 
 #[async_test]
 async fn test_redact_thread_root_keeps_thread_summary() {
-    // Redacting the thread root must not hide the thread: the thread summary
-    // is preserved on the redacted item.
+    // Redacting the thread root must not hide the thread: the thread summary is
+    // preserved on the redacted item.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -317,16 +317,16 @@ async fn test_redact_thread_root_keeps_thread_summary() {
     let timeline = room.timeline().await.unwrap();
     let (_, mut stream) = timeline.subscribe().await;
 
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
     let thread_event_id = event_id!("$thread_root");
     let latest_event_id = event_id!("$latest_event");
 
-    // `with_bundled_thread_summary` expects `Raw<AnySyncMessageLikeEvent>`,
-    // so we cast from the more general `Raw<AnySyncTimelineEvent>`.
+    // `with_bundled_thread_summary` expects `Raw<AnySyncMessageLikeEvent>`, so
+    // we cast from the more general `Raw<AnySyncTimelineEvent>`.
     let reply_event = f
         .text_msg("the last reply")
         .event_id(latest_event_id)
-        .sender(&BOB)
+        .sender(User::Bob)
         .into_raw_sync()
         .cast_unchecked();
 
@@ -358,7 +358,7 @@ async fn test_redact_thread_root_keeps_thread_summary() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id)
-                .add_timeline_event(f.redaction(thread_event_id).sender(&ALICE)),
+                .add_timeline_event(f.redaction(thread_event_id).sender(User::Alice)),
         )
         .await;
 
@@ -389,16 +389,16 @@ async fn test_already_redacted_thread_root_keeps_bundled_thread_summary() {
     let timeline = room.timeline().await.unwrap();
     let (_, mut stream) = timeline.subscribe().await;
 
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
     let thread_event_id = event_id!("$thread_root");
     let latest_event_id = event_id!("$latest_event");
 
-    // `with_bundled_thread_summary` expects `Raw<AnySyncMessageLikeEvent>`,
-    // so we cast from the more general `Raw<AnySyncTimelineEvent>`.
+    // `with_bundled_thread_summary` expects `Raw<AnySyncMessageLikeEvent>`, so
+    // we cast from the more general `Raw<AnySyncTimelineEvent>`.
     let reply_event = f
         .text_msg("the last reply")
         .event_id(latest_event_id)
-        .sender(&BOB)
+        .sender(User::Bob)
         .into_raw_sync()
         .cast_unchecked();
 
@@ -408,7 +408,7 @@ async fn test_already_redacted_thread_root_keeps_bundled_thread_summary() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
-                f.redacted(&ALICE, RedactedRoomMessageEventContent::new())
+                f.redacted(User::Alice, RedactedRoomMessageEventContent::new())
                     .event_id(thread_event_id)
                     .with_bundled_thread_summary(reply_event, 42, false),
             ),
@@ -447,7 +447,7 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
     assert!(initial_items.is_empty());
 
     // Start with a simple message, with no bundled thread info.
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
     let thread_event_id = event_id!("$thread_root");
 
     let event = f.text_msg("thready thread mcthreadface").event_id(thread_event_id);
@@ -471,53 +471,39 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
     let reply_event_id = event_id!("$thread_reply");
     let event = f
         .text_msg("thread reply")
-        .sender(&BOB)
+        .sender(User::Bob)
         .in_thread(thread_event_id, thread_event_id)
         .event_id(reply_event_id);
 
     server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
 
     // The timeline sees the reply.
-    //
-    // TODO: maybe we should include the thread summaries if and only if the live
-    // timeline is configured to exclude thread replies, aka, it requires
-    // thread-focused timelines to consult the thread replies.
     assert_let_timeout!(Some(timeline_updates) = stream.next());
-    assert_eq!(timeline_updates.len(), 3);
+    assert_eq!(timeline_updates.len(), 2);
 
     assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), reply_event_id);
     assert!(event_item.content().thread_summary().is_none());
     assert_eq!(event_item.content().thread_root().as_deref(), Some(thread_event_id));
-    // First, the replied-to event (thread root) doesn't have any thread summary
-    // info.
+    // The replied-to event (thread root) doesn't have any thread summary info.
     let replied_to_details = value.as_event().unwrap().content().in_reply_to().unwrap().event;
     assert_let!(TimelineDetails::Ready(replied_to_event) = replied_to_details);
     assert!(replied_to_event.content.thread_summary().is_none());
 
-    // Since the replied-to item (the thread root) has been updated, all replies get
-    // updated too, including the item we just pushed.
-    assert_let!(VectorDiff::Set { index: 2, value } = &timeline_updates[1]);
-    let event_item = value.as_event().unwrap();
-    assert_eq!(event_item.event_id().unwrap(), reply_event_id);
-    let replied_to_details = value.as_event().unwrap().content().in_reply_to().unwrap().event;
-    assert_let!(TimelineDetails::Ready(replied_to_event) = replied_to_details);
-    // Spoiling a bit here…
-    assert!(replied_to_event.content.thread_summary().is_some());
-
-    // And finally, the thread root event receives a thread summary.
-    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[2]);
+    // And the thread root event receives a thread summary update.
+    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[1]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), thread_event_id);
     assert!(event_item.content().thread_root().is_none());
 
-    // The thread summary contains the detailed information about the latest event.
+    // The thread summary contains the detailed information about the latest
+    // event.
     assert_let!(Some(summary) = event_item.content().thread_summary());
     assert!(summary.latest_event.is_ready());
     assert_let!(TimelineDetails::Ready(latest_event) = summary.latest_event);
     assert_eq!(latest_event.content.as_message().unwrap().body(), "thread reply");
-    assert_eq!(latest_event.sender, *BOB);
+    assert_eq!(latest_event.sender, User::Bob);
     assert!(latest_event.sender_profile.is_unavailable());
 
     // The thread summary contains the number of replies.
@@ -532,7 +518,7 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("another thread reply")
-                    .sender(&BOB)
+                    .sender(User::Bob)
                     .in_thread(thread_event_id, reply_event_id)
                     .event_id(another_reply_event_id),
             ),
@@ -540,7 +526,7 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
         .await;
 
     assert_let_timeout!(Some(timeline_updates) = stream.next());
-    assert_eq!(timeline_updates.len(), 4);
+    assert_eq!(timeline_updates.len(), 3);
 
     // (Read receipt from Bob moves.)
     assert_let!(VectorDiff::Set { index: 2, .. } = &timeline_updates[0]);
@@ -552,19 +538,9 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
     assert!(event_item.content().thread_summary().is_none());
     assert_eq!(event_item.content().thread_root().as_deref(), Some(thread_event_id));
 
-    // Then the first thread reply is updated with the up-to-date thread summary in
-    // the replied-to event.
-    assert_let!(VectorDiff::Set { index: 2, value } = &timeline_updates[2]);
-    let event_item = value.as_event().unwrap();
-    assert_eq!(event_item.event_id().unwrap(), reply_event_id);
-    let replied_to_details = value.as_event().unwrap().content().in_reply_to().unwrap().event;
-    assert_let!(TimelineDetails::Ready(replied_to_event) = replied_to_details);
-    // Spoiling a bit here…
-    assert_eq!(replied_to_event.content.thread_summary().unwrap().num_replies, 2);
-
     // Then, we receive an update for the thread root itself, which now has an
     // up-to-date thread summary.
-    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[3]);
+    assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[2]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), thread_event_id);
     assert!(event_item.content().thread_root().is_none());
@@ -575,7 +551,7 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
     assert!(summary.latest_event.is_ready());
     assert_let!(TimelineDetails::Ready(latest_event) = summary.latest_event);
     assert_eq!(latest_event.content.as_message().unwrap().body(), "another thread reply");
-    assert_eq!(latest_event.sender, *BOB);
+    assert_eq!(latest_event.sender, User::Bob);
     assert!(latest_event.sender_profile.is_unavailable());
 
     // The number of replies has been updated.
@@ -584,9 +560,9 @@ async fn test_new_thread_reply_causes_thread_summary_update() {
 
 #[async_test]
 async fn test_thread_msg_edit_reflects_in_summary() {
-    // A new message edit of a threaded reply received in sync (but after we already
-    // had a thread) will cause the thread root's thread summary to be updated
-    // with the latest content.
+    // A new message edit of a threaded reply received in sync (but after we
+    // already had a thread) will cause the thread root's thread summary to be
+    // updated with the latest content.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -604,9 +580,9 @@ async fn test_thread_msg_edit_reflects_in_summary() {
     let (initial_items, mut stream) = timeline.subscribe().await;
     assert!(initial_items.is_empty());
 
-    // Start with a message (with no bundled thread info), and a threaded reply to
-    // it.
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    // Start with a message (with no bundled thread info), and a threaded reply
+    // to it.
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
     let thread_event_id = event_id!("$thread_root");
     let reply_event_id = event_id!("$thread_reply");
 
@@ -619,7 +595,7 @@ async fn test_thread_msg_edit_reflects_in_summary() {
                 )
                 .add_timeline_event(
                     f.text_msg("threaded reply")
-                        .sender(&BOB)
+                        .sender(User::Bob)
                         .in_thread(thread_event_id, thread_event_id)
                         .event_id(reply_event_id),
                 ),
@@ -627,8 +603,11 @@ async fn test_thread_msg_edit_reflects_in_summary() {
         .await;
 
     assert_let_timeout!(Some(timeline_updates) = stream.next());
-    // Thread root + new implicit read receipt + new thread summary + day divider.
-    // TODO: could we optimize this, to have only a single timeline update?
+    //   thread root
+    // + new implicit read receipt
+    // + date divider
+    // + new thread summary update from `RoomEventCacheUpdate`
+    // = 4
     assert_eq!(timeline_updates.len(), 4);
 
     // Sanity check the timeline diffs.
@@ -636,29 +615,32 @@ async fn test_thread_msg_edit_reflects_in_summary() {
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
         let event_item = value.as_event().unwrap();
         assert_eq!(event_item.event_id().unwrap(), thread_event_id);
-        // At first, the summary isn't here.
-        assert!(event_item.content().thread_summary().is_none());
+        // The thread summary is already here, because the Timeline eagerly
+        // fetch it.
+        assert_let!(Some(summary) = event_item.content().thread_summary());
+        // but the in-thread event is not known yet!
+        assert!(summary.latest_event.is_unavailable());
+        // hence, zero replies!
+        assert_eq!(summary.num_replies, 0);
         // And it only has the read receipt of its author.
         assert_eq!(event_item.read_receipts().len(), 1);
 
-        // Then, a read-receipt "set" because Bob having sent a reply means he's seen
-        // the thread root.
+        // Then, a read-receipt "set" because Bob having sent a reply means he's
+        // seen the thread root.
         assert_let!(VectorDiff::Set { index: 0, value } = &timeline_updates[1]);
         let event_item = value.as_event().unwrap();
         assert_eq!(event_item.event_id().unwrap(), thread_event_id);
-        assert!(event_item.content().thread_summary().is_none());
         // Now, with Bob's read receipt.
         assert_eq!(event_item.read_receipts().len(), 2);
 
-        // The day divider is added.
+        // The date divider is added.
         assert_let!(VectorDiff::PushFront { value } = &timeline_updates[2]);
         assert!(value.is_date_divider());
 
-        // Eventually the summary comes in.
+        // The thread summary update (because the in-thread event is received).
         assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[3]);
         let event_item = value.as_event().unwrap();
         assert_eq!(event_item.event_id().unwrap(), thread_event_id);
-        // Now there is a summary!
         assert_let!(Some(summary) = event_item.content().thread_summary());
         assert_let!(TimelineDetails::Ready(latest_event) = summary.latest_event);
         assert_eq!(
@@ -681,7 +663,7 @@ async fn test_thread_msg_edit_reflects_in_summary() {
                         reply_event_id,
                         RoomMessageEventContentWithoutRelation::text_plain("edited threaded reply"),
                     )
-                    .sender(&BOB)
+                    .sender(User::Bob)
                     .event_id(edit_reply_event_id),
             ),
         )
@@ -713,9 +695,9 @@ async fn test_thread_msg_edit_reflects_in_summary() {
 
 #[async_test]
 async fn test_thread_poll_edit_reflects_in_summary() {
-    // A new poll edit of a threaded reply received in sync (at the same time as the
-    // original poll) will cause the thread root's thread summary to be updated
-    // with the latest content.
+    // A new poll edit of a threaded reply received in sync (at the same time as
+    // the original poll) will cause the thread root's thread summary to be
+    // updated with the latest content.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -734,7 +716,7 @@ async fn test_thread_poll_edit_reflects_in_summary() {
     assert!(initial_items.is_empty());
 
     // Have all the events, including the edit, arrive in the same sync.
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
     let thread_event_id = event_id!("$thread_root");
     let reply_event_id = event_id!("$thread_reply");
     let edit_reply_event_id = event_id!("$thread_reply_edit");
@@ -752,7 +734,7 @@ async fn test_thread_poll_edit_reflects_in_summary() {
                         "What's your favorite colour?",
                         vec!["Red", "Green", "Blue"],
                     )
-                    .sender(&BOB)
+                    .sender(User::Bob)
                     .in_thread(thread_event_id, thread_event_id)
                     .event_id(reply_event_id),
                 )
@@ -764,49 +746,56 @@ async fn test_thread_poll_edit_reflects_in_summary() {
                         "What's your favourite colour?",
                         vec!["Red", "Green", "Blue", "Yellow"],
                     )
-                    .sender(&BOB)
+                    .sender(User::Bob)
                     .event_id(edit_reply_event_id),
                 ),
         )
         .await;
 
     assert_let_timeout!(Some(timeline_updates) = stream.next());
-    // Thread root + new implicit read receipt + new thread summary + day divider.
-    // TODO: could we optimize this, to have only a single timeline update?
+    //   thread root
+    // + new implicit read receipt
+    // + date divider
+    // + new thread summary update from `RoomEventCacheUpdate`
+    // = 4
     assert_eq!(timeline_updates.len(), 4);
 
     assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), thread_event_id);
-    // At first, the summary isn't here.
-    assert!(event_item.content().thread_summary().is_none());
+    // The thread root contains the thread summary (because it is eagerly
+    // fetched).
+    assert_let!(Some(summary) = event_item.content().thread_summary());
+    // but the in-thread event is not known yet!
+    assert!(summary.latest_event.is_unavailable());
+    // hence, zero replies!
+    assert_eq!(summary.num_replies, 0);
     // And it only has the read receipt of its author.
     assert_eq!(event_item.read_receipts().len(), 1);
 
-    // Then, a read-receipt "set" because Bob having sent a reply means he's seen
-    // the thread root.
+    // Then, a read-receipt "set" because Bob having sent a reply means he's
+    // seen the thread root.
     assert_let!(VectorDiff::Set { index: 0, value } = &timeline_updates[1]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), thread_event_id);
-    assert!(event_item.content().thread_summary().is_none());
     // Now, with Bob's read receipt.
     assert_eq!(event_item.read_receipts().len(), 2);
 
-    // The day divider is added.
+    // The date divider is added.
     assert_let!(VectorDiff::PushFront { value } = &timeline_updates[2]);
     assert!(value.is_date_divider());
 
-    // Eventually the summary comes in.
+    // The thread summary update (because the in-thread event is received).
     assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[3]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id().unwrap(), thread_event_id);
-    // Now there is a summary!
     assert_let!(Some(summary) = event_item.content().thread_summary());
     assert_let!(TimelineDetails::Ready(latest_event) = summary.latest_event);
     assert_eq!(
         latest_event.identifier,
         TimelineEventItemId::EventId(edit_reply_event_id.to_owned())
     );
+    assert_eq!(summary.num_replies, 1);
 
     let poll_results = latest_event.content.as_poll().unwrap().results();
     assert_eq!(poll_results.question, "What's your favourite colour?");
@@ -821,9 +810,10 @@ async fn test_thread_poll_edit_reflects_in_summary() {
 #[async_test]
 async fn test_thread_filtering_for_sync() {
     // Make sure that:
+    //
+    // - a live timeline that hides threaded events _will_ hide them (and only
+    //   keep the summary)
     // - a live timeline that shows threaded events will show them
-    // - a live timeline that hides threaded events *will* hide them (and only keep
-    //   the summary)
     // - a thread timeline will show the threaded events
 
     let server = MatrixMockServer::new().await;
@@ -832,6 +822,7 @@ async fn test_thread_filtering_for_sync() {
     let room_id = room_id!("!a:b.c");
     let sender_id = user_id!("@alice:b.c");
     let thread_root_event_id = owned_event_id!("$root");
+    let thread_event_id = owned_event_id!("$threaded_event");
 
     let room = server.sync_joined_room(&client, room_id).await;
 
@@ -855,7 +846,7 @@ async fn test_thread_filtering_for_sync() {
 
     let thread_timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -877,29 +868,45 @@ async fn test_thread_filtering_for_sync() {
                     factory
                         .text_msg("Within thread")
                         .sender(sender_id)
-                        .event_id(event_id!("$threaded_event"))
+                        .event_id(&thread_event_id)
                         .in_thread(&thread_root_event_id, &thread_root_event_id),
                 ),
         )
         .await;
 
     // A live timeline hiding in-thread events should only contain the date
-    // separator and the thread root.
+    // separator and the thread root, with the thread summary.
     {
         assert_let_timeout!(Some(timeline_updates) = filtered_timeline_stream.next());
         assert_eq!(timeline_updates.len(), 3);
 
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
         let event_item = value.as_event().unwrap();
-        assert_eq!(event_item.content().as_message().unwrap().body(), "Thread root");
-        assert_matches!(event_item.content().thread_summary(), None);
+        assert_eq!(event_item.event_id(), Some(thread_root_event_id.as_ref()));
+        // The thread root contains the thread summary (because it is eagerly
+        // fetched).
+        assert_let!(Some(summary) = event_item.content().thread_summary());
+        // but the in-thread event is not known yet!
+        assert!(summary.latest_event.is_unavailable());
+        // hence, zero replies!
+        assert_eq!(summary.num_replies, 0);
+        // And it only has the read receipt of its author.
+        assert_eq!(event_item.read_receipts().len(), 1);
 
         assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
         assert!(value.is_date_divider());
 
-        // The item gets a thread summary.
+        // The thread root receives a thread summary update (because the
+        // in-thread event is received).
         assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[2]);
-        assert_matches!(value.as_event().unwrap().content().thread_summary(), Some(_));
+        let event_item = value.as_event().unwrap();
+        assert_eq!(event_item.event_id(), Some(thread_root_event_id.as_ref()));
+        assert_let!(Some(summary) = event_item.content().thread_summary());
+        // now the in-thread event is known!
+        assert!(summary.latest_event.is_ready());
+        assert_eq!(summary.num_replies, 1);
+        // And it only has the read receipt of its author.
+        assert_eq!(event_item.read_receipts().len(), 1);
 
         assert_pending!(filtered_timeline_stream);
     }
@@ -907,68 +914,72 @@ async fn test_thread_filtering_for_sync() {
     // A non-filtered live timeline should contain all the items.
     {
         assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
-        assert_eq!(timeline_updates.len(), 6);
+        assert_eq!(timeline_updates.len(), 5);
 
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
         let event_item = value.as_event().unwrap();
-        assert_eq!(event_item.content().as_message().unwrap().body(), "Thread root");
-        assert_matches!(event_item.content().thread_summary(), None);
+        assert_eq!(event_item.event_id(), Some(thread_root_event_id.as_ref()));
+        // The thread root contains the thread summary.
+        assert_let!(Some(summary) = event_item.content().thread_summary());
+        // but the in-thread event is not known yet!
+        assert!(summary.latest_event.is_unavailable());
+        // hence, zero replies!
+        assert_eq!(summary.num_replies, 0);
         assert!(event_item.read_receipts().is_empty().not());
 
         // The read receipt from the author moves to the second item.
         assert_let!(VectorDiff::Set { index: 0, value } = &timeline_updates[1]);
-        let event_item = value.as_event().unwrap();
-        assert_matches!(event_item.content().thread_summary(), None);
-        assert!(event_item.read_receipts().is_empty());
+        assert!(value.as_event().unwrap().read_receipts().is_empty());
 
         // The threaded event is pushed to the timeline.
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[2]);
-        assert_eq!(
-            value.as_event().unwrap().content().as_message().unwrap().body(),
-            "Within thread"
-        );
+        assert_eq!(value.as_event().unwrap().event_id(), Some(thread_event_id.as_ref()));
 
         assert_let!(VectorDiff::PushFront { value } = &timeline_updates[3]);
         assert!(value.is_date_divider());
 
-        // The thread event is a reply (because of the reply fallback), and since its
-        // replied-to timeline item has been updated, it also gets updated.
-        assert_let!(VectorDiff::Set { index: 2, value } = &timeline_updates[4]);
-        assert_eq!(
-            value.as_event().unwrap().content().as_message().unwrap().body(),
-            "Within thread"
-        );
-
         // Then the thread summary is updated on the thread root.
-        assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[5]);
-        assert_matches!(value.as_event().unwrap().content().thread_summary(), Some(_));
+        //
+        // Note this is a bit useless to have a thread summary in this case, but
+        // better be safe, we don't know which usecases are for all
+        // users.
+        assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[4]);
+        let event_item = value.as_event().unwrap();
+        assert_eq!(event_item.event_id(), Some(thread_root_event_id.as_ref()));
+        assert_let!(Some(summary) = event_item.content().thread_summary());
+        // now the in-thread event is known!
+        assert!(summary.latest_event.is_ready());
+        assert_eq!(summary.num_replies, 1);
 
         assert_pending!(timeline_stream);
     }
 
-    // The threaded timeline should only contain the thread root and the threaded
-    // event.
+    // The threaded timeline should only contain the thread root and the
+    // threaded event.
     {
         assert_let_timeout!(Some(timeline_updates) = thread_timeline_stream.next());
         assert_eq!(timeline_updates.len(), 4);
 
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
         let event_item = value.as_event().unwrap();
-        assert_eq!(event_item.content().as_message().unwrap().body(), "Thread root");
+        assert_eq!(event_item.event_id(), Some(thread_root_event_id.as_ref()));
+        // The thread root contains the thread summary.
+        assert_let!(Some(summary) = event_item.content().thread_summary());
+        // but the in-thread event is not known yet!
+        assert!(summary.latest_event.is_unavailable());
+        // hence, zero replies!
+        assert_eq!(summary.num_replies, 0);
+        assert!(event_item.read_receipts().is_empty().not());
 
         // The read receipt from the author moves to the second item.
         assert_let!(VectorDiff::Set { index: 0, value } = &timeline_updates[1]);
-        let event_item = value.as_event().unwrap();
-        assert_matches!(event_item.content().thread_summary(), None);
-        assert!(event_item.read_receipts().is_empty());
+        assert!(value.as_event().unwrap().read_receipts().is_empty());
 
         // The threaded event is pushed to the timeline.
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[2]);
-        assert_eq!(
-            value.as_event().unwrap().content().as_message().unwrap().body(),
-            "Within thread"
-        );
+        assert_eq!(value.as_event().unwrap().event_id(), Some(thread_event_id.as_ref()));
 
+        // Date divider is added.
         assert_let!(VectorDiff::PushFront { value } = &timeline_updates[3]);
         assert!(value.is_date_divider());
 
@@ -978,8 +989,8 @@ async fn test_thread_filtering_for_sync() {
 
 #[async_test]
 async fn test_thread_timeline_gets_related_events_from_sync() {
-    // If a thread timeline receives a sync event related to an in-thread event, it
-    // gets updated.
+    // If a thread timeline receives a sync event related to an in-thread event,
+    // it gets updated.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -993,7 +1004,7 @@ async fn test_thread_timeline_gets_related_events_from_sync() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -1031,8 +1042,9 @@ async fn test_thread_timeline_gets_related_events_from_sync() {
 
     assert_pending!(stream);
 
-    // When we get a reaction for the in-thread event, from sync, the timeline gets
-    // updated, even though the reaction doesn't mention the thread directly.
+    // When we get a reaction for the in-thread event, from sync, the timeline
+    // gets updated, even though the reaction doesn't mention the thread
+    // directly.
     server
         .sync_room(
             &client,
@@ -1048,10 +1060,11 @@ async fn test_thread_timeline_gets_related_events_from_sync() {
     assert_eq!(event_item.event_id().unwrap(), threaded_event_id);
     assert!(event_item.reactions().is_empty().not());
 
-    // If I open another timeline on the same thread, I still see the related event.
+    // If I open another timeline on the same thread, I still see the related
+    // event.
     let other_timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id })
         .build()
         .await
         .unwrap();
@@ -1071,8 +1084,8 @@ async fn test_thread_timeline_gets_related_events_from_sync() {
 
 #[async_test]
 async fn test_thread_timeline_gets_local_echoes() {
-    // If a thread timeline receives a local echo of an in-thread event, it
-    // gets updated. If the event is a reaction, it gets updated too.
+    // If a thread timeline receives a local echo of an in-thread event, it gets
+    // updated. If the event is a reaction, it gets updated too.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -1085,7 +1098,7 @@ async fn test_thread_timeline_gets_local_echoes() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -1103,7 +1116,7 @@ async fn test_thread_timeline_gets_local_echoes() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("hello world")
-                    .sender(*ALICE)
+                    .sender(User::Alice)
                     .event_id(threaded_event_id)
                     .in_thread(&thread_root_event_id, threaded_event_id)
                     .server_ts(MilliSecondsSinceUnixEpoch::now()),
@@ -1121,7 +1134,7 @@ async fn test_thread_timeline_gets_local_echoes() {
     server.mock_room_state_encryption().plain().mount().await;
 
     let (event_receiver, mock_builder) =
-        server.mock_room_send().ok_with_capture(sent_event_id, *ALICE);
+        server.mock_room_send().ok_with_capture(sent_event_id, User::Alice);
     mock_builder.mock_once().mount().await;
 
     timeline.send(RoomMessageEventContent::text_plain("hello to you too!").into()).await.unwrap();
@@ -1170,13 +1183,13 @@ async fn test_thread_timeline_gets_local_echoes() {
         assert_let!(Some(Relation::Thread(thread)) = event.content.relates_to.clone());
         assert_eq!(thread.event_id, thread_root_event_id);
         assert!(thread.is_falling_back);
-        // The reply-to fallback is set to the latest in-thread event, not the thread
-        // root.
+        // The reply-to fallback is set to the latest in-thread event, not the
+        // thread root.
         assert_eq!(thread.in_reply_to.unwrap().event_id, threaded_event_id);
     }
 
-    // If I send a reaction for the in-thread event, the timeline gets updated, even
-    // though the reaction doesn't mention the thread directly.
+    // If I send a reaction for the in-thread event, the timeline gets updated,
+    // even though the reaction doesn't mention the thread directly.
     server.mock_room_send().ok(event_id!("$reaction_id")).mock_once().mount().await;
     timeline.toggle_reaction(&event_item.identifier(), "👍").await.unwrap();
 
@@ -1192,8 +1205,8 @@ async fn test_thread_timeline_gets_local_echoes() {
     assert_let_timeout!(Some(timeline_updates) = stream.next());
     assert!(!timeline_updates.is_empty());
 
-    // Sometimes, a double `VectorDiff::Set` is received because of another update.
-    // Let's make the test reliable.
+    // Sometimes, a double `VectorDiff::Set` is received because of another
+    // update. Let's make the test reliable.
     for timeline_update in timeline_updates {
         assert_let!(VectorDiff::Set { index: 2, value } = timeline_update);
         let event_item = value.as_event().unwrap();
@@ -1207,8 +1220,8 @@ async fn test_thread_timeline_gets_local_echoes() {
 
 #[async_test]
 async fn test_thread_timeline_can_send_edit() {
-    // If I send an edit to a threaded timeline, it just works (aka the system to
-    // set the threaded relationship doesn't kick in, since there's already a
+    // If I send an edit to a threaded timeline, it just works (aka the system
+    // to set the threaded relationship doesn't kick in, since there's already a
     // relationship).
 
     let server = MatrixMockServer::new().await;
@@ -1222,7 +1235,7 @@ async fn test_thread_timeline_can_send_edit() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -1240,7 +1253,7 @@ async fn test_thread_timeline_can_send_edit() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("hello world")
-                    .sender(*ALICE)
+                    .sender(User::Alice)
                     .event_id(threaded_event_id)
                     .in_thread(&thread_root_event_id, threaded_event_id)
                     .server_ts(MilliSecondsSinceUnixEpoch::now()),
@@ -1292,8 +1305,8 @@ async fn test_thread_timeline_can_send_edit() {
 
 #[async_test]
 async fn test_send_sticker_thread() {
-    // If I send a sticker to a threaded timeline, it just works (aka the system to
-    // set the threaded relationship does kick in).
+    // If I send a sticker to a threaded timeline, it just works (aka the system
+    // to set the threaded relationship does kick in).
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -1306,7 +1319,7 @@ async fn test_send_sticker_thread() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -1324,7 +1337,7 @@ async fn test_send_sticker_thread() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("hello world")
-                    .sender(*ALICE)
+                    .sender(User::Alice)
                     .event_id(threaded_event_id)
                     .in_thread(&thread_root_event_id, threaded_event_id)
                     .server_ts(MilliSecondsSinceUnixEpoch::now()),
@@ -1384,7 +1397,7 @@ async fn test_send_poll_thread() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -1402,7 +1415,7 @@ async fn test_send_poll_thread() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("hello world")
-                    .sender(*ALICE)
+                    .sender(User::Alice)
                     .event_id(threaded_event_id)
                     .in_thread(&thread_root_event_id, threaded_event_id)
                     .server_ts(MilliSecondsSinceUnixEpoch::now()),
@@ -1454,8 +1467,8 @@ async fn test_send_poll_thread() {
 
 #[async_test]
 async fn test_sending_read_receipt_with_no_events_doesnt_unset_read_flag() {
-    // If a thread timeline has no events, then marking it as read doesn't unset the
-    // unread flag on the room.
+    // If a thread timeline has no events, then marking it as read doesn't unset
+    // the unread flag on the room.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
@@ -1472,7 +1485,7 @@ async fn test_sending_read_receipt_with_no_events_doesnt_unset_read_flag() {
     // Create a threaded timeline, with no events in it.
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root_event_id.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root_event_id.clone() })
         .build()
         .await
         .unwrap();
@@ -1483,9 +1496,9 @@ async fn test_sending_read_receipt_with_no_events_doesnt_unset_read_flag() {
     assert!(initial_items.is_empty());
     assert_pending!(stream);
 
-    // Try to mark the timeline as read.
-    // This should not unset the unread flag on the room (if it tried to do so, the
-    // test would fail with a 404, because the endpoint hasn't been set).
+    // Try to mark the timeline as read. This should not unset the unread flag
+    // on the room (if it tried to do so, the test would fail with a 404,
+    // because the endpoint hasn't been set).
     let marked_as_read = timeline.mark_as_read(SendReceiptType::Read).await.unwrap();
     assert!(marked_as_read.not());
 }
@@ -1507,7 +1520,7 @@ async fn test_read_receipts() {
     // Create a threaded timeline, with no events in it.
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.clone() })
         .build()
         .await
         .unwrap();
@@ -1526,19 +1539,19 @@ async fn test_read_receipts() {
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
                     f.text_msg("hey to you too!")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .in_thread(&thread_root, &thread_root)
                         .event_id(event_id!("$1")),
                 )
                 .add_timeline_event(
                     f.text_msg("how's it going?")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .in_thread(&thread_root, event_id!("$1"))
                         .event_id(event_id!("$2")),
                 )
                 .add_timeline_event(
                     f.text_msg("good, u?")
-                        .sender(*BOB)
+                        .sender(User::Bob)
                         .in_thread(&thread_root, event_id!("$2"))
                         .event_id(event_id!("$3")),
                 ),
@@ -1552,17 +1565,18 @@ async fn test_read_receipts() {
     // Second event has Alice's implicit read receipt, third event has Bob's
     // implicit read receipt.
     {
-        // Alice's event gets pushed back, first, with its own implicit read receipt.
+        // Alice's event gets pushed back, first, with its own implicit read
+        // receipt.
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
         let ev0 = value.as_event().unwrap();
         assert_eq!(ev0.event_id(), Some(event_id!("$1")));
         let rr = ev0.read_receipts();
         assert_eq!(rr.len(), 1);
-        assert_eq!(rr[*ALICE].thread, receipt_thread);
+        assert_eq!(rr[&User::Alice].thread, receipt_thread);
 
-        // But then, as we're about to push another event from Alice, its read receipt
-        // disappears from the first event.
-        // XXX wouldn't it be nice that we didn't have this update?
+        // But then, as we're about to push another event from Alice, its read
+        // receipt disappears from the first event. XXX wouldn't it be nice that
+        // we didn't have this update?
         assert_let!(VectorDiff::Set { index: 0, value } = &timeline_updates[1]);
         let ev0 = value.as_event().unwrap();
         assert_eq!(ev0.event_id(), Some(event_id!("$1")));
@@ -1574,7 +1588,7 @@ async fn test_read_receipts() {
         assert_eq!(ev1.event_id(), Some(event_id!("$2")));
         let rr = ev1.read_receipts();
         assert_eq!(rr.len(), 1);
-        assert_eq!(rr[*ALICE].thread, receipt_thread);
+        assert_eq!(rr[&User::Alice].thread, receipt_thread);
 
         // Third event has Bob's implicit read receipt.
         assert_let!(VectorDiff::PushBack { value } = &timeline_updates[3]);
@@ -1582,24 +1596,25 @@ async fn test_read_receipts() {
         assert_eq!(ev2.event_id(), Some(event_id!("$3")));
         let rr = ev2.read_receipts();
         assert_eq!(rr.len(), 1);
-        assert_eq!(rr[*BOB].thread, receipt_thread);
+        assert_eq!(rr[&User::Bob].thread, receipt_thread);
 
         assert_let!(VectorDiff::PushFront { value } = &timeline_updates[4]);
         assert!(value.is_date_divider());
     }
 
     // Receive a read receipt update:
+    //
     // - an explicit read receipt for Alice on $3, which will move their read
     //   receipt to the latest event.
-    // - an explicit read receipt for Bob on $3, which will not do anything (because
-    //   of the implicit read receipt)
+    // - an explicit read receipt for Bob on $3, which will not do anything
+    //   (because of the implicit read receipt)
     server
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id).add_receipt(
                 f.read_receipts()
-                    .add(event_id!("$3"), *ALICE, ReceiptType::Read, receipt_thread.clone())
-                    .add(event_id!("$3"), *BOB, ReceiptType::Read, receipt_thread.clone())
+                    .add(event_id!("$3"), User::Alice, ReceiptType::Read, receipt_thread.clone())
+                    .add(event_id!("$3"), User::Bob, ReceiptType::Read, receipt_thread.clone())
                     .into_event(),
             ),
         )
@@ -1623,8 +1638,8 @@ async fn test_read_receipts() {
         assert_eq!(event_item.event_id(), Some(event_id!("$3")));
         let rr = event_item.read_receipts();
         assert_eq!(rr.len(), 2);
-        assert_eq!(rr[*ALICE].thread, receipt_thread);
-        assert_eq!(rr[*BOB].thread, receipt_thread);
+        assert_eq!(rr[&User::Alice].thread, receipt_thread);
+        assert_eq!(rr[&User::Bob].thread, receipt_thread);
     }
 }
 
@@ -1635,7 +1650,6 @@ async fn test_initial_read_receipts_are_correctly_populated() {
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
-    client.event_cache().subscribe().unwrap();
 
     let room_id = room_id!("!a:b.c");
     let thread_root = owned_event_id!("$root");
@@ -1643,8 +1657,8 @@ async fn test_initial_read_receipts_are_correctly_populated() {
 
     // Start with a room that has an event with some initial read receipts.
     //
-    // It is sync'd *before* the timeline is created, so the timeline will have to
-    // load the receipts from the store.
+    // It is sync'd _before_ the timeline is created, so the timeline will have
+    // to load the receipts from the store.
     let f = EventFactory::new();
     let room = server
         .sync_room(
@@ -1652,13 +1666,13 @@ async fn test_initial_read_receipts_are_correctly_populated() {
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
                     f.text_msg("hey to you too!")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .in_thread(&thread_root, &thread_root)
                         .event_id(event_id!("$1")),
                 )
                 .add_receipt(
                     f.read_receipts()
-                        .add(event_id!("$1"), *BOB, ReceiptType::Read, receipt_thread.clone())
+                        .add(event_id!("$1"), User::Bob, ReceiptType::Read, receipt_thread.clone())
                         .into_event(),
                 ),
         )
@@ -1667,7 +1681,7 @@ async fn test_initial_read_receipts_are_correctly_populated() {
     // Create a threaded timeline.
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.clone() })
         .build()
         .await
         .unwrap();
@@ -1688,8 +1702,8 @@ async fn test_initial_read_receipts_are_correctly_populated() {
     assert_eq!(ev.event_id(), Some(event_id!("$1")));
     let rr = ev.read_receipts();
     assert_eq!(rr.len(), 2);
-    assert_eq!(rr[*ALICE].thread, receipt_thread);
-    assert_eq!(rr[*BOB].thread, receipt_thread);
+    assert_eq!(rr[&User::Alice].thread, receipt_thread);
+    assert_eq!(rr[&User::Bob].thread, receipt_thread);
 }
 
 #[async_test]
@@ -1700,30 +1714,36 @@ async fn test_initial_read_receipts_compatibility_mode() {
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
-    client.event_cache().subscribe().unwrap();
 
     let room_id = room_id!("!a:b.c");
 
     // Start with a room that has an event with some initial read receipts.
     //
-    // It is sync'd *before* the timeline is created, so the timeline will have to
-    // load the receipts from the store.
+    // It is sync'd _before_ the timeline is created, so the timeline will have
+    // to load the receipts from the store.
     let f = EventFactory::new();
     let room = server
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
-                    f.text_msg("hello in main timeline").sender(*BOB).event_id(event_id!("$0")),
+                    f.text_msg("hello in main timeline")
+                        .sender(User::Bob)
+                        .event_id(event_id!("$0")),
                 )
                 .add_timeline_event(
                     f.text_msg("hello back in main timeline")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .event_id(event_id!("$1")),
                 )
                 .add_receipt(
                     f.read_receipts()
-                        .add(event_id!("$1"), *BOB, ReceiptType::Read, ReceiptThread::Unthreaded)
+                        .add(
+                            event_id!("$1"),
+                            User::Bob,
+                            ReceiptType::Read,
+                            ReceiptThread::Unthreaded,
+                        )
                         .into_event(),
                 ),
         )
@@ -1765,19 +1785,18 @@ async fn test_initial_read_receipts_compatibility_mode() {
         assert_eq!(ev.event_id(), Some(event_id!("$1")));
         let rr = ev.read_receipts();
         assert_eq!(rr.len(), 2);
-        assert!(rr.get(*ALICE).is_some());
-        assert!(rr.get(*BOB).is_some());
+        assert!(rr.get(&User::Alice).is_some());
+        assert!(rr.get(&User::Bob).is_some());
     }
 }
 
 #[async_test]
 async fn test_send_read_receipts() {
-    // Threaded read receipts can be sent from a thread timeline. Trying to send a
-    // read receipt on an event that had one is a no-op.
+    // Threaded read receipts can be sent from a thread timeline. Trying to send
+    // a read receipt on an event that had one is a no-op.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
-    client.event_cache().subscribe().unwrap();
 
     let user_id = client.user_id().unwrap();
 
@@ -1793,7 +1812,7 @@ async fn test_send_read_receipts() {
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
                     f.text_msg("hey to you too!")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .in_thread(&thread_root, &thread_root)
                         .event_id(event_id!("$1")),
                 )
@@ -1805,13 +1824,13 @@ async fn test_send_read_receipts() {
                 )
                 .add_timeline_event(
                     f.text_msg("good and you?")
-                        .sender(*BOB)
+                        .sender(User::Bob)
                         .in_thread(&thread_root, event_id!("$2"))
                         .event_id(event_id!("$3")),
                 )
                 .add_timeline_event(
                     f.text_msg("u there?")
-                        .sender(*BOB)
+                        .sender(User::Bob)
                         .in_thread(&thread_root, event_id!("$3"))
                         .event_id(event_id!("$4")),
                 )
@@ -1827,15 +1846,15 @@ async fn test_send_read_receipts() {
     // Create a threaded timeline.
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.clone() })
         .build()
         .await
         .unwrap();
 
     let (mut initial_items, mut stream) = timeline.subscribe().await;
 
-    // Either the initial timeline is not empty, or it will soon receive an update
-    // from the event cache.
+    // Either the initial timeline is not empty, or it will soon receive an
+    // update from the event cache.
     if initial_items.is_empty() {
         assert_let_timeout!(Some(timeline_updates) = stream.next());
         for up in timeline_updates {
@@ -1843,16 +1862,16 @@ async fn test_send_read_receipts() {
         }
     }
 
-    // Now that the timeline is populated, we can check the initial read receipts.
-    // Note: 0 is the index of the date divider.
+    // Now that the timeline is populated, we can check the initial read
+    // receipts. Note: 0 is the index of the date divider.
     let ev = initial_items[1].as_event().unwrap();
     assert_eq!(ev.event_id(), Some(event_id!("$1")));
     let rr = ev.read_receipts();
     assert_eq!(rr.len(), 1);
-    assert_eq!(rr[*ALICE].thread, receipt_thread);
+    assert_eq!(rr[&User::Alice].thread, receipt_thread);
 
-    // The timeline doesn't include the read receipt for the current user, but this
-    // is where it would be, if it did.
+    // The timeline doesn't include the read receipt for the current user, but
+    // this is where it would be, if it did.
     let ev = initial_items[2].as_event().unwrap();
     assert_eq!(ev.event_id(), Some(event_id!("$2")));
     assert!(ev.read_receipts().is_empty());
@@ -1870,16 +1889,16 @@ async fn test_send_read_receipts() {
     assert_eq!(ev.event_id(), Some(event_id!("$4")));
     let rr = ev.read_receipts();
     assert_eq!(rr.len(), 1);
-    assert_eq!(rr[*BOB].thread, receipt_thread);
+    assert_eq!(rr[&User::Bob].thread, receipt_thread);
 
-    // `$1` is already covered by the user's real read receipt, so sending one there
-    // is a no-op.
+    // `$1` is already covered by the user's real read receipt, so sending one
+    // there is a no-op.
     let did_send =
         timeline.send_single_receipt(SendReceiptType::Read, owned_event_id!("$1")).await.unwrap();
     assert!(did_send.not());
 
-    // `$2` is the user's own event with their receipt is directly before it. Also a
-    // no-op.
+    // `$2` is the user's own event with their receipt is directly before it.
+    // Also a no-op.
     let did_send =
         timeline.send_single_receipt(SendReceiptType::Read, owned_event_id!("$2")).await.unwrap();
     assert!(did_send.not());
@@ -1914,8 +1933,8 @@ async fn test_send_read_receipts() {
             )
             .await;
 
-        // The timeline receives an update for the read receipt, but it won't move it,
-        // since it doesn't signal our own read receipt.
+        // The timeline receives an update for the read receipt, but it won't
+        // move it, since it doesn't signal our own read receipt.
         yield_now().await;
         assert_pending!(stream);
     }
@@ -1947,8 +1966,8 @@ async fn test_send_read_receipts() {
             )
             .await;
 
-        // The timeline receives an update for the read receipt, but it won't move it,
-        // since it doesn't signal our own read receipt.
+        // The timeline receives an update for the read receipt, but it won't
+        // move it, since it doesn't signal our own read receipt.
         yield_now().await;
         assert_pending!(stream);
     }
@@ -1965,7 +1984,6 @@ async fn test_send_read_receipt_moves_real_receipt_forward() {
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
-    client.event_cache().subscribe().unwrap();
 
     let user_id = client.user_id().unwrap();
 
@@ -1980,13 +1998,13 @@ async fn test_send_read_receipt_moves_real_receipt_forward() {
             JoinedRoomBuilder::new(room_id)
                 .add_timeline_event(
                     f.text_msg("first")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .in_thread(&thread_root, &thread_root)
                         .event_id(event_id!("$0")),
                 )
                 .add_timeline_event(
                     f.text_msg("second")
-                        .sender(*ALICE)
+                        .sender(User::Alice)
                         .in_thread(&thread_root, event_id!("$0"))
                         .event_id(event_id!("$1")),
                 )
@@ -2001,7 +2019,7 @@ async fn test_send_read_receipt_moves_real_receipt_forward() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.clone() })
         .build()
         .await
         .unwrap();
@@ -2032,12 +2050,12 @@ async fn test_send_read_receipt_moves_real_receipt_forward() {
 
 #[async_test]
 async fn test_send_read_receipt_with_only_own_events_is_a_no_op() {
-    // Sending a read receipt is a no-op when the target and everything before it
-    // are the user's own events, since a receipt is never sent to one of those.
+    // Sending a read receipt is a no-op when the target and everything before
+    // it are the user's own events, since a receipt is never sent to one of
+    // those.
 
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
-    client.event_cache().subscribe().unwrap();
 
     let user_id = client.user_id().unwrap();
 
@@ -2066,7 +2084,7 @@ async fn test_send_read_receipt_with_only_own_events_is_a_no_op() {
 
     let timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.clone() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.clone() })
         .build()
         .await
         .unwrap();
@@ -2079,8 +2097,8 @@ async fn test_send_read_receipt_with_only_own_events_is_a_no_op() {
         }
     }
 
-    // Both the user's latest event and the one before it are the user's, so both
-    // bail.
+    // Both the user's latest event and the one before it are the user's, so
+    // both bail.
     let did_send =
         timeline.send_single_receipt(SendReceiptType::Read, owned_event_id!("$2")).await.unwrap();
     assert!(did_send.not());
@@ -2095,13 +2113,12 @@ async fn test_permalink_doesnt_listen_to_thread_sync() {
     let server = MatrixMockServer::new().await;
 
     let client = client_with_threading_support(&server).await;
-    let event_cache = client.event_cache();
-    event_cache.subscribe().unwrap();
+    let event_cache = client.event_cache().unwrap();
 
     let room_id = room_id!("!a:b.c");
     let room = server.sync_joined_room(&client, room_id).await;
 
-    let f = EventFactory::new().sender(&ALICE).room(room_id);
+    let f = EventFactory::new().sender(User::Alice).room(room_id);
     let thread_root = event_id!("$thread_root");
     let event = f
         .text_msg("hey to you too")
@@ -2176,10 +2193,9 @@ async fn test_redacted_replied_to_is_updated() {
     let server = MatrixMockServer::new().await;
 
     let client = client_with_threading_support(&server).await;
-    client.event_cache().subscribe().unwrap();
 
     let room_id = room_id!("!a:b.c");
-    let f = EventFactory::new().sender(&ALICE).room(room_id);
+    let f = EventFactory::new().sender(User::Alice).room(room_id);
     let thread_root = event_id!("$thread_root");
     let first_reply = event_id!("$first_reply");
     let second_reply = event_id!("$second_reply");
@@ -2187,7 +2203,7 @@ async fn test_redacted_replied_to_is_updated() {
     let room = server.sync_joined_room(&client, room_id).await;
 
     let timeline = TimelineBuilder::new(&room)
-        .with_focus(TimelineFocus::Thread { root_event_id: thread_root.to_owned() })
+        .with_focus(TimelineFocus::Thread { thread_id: thread_root.to_owned() })
         .build()
         .await
         .unwrap();
@@ -2250,14 +2266,14 @@ async fn test_redacted_replied_to_is_updated() {
     assert_let_timeout!(Some(timeline_updates) = stream.next());
     assert_eq!(timeline_updates.len(), 3);
 
-    // The first reply is being redacted by the `m.room.redaction` event the thread
-    // timeline receives.
+    // The first reply is being redacted by the `m.room.redaction` event the
+    // thread timeline receives.
     assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[0]);
     let ev1 = value.as_event().unwrap();
     assert_eq!(ev1.event_id(), Some(first_reply));
 
-    // The second reply is being updated because the event it replies to has been
-    // updated.
+    // The second reply is being updated because the event it replies to has
+    // been updated.
     assert_let!(VectorDiff::Set { index: 2, value } = &timeline_updates[1]);
     let ev2 = value.as_event().unwrap();
     assert_eq!(ev2.event_id(), Some(second_reply));
@@ -2281,10 +2297,8 @@ async fn test_redaction_affects_thread_summary() {
     let server = MatrixMockServer::new().await;
     let client = client_with_threading_support(&server).await;
 
-    client.event_cache().subscribe().unwrap();
-
     let room_id = room_id!("!a:b.c");
-    let f = EventFactory::new().room(room_id).sender(&ALICE);
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
 
     let thread_root = event_id!("$thread_root");
     let thread_reply = event_id!("$thread_reply");
@@ -2343,11 +2357,18 @@ async fn test_redaction_affects_thread_summary() {
         )
         .await;
 
-    // The thread summary has disappeared!
+    // The thread summary has disappeared! Note: it is still `Some(_)` but all
+    // data have been erased.
     assert_let_timeout!(Some(timeline_updates) = stream.next());
     assert_eq!(timeline_updates.len(), 1);
+
+    // We receive this update.
     assert_let!(VectorDiff::Set { index: 1, value } = &timeline_updates[0]);
     let event_item = value.as_event().unwrap();
     assert_eq!(event_item.event_id(), Some(thread_root));
-    assert!(event_item.content().as_msglike().unwrap().thread_summary.is_none());
+    assert_let!(Some(thread_summary) = &event_item.content().as_msglike().unwrap().thread_summary);
+    assert_eq!(thread_summary.num_replies, 0);
+    assert!(thread_summary.latest_event.is_unavailable());
+
+    assert_pending!(stream);
 }

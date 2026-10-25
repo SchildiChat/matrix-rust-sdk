@@ -12,7 +12,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![cfg_attr(not(target_family = "wasm"), deny(clippy::future_not_send))]
+
+// TODO: Re-enable once https://github.com/rust-lang/rust-clippy/issues/17812 is resolved.
+// #![cfg_attr(not(target_family = "wasm"), deny(clippy::future_not_send))]
 
 #[cfg(feature = "sso-login")]
 use std::future::Future;
@@ -143,10 +145,10 @@ impl LoginBuilder {
     /// [`Client::refresh_access_token()`] or
     /// [`MatrixAuth::refresh_access_token()`] needs to be called manually.
     ///
-    /// This behavior can be changed by calling
-    /// [`handle_refresh_tokens()`] when building the `Client`.
+    /// This behavior can be changed by calling [`handle_refresh_tokens()`] when
+    /// building the `Client`.
     ///
-    /// *Note* that refreshing access tokens might not be supported or might be
+    /// _Note_ that refreshing access tokens might not be supported or might be
     /// enforced by the homeserver regardless of this setting.
     ///
     /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens
@@ -282,13 +284,12 @@ where
     ///
     /// By default, the `Client` won't handle refreshing access tokens, so
     /// [`Client::refresh_access_token()`] or
-    /// [`MatrixAuth::refresh_access_token()`] needs to be called
-    /// manually.
+    /// [`MatrixAuth::refresh_access_token()`] needs to be called manually.
     ///
-    /// This behavior can be changed by calling
-    /// [`handle_refresh_tokens()`] when building the `Client`.
+    /// This behavior can be changed by calling [`handle_refresh_tokens()`] when
+    /// building the `Client`.
     ///
-    /// *Note* that refreshing access tokens might not be supported or might be
+    /// _Note_ that refreshing access tokens might not be supported or might be
     /// enforced by the homeserver regardless of this setting.
     ///
     /// [refreshing access tokens]: https://spec.matrix.org/v1.3/client-server-api/#refreshing-access-tokens

@@ -4,7 +4,6 @@ use std::{
 };
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use matrix_sdk::{
     ThreadingSupport,
     test_utils::mocks::{MatrixMockServer, RoomContextResponseTemplate},
@@ -25,6 +24,7 @@ use ruma::{
     mxc_uri, owned_user_id, room_id, uint, user_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use wiremock::{
     Mock, Request, ResponseTemplate,
     matchers::{header, method, path},
@@ -77,8 +77,8 @@ async fn test_notification_client_with_context() {
         .mount()
         .await;
 
-    // The encryption state is also fetched to figure whether the room is encrypted
-    // or not.
+    // The encryption state is also fetched to figure whether the room is
+    // encrypted or not.
     server.mock_room_state_encryption().plain().mount().await;
 
     let item = notification_client.get_notification_with_context(room_id, event_id).await.unwrap();
@@ -95,14 +95,6 @@ async fn test_notification_client_with_context() {
 #[async_test]
 async fn test_subscribed_threads_get_notifications() {
     let server = MatrixMockServer::new().await;
-    let client = server
-        .client_builder()
-        .no_server_versions()
-        .on_builder(|builder| {
-            builder.with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
-        })
-        .build()
-        .await;
 
     let sender = user_id!("@user:example.org");
     let room_id = room_id!("!a98sd12bjh:example.org");
@@ -113,6 +105,15 @@ async fn test_subscribed_threads_get_notifications() {
 
     // First, mock an empty sync so the room is known.
     server.mock_room_state_encryption().plain().mount().await;
+
+    let client = server
+        .client_builder()
+        .no_server_versions()
+        .on_builder(|builder| {
+            builder.with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
+        })
+        .build()
+        .await;
 
     // To have access to the push rules context, we must know the own's member
     // event.
@@ -200,14 +201,6 @@ async fn test_subscribed_threads_get_notifications() {
 #[async_test]
 async fn test_unsubscribed_threads_get_notifications() {
     let server = MatrixMockServer::new().await;
-    let client = server
-        .client_builder()
-        .no_server_versions()
-        .on_builder(|builder| {
-            builder.with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
-        })
-        .build()
-        .await;
 
     let sender = user_id!("@user:example.org");
     let room_id = room_id!("!a98sd12bjh:example.org");
@@ -218,6 +211,15 @@ async fn test_unsubscribed_threads_get_notifications() {
 
     // First, mock an empty sync so the room is known.
     server.mock_room_state_encryption().plain().mount().await;
+
+    let client = server
+        .client_builder()
+        .no_server_versions()
+        .on_builder(|builder| {
+            builder.with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
+        })
+        .build()
+        .await;
 
     // To have access to the push rules context, we must know the own's member
     // event.
@@ -240,8 +242,8 @@ async fn test_unsubscribed_threads_get_notifications() {
     let process_setup = NotificationProcessSetup::SingleProcess { sync_service };
     let notification_client = NotificationClient::new(client.clone(), process_setup).await.unwrap();
 
-    // For a thread with an unknown subscription status (note: we're not mocking the
-    // get endpoint, since 404 is equivalent to no thread status),
+    // For a thread with an unknown subscription status (note: we're not mocking
+    // the get endpoint, since 404 is equivalent to no thread status),
     let thread_root = event_id!("$thread_root");
 
     let sender_member_event =
@@ -296,7 +298,8 @@ async fn test_unsubscribed_threads_get_notifications() {
             .mount()
             .await;
 
-        // I do get a notification about it, because it's not technically in the thread.
+        // I do get a notification about it, because it's not technically in the
+        // thread.
         let item =
             notification_client.get_notification_with_context(room_id, thread_root).await.unwrap();
         assert_matches!(item, NotificationStatus::Event(..));
@@ -385,7 +388,8 @@ async fn test_notification_client_sliding_sync() {
     Mock::given(SlidingSyncMatcher)
         .respond_with(move |request: &Request| {
             let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-            // Repeat the transaction id in the response, to validate sticky parameters.
+            // Repeat the transaction id in the response, to validate sticky
+            // parameters.
             let mut pos = pos.lock().unwrap();
             *pos += 1;
             let pos_as_str = (*pos).to_string();
@@ -578,7 +582,8 @@ async fn test_notification_client_sliding_sync_invites() {
     Mock::given(SlidingSyncMatcher)
         .respond_with(move |request: &Request| {
             let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-            // Repeat the transaction id in the response, to validate sticky parameters.
+            // Repeat the transaction id in the response, to validate sticky
+            // parameters.
             let mut pos = pos.lock().unwrap();
             *pos += 1;
             let pos_as_str = (*pos).to_string();
@@ -723,7 +728,8 @@ async fn test_notification_client_sliding_sync_invites_with_event_id() {
     Mock::given(SlidingSyncMatcher)
         .respond_with(move |request: &Request| {
             let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-            // Repeat the transaction id in the response, to validate sticky parameters.
+            // Repeat the transaction id in the response, to validate sticky
+            // parameters.
             let mut pos = pos.lock().unwrap();
             *pos += 1;
             let pos_as_str = (*pos).to_string();
@@ -872,7 +878,8 @@ async fn test_notification_client_mixed() {
             let sender_member_event = sender_member_event.clone();
             move |request: &Request| {
                 let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-                // Repeat the transaction id in the response, to validate sticky parameters.
+                // Repeat the transaction id in the response, to validate sticky
+                // parameters.
                 let mut pos = pos.lock().unwrap();
                 *pos += 1;
                 let pos_as_str = (*pos).to_string();
@@ -920,8 +927,8 @@ async fn test_notification_client_mixed() {
         .mount()
         .await;
 
-    // The encryption state is also fetched to figure whether the room is encrypted
-    // or not.
+    // The encryption state is also fetched to figure whether the room is
+    // encrypted or not.
     server.mock_room_state_encryption().plain().mount().await;
 
     let dummy_sync_service = Arc::new(SyncService::builder(client.clone()).build().await.unwrap());
@@ -1041,7 +1048,8 @@ async fn test_notification_client_sliding_sync_filters_out_events_from_ignored_u
     Mock::given(SlidingSyncMatcher)
         .respond_with(move |request: &Request| {
             let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-            // Repeat the transaction id in the response, to validate sticky parameters.
+            // Repeat the transaction id in the response, to validate sticky
+            // parameters.
             let mut pos = pos.lock().unwrap();
             *pos += 1;
             let pos_as_str = (*pos).to_string();
@@ -1116,13 +1124,14 @@ async fn test_notification_client_context_filters_out_events_from_ignored_users(
 
     server.sync_joined_room(&client, room_id).await;
 
-    // Add mock for sliding sync so we get the ignored user list from its account
-    // data
+    // Add mock for sliding sync so we get the ignored user list from its
+    // account data
     let pos = Mutex::new(0);
     Mock::given(SlidingSyncMatcher)
         .respond_with(move |request: &Request| {
             let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-            // Repeat the transaction id in the response, to validate sticky parameters.
+            // Repeat the transaction id in the response, to validate sticky
+            // parameters.
             let mut pos = pos.lock().unwrap();
             *pos += 1;
             let pos_as_str = (*pos).to_string();
@@ -1175,8 +1184,8 @@ async fn test_notification_client_context_filters_out_events_from_ignored_users(
         }])
         .await;
 
-    // If the event is not found even though there was a mocked response for it, it
-    // was discarded as expected.
+    // If the event is not found even though there was a mocked response for it,
+    // it was discarded as expected.
     let result =
         notification_client.get_notification_with_context(room_id, event_id).await.unwrap();
 
@@ -1249,8 +1258,8 @@ async fn test_notification_room_display_name_excludes_service_members() {
         .mount()
         .await;
 
-    // Check that the notification we get with sliding sync shows the correct room
-    // name
+    // Check that the notification we get with sliding sync shows the correct
+    // room name
     let notification_client =
         NotificationClient::new(client.clone(), process_setup.clone()).await.unwrap();
     assert_let!(

@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ruma::{events::AnySyncTimelineEvent, serde::Raw};
+use ruma::{
+    events::{AnySyncTimelineEvent, relation::RelationType},
+    serde::Raw,
+};
 use serde::Deserialize;
 
 use crate::deserialized_responses::EncryptionInfo;
 
-/// Represents all possible validation errors that can occur when processing
-/// an event edit.
+/// Represents all possible validation errors that can occur when processing an
+/// event edit.
 ///
 /// These errors ensure that a replacement event complies with the rules
 /// required to safely and correctly modify an existing event.
@@ -26,8 +29,8 @@ use crate::deserialized_responses::EncryptionInfo;
 /// [spec]: https://spec.matrix.org/v1.17/client-server-api/#validity-of-replacement-events
 #[derive(Debug, thiserror::Error)]
 pub enum EditValidityError {
-    /// Occurs when the sender of the replacement event does not match
-    /// the sender of the original event.
+    /// Occurs when the sender of the replacement event does not match the
+    /// sender of the original event.
     ///
     /// Only the original sender is allowed to edit their own event.
     #[error(
@@ -42,11 +45,11 @@ pub enum EditValidityError {
     #[error("the original event or the replacement event contains a state key")]
     StateKeyPresent,
 
-    /// Occurs when the content type of the original event differs from
-    /// that of the replacement event.
+    /// Occurs when the content type of the original event differs from that of
+    /// the replacement event.
     ///
-    /// Edits must not change the event’s content type, as this would
-    /// introduce semantic inconsistencies.
+    /// Edits must not change the event’s content type, as this would introduce
+    /// semantic inconsistencies.
     #[error(
         "the content type of the original event is `{content_type}` while the replacement is a `{replacement_type}`"
     )]
@@ -67,8 +70,8 @@ pub enum EditValidityError {
     #[error("the replacement event is not a replacement for the original event")]
     NotReplacement,
 
-    /// Occurs when a required field is missing from either the original
-    /// or the replacement event.
+    /// Occurs when a required field is missing from either the original or the
+    /// replacement event.
     ///
     /// The event is considered malformed and cannot be validated.
     #[error("the event was encrypted, as such it should have an `m.new_content` field")]
@@ -77,8 +80,8 @@ pub enum EditValidityError {
     #[error(transparent)]
     InvalidJson(#[from] serde_json::Error),
 
-    /// Occurs when the original event is encrypted but the replacement
-    /// event is not.
+    /// Occurs when the original event is encrypted but the replacement event is
+    /// not.
     #[error("the original event was encrypted while the replacement is not")]
     ReplacementNotEncrypted,
 }
@@ -91,7 +94,7 @@ pub enum EditValidityError {
 /// the event might not contain the room ID if it wasn received over a `/sync`
 /// request.
 ///
-/// *Warning*: Callers must ensure that the original event and replacement event
+/// _Warning_: Callers must ensure that the original event and replacement event
 /// belong to the same room, that is, they have the same room ID.
 ///
 /// [spec]: https://spec.matrix.org/v1.17/client-server-api/#validity-of-replacement-events
@@ -101,8 +104,6 @@ pub fn check_validity_of_replacement_events(
     replacement_json: &Raw<AnySyncTimelineEvent>,
     replacement_encryption_info: Option<&EncryptionInfo>,
 ) -> Result<(), EditValidityError> {
-    const REPLACEMENT_REL_TYPE: &str = "m.replace";
-
     #[derive(Debug, Deserialize)]
     struct MinimalEvent<'a> {
         sender: &'a str,
@@ -126,7 +127,7 @@ pub fn check_validity_of_replacement_events(
 
     #[derive(Debug, Deserialize)]
     struct MinimalRelatesTo<'a> {
-        rel_type: Option<&'a str>,
+        rel_type: Option<RelationType>,
         event_id: Option<&'a str>,
     }
 
@@ -136,17 +137,17 @@ pub fn check_validity_of_replacement_events(
     // We don't check the room ID here since this event might have been received
     // over /sync, in this case the JSON likely won't contain the room ID field.
 
-    // The original event and replacement event must have the same sender (i.e. you
-    // cannot edit someone else’s messages).
+    // The original event and replacement event must have the same sender (i.e.
+    // you cannot edit someone else’s messages).
     if original_event.sender != replacement_event.sender {
         return Err(EditValidityError::InvalidSender);
     }
 
-    // This check isn't part of the list in the spec, but it makes sense to check if
-    // the replacement event is has the correct rel_type and if it's an edit for the
-    // original event.
+    // This check isn't part of the list in the spec, but it makes sense to
+    // check if the replacement event is has the correct rel_type and if it's an
+    // edit for the original event.
     if let Some(relates_to) = replacement_event.content.relates_to {
-        if relates_to.rel_type != Some(REPLACEMENT_REL_TYPE)
+        if relates_to.rel_type != Some(RelationType::Replacement)
             || relates_to.event_id != Some(original_event.event_id)
         {
             return Err(EditValidityError::NotReplacement);
@@ -155,8 +156,8 @@ pub fn check_validity_of_replacement_events(
         return Err(EditValidityError::NotReplacement);
     }
 
-    // The replacement and original events must have the same type (i.e. you cannot
-    // change the original event’s type).
+    // The replacement and original events must have the same type (i.e. you
+    // cannot change the original event’s type).
     if original_event.event_type != replacement_event.event_type {
         return Err(EditValidityError::MismatchContentType {
             content_type: original_event.event_type.to_owned(),
@@ -164,17 +165,17 @@ pub fn check_validity_of_replacement_events(
         });
     }
 
-    // The replacement and original events must not have a state_key property (i.e.
-    // you cannot edit state events at all).
+    // The replacement and original events must not have a state_key property
+    // (i.e. you cannot edit state events at all).
     if original_event.state_key.is_some() || replacement_event.state_key.is_some() {
         return Err(EditValidityError::StateKeyPresent);
     }
 
-    // The original event must not, itself, have a rel_type of m.replace (i.e. you
-    // cannot edit an edit — though you can send multiple edits for a single
+    // The original event must not, itself, have a rel_type of m.replace (i.e.
+    // you cannot edit an edit — though you can send multiple edits for a single
     // original event).
     if let Some(relates_to) = original_event.content.relates_to
-        && relates_to.rel_type == Some(REPLACEMENT_REL_TYPE)
+        && relates_to.rel_type == Some(RelationType::Replacement)
     {
         return Err(EditValidityError::OriginalEventIsReplacement);
     }

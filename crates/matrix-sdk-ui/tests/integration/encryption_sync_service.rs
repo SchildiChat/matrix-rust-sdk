@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    pin::pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use futures_util::{StreamExt as _, pin_mut};
+use futures_util::StreamExt as _;
 use matrix_sdk::test_utils::mocks::MatrixMockServer;
 use matrix_sdk_base::crypto::store::types::Changes;
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
@@ -37,7 +38,7 @@ async fn run_iterations(
     sync_permit_guard: OwnedMutexGuard<EncryptionSyncPermit>,
 ) -> anyhow::Result<()> {
     let iterations = encryption_sync.run_iterations(sync_permit_guard);
-    pin_mut!(iterations);
+    let mut iterations = pin!(iterations);
 
     for i in 0..num_iterations {
         match iterations.next().await {
@@ -60,7 +61,7 @@ async fn test_smoke_encryption_sync_works() -> anyhow::Result<()> {
     let encryption_sync = EncryptionSyncService::new(client, None).await?;
 
     let stream = encryption_sync.sync(sync_permit_guard);
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     // Requests enable the e2ee and to_device extensions on the first run.
     sliding_sync_then_assert_request_and_fake_response! {
@@ -81,8 +82,8 @@ async fn test_smoke_encryption_sync_works() -> anyhow::Result<()> {
         },
     };
 
-    // The request then passes the `pos`ition marker to the next request, as usual
-    // in sliding sync.
+    // The request then passes the `pos`ition marker to the next request, as
+    // usual in sliding sync.
     sliding_sync_then_assert_request_and_fake_response! {
         [server, stream]
         assert request >= {
@@ -153,7 +154,7 @@ async fn test_smoke_encryption_sync_works() -> anyhow::Result<()> {
     // Start a new sync.
     let sync_permit_guard = sync_permit.clone().lock_owned().await;
     let stream = encryption_sync.sync(sync_permit_guard);
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     // The next request will contain extensions again.
     sliding_sync_then_assert_request_and_fake_response! {
@@ -181,7 +182,8 @@ async fn setup_mocking_sliding_sync_server(server: &MockServer) -> MockGuard {
     Mock::given(SlidingSyncMatcher)
         .respond_with(move |request: &Request| {
             let partial_request: PartialSlidingSyncRequest = request.body_json().unwrap();
-            // Repeat the transaction id in the response, to validate sticky parameters.
+            // Repeat the transaction id in the response, to validate sticky
+            // parameters.
             let mut pos = pos.lock().unwrap();
             *pos += 1;
             let pos_as_str = (*pos).to_string();
@@ -354,10 +356,10 @@ async fn test_encryption_sync_always_reloads_todevice_token() -> anyhow::Result<
     let encryption_sync = EncryptionSyncService::new(client.clone(), None).await?;
 
     let stream = encryption_sync.sync(sync_permit_guard);
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
-    // First iteration fills the whole request; server responds with the to-device
-    // token that should remembered.
+    // First iteration fills the whole request; server responds with the
+    // to-device token that should remembered.
     sliding_sync_then_assert_request_and_fake_response! {
         [server, stream]
         assert request = {
@@ -406,9 +408,9 @@ async fn test_encryption_sync_always_reloads_todevice_token() -> anyhow::Result<
         },
     };
 
-    // This encryption sync now conceptually goes to sleep, and another encryption
-    // sync starts in another process, runs a sync and changes the to-device
-    // token cached on disk.
+    // This encryption sync now conceptually goes to sleep, and another
+    // encryption sync starts in another process, runs a sync and changes the
+    // to-device token cached on disk.
     if let Some(olm_machine) = &*client.olm_machine_for_testing().await {
         olm_machine
             .store()
@@ -463,7 +465,7 @@ async fn test_notification_client_does_not_upload_duplicate_one_time_keys() -> a
     let encryption_sync = EncryptionSyncService::new(client.clone(), None).await?;
 
     let stream = encryption_sync.sync(sync_permit_guard);
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     Mock::given(method("POST"))
         .and(path("/_matrix/client/v3/keys/query"))
@@ -582,12 +584,12 @@ async fn test_notification_client_does_not_upload_duplicate_one_time_keys() -> a
 
     server
         .mock_sync()
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        .ok_json(json!({
             "next_batch": "foo",
             "device_one_time_keys_count": {
                 "signed_curve25519": 49
             }
-        })))
+        }))
         .mount()
         .await;
 

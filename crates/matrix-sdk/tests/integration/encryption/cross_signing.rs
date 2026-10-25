@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_matches2::assert_let;
 use matrix_sdk::{encryption::CrossSigningResetAuthType, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_test::async_test;
 use ruma::api::{
@@ -20,6 +19,7 @@ use ruma::api::{
     error::{ErrorKind, StandardErrorBody},
 };
 use similar_asserts::assert_eq;
+use strass::assert_let;
 
 #[async_test]
 async fn test_reset_legacy_auth() {
@@ -51,10 +51,8 @@ async fn test_reset_legacy_auth() {
 
     assert_let!(CrossSigningResetAuthType::Uiaa(uiaa_info) = reset_handle.auth_type());
 
-    let mut password = uiaa::Password::new(user_id.to_owned().into(), "1234".to_owned());
-    password.session = uiaa_info.session.clone();
     reset_handle
-        .auth(Some(uiaa::AuthData::Password(password)))
+        .auth(uiaa_info.as_password_auth_data(user_id.to_owned().into(), "1234".to_owned()))
         .await
         .expect("We should be able to reset the cross-signing keys using the reset handle");
 
@@ -93,10 +91,10 @@ async fn test_reset_legacy_auth_invalid_password() {
 
     assert_let!(CrossSigningResetAuthType::Uiaa(uiaa_info) = reset_handle.auth_type());
 
-    let mut password = uiaa::Password::new(user_id.to_owned().into(), "wrong-password".to_owned());
-    password.session = uiaa_info.session.clone();
     reset_handle
-        .auth(Some(uiaa::AuthData::Password(password)))
+        .auth(
+            uiaa_info.as_password_auth_data(user_id.to_owned().into(), "wrong-password".to_owned()),
+        )
         .await
         .expect_err("Resetting with the wrong password should return the error");
 }
@@ -123,9 +121,8 @@ async fn test_reset_unstable_oauth() {
         .mount()
         .await;
 
-    // And finally succeed.
-    // This works because the first mocked endpoint that matches the path is used
-    // until it is invalidated by `up_to_n_times`.
+    // And finally succeed. This works because the first mocked endpoint that
+    // matches the path is used until it is invalidated by `up_to_n_times`.
     server
         .mock_upload_cross_signing_keys()
         .ok()
@@ -157,7 +154,7 @@ async fn test_reset_unstable_oauth() {
     );
 
     // Then it retries until it succeeds.
-    reset_handle.auth(None).await.expect("We should be able to reset the cross-signing keys after some attempts, waiting for the auth issue to allow us to upload");
+    reset_handle.auth(oauth_info.as_auth_data()).await.expect("We should be able to reset the cross-signing keys after some attempts, waiting for the auth issue to allow us to upload");
 
     assert!(
         client.encryption().cross_signing_status().await.unwrap().is_complete(),
@@ -182,8 +179,8 @@ async fn test_reset_stable_oauth() {
 
     server.mock_upload_keys().ok().expect(1).named("Initial device keys upload").mount().await;
 
-    // First, return the UIAA response without expecting the UIAA auth data in the
-    // request.
+    // First, return the UIAA response without expecting the UIAA auth data in
+    // the request.
     server
         .mock_upload_cross_signing_keys()
         .uiaa_stable_oauth(session, None)
@@ -192,8 +189,8 @@ async fn test_reset_stable_oauth() {
         .mount()
         .await;
 
-    // Then return the UIAA response 5 times while expecting the UIAA auth data in
-    // the request.
+    // Then return the UIAA response 5 times while expecting the UIAA auth data
+    // in the request.
     let extra_error =
         StandardErrorBody::new(ErrorKind::Forbidden, "Stage not completed".to_owned());
     server
@@ -206,9 +203,8 @@ async fn test_reset_stable_oauth() {
         .mount()
         .await;
 
-    // And finally succeed.
-    // This works because the first mocked endpoint that matches the path is used
-    // until it is invalidated by `up_to_n_times`.
+    // And finally succeed. This works because the first mocked endpoint that
+    // matches the path is used until it is invalidated by `up_to_n_times`.
     server
         .mock_upload_cross_signing_keys()
         .expect_uiaa_auth_data(&expected_auth_data)
@@ -241,9 +237,7 @@ async fn test_reset_stable_oauth() {
     );
 
     // Then it retries until it succeeds.
-    let mut oauth = uiaa::OAuth::new();
-    oauth.session = oauth_info.session.clone();
-    reset_handle.auth(Some(uiaa::AuthData::OAuth(oauth))).await.expect("We should be able to reset the cross-signing keys after some attempts, waiting for the auth issue to allow us to upload");
+    reset_handle.auth(oauth_info.as_auth_data()).await.expect("We should be able to reset the cross-signing keys after some attempts, waiting for the auth issue to allow us to upload");
 
     assert!(
         client.encryption().cross_signing_status().await.unwrap().is_complete(),

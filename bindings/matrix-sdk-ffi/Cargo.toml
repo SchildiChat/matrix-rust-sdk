@@ -22,7 +22,7 @@ crate-type = [
 ]
 
 [features]
-default = ["bundled-sqlite", "unstable-msc4274", "experimental-element-recent-emojis", "experimental-push-secrets", "experimental-search", "rustls-aws-lc-rs"]
+default = ["bundled-sqlite", "unstable-msc4274", "unstable-msc4354", "experimental-element-recent-emojis", "experimental-push-secrets", "experimental-search", "rustls-aws-lc-rs"]
 experimental-search = ["matrix-sdk/experimental-search", "matrix-sdk-ui/experimental-search"]
 # Use SQLite for the session storage.
 sqlite = ["matrix-sdk/sqlite", "dep:matrix-sdk-sqlite"]
@@ -31,6 +31,9 @@ bundled-sqlite = ["sqlite", "matrix-sdk/bundled-sqlite"]
 # Use IndexedDB for the session storage.
 indexeddb = ["matrix-sdk/indexeddb"]
 unstable-msc4274 = ["matrix-sdk-ui/unstable-msc4274"]
+# Add support for sticky events (MSC4354), delivered over sliding sync via the
+# MSC4480 extension.
+unstable-msc4354 = ["matrix-sdk-ui/unstable-msc4354"]
 # Required when targeting a Javascript environment, like Wasm in a browser.
 js = ["matrix-sdk-ui/js"]
 # Enable sentry error monitoring, not compatible with Wasm platforms.
@@ -110,6 +113,7 @@ sentry = { workspace = true, optional = true, features = [
 ] }
 sentry-tracing = { workspace = true, optional = true }
 thiserror.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-core.workspace = true
@@ -133,17 +137,15 @@ uniffi = { workspace = true, features = ["tokio"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 paranoid-android = { version = "0.2.2", default-features = false }
-# Needed for `rustls-platform-verifier`. Newer versions aren't compatible with it.
-jni = "0.21.1"
+# Needed for `rustls-platform-verifier` and exposing the JNI init function.
+jni = "0.22.4"
 # Used to access the credential storage on Android
-rustls-platform-verifier = "0.6.2"
-# Needed for intializing and keeping the JavaVM reference around
-once_cell = "1.21.4"
-# Gobley's jvm-getter is used to get a JVM pointer from all Android versions
-jvm-getter = "0.1.0"
+rustls-platform-verifier = "0.7.1"
 
 [dev-dependencies]
+strass.workspace = true
 matrix-sdk = { workspace = true, features = ["testing", "rustls-aws-lc-rs"] }
+matrix-sdk-test.workspace = true
 similar-asserts.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

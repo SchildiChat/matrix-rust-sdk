@@ -15,17 +15,17 @@
 use std::{sync::Arc, time::Duration};
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{Error, assert_let_timeout, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::store::QueueWedgeError;
-use matrix_sdk_test::{ALICE, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_test::{JoinedRoomBuilder, User, async_test, event_factory::EventFactory};
 use matrix_sdk_ui::timeline::{EventItemOrigin, EventSendState, RoomExt};
 use ruma::{
     MilliSecondsSinceUnixEpoch, event_id, events::room::message::RoomMessageEventContent, room_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use stream_assert::{assert_next_matches, assert_pending};
 use tokio::{task::yield_now, time::sleep};
 
@@ -45,7 +45,8 @@ async fn test_message_order() {
     server
         .mock_room_send()
         .body_matches_partial_json(json!({ "body": "First!" }))
-        .ok_with_delay(event_id!("$ev0"), Duration::from_millis(200))
+        .with_delay(Duration::from_millis(200))
+        .ok(event_id!("$ev0"))
         .mount()
         .await;
 
@@ -54,7 +55,8 @@ async fn test_message_order() {
     server
         .mock_room_send()
         .body_matches_partial_json(json!({ "body": "Second." }))
-        .ok_with_delay(event_id!("$ev1"), Duration::from_millis(100))
+        .with_delay(Duration::from_millis(100))
+        .ok(event_id!("$ev1"))
         .mount()
         .await;
 
@@ -106,12 +108,12 @@ async fn test_retry_order() {
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    // When trying to send an event, return with a 500 error, which is interpreted
-    // as a transient error.
+    // When trying to send an event, return with a 500 error, which is
+    // interpreted as a transient error.
     let scoped_faulty_send = server.mock_room_send().error500().expect(3).mount_as_scoped().await;
 
-    // Send two messages without mocking the server response.
-    // It will respond with a 500, resulting in a failed-to-send state.
+    // Send two messages without mocking the server response. It will respond
+    // with a 500, resulting in a failed-to-send state.
     timeline.send(RoomMessageEventContent::text_plain("First!").into()).await.unwrap();
     timeline.send(RoomMessageEventContent::text_plain("Second.").into()).await.unwrap();
 
@@ -126,10 +128,10 @@ async fn test_retry_order() {
         assert_eq!(value.content().as_message().unwrap().body(), "Second.");
     });
 
-    // Local echoes are updated with the failed send state as soon as
-    // the 404 response is received. The send queue uses `short_retry()`
-    // (3 retries) with 500ms minimum exponential backoff, so this can take
-    // up to ~1.5s before the failure is surfaced.
+    // Local echoes are updated with the failed send state as soon as the 404
+    // response is received. The send queue uses `short_retry()` (3 retries)
+    // with 500ms minimum exponential backoff, so this can take up to ~1.5s
+    // before the failure is surfaced.
     assert_let_timeout!(
         Duration::from_secs(5),
         Some(VectorDiff::Set { index: 0, value: first }) = timeline_stream.next()
@@ -141,7 +143,8 @@ async fn test_retry_order() {
     server
         .mock_room_send()
         .body_matches_partial_json(json!({ "body": "First!" }))
-        .ok_with_delay(event_id!("$ev0"), Duration::from_millis(100))
+        .with_delay(Duration::from_millis(100))
+        .ok(event_id!("$ev0"))
         .mount()
         .await;
 
@@ -150,7 +153,8 @@ async fn test_retry_order() {
     server
         .mock_room_send()
         .body_matches_partial_json(json!({ "body": "Second." }))
-        .ok_with_delay(event_id!("$ev1"), Duration::from_millis(200))
+        .with_delay(Duration::from_millis(200))
+        .ok(event_id!("$ev1"))
         .mount()
         .await;
 
@@ -191,8 +195,8 @@ async fn test_reloaded_failed_local_echoes_are_marked_as_failed() {
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
-    // When trying to send an event, return with a 413 error, which is interpreted
-    // as a permanent error.
+    // When trying to send an event, return with a 413 error, which is
+    // interpreted as a permanent error.
     server.mock_room_send().error_too_large().expect(1).mount().await;
 
     // Sending an event will respond with a 500, resulting in a failed-to-send
@@ -262,8 +266,8 @@ async fn test_clear_with_echoes() {
 
         timeline.send(RoomMessageEventContent::text_plain("Send failure").into()).await.unwrap();
 
-        // Wait for the first message to fail. Don't use time, but listen for the first
-        // timeline item diff to get back signalling the error.
+        // Wait for the first message to fail. Don't use time, but listen for
+        // the first timeline item diff to get back signalling the error.
 
         assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
         // 2 updates: date divider and local echo.
@@ -277,7 +281,8 @@ async fn test_clear_with_echoes() {
     // Next message will take "forever" to send.
     server
         .mock_room_send()
-        .ok_with_delay(event_id!("$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP"), Duration::from_secs(3600))
+        .with_delay(Duration::from_secs(3600))
+        .ok(event_id!("$PyHxV5mYzjetBUT3qZq7V95GOzxb02EP"))
         .mount()
         .await;
 
@@ -289,7 +294,7 @@ async fn test_clear_with_echoes() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id)
-                .add_timeline_event(f.text_msg("another message").sender(&ALICE)),
+                .add_timeline_event(f.text_msg("another message").sender(User::Alice)),
         )
         .await;
 
@@ -338,7 +343,8 @@ async fn test_no_duplicate_date_divider() {
     server
         .mock_room_send()
         .body_matches_partial_json(json!({ "body": "First!" }))
-        .ok_with_delay(event_id!("$ev0"), Duration::from_millis(200))
+        .with_delay(Duration::from_millis(200))
+        .ok(event_id!("$ev0"))
         .mount()
         .await;
 
@@ -347,7 +353,8 @@ async fn test_no_duplicate_date_divider() {
     server
         .mock_room_send()
         .body_matches_partial_json(json!({ "body": "Second." }))
-        .ok_with_delay(event_id!("$ev1"), Duration::from_millis(100))
+        .with_delay(Duration::from_millis(100))
+        .ok(event_id!("$ev1"))
         .mount()
         .await;
 

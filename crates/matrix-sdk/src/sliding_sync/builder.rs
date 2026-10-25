@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use cfg_if::cfg_if;
 use matrix_sdk_common::timer;
 use ruma::{OwnedRoomId, api::client::sync::sync_events::v5 as http};
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, broadcast::channel};
@@ -88,8 +87,8 @@ impl SlidingSyncBuilder {
         Ok(self.add_list(list))
     }
 
-    /// Activate e2ee, to-device-message, account data, typing and receipt
-    /// extensions if not yet configured.
+    /// Activate e2ee, to-device-message, account data, typing, receipt and
+    /// (if compiled in) sticky events extensions if not yet configured.
     ///
     /// Will leave any extension configuration found untouched, so the order
     /// does not matter.
@@ -114,6 +113,11 @@ impl SlidingSyncBuilder {
 
             if cfg.typing.enabled.is_none() {
                 cfg.typing.enabled = Some(true);
+            }
+
+            #[cfg(feature = "unstable-msc4354")]
+            if cfg.sticky_events.enabled.is_none() {
+                cfg.sticky_events.enabled = Some(true);
             }
         }
         self
@@ -212,12 +216,32 @@ impl SlidingSyncBuilder {
         self
     }
 
+    /// Set the sticky events (MSC4480) extension configuration.
+    ///
+    /// The `since` token of the extension is managed by the sliding sync
+    /// itself, any value set here is ignored.
+    #[cfg(feature = "unstable-msc4354")]
+    pub fn with_sticky_events_extension(
+        mut self,
+        sticky_events: http::request::StickyEvents,
+    ) -> Self {
+        self.extensions.get_or_insert_with(Default::default).sticky_events = sticky_events;
+        self
+    }
+
+    /// Unset the sticky events (MSC4480) extension configuration.
+    #[cfg(feature = "unstable-msc4354")]
+    pub fn without_sticky_events_extension(mut self) -> Self {
+        self.extensions.get_or_insert_with(Default::default).sticky_events = Default::default();
+        self
+    }
+
     /// Sets a custom timeout duration for the sliding sync polling endpoint.
     ///
     /// This is the maximum time to wait before the sliding sync server returns
-    /// the long-polling request. If no events (or other data) become
-    /// available before this time elapses, the server will a return a
-    /// response with empty fields.
+    /// the long-polling request. If no events (or other data) become available
+    /// before this time elapses, the server will a return a response with empty
+    /// fields.
     ///
     /// There's an additional network timeout on top of that that can be
     /// configured with [`Self::network_timeout`].
@@ -229,8 +253,8 @@ impl SlidingSyncBuilder {
     /// Sets a custom network timeout for the sliding sync polling.
     ///
     /// This is not the polling timeout that can be configured with
-    /// [`Self::poll_timeout`], but an additional timeout that will be
-    /// added to the former.
+    /// [`Self::poll_timeout`], but an additional timeout that will be added to
+    /// the former.
     pub fn network_timeout(mut self, timeout: Duration) -> Self {
         self.network_timeout = timeout;
         self
@@ -272,18 +296,23 @@ impl SlidingSyncBuilder {
         }
 
         let (share_pos, pos) = {
-            cfg_if! {
-                if #[cfg(feature = "e2e-encryption")] {
+            cfg_select! {
+                feature = "e2e-encryption" => {
                     if self.share_pos {
-                        // If the sliding sync instance is configured to share its current sync
-                        // position, we will restore it from the cache.
-                        (true, super::cache::restore_sliding_sync_state(&client, &self.storage_key).await?.and_then(|fields| fields.pos))
+                        // If the sliding sync instance is configured to share
+                        // its current sync position, we will restore it from
+                        // the cache.
+                        (
+                            true,
+                            super::cache::restore_sliding_sync_state(&client, &self.storage_key)
+                                .await?
+                                .and_then(|fields| fields.pos),
+                        )
                     } else {
                         (false, None)
                     }
-                } else {
-                    (false, None)
                 }
+                _ => (false, None),
             }
         };
 
@@ -298,7 +327,11 @@ impl SlidingSyncBuilder {
 
             lists,
 
-            position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers { pos })),
+            position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers {
+                pos,
+                #[cfg(feature = "unstable-msc4354")]
+                sticky_events_since: None,
+            })),
 
             room_subscriptions: StdRwLock::new(self.room_subscriptions),
             extensions: self.extensions.unwrap_or_default(),

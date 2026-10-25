@@ -1,23 +1,38 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use futures_util::future::try_join_all;
 use matrix_sdk_base::{
     RequestedRequiredStates, ThreadSubscriptionCatchupToken, sync::SyncResponse, timer,
 };
-use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
+use matrix_sdk_common::{deserialized_responses::ProcessedToDeviceEvent, timeout::timeout};
 use ruma::{
     OwnedRoomId,
     api::{
         FeatureFlag, SupportedVersions,
         client::sync::sync_events::v5::{self as http, response},
     },
+    assign,
+    directory::RoomTypeFilter,
     events::GlobalAccountDataEventType,
+    presence::PresenceState,
+    uint,
 };
 use tokio::sync::MutexGuard;
 use tracing::error;
 
 use super::{SlidingSync, SlidingSyncBuilder};
 use crate::{Client, Result, sync::subscribe_to_room_latest_events};
+
+/// The connection ID of the dedicated sliding sync connection used by
+/// [`Client::has_encrypted_rooms`].
+const HAS_ENCRYPTED_ROOMS_CONNECTION_ID: &str = "encrypted-rooms";
+
+/// The name of the single sliding sync list requested by
+/// [`Client::has_encrypted_rooms`].
+const HAS_ENCRYPTED_ROOMS_LIST_NAME: &str = "encrypted_rooms";
 
 /// A sliding sync version.
 #[derive(Clone, Debug)]
@@ -108,8 +123,8 @@ impl Client {
     /// Be careful: This method may hit the store and will send new requests for
     /// each call. It can be costly to call it repeatedly.
     ///
-    /// If `/versions` is unreachable, it will simply move
-    /// potential sliding sync versions aside. No error will be reported.
+    /// If `/versions` is unreachable, it will simply move potential sliding
+    /// sync versions aside. No error will be reported.
     pub async fn available_sliding_sync_versions(&self) -> Vec<Version> {
         let supported_versions = self.supported_versions().await.ok();
 
@@ -125,6 +140,66 @@ impl Client {
     /// Note: the identifier must not be more than 16 chars long!
     pub fn sliding_sync(&self, id: impl Into<String>) -> Result<SlidingSyncBuilder> {
         Ok(SlidingSync::builder(id.into(), self.clone())?)
+    }
+
+    /// Whether the user has joined at least one encrypted room.
+    ///
+    /// Spaces, as well as invited, knocked and left rooms, aren't taken into
+    /// account. A joined room whose encryption state is still unknown is
+    /// considered to be encrypted.
+    ///
+    /// The local room cache is consulted first. If it doesn't know of any
+    /// encrypted room, e.g. on a fresh login, the homeserver is asked directly
+    /// via a dedicated SS connection with the appropriate filters.
+    pub async fn has_encrypted_rooms(&self, wait: Duration) -> Result<bool> {
+        // Ask the local cache first to avoid asking the server if we already
+        // know the answer.
+        if self.joined_rooms().iter().any(|room| {
+            if room.is_space() {
+                return false;
+            }
+
+            let state = room.encryption_state();
+            state.is_encrypted() || state.is_unknown()
+        }) {
+            return Ok(true);
+        }
+
+        if matches!(self.sliding_sync_version(), Version::None) {
+            return Err(super::Error::VersionIsMissing.into());
+        }
+
+        // Ask the server for an authoritative count using a one-off request on
+        // a dedicated SS connection.
+        let list = assign!(http::request::List::default(), {
+            // Only fetch the first room. The default `room_details` requests
+            // no state and no timeline events.
+            ranges: vec![(uint!(0), uint!(0))],
+            filters: Some(assign!(http::request::ListFilters::default(), {
+                is_encrypted: Some(true),
+                is_invite: Some(false),
+                not_room_types: vec![RoomTypeFilter::Space],
+            })),
+        });
+
+        let request = assign!(http::Request::new(), {
+            conn_id: Some(HAS_ENCRYPTED_ROOMS_CONNECTION_ID.to_owned()),
+            lists: BTreeMap::from([(HAS_ENCRYPTED_ROOMS_LIST_NAME.to_owned(), list)]),
+            // This request must not mark the user as online.
+            set_presence: PresenceState::Offline,
+        });
+
+        let response = timeout(async { self.send(request).await }, wait)
+            .await
+            .map_err(|_| crate::Error::Timeout)??;
+
+        let Some(list) = response.lists.get(HAS_ENCRYPTED_ROOMS_LIST_NAME) else {
+            return Err(crate::Error::UnknownError(
+                "the sliding sync response is missing the encrypted rooms count".into(),
+            ));
+        };
+
+        Ok(u64::from(list.count) > 0)
     }
 
     /// Handle all the information provided in a sliding sync response, except
@@ -149,6 +224,13 @@ impl Client {
             .await?;
 
         tracing::debug!("done processing on base_client");
+
+        // The Event Cache now receives the room updates.
+        if let Some(event_cache) = self.event_cache() {
+            Box::pin(event_cache.handle_room_updates(response.rooms.clone())).await?;
+        }
+
+        // Finally, let's call the sync response handler.
         self.call_sync_response_handlers(&response).await?;
 
         Ok(response)
@@ -192,7 +274,8 @@ impl SlidingSyncResponseProcessor {
             )
             .await?
         {
-            // Some new keys might have been received, so trigger a backup if needed.
+            // Some new keys might have been received, so trigger a backup if
+            // needed.
             self.client.encryption().backups().maybe_trigger_backup();
 
             to_device_events
@@ -258,6 +341,12 @@ impl SlidingSyncResponseProcessor {
 
         response.to_device.extend(self.to_device_events);
 
+        // The Event Cache now receives the room updates.
+        if let Some(event_cache) = self.client.event_cache() {
+            Box::pin(event_cache.handle_room_updates(response.rooms.clone())).await?;
+        }
+
+        // Finally, let's call the sync response handler.
         self.client.call_sync_response_handlers(&response).await?;
 
         Ok(response)
@@ -274,8 +363,8 @@ async fn update_in_memory_caches(
 ) {
     let _timer = timer!(tracing::Level::TRACE, "update_in_memory_caches");
 
-    // If the push rules have changed, update the cached notification mode for *all*
-    // the joined rooms.
+    // If the push rules have changed, update the cached notification mode for
+    // _all_ the joined rooms.
     if response.account_data.iter().any(|event| {
         event
             .get_field::<GlobalAccountDataEventType>("type")
@@ -295,8 +384,8 @@ async fn update_in_memory_caches(
             }
         }
     } else {
-        // Otherwise, precompute the cached user-defined notification mode only for the
-        // newly joined rooms.
+        // Otherwise, precompute the cached user-defined notification mode only
+        // for the newly joined rooms.
 
         // We'll compute the rules only once, lazily, if needs be.
         let mut rules = None;
@@ -312,14 +401,16 @@ async fn update_in_memory_caches(
                 continue;
             };
 
-            // Reuse the previous `Rules` instance, or compute it once and for all.
+            // Reuse the previous `Rules` instance, or compute it once and for
+            // all.
             let rules = if let Some(rules) = &mut rules {
                 rules
             } else {
                 rules.insert(client.notification_settings().await.rules().await.clone())
             };
 
-            // Define an initial value for the cached user-defined notification mode.
+            // Define an initial value for the cached user-defined notification
+            // mode.
             if let Some(mode) = rules.get_user_defined_room_notification_mode(room.room_id()) {
                 room.update_cached_user_defined_notification_mode(mode);
             }
@@ -336,8 +427,8 @@ async fn handle_receipts_extension(
 ) -> Result<()> {
     let _timer = timer!(tracing::Level::TRACE, "handle_receipts_extension");
 
-    // We need to compute read receipts for each joined room that has received an
-    // update, or from each room that has received a receipt ephemeral event.
+    // We need to compute read receipts for each joined room that has received
+    // an update, or from each room that has received a receipt ephemeral event.
     let room_ids = BTreeSet::from_iter(
         sync_response
             .rooms
@@ -438,8 +529,8 @@ mod tests {
         let client = MockClientBuilder::new(None).build().await;
         let available_versions = client.available_sliding_sync_versions().await;
 
-        // `.well-known` and `/versions` aren't available. It's impossible to find any
-        // versions.
+        // `.well-known` and `/versions` aren't available. It's impossible to
+        // find any versions.
         assert!(available_versions.is_empty());
     }
 
@@ -474,8 +565,8 @@ mod tests {
             .build()
             .await?;
 
-        // Mock a sync response.
-        // A `m.push_rules` with `room` is cached during the sync.
+        // Mock a sync response. A `m.push_rules` with `room` is cached during
+        // the sync.
         {
             let server_response = assign!(http::Response::new("0".to_owned()), {
                 rooms: BTreeMap::from([(
@@ -527,9 +618,8 @@ mod tests {
             Some(RoomNotificationMode::AllMessages),
         );
 
-        // Mock a sync response.
-        // A `m.push_rules` with `room` is cached during the sync.
-        // It overwrites the previous cache.
+        // Mock a sync response. A `m.push_rules` with `room` is cached during
+        // the sync. It overwrites the previous cache.
         {
             let server_response = assign!(http::Response::new("0".to_owned()), {
                 rooms: BTreeMap::from([(
@@ -578,9 +668,9 @@ mod tests {
             Some(RoomNotificationMode::MentionsAndKeywordsOnly),
         );
 
-        // Mock a sync response.
-        // Even if the room doesn't appear in the response, its notification mode will
-        // be updated immediately if a new `m.push_rules` is received.
+        // Mock a sync response. Even if the room doesn't appear in the
+        // response, its notification mode will be updated immediately if a new
+        // `m.push_rules` is received.
         {
             let server_response = assign!(http::Response::new("0".to_owned()), {
                 extensions: assign!(http::response::Extensions::default(), {
@@ -636,11 +726,8 @@ mod tests {
         // Create the room beforehand.
         client.base_client().get_or_create_room(room_id, RoomState::Joined);
 
-        // Enable the event cache (required for the latest events).
-        client.event_cache().subscribe()?;
-
         // The latest event “listener” for this room has NOT been enabled.
-        assert!(client.latest_events().await.is_listening_to_room(room_id).await.not());
+        assert!(client.latest_events().await.unwrap().is_listening_to_room(room_id).await.not());
 
         // Create the sliding sync client.
         let sliding_sync = client
@@ -676,7 +763,7 @@ mod tests {
         assert!(client.get_room(room_id).is_some());
 
         // The latest event “listener” for this room has been enabled.
-        assert!(client.latest_events().await.is_listening_to_room(room_id).await);
+        assert!(client.latest_events().await.unwrap().is_listening_to_room(room_id).await);
 
         Ok(())
     }
@@ -687,7 +774,6 @@ mod tests {
 
         // Given a logged-in client.
         let client = MockClientBuilder::new(None).build().await;
-        client.event_cache().subscribe().unwrap();
 
         let mut room_info_notable_update_stream = client.room_info_notable_update_receiver();
 
@@ -728,8 +814,8 @@ mod tests {
         );
         assert!(room_info_notable_update_stream.is_empty());
 
-        // When I send sliding sync response containing a couple of events with no read
-        // receipt.
+        // When I send sliding sync response containing a couple of events with
+        // no read receipt.
         let room_id = room_id!("!r:e.uk");
         let f = EventFactory::new().room(room_id).sender(user_id!("@u:h.uk"));
         let events = vec![
@@ -775,8 +861,8 @@ mod tests {
             }
         );
 
-        // At some point, we receive an update for the `LATEST_EVENT` too, since this is
-        // enabled by default.
+        // At some point, we receive an update for the `LATEST_EVENT` too, since
+        // this is enabled by default.
         assert_matches!(
             room_info_notable_update_stream.recv().await,
             Ok(RoomInfoNotableUpdate { room_id: received_room_id, reasons: received_reasons }) => {

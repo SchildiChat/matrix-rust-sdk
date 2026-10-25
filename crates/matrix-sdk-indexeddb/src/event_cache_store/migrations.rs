@@ -21,10 +21,10 @@ use thiserror::Error;
 
 /// The current version and keys used in the database.
 pub mod current {
-    use super::{Version, v8};
+    use super::{Version, v9};
 
-    pub const VERSION: Version = Version::V8;
-    pub use v8::keys;
+    pub const VERSION: Version = Version::V9;
+    pub use v9::keys;
 }
 
 /// Opens a connection to the IndexedDB database and takes care of upgrading it
@@ -68,6 +68,8 @@ pub enum Version {
     V7 = 7,
     /// Version 8 of the database, for details see [`v8`].
     V8 = 8,
+    /// Version 9 of the database, for details see [`v9`].
+    V9 = 9,
 }
 
 impl Version {
@@ -82,7 +84,8 @@ impl Version {
             Self::V5 => v5::upgrade(transaction).map(Some),
             Self::V6 => v6::upgrade(transaction).map(Some),
             Self::V7 => v7::upgrade(transaction).map(Some),
-            Self::V8 => Ok(None),
+            Self::V8 => v8::upgrade(transaction).map(Some),
+            Self::V9 => Ok(None),
         }
     }
 }
@@ -105,6 +108,7 @@ impl TryFrom<u32> for Version {
             6 => Ok(Version::V6),
             7 => Ok(Version::V7),
             8 => Ok(Version::V8),
+            9 => Ok(Version::V9),
             v => Err(UnknownVersionError(v)),
         }
     }
@@ -179,8 +183,8 @@ pub mod v1 {
 
     /// Create an object store for tracking information about linked chunks.
     ///
-    /// * Primary Key - `id`
-    /// * Index - `is_last` - tracks the last chunk in linked chunks
+    /// - Primary Key - `id`
+    /// - Index - `is_last` - tracks the last chunk in linked chunks
     fn create_linked_chunks_object_store(db: &Database) -> Result<(), Error> {
         let _ = db
             .create_object_store(keys::LINKED_CHUNKS)
@@ -193,11 +197,11 @@ pub mod v1 {
 
     /// Create an object store for tracking information about events.
     ///
-    /// * Primary Key - `id`
-    /// * Index (unique) - `room` - tracks whether an event is in a given room
-    /// * Index (unique) - `position` - tracks position of an event in linked
+    /// - Primary Key - `id`
+    /// - Index (unique) - `room` - tracks whether an event is in a given room
+    /// - Index (unique) - `position` - tracks position of an event in linked
     ///   chunks
-    /// * Index - `relation` - tracks any event to which the given event is
+    /// - Index - `relation` - tracks any event to which the given event is
     ///   related
     fn create_events_object_store(db: &Database) -> Result<(), Error> {
         let events = db
@@ -283,10 +287,11 @@ mod v3 {
     /// Remove events object store
     pub fn remove_events_object_store(transaction: &Transaction<'_>) -> Result<(), Error> {
         let object_store = transaction.object_store(keys::EVENTS)?;
-        // It is faster to clear all events first, then delete the object store rather
-        // than immediately deleting.
+        // It is faster to clear all events first, then delete the object store
+        // rather than immediately deleting.
         //
-        // For details, see https://www.artificialworlds.net/blog/2024/02/02/deleting-an-indexed-db-store-can-be-incredibly-slow-on-firefox/
+        // For details, see
+        // https://www.artificialworlds.net/blog/2024/02/02/deleting-an-indexed-db-store-can-be-incredibly-slow-on-firefox/
         object_store.clear()?;
         transaction.db().delete_object_store(keys::EVENTS)?;
         Ok(())
@@ -294,11 +299,11 @@ mod v3 {
 
     /// Create an object store for tracking information about events.
     ///
-    /// * Primary Key - `id`
-    /// * Index - `room` - tracks whether an event is in a given room
-    /// * Index (unique) - `position` - tracks position of an event in linked
+    /// - Primary Key - `id`
+    /// - Index - `room` - tracks whether an event is in a given room
+    /// - Index (unique) - `position` - tracks position of an event in linked
     ///   chunks
-    /// * Index - `relation` - tracks any event to which the given event is
+    /// - Index - `relation` - tracks any event to which the given event is
     ///   related
     pub fn create_events_object_store(db: &Database) -> Result<(), Error> {
         let events = db
@@ -408,8 +413,8 @@ mod v6 {
     /// properly handle deleting events - namely, subsequent events in the same
     /// chunk did not have their indices decremented after an event was deleted.
     /// This caused bugs when callers tried to address events by position, as
-    /// the assumption is that deletions do not leave gaps between indices,
-    /// but rather shift higher indices down.
+    /// the assumption is that deletions do not leave gaps between indices, but
+    /// rather shift higher indices down.
     ///
     /// The implementation has now been fixed, but it is also necessary to clear
     /// existing data where the indices may have gaps due to deletions that
@@ -505,6 +510,68 @@ pub mod v8 {
         let threads = transaction.object_store(keys::THREADS)?;
         threads.clear()?;
 
+        Ok(())
+    }
+
+    /// Upgrade database from `v8` to `v9`
+    pub fn upgrade(transaction: &Transaction<'_>) -> Result<Version, Error> {
+        v9::empty_event_cache(transaction)?;
+        v9::add_out_of_band_index_to_events_object_store(transaction)?;
+        Ok(Version::V9)
+    }
+}
+
+pub mod v9 {
+    use indexed_db_futures::Build;
+
+    use super::*;
+
+    pub mod keys {
+        // Re-use all the same keys from `v8`.
+        pub use super::v8::keys::*;
+
+        pub const EVENTS_OUT_OF_BAND: &str = "events_out_of_band";
+        pub const EVENTS_OUT_OF_BAND_KEY_PATH: &str = "out_of_band";
+    }
+
+    /// Empty the entire store, as the logic for querying whether events are
+    /// stored out-of-band has changed.
+    pub fn empty_event_cache(transaction: &Transaction<'_>) -> Result<(), Error> {
+        let linked_chunks = transaction.object_store(keys::LINKED_CHUNKS)?;
+        linked_chunks.clear()?;
+
+        let gaps = transaction.object_store(keys::GAPS)?;
+        gaps.clear()?;
+
+        let events = transaction.object_store(keys::EVENTS)?;
+        events.clear()?;
+
+        let threads = transaction.object_store(keys::THREADS)?;
+        threads.clear()?;
+
+        Ok(())
+    }
+
+    /// Add a new index to the events object store which tracks whether the
+    /// corresponding event is stored out-of-band - i.e., not inside of a linked
+    /// chunk.
+    ///
+    /// The key for this index is unique and composed of the linked chunk id and
+    /// the event id of the event. Furthermore, events which have a position in
+    /// a linked chunk are not visible through this index.
+    ///
+    /// The benefit is that one can determine whether a given event is stored
+    /// out-of-band simply by checking whether the relevant key is present in
+    /// the index - i.e., without having to deserialize the entire event
+    /// object.
+    pub fn add_out_of_band_index_to_events_object_store(
+        transaction: &Transaction<'_>,
+    ) -> Result<(), Error> {
+        let events = transaction.object_store(keys::EVENTS)?;
+        let _ = events
+            .create_index(keys::EVENTS_OUT_OF_BAND, keys::EVENTS_OUT_OF_BAND_KEY_PATH.into())
+            .with_unique(true)
+            .build()?;
         Ok(())
     }
 }

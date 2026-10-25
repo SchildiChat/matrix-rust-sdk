@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{pin::pin, time::Duration};
 
-use futures_util::{FutureExt, StreamExt as _, pin_mut};
+use futures_util::{FutureExt, StreamExt as _};
 use js_int::uint;
 use matrix_sdk::{
     assert_let_timeout, live_locations_observer::LiveLocationShare,
@@ -140,9 +140,6 @@ async fn test_most_recent_event_in_stream() {
         )
         .await;
 
-    // Enable the event cache so the initial snapshot can be loaded from it.
-    client.event_cache().subscribe().unwrap();
-
     let room = client.get_room(*DEFAULT_TEST_ROOM_ID).unwrap();
 
     let mut timeline_events = Vec::new();
@@ -165,7 +162,8 @@ async fn test_most_recent_event_in_stream() {
         );
     }
 
-    let mut event_cache_updates_stream = client.event_cache().subscribe_to_room_generic_updates();
+    let mut event_cache_updates_stream =
+        client.event_cache().unwrap().subscribe_to_room_generic_updates();
 
     server
         .sync_room(
@@ -178,8 +176,8 @@ async fn test_most_recent_event_in_stream() {
     // querying.
     assert_let_timeout!(Ok(_) = event_cache_updates_stream.recv());
 
-    // Create the stream after syncing all beacon events — the initial snapshot is
-    // loaded from the event cache and already reflects the latest beacon.
+    // Create the stream after syncing all beacon events — the initial snapshot
+    // is loaded from the event cache and already reflects the latest beacon.
     let live_locations_observer = room.live_locations_observer().await;
     let (mut shares, _stream) = live_locations_observer.subscribe();
 
@@ -236,9 +234,10 @@ async fn test_observe_single_live_location_share() {
     let room = client.get_room(*DEFAULT_TEST_ROOM_ID).unwrap();
     let live_locations_observer = room.live_locations_observer().await;
     let (initial, stream) = live_locations_observer.subscribe();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
-    // Initial snapshot contains the beacon_info from state (no last_location yet).
+    // Initial snapshot contains the beacon_info from state (no last_location
+    // yet).
     assert_eq!(initial.len(), 1);
     assert!(initial[0].last_location.is_none());
 
@@ -302,7 +301,7 @@ async fn test_observing_live_location_does_not_return_non_live() {
     let room = client.get_room(*DEFAULT_TEST_ROOM_ID).unwrap();
     let live_locations_observer = room.live_locations_observer().await;
     let (initial, stream) = live_locations_observer.subscribe();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     // Initial is empty because beacon_info is not live.
     assert!(initial.is_empty());
@@ -355,9 +354,10 @@ async fn test_location_update_for_already_tracked_user() {
     let room = client.get_room(*DEFAULT_TEST_ROOM_ID).unwrap();
     let live_locations_observer = room.live_locations_observer().await;
     let (initial, stream) = live_locations_observer.subscribe();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
-    // Initial snapshot contains the beacon_info from state (no last_location yet).
+    // Initial snapshot contains the beacon_info from state (no last_location
+    // yet).
     assert_eq!(initial.len(), 1);
     assert!(initial[0].last_location.is_none());
 
@@ -387,7 +387,8 @@ async fn test_location_update_for_already_tracked_user() {
     assert_eq!(last_location.location.uri, "geo:10,20;u=5");
     assert_eq!(share.beacon_info.description, Some("Alice location".to_owned()));
 
-    // Alice's second beacon — already tracked, beacon_info is reused from cache.
+    // Alice's second beacon — already tracked, beacon_info is reused from
+    // cache.
     server
         .sync_room(
             &client,
@@ -411,7 +412,8 @@ async fn test_location_update_for_already_tracked_user() {
     assert_eq!(user_id, "@alice:localhost");
     let last_location = last_location.expect("Expected last location");
     assert_eq!(last_location.location.uri, "geo:30,40;u=10");
-    // beacon_info is preserved from the initial share — not re-fetched from state.
+    // beacon_info is preserved from the initial share — not re-fetched from
+    // state.
     assert_eq!(beacon_info.description, Some("Alice location".to_owned()));
 }
 
@@ -441,9 +443,10 @@ async fn test_beacon_info_stop_removes_user_from_stream() {
     let room = client.get_room(*DEFAULT_TEST_ROOM_ID).unwrap();
     let live_locations_observer = room.live_locations_observer().await;
     let (initial, stream) = live_locations_observer.subscribe();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
-    // Initial snapshot contains the beacon_info from state (no last_location yet).
+    // Initial snapshot contains the beacon_info from state (no last_location
+    // yet).
     assert_eq!(initial.len(), 1);
     assert!(initial[0].last_location.is_none());
 
@@ -505,7 +508,7 @@ async fn test_multiple_users_in_stream() {
     let room = client.get_room(*DEFAULT_TEST_ROOM_ID).unwrap();
     let live_locations_observer = room.live_locations_observer().await;
     let (initial, stream) = live_locations_observer.subscribe();
-    pin_mut!(stream);
+    let mut stream = pin!(stream);
 
     // Initial snapshot contains both alice and bob beacon_infos from state.
     assert_eq!(initial.len(), 2);
@@ -572,9 +575,6 @@ async fn test_initial_load_contains_location_from_event_cache() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    // Enable event cache BEFORE syncing so events get cached.
-    client.event_cache().subscribe().unwrap();
-
     let now = MilliSecondsSinceUnixEpoch::now();
     let f = EventFactory::new();
 
@@ -599,7 +599,8 @@ async fn test_initial_load_contains_location_from_event_cache() {
         .server_ts(now)
         .into_raw_sync();
 
-    let mut event_cache_updates_stream = client.event_cache().subscribe_to_room_generic_updates();
+    let mut event_cache_updates_stream =
+        client.event_cache().unwrap().subscribe_to_room_generic_updates();
 
     server
         .sync_room(

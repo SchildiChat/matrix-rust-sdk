@@ -41,7 +41,7 @@ use ruma::{
     serde::Raw,
     time::Instant,
 };
-use tracing::{debug, error, instrument, warn};
+use tracing::{Level, error, instrument, warn};
 
 use crate::{Client, Result, Room, event_handler::HandlerKind};
 
@@ -159,10 +159,17 @@ impl Client {
 
         let response = Box::pin(self.base_client().receive_sync_response(response)).await?;
 
-        // Some new keys might have been received, so trigger a backup if needed.
+        // Some new keys might have been received, so trigger a backup if
+        // needed.
         #[cfg(feature = "e2e-encryption")]
         self.encryption().backups().maybe_trigger_backup();
 
+        // The Event Cache now receives the room updates.
+        if let Some(event_cache) = self.event_cache() {
+            Box::pin(event_cache.handle_room_updates(response.rooms.clone())).await?;
+        }
+
+        // Finally, let's call the sync response handler.
         self.call_sync_response_handlers(&response).await?;
 
         Ok(response)
@@ -172,26 +179,36 @@ impl Client {
     /// been processed.
     ///
     /// At this point, the sync response's data has been taken into account and
-    /// persisted in the store, if needs be. This function is only calling
-    /// the event, room update and notification handlers.
+    /// persisted in the store, if needs be. This function is only calling the
+    /// event, room update and notification handlers.
     #[tracing::instrument(skip(self, response))]
     pub(crate) async fn call_sync_response_handlers(
         &self,
         response: &BaseSyncResponse,
     ) -> Result<()> {
-        let _timer = timer!(tracing::Level::TRACE, "_method");
+        let _timer = timer!(Level::TRACE, "_method");
 
         let BaseSyncResponse { rooms, presence, account_data, to_device, notifications } = response;
 
-        let now = Instant::now();
+        let timer = timer!(Level::DEBUG, "Run event handlers");
+
         self.handle_sync_events(HandlerKind::GlobalAccountData, None, account_data).await?;
         self.handle_sync_events(HandlerKind::Presence, None, presence).await?;
         self.handle_sync_to_device_events(to_device).await?;
 
-        // Ignore errors when there are no receivers.
-        let _ = self.inner.room_updates_sender.send(rooms.clone());
+        // Broadcast updates if and only if there is at least one receiver. The
+        // goal is to avoid to clone `rooms`.
+        //
+        // What if a receiver is created right after `receiver_count` is called?
+        // Well, the same thing as if this condition didn't exist: if the
+        // receiver would be created right after `send` is called, it would have
+        // missed the update. That's okay.
+        if self.inner.room_updates_sender.receiver_count() > 0 {
+            // Ignore errors when there are no receivers.
+            let _ = self.inner.room_updates_sender.send(rooms.clone());
+        }
 
-        for (room_id, room_info) in &rooms.joined {
+        for (room_id, updates) in &rooms.joined {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -199,7 +216,7 @@ impl Client {
 
             self.send_room_update(room_id, || RoomUpdate::Joined {
                 room: room.clone(),
-                updates: room_info.clone(),
+                updates: updates.clone(),
             });
 
             let JoinedRoomUpdate {
@@ -211,7 +228,7 @@ impl Client {
                 ephemeral,
                 ambiguity_changes: _,
                 avatar_changes: _,
-            } = room_info;
+            } = updates;
 
             let room = Some(&room);
             self.handle_sync_events(HandlerKind::RoomAccountData, room, account_data).await?;
@@ -222,7 +239,7 @@ impl Client {
             self.handle_sync_events(HandlerKind::EphemeralRoomData, room, ephemeral).await?;
         }
 
-        for (room_id, room_info) in &rooms.left {
+        for (room_id, updates) in &rooms.left {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -230,10 +247,10 @@ impl Client {
 
             self.send_room_update(room_id, || RoomUpdate::Left {
                 room: room.clone(),
-                updates: room_info.clone(),
+                updates: updates.clone(),
             });
 
-            let LeftRoomUpdate { timeline, state, account_data, ambiguity_changes: _ } = room_info;
+            let LeftRoomUpdate { timeline, state, account_data, ambiguity_changes: _ } = updates;
 
             let room = Some(&room);
             self.handle_sync_events(HandlerKind::RoomAccountData, room, account_data).await?;
@@ -241,7 +258,7 @@ impl Client {
             self.handle_sync_timeline_events(room, &timeline.events).await?;
         }
 
-        for (room_id, room_info) in &rooms.invited {
+        for (room_id, updates) in &rooms.invited {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -249,14 +266,14 @@ impl Client {
 
             self.send_room_update(room_id, || RoomUpdate::Invited {
                 room: room.clone(),
-                updates: room_info.clone(),
+                updates: updates.clone(),
             });
 
-            let invite_state = &room_info.invite_state.events;
+            let invite_state = &updates.invite_state.events;
             self.handle_sync_events(HandlerKind::StrippedState, Some(&room), invite_state).await?;
         }
 
-        for (room_id, room_info) in &rooms.knocked {
+        for (room_id, updates) in &rooms.knocked {
             let Some(room) = self.get_room(room_id) else {
                 error!(?room_id, "Can't call event handler, room not found");
                 continue;
@@ -264,16 +281,16 @@ impl Client {
 
             self.send_room_update(room_id, || RoomUpdate::Knocked {
                 room: room.clone(),
-                updates: room_info.clone(),
+                updates: updates.clone(),
             });
 
-            let knock_state = &room_info.knock_state.events;
+            let knock_state = &updates.knock_state.events;
             self.handle_sync_events(HandlerKind::StrippedState, Some(&room), knock_state).await?;
         }
 
-        debug!("Ran event handlers in {:?}", now.elapsed());
+        drop(timer);
 
-        let now = Instant::now();
+        let timer = timer!(Level::DEBUG, "Run notification handlers");
 
         // Construct notification event handler futures
         let mut futures = Vec::new();
@@ -296,7 +313,7 @@ impl Client {
             fut.await;
         }
 
-        debug!("Ran notification handlers in {:?}", now.elapsed());
+        drop(timer);
 
         Ok(())
     }
@@ -339,9 +356,9 @@ impl Client {
     pub(crate) async fn delay_sync(last_sync_time: &mut Option<Instant>) {
         let now = Instant::now();
 
-        // If the last sync happened less than a second ago, sleep for a
-        // while to not hammer out requests if the server doesn't respect
-        // the sync timeout.
+        // If the last sync happened less than a second ago, sleep for a while
+        // to not hammer out requests if the server doesn't respect the sync
+        // timeout.
         if let Some(t) = last_sync_time
             && now - *t <= Duration::from_secs(1)
         {
@@ -352,7 +369,8 @@ impl Client {
     }
 }
 
-/// Call `LatestEvents::listen_to_room` for rooms in `response`.
+/// Call `LatestEvents::listen_to_room` for rooms in `response` if
+/// `LatestEvents` is enabled.
 ///
 /// That way, the latest event is computed and updated for all rooms receiving
 /// an update from the sync.
@@ -361,15 +379,11 @@ pub(crate) async fn subscribe_to_room_latest_events<'a, R>(client: &'a Client, r
 where
     R: Iterator<Item = &'a OwnedRoomId>,
 {
-    if !client.event_cache().has_subscribed() {
-        return;
-    }
-
-    let latest_events = client.latest_events().await;
-
-    for room_id in room_ids {
-        if let Err(error) = latest_events.listen_to_room(room_id).await {
-            error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+    if let Some(latest_events) = client.latest_events().await {
+        for room_id in room_ids {
+            if let Err(error) = latest_events.listen_to_room(room_id).await {
+                error!(?error, ?room_id, "Failed to listen to the latest event for this room");
+            }
         }
     }
 }

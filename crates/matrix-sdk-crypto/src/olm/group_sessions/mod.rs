@@ -109,7 +109,12 @@ pub struct ExportedRoomKey {
     /// defined in [MSC3061].
     ///
     /// [MSC3061]: https://github.com/matrix-org/matrix-spec-proposals/pull/3061
-    #[serde(default, rename = "m.shared_history", alias = "org.matrix.msc3061.shared_history")]
+    #[serde(
+        default,
+        rename = "shared_history",
+        alias = "m.shared_history",
+        alias = "org.matrix.msc3061.shared_history"
+    )]
     pub shared_history: bool,
 }
 
@@ -163,9 +168,12 @@ impl RoomKeyExport for &ExportedRoomKey {
 /// This can be used to back up the [`InboundGroupSession`] to the server using
 /// [server-side key backups].
 ///
-/// See <https://spec.matrix.org/v1.13/client-server-api/#definition-backedupsessiondata>.
+/// See
+/// [https://spec.matrix.org/v1.13/client-server-api/#definition-backedupsessiondata][https-spec-matrix-org-v1-13-client-server-api-definition-backedupsessiondata].
 ///
 /// [server-side key backups]: https://spec.matrix.org/v1.13/client-server-api/#server-side-key-backups
+///
+/// [https-spec-matrix-org-v1-13-client-server-api-definition-backedupsessiondata]: https://spec.matrix.org/v1.13/client-server-api/#definition-backedupsessiondata
 #[derive(Deserialize, Serialize)]
 #[allow(missing_debug_implementations)]
 pub struct BackedUpRoomKey {
@@ -196,7 +204,12 @@ pub struct BackedUpRoomKey {
     /// defined in [MSC3061].
     ///
     /// [MSC3061]: https://github.com/matrix-org/matrix-spec-proposals/pull/3061
-    #[serde(default, rename = "m.shared_history", alias = "org.matrix.msc3061.shared_history")]
+    #[serde(
+        default,
+        rename = "shared_history",
+        alias = "m.shared_history",
+        alias = "org.matrix.msc3061.shared_history"
+    )]
     pub shared_history: bool,
 }
 
@@ -211,12 +224,13 @@ impl TryFrom<ExportedRoomKey> for ForwardedRoomKeyContent {
     fn try_from(room_key: ExportedRoomKey) -> Result<ForwardedRoomKeyContent, Self::Error> {
         match room_key.algorithm {
             EventEncryptionAlgorithm::MegolmV1AesSha2 => {
-                // The forwarded room key content only supports a single claimed sender
-                // key and it requires it to be a Ed25519 key. This here will be lossy
-                // conversion since we're dropping all other key types.
+                // The forwarded room key content only supports a single claimed
+                // sender key and it requires it to be a Ed25519 key. This here
+                // will be lossy conversion since we're dropping all other key
+                // types.
                 //
-                // This was fixed by the megolm v2 content. Hopefully we'll deprecate megolm v1
-                // before we have multiple signing keys.
+                // This was fixed by the megolm v2 content. Hopefully we'll
+                // deprecate megolm v1 before we have multiple signing keys.
                 if let Some(SigningKey::Ed25519(claimed_ed25519_key)) =
                     room_key.sender_claimed_keys.get(&DeviceKeyAlgorithm::Ed25519)
                 {

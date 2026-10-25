@@ -1,6 +1,5 @@
-use std::{collections::BTreeMap, iter, ops::Not, time::Duration};
+use std::{assert_matches, collections::BTreeMap, iter, ops::Not, time::Duration};
 
-use assert_matches2::{assert_let, assert_matches};
 use js_int::uint;
 use matrix_sdk::{
     RoomDisplayName, RoomMemberships,
@@ -10,19 +9,19 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::DmRoomDefinition;
 use matrix_sdk_test::{
-    BOB, DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, async_test,
-    bulk_room_members, event_factory::EventFactory, sync_state_event, test_json,
+    BOB, DEFAULT_TEST_ROOM_ID, JoinedRoomBuilder, LeftRoomBuilder, SyncResponseBuilder, User,
+    async_test, bulk_room_members, event_factory::EventFactory, test_json,
 };
 use ruma::{
     event_id,
     events::{
         AnyGlobalAccountDataEvent, AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
-        direct::DirectUserIdentifier,
         room::{avatar, member::MembershipState, message::RoomMessageEventContent},
     },
     mxc_uri, owned_room_alias_id, room_id, room_version_id, user_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use wiremock::{
     Mock, ResponseTemplate,
     matchers::{body_json, header, method, path, path_regex},
@@ -101,20 +100,9 @@ async fn test_room_names() {
     );
 
     let mut sync_builder = SyncResponseBuilder::new();
+    let f = EventFactory::new();
 
-    let own_left_member_event = sync_state_event!({
-        "content": {
-            "membership": "leave",
-        },
-        "event_id": "$747273582443PhrS9:localhost",
-        "origin_server_ts": 1472735820,
-        "sender": own_user_id,
-        "state_key": own_user_id,
-        "type": "m.room.member",
-        "unsigned": {
-            "age": 1234
-        }
-    });
+    let own_left_member_event = f.member(own_user_id).leave().into_raw_sync_state();
 
     // Left room with a lot of members.
     let room_id = room_id!("!plenty_of_members:localhost");
@@ -140,40 +128,18 @@ async fn test_room_names() {
 
     // Room with joined and invited members.
     let room_id = room_id!("!joined_invited_members:localhost");
-    sync_builder.add_left_room(LeftRoomBuilder::new(room_id).add_state_bulk([
-        sync_state_event!({
-            "content": {
-                "membership": "join",
-            },
-            "event_id": "$example1_join",
-            "origin_server_ts": 151800140,
-            "sender": "@example1:localhost",
-            "state_key": "@example1:localhost",
-            "type": "m.room.member",
-        }),
-        sync_state_event!({
-            "content": {
-                "displayname": "Bob",
-                "membership": "invite",
-            },
-            "event_id": "$bob_invite",
-            "origin_server_ts": 151800140,
-            "sender": "@example1:localhost",
-            "state_key": "@bob:localhost",
-            "type": "m.room.member",
-        }),
-        sync_state_event!({
-            "content": {
-                "membership": "leave",
-            },
-            "event_id": "$example3_leave",
-            "origin_server_ts": 151800140,
-            "sender": "@example3:localhost",
-            "state_key": "@example3:localhost",
-            "type": "m.room.member",
-        }),
-        own_left_member_event.clone(),
-    ]));
+    let example1 = user_id!("@example1:localhost");
+    sync_builder.add_left_room(
+        LeftRoomBuilder::new(room_id).add_state_bulk([
+            f.member(example1).into_raw_sync_state(),
+            f.member(example1)
+                .invited(user_id!("@bob:localhost"))
+                .display_name("Bob")
+                .into_raw_sync_state(),
+            f.member(user_id!("@example3:localhost")).leave().into_raw_sync_state(),
+            own_left_member_event.clone(),
+        ]),
+    );
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
 
     client.sync_once(SyncSettings::default().token(SyncToken::NoToken)).await.unwrap();
@@ -289,10 +255,7 @@ async fn test_state_event_getting() {
         .deserialize()
         .unwrap();
 
-    assert_matches::assert_matches!(
-        encryption_event.as_sync(),
-        Some(AnySyncStateEvent::RoomEncryption(_))
-    );
+    assert_matches!(encryption_event.as_sync(), Some(AnySyncStateEvent::RoomEncryption(_)));
 }
 
 #[async_test]
@@ -612,15 +575,12 @@ async fn test_event() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
-    let cache = client.event_cache();
-    let _ = cache.subscribe();
-
     let f = EventFactory::new().sender(user_id!("@example:localhost"));
     let room = server
         .sync_room(
             &client,
-            // We need the member event and power levels locally so the push rules processor
-            // works.
+            // We need the member event and power levels locally so the push
+            // rules processor works.
             JoinedRoomBuilder::new(&DEFAULT_TEST_ROOM_ID)
                 .add_state_event(f.member(user_id!("@example:localhost")).display_name("example"))
                 .add_state_event(f.default_power_levels()),
@@ -664,7 +624,6 @@ async fn test_event_with_context() {
     let next_event_id = event_id!("$next_1234");
 
     let (client, server) = logged_in_client_with_server().await;
-    client.event_cache().subscribe().unwrap();
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
@@ -730,7 +689,7 @@ async fn test_is_direct() {
     sync_builder.add_joined_room(
         JoinedRoomBuilder::new(&DEFAULT_TEST_ROOM_ID)
             .add_state_event(f.member(user_id!("@example:localhost")).display_name("example"))
-            .add_state_event(f.member(&BOB).sender(&BOB)),
+            .add_state_event(f.member(User::Bob).sender(User::Bob)),
     );
 
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
@@ -745,7 +704,7 @@ async fn test_is_direct() {
 
     // Set the room as direct.
     let direct_content = json!({
-        *BOB: [*DEFAULT_TEST_ROOM_ID],
+        User::Bob: [*DEFAULT_TEST_ROOM_ID],
     });
 
     // Setting the room as direct will request the members of the room.
@@ -755,7 +714,7 @@ async fn test_is_direct() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "chunk": [
                 f.member(user_id!("@example:localhost")).display_name("example").into_raw_sync_state(),
-                f.member(&BOB).sender(&BOB).into_raw_sync_state(),
+                f.member(User::Bob).sender(User::Bob).into_raw_sync_state(),
             ],
         })))
         .expect(1)
@@ -777,9 +736,7 @@ async fn test_is_direct() {
 
     // Mock the sync response we should get from the homeserver.
     let f = EventFactory::new();
-    sync_builder.add_global_account_data(
-        f.direct().add_user((*BOB).to_owned().into(), *DEFAULT_TEST_ROOM_ID),
-    );
+    sync_builder.add_global_account_data(f.direct().add_user(User::Bob, *DEFAULT_TEST_ROOM_ID));
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
@@ -787,7 +744,7 @@ async fn test_is_direct() {
     // The room is direct now.
     let direct_targets = room.direct_targets();
     assert_eq!(direct_targets.len(), 1);
-    assert!(direct_targets.contains(<&DirectUserIdentifier>::from(*BOB)));
+    assert!(direct_targets.contains(User::Bob.as_str()));
     assert!(room.is_direct().await.unwrap());
 
     // Unset the room as direct.
@@ -888,7 +845,7 @@ async fn test_is_dm_using_matrix_spec() {
     // We mock the m.direct account data with a single target for the room id
     let direct_data = EventFactory::new()
         .direct()
-        .add_user(alice_user_id.to_owned().into(), room_id)
+        .add_user(alice_user_id, room_id)
         .into_raw::<AnyGlobalAccountDataEvent>();
     server
         .mock_sync()
@@ -898,8 +855,8 @@ async fn test_is_dm_using_matrix_spec() {
         .await;
 
     let room = server.sync_joined_room(&client, room_id).await;
-    // Room has direct targets, so it's considered direct and a DM using the spec
-    // definition.
+    // Room has direct targets, so it's considered direct and a DM using the
+    // spec definition.
     assert!(room.compute_is_dm().await.unwrap());
 
     // We mock the m.direct account data with no targets
@@ -931,7 +888,7 @@ async fn test_is_dm_using_at_most_two_members_definition() {
     // We mock the m.direct account data with a single target for the room id
     let direct_data = EventFactory::new()
         .direct()
-        .add_user(alice_user_id.to_owned().into(), room_id)
+        .add_user(alice_user_id, room_id)
         .into_raw::<AnyGlobalAccountDataEvent>();
     server
         .mock_sync()

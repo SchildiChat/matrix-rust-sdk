@@ -28,7 +28,12 @@ use super::{
     from_widget::{FromWidgetRequest, SendEventResponse},
     to_widget::ToWidgetResponse,
 };
-use crate::widget::{Capabilities, machine::from_widget::DownloadFileResponse};
+use crate::widget::{
+    Capabilities,
+    machine::from_widget::{
+        DownloadFileResponse, RtcLivekitDelegateDelayedLeaveResponse, RtcLivekitGetTokenResponse,
+    },
+};
 
 /// Incoming message for the widget client side module that it must process.
 pub(crate) enum IncomingMessage {
@@ -66,32 +71,38 @@ pub(crate) enum IncomingMessage {
 }
 
 pub(crate) enum MatrixDriverResponse {
-    /// Client acquired capabilities from the user.
-    /// A response to a [`MatrixDriverRequestData::AcquireCapabilities`]
-    /// command.
+    /// Client acquired capabilities from the user. A response to a
+    /// [`MatrixDriverRequestData::AcquireCapabilities`] command.
     CapabilitiesAcquired(Capabilities),
-    /// Client got OpenId token for a given request ID.
-    /// A response to a [`MatrixDriverRequestData::GetOpenId`] command.
+    /// Client got OpenId token for a given request ID. A response to a
+    /// [`MatrixDriverRequestData::GetOpenId`] command.
     OpenIdReceived(request_openid_token::v3::Response),
-    /// Client read some Matrix event(s).
-    /// A response to a [`MatrixDriverRequestData::ReadEvents`] command.
+    /// Client read some Matrix event(s). A response to a
+    /// [`MatrixDriverRequestData::ReadEvents`] command.
     EventsRead(Vec<Raw<AnyTimelineEvent>>),
-    /// Client read some Matrix room state entries.
-    /// A response to a [`MatrixDriverRequestData::ReadState`] command.
+    /// Client read some Matrix room state entries. A response to a
+    /// [`MatrixDriverRequestData::ReadState`] command.
     StateRead(Vec<Raw<AnyStateEvent>>),
-    /// Client sent some Matrix event. The response contains the event ID.
-    /// A response to a [`MatrixDriverRequestData::SendEvent`] command.
+    /// Client sent some Matrix event. The response contains the event ID. A
+    /// response to a [`MatrixDriverRequestData::SendEvent`] command.
     EventSent(SendEventResponse),
     /// A response to a `Action::SendToDevice` command.
     ToDeviceSent(SendToDeviceEventResponse),
-    /// Client updated a delayed event.
-    /// A response to a [`MatrixDriverRequestData::UpdateDelayedEvent`] command.
+    /// Client updated a delayed event. A response to a
+    /// [`MatrixDriverRequestData::UpdateDelayedEvent`] command.
     DelayedEventUpdated(delayed_events::update_delayed_event::unstable_v1::Response),
     /// The client successfully downloaded a file from a widget action.
     FileDownloaded(DownloadFileResponse),
-    /// Client fetched the RTC transports advertised by the homeserver.
-    /// A response to a [`MatrixDriverRequestData::GetRtcTransports`] command.
+    /// Client fetched the RTC transports advertised by the homeserver. A
+    /// response to a [`MatrixDriverRequestData::GetRtcTransports`] command.
     RtcTransportsReceived(Vec<RtcTransport>),
+    /// Client obtained a LiveKit SFU token from the homeserver. A response to
+    /// a [`MatrixDriverRequestData::RtcLivekitGetToken`] command.
+    RtcLivekitTokenReceived(RtcLivekitGetTokenResponse),
+    /// Client handed a delayed leave event over to the homeserver. A response
+    /// to a [`MatrixDriverRequestData::RtcLivekitDelegateDelayedLeave`]
+    /// command.
+    RtcLivekitDelayedLeaveDelegated(RtcLivekitDelegateDelayedLeaveResponse),
 }
 
 pub(super) struct IncomingWidgetMessage {
@@ -144,7 +155,8 @@ impl<'de> Deserialize<'de> for IncomingWidgetMessage {
 
 #[cfg(test)]
 mod tests {
-    use assert_matches2::assert_let;
+    use ruma::server_name;
+    use strass::assert_let;
 
     use crate::widget::machine::{
         from_widget::FromWidgetRequest,
@@ -215,5 +227,100 @@ mod tests {
         assert_let!(
             FromWidgetRequest::GetRtcTransports {} = incoming_request.deserialize().unwrap()
         );
+    }
+
+    #[test]
+    fn parse_rtc_livekit_get_token_widget_action() {
+        let raw = r#"
+        {
+            "api": "fromWidget",
+            "widgetId": "aGNStSuL3hhIISSCXgpt15j2",
+            "requestId": "generated-id-1234",
+            "action": "org.matrix.msc4533.rtc_livekit_get_token",
+            "data": {
+                "server_name": "example.org",
+                "url": "wss://livekit.example.org",
+                "room_id": "!1:example.org",
+                "slot_id": "m.call",
+                "member_id": "member-id"
+            }
+        }
+        "#;
+
+        assert_let!(
+            IncomingWidgetMessageKind::Request(incoming_request) =
+                serde_json::from_str::<IncomingWidgetMessage>(raw).unwrap().kind
+        );
+        assert_let!(
+            FromWidgetRequest::RtcLivekitGetToken(req) = incoming_request.deserialize().unwrap()
+        );
+
+        assert_eq!(req.server_name.as_deref(), Some(server_name!("example.org")));
+        assert_eq!(req.url, "wss://livekit.example.org");
+        assert_eq!(req.room_id, "!1:example.org");
+        assert_eq!(req.slot_id, "m.call");
+        assert_eq!(req.member_id, "member-id");
+    }
+
+    #[test]
+    fn parse_rtc_livekit_get_token_widget_action_without_server_name() {
+        let raw = r#"
+        {
+            "api": "fromWidget",
+            "widgetId": "aGNStSuL3hhIISSCXgpt15j2",
+            "requestId": "generated-id-1234",
+            "action": "org.matrix.msc4533.rtc_livekit_get_token",
+            "data": {
+                "url": "wss://livekit.example.org",
+                "room_id": "!1:example.org",
+                "slot_id": "m.call",
+                "member_id": "member-id"
+            }
+        }
+        "#;
+
+        assert_let!(
+            IncomingWidgetMessageKind::Request(incoming_request) =
+                serde_json::from_str::<IncomingWidgetMessage>(raw).unwrap().kind
+        );
+        assert_let!(
+            FromWidgetRequest::RtcLivekitGetToken(req) = incoming_request.deserialize().unwrap()
+        );
+
+        assert_eq!(req.server_name, None);
+    }
+
+    #[test]
+    fn parse_rtc_livekit_delegate_delayed_leave_widget_action() {
+        let raw = r#"
+        {
+            "api": "fromWidget",
+            "widgetId": "aGNStSuL3hhIISSCXgpt15j2",
+            "requestId": "generated-id-1234",
+            "action": "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave",
+            "data": {
+                "url": "wss://livekit.example.org",
+                "room_id": "!1:example.org",
+                "slot_id": "m.call",
+                "member_id": "member-id",
+                "delay_id": "delay-id"
+            }
+        }
+        "#;
+
+        assert_let!(
+            IncomingWidgetMessageKind::Request(incoming_request) =
+                serde_json::from_str::<IncomingWidgetMessage>(raw).unwrap().kind
+        );
+        assert_let!(
+            FromWidgetRequest::RtcLivekitDelegateDelayedLeave(req) =
+                incoming_request.deserialize().unwrap()
+        );
+
+        assert_eq!(req.url, "wss://livekit.example.org");
+        assert_eq!(req.room_id, "!1:example.org");
+        assert_eq!(req.slot_id, "m.call");
+        assert_eq!(req.member_id, "member-id");
+        assert_eq!(req.delay_id, "delay-id");
     }
 }

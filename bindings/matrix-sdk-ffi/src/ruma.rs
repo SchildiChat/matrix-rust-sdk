@@ -105,6 +105,8 @@ use crate::{
 pub enum AuthData {
     /// Password-based authentication (`m.login.password`).
     Password { password_details: AuthDataPasswordDetails },
+    /// OAuth authentication (`m.oauth`).
+    OAuth { session: String },
 }
 
 #[derive(uniffi::Record)]
@@ -114,6 +116,9 @@ pub struct AuthDataPasswordDetails {
 
     /// The plaintext password.
     password: String,
+
+    /// The UIAA session token.
+    session: String,
 }
 
 impl From<AuthData> for ruma::api::client::uiaa::AuthData {
@@ -122,17 +127,22 @@ impl From<AuthData> for ruma::api::client::uiaa::AuthData {
             AuthData::Password { password_details } => {
                 let user_id = ruma::UserId::parse(password_details.identifier).unwrap();
 
-                ruma::api::client::uiaa::AuthData::Password(ruma::api::client::uiaa::Password::new(
+                ruma::api::client::uiaa::AuthData::Password(
+                    assign!(ruma::api::client::uiaa::Password::new(
                     user_id.into(),
                     password_details.password,
-                ))
+                ), { session: Some(password_details.session) }),
+                )
             }
+            AuthData::OAuth { session } => ruma::api::client::uiaa::AuthData::OAuth(
+                assign!(ruma::api::client::uiaa::OAuth::new(), { session: Some(session) }),
+            ),
         }
     }
 }
 
-/// Parse a matrix entity from a given URI, be it either
-/// a `matrix.to` link or a `matrix:` URI
+/// Parse a matrix entity from a given URI, be it either a `matrix.to` link or a
+/// `matrix:` URI
 #[matrix_sdk_ffi_macros::export]
 pub fn parse_matrix_entity_from(uri: String) -> Option<MatrixEntity> {
     if let Ok(matrix_uri) = RumaMatrixUri::parse(&uri) {
@@ -540,12 +550,14 @@ pub enum MessageType {
     },
 }
 
-/// From MSC2530: https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
+/// From MSC2530:
+/// https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
 /// If the filename field is present in a media message, clients should treat
-/// body as a caption instead of a file name. Otherwise, the body is the
-/// file name.
+/// body as a caption instead of a file name. Otherwise, the body is the file
+/// name.
 ///
 /// So:
+///
 /// - if a media has a filename and a caption, the body is the caption, filename
 ///   is its own field.
 /// - if a media only has a filename, then body is the filename.

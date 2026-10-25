@@ -1,13 +1,12 @@
 use std::time::Duration;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{assert_let_timeout, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::timeout::timeout;
 use matrix_sdk_test::{
-    ALICE, BOB, CAROL, JoinedRoomBuilder, async_test, event_factory::EventFactory,
+    ALICE, BOB, CAROL, JoinedRoomBuilder, User, async_test, event_factory::EventFactory,
 };
 use matrix_sdk_ui::timeline::{
     Error as TimelineError, EventSendState, MsgLikeContent, MsgLikeKind, RoomExt, TimelineDetails,
@@ -30,6 +29,7 @@ use ruma::{
     owned_event_id, owned_mxc_uri, room_id,
 };
 use serde_json::json;
+use strass::assert_let;
 use stream_assert::{assert_next_matches, assert_pending};
 use tokio::task::yield_now;
 use wiremock::{
@@ -598,7 +598,7 @@ async fn test_transfer_in_reply_to_details_to_re_received_item() {
 
     // Given a reply to an event that's not itself in the timeline...
     let event_id_1 = event_id!("$event1");
-    let reply_event = f.text_msg("Reply").sender(&BOB).reply_to(event_id_1).into_raw_sync();
+    let reply_event = f.text_msg("Reply").sender(User::Bob).reply_to(event_id_1).into_raw_sync();
     server
         .sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(reply_event.clone()))
         .await;
@@ -615,7 +615,12 @@ async fn test_transfer_in_reply_to_details_to_re_received_item() {
     server
         .mock_room_event()
         .match_event_id()
-        .ok(f.text_msg("Original Message").sender(&ALICE).room(room_id).event_id(event_id_1).into())
+        .ok(f
+            .text_msg("Original Message")
+            .sender(User::Alice)
+            .room(room_id)
+            .event_id(event_id_1)
+            .into())
         .mock_once()
         .mount()
         .await;
@@ -664,7 +669,7 @@ async fn test_send_reply() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
-                f.text_msg("Hello from Bob").sender(&BOB).event_id(event_id_from_bob),
+                f.text_msg("Hello from Bob").sender(User::Bob).event_id(event_id_from_bob),
             ),
         )
         .await;
@@ -724,9 +729,9 @@ async fn test_send_reply() {
     // so it's not available if the timeline got cleared. Not critical, but
     // there's notable room for improvement here.
     //
-    // let replied_to_event =
-    // assert_matches!(&in_reply_to.event, TimelineDetails::Ready(ev) => ev);
-    // assert_eq!(replied_to_event.sender(), *BOB);
+    // let replied_to_event = assert_matches!(&in_reply_to.event,
+    // TimelineDetails::Ready(ev) => ev); assert_eq!(replied_to_event.sender(),
+    // *BOB);
 
     let diff = timeout(timeline_stream.next(), Duration::from_secs(1)).await.unwrap().unwrap();
     assert_let!(VectorDiff::Set { index: 0, value: reply_item_remote_echo } = diff);
@@ -740,9 +745,9 @@ async fn test_send_reply() {
 
     // Same as above.
     //
-    // let replied_to_event =
-    // assert_matches!(&in_reply_to.event, TimelineDetails::Ready(ev) =>
-    // ev); assert_eq!(replied_to_event.sender(), *BOB);
+    // let replied_to_event = assert_matches!(&in_reply_to.event,
+    // TimelineDetails::Ready(ev) => ev); assert_eq!(replied_to_event.sender(),
+    // *BOB);
 }
 
 #[async_test]
@@ -767,7 +772,7 @@ async fn test_send_reply_can_be_aborted() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
-                f.text_msg("Hello from Bob").sender(&BOB).event_id(event_id_from_bob),
+                f.text_msg("Hello from Bob").sender(User::Bob).event_id(event_id_from_bob),
             ),
         )
         .await;
@@ -899,7 +904,7 @@ async fn test_send_reply_to_threaded() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("Hello, World!")
-                    .sender(&BOB)
+                    .sender(User::Bob)
                     .event_id(event_id_1)
                     .in_thread(&thread_root, &thread_root),
             ),
@@ -972,7 +977,7 @@ async fn test_send_reply_with_event_id() {
     let event_id_from_bob = event_id!("$event_from_bob");
     let f = EventFactory::new();
     let bob_event =
-        f.text_msg("Hello from Bob").sender(&BOB).event_id(event_id_from_bob).into_event();
+        f.text_msg("Hello from Bob").sender(User::Bob).event_id(event_id_from_bob).into_event();
     server
         .sync_room(
             &client,
@@ -1064,7 +1069,7 @@ async fn test_send_reply_enforce_thread() {
         .sync_room(
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
-                f.text_msg("Hello from Bob").sender(&BOB).event_id(event_id_from_bob),
+                f.text_msg("Hello from Bob").sender(User::Bob).event_id(event_id_from_bob),
             ),
         )
         .await;
@@ -1101,7 +1106,7 @@ async fn test_send_reply_enforce_thread() {
     // Starting a thread.
     let thread_timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: event_id_from_bob.to_owned() })
+        .with_focus(TimelineFocus::Thread { thread_id: event_id_from_bob.to_owned() })
         .build()
         .await
         .unwrap();
@@ -1159,7 +1164,7 @@ async fn test_send_reply_enforce_thread_is_reply() {
             &client,
             JoinedRoomBuilder::new(room_id).add_timeline_event(
                 f.text_msg("Hello from Bob")
-                    .sender(&BOB)
+                    .sender(User::Bob)
                     .event_id(event_id_from_bob)
                     .in_thread(&thread_root, &thread_root),
             ),
@@ -1202,7 +1207,7 @@ async fn test_send_reply_enforce_thread_is_reply() {
     // Starting a thread, and making an explicit reply inside the thread.
     let thread_timeline = room
         .timeline_builder()
-        .with_focus(TimelineFocus::Thread { root_event_id: event_id_from_bob.to_owned() })
+        .with_focus(TimelineFocus::Thread { thread_id: event_id_from_bob.to_owned() })
         .build()
         .await
         .unwrap();
@@ -1242,10 +1247,10 @@ async fn test_send_reply_enforce_thread_is_reply() {
 
 #[async_test]
 async fn test_send_reply_with_event_id_that_is_redacted() {
-    // This test checks if is possible to reply to a redacted event that is not in
-    // the timeline. The event id will go through a process where the event is
-    // fetched and the content will be extracted and deserialised to be used in
-    // the reply.
+    // This test checks if is possible to reply to a redacted event that is not
+    // in the timeline. The event id will go through a process where the event
+    // is fetched and the content will be extracted and deserialised to be used
+    // in the reply.
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
 
@@ -1261,7 +1266,7 @@ async fn test_send_reply_with_event_id_that_is_redacted() {
     let redacted_event_id_from_bob = event_id!("$event_from_bob");
     let f = EventFactory::new();
     let event_from_bob = f
-        .redacted(&BOB, RedactedReactionEventContent::new())
+        .redacted(User::Bob, RedactedReactionEventContent::new())
         .event_id(redacted_event_id_from_bob)
         .into_event();
     server
