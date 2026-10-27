@@ -20,7 +20,6 @@ use matrix_sdk_base::{
     sleep,
 };
 use ruma::{
-    TransactionId,
     api::{
         EndpointError as _, SupportedVersions,
         client::rendezvous::{
@@ -163,7 +162,6 @@ impl Channel {
     pub(super) async fn send(&mut self, message: String) -> Result<(), SecureChannelError> {
         let request = update_rendezvous_session::unstable::Request::new(
             self.rendezvous_id.to_string(),
-            TransactionId::new(),
             self.sequence_token.to_string(),
             message,
         );
