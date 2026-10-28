@@ -68,7 +68,7 @@ rcgen = { version = "0.14.10", default-features = false }
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
 reqwest = { version = "0.13.5", default-features = false }
 rmp-serde = { version = "1.3.1", default-features = false }
-ruma = { git = "https://github.com/SchildiChat/ruma", rev = "58998b57c", features = [
+ruma = { git = "https://github.com/SchildiChat/ruma", rev = "915cca620", features = [
     "client-api-c",
     "compat-unset-avatar",
     "compat-upload-signatures",
