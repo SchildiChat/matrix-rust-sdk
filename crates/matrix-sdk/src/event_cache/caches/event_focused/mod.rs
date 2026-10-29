@@ -43,6 +43,7 @@ use tokio::sync::broadcast::{Receiver, Sender};
 use tracing::{instrument, trace};
 
 // SC start
+use ruma::EventId;
 use matrix_sdk_common::serde_helpers::extract_broadcast_outside_thread;
 // SC end
 
@@ -694,6 +695,15 @@ impl EventFocusedCache {
     /// pagination depending on the mode.
     pub async fn paginate_forwards(&self, num_events: u16) -> Result<PaginationResult> {
         self.inner.write().await?.paginate_forwards(num_events).await
+    }
+
+    /// SC: Whether this cache is in room pagination mode and currently holds
+    /// the given event in memory.
+    pub async fn contains_event(&self, event_id: &EventId) -> Result<bool> {
+        let state = self.inner.read().await?;
+
+        Ok(matches!(state.pagination_mode, EventFocusedPaginationMode::Room { .. })
+            && state.chunk.events().any(|(_, event)| event.event_id() == Some(event_id)))
     }
 
     /// Get the thread root event ID if this linked chunk is in thread mode.

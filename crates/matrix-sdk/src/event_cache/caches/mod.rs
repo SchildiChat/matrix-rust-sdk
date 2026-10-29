@@ -276,6 +276,19 @@ impl Caches {
                 Ok(locked_cache) => locked_cache,
                 // Event-focused cache does not exist, let's create it.
                 Err(mut event_focused_caches) => {
+                    // SC: Re-use an existing event-focused cache that already holds this event.
+                    for (existing_key, cache) in event_focused_caches.iter() {
+                        if existing_key.thread_mode == key.thread_mode
+                            && cache.contains_event(&key.focused_event_id).await?
+                        {
+                            let existing_key = existing_key.clone();
+                            return Ok(OwnedRwLockWriteGuard::downgrade_map(
+                                event_focused_caches,
+                                |caches| caches.get(&existing_key).unwrap(),
+                            ));
+                        }
+                    }
+
                     let cache = event_focused::EventFocusedCache::new(
                         self.room.weak_room().clone(),
                         key.clone(),
