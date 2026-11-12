@@ -1029,9 +1029,9 @@ impl Timeline {
     pub async fn force_send_single_receipt(
         &self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
         event_id: OwnedEventId,
     ) -> Result<bool> {
+        let thread = self.controller.infer_thread_for_read_receipt(&receipt_type);
         trace!("force-sending receipt");
         if receipt_type == ReceiptType::FullyRead {
             self.room().send_single_receipt_allowing_backward(receipt_type.clone(), thread.clone(), event_id.clone()).await?;

@@ -1037,7 +1037,6 @@ impl Room {
 
         timeline.force_send_single_receipt(
             receipt_type.into(),
-            ruma::events::receipt::ReceiptThread::Unthreaded,
             event_id,
         ).await?;
         Ok(())

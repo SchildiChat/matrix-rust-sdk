@@ -448,7 +448,7 @@ impl Timeline {
         let event_id = EventId::parse(event_id)?;
 
         self.inner
-            .force_send_single_receipt(receipt_type.into(), ruma::events::receipt::ReceiptThread::Unthreaded, event_id)
+            .force_send_single_receipt(receipt_type.into(), event_id)
             .await?;
         Ok(())
     }
