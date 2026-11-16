@@ -60,6 +60,7 @@ use super::{
 };
 use crate::{
     Room,
+    event_cache::caches::room::LinkedChunkUpdateSender,
     paginators::{PaginationResult, Paginator, StartFromResult, thread::PaginableThread},
     room::{IncludeRelations, MessagesOptions, RelationsOptions, WeakRoom},
 };
@@ -131,7 +132,7 @@ pub struct EventFocusedCacheState {
     pub update_sender: EventFocusedCacheUpdateSender,
 
     /// A sender for globally observable linked chunk updates.
-    linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
+    linked_chunk_update_sender: LinkedChunkUpdateSender,
 }
 
 impl EventFocusedCacheState {
@@ -338,7 +339,7 @@ impl EventFocusedCacheState {
     fn propagate_changes(&mut self) {
         let updates = self.chunk.store_updates().take();
         if !updates.is_empty() {
-            let _ = self.linked_chunk_update_sender.send(RoomEventCacheLinkedChunkUpdate {
+            self.linked_chunk_update_sender.send(RoomEventCacheLinkedChunkUpdate {
                 updates,
                 linked_chunk_id: OwnedLinkedChunkId::EventFocused(
                     self.room.room_id().to_owned(),
@@ -612,7 +613,7 @@ impl EventFocusedCache {
         room: WeakRoom,
         key: EventFocusedCacheKey,
         state: &StateLock,
-        linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
+        linked_chunk_update_sender: LinkedChunkUpdateSender,
     ) -> Result<Self> {
         let room_id = room.room_id().to_owned();
 

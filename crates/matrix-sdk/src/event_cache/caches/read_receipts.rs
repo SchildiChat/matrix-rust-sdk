@@ -871,7 +871,7 @@ mod tests {
 
     use matrix_sdk_base::{read_receipts::ReadReceipts, store::MemoryStore};
     use matrix_sdk_common::{deserialized_responses::TimelineEvent, ring_buffer::RingBuffer};
-    use matrix_sdk_test::{ALICE, event_factory::EventFactory};
+    use matrix_sdk_test::{User, event_factory::EventFactory};
     use ruma::{
         EventId, MilliSecondsSinceUnixEpoch, RoomId, UserId, event_id,
         events::{
@@ -897,10 +897,10 @@ mod tests {
     fn test_stop_on_event_ids() {
         use std::collections::HashSet;
 
-        use matrix_sdk_test::BOB;
+        use matrix_sdk_test::User;
 
         let room = room_id!("!omelette:fromage.fr");
-        let f = EventFactory::new().room(room).sender(*BOB);
+        let f = EventFactory::new().room(room).sender(User::Bob);
         let outcome = BackPaginationOutcome {
             reached_start: false,
             events: vec![
@@ -1291,7 +1291,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_noop() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
 
         // Create a non-empty linked chunk, with no messages sent by the current
         // user.
@@ -1335,7 +1335,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_implicit() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with one message sent by the current
@@ -1378,7 +1378,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_active_receipt() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
 
         // Create a non-empty linked chunk, with no messages sent by the current
         // user.
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_new_receipt_event() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with no messages sent by the current
@@ -1472,7 +1472,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_stashes_pending_receipts() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with no messages sent by the current
@@ -1523,7 +1523,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_matched_pending_receipt() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with no messages sent by the current
@@ -1570,7 +1570,7 @@ mod tests {
     #[test]
     fn test_select_best_receipt_mixed() {
         let room_id = room_id!("!roomid:example.org");
-        let f = EventFactory::new().room(room_id).sender(*ALICE);
+        let f = EventFactory::new().room(room_id).sender(User::Alice);
         let own_user_id = user_id!("@not_alice:example.org");
 
         // Create a non-empty linked chunk, with one message sent by the current
