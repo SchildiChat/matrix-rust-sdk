@@ -3291,6 +3291,8 @@ pub struct CreateRoomParameters {
     pub name: Option<String>,
     #[uniffi(default = None)]
     pub room_version: Option<String>, // SC
+    #[uniffi(default = true)]
+    pub federate: bool, // SC
     #[uniffi(default = None)]
     pub topic: Option<String>,
     pub is_encrypted: bool,
@@ -3370,9 +3372,12 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
 
         request.initial_state = initial_state;
 
-        if value.is_space {
+        if value.is_space || !value.federate {
             let mut creation_content = CreationContent::new();
-            creation_content.room_type = Some(RoomType::Space);
+            if value.is_space {
+                creation_content.room_type = Some(RoomType::Space);
+            }
+            creation_content.federate = value.federate;
             request.creation_content = Some(Raw::new(&creation_content)?);
         }
 
@@ -4085,6 +4090,7 @@ mod tests {
         let params = CreateRoomParameters {
             name: Some("A room".to_owned()),
             room_version: None, // SC
+            federate: true, // SC
             topic: Some("A topic".to_owned()),
             is_encrypted: true,
             is_direct: true,
