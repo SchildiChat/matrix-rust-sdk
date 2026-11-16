@@ -1801,14 +1801,25 @@ impl TimelineController {
     ///
     /// A `SendReceiptType::FullyRead` will always use
     /// `ReceiptThread::Unthreaded`
-    pub(super) fn infer_thread_for_read_receipt(
+    pub(super) async fn infer_thread_for_read_receipt( // SC: async
         &self,
         receipt_type: &SendReceiptType,
+        event_id: &EventId, // SC
     ) -> ReceiptThread {
         if matches!(receipt_type, SendReceiptType::FullyRead) {
             ReceiptThread::Unthreaded
         } else {
-            self.focus.receipt_thread()
+            // SC: Broadcast events rendered in main need to be unthreaded
+            let thread = self.focus.receipt_thread();
+            if thread == ReceiptThread::Main
+                && self.state.read().await.items.all_remote_events()
+                    .get_by_event_id(event_id)
+                    .is_some_and(|event| event.thread_root_id.is_some())
+            {
+                ReceiptThread::Unthreaded
+            } else {
+                thread
+            }
         }
     }
 

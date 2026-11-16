@@ -564,6 +564,13 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
 
                 for (user_id, receipt) in receipts {
                     let is_own_user_id = user_id == own_user_id;
+                    // SC: We have thread broadcasts that send unthreaded receipts, better to not
+                    // treat as marking the thread as read
+                    if is_own_user_id && self.focus.is_thread()
+                        && receipt.thread == ReceiptThread::Unthreaded
+                    {
+                        continue;
+                    }
                     let full_receipt = FullReceipt {
                         event_id: &event_id,
                         user_id: &user_id,
