@@ -86,6 +86,7 @@ use ruma::{
     api::{
         client::{
             alias::get_alias,
+            delayed_events::update_delayed_event::UpdateAction,
             discovery::get_authorization_server_metadata::v1::{
                 AccountManagementActionData, DeviceDeleteData, DeviceViewData,
             },
@@ -131,7 +132,7 @@ use tracing::{debug, error, warn};
 use url::Url;
 
 use super::{
-    room::{Room, room_info::RoomInfo},
+    room::{RequestConfigOverride, Room, room_info::RoomInfo},
     session_verification::SessionVerificationController,
 };
 use crate::{
@@ -2349,9 +2350,15 @@ impl Client {
     /// a fallback, unless well-known discovery was disabled with
     /// [`ClientBuilder::disable_well_known_lookup`] or
     /// [`Client::disable_well_known_lookup`].
+    ///
+    /// Both the `m.livekit` and the legacy `livekit` transport types count as
+    /// LiveKit support.
+    #[allow(deprecated)]
     pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
         let transports = self.inner.discover_rtc_transports().await?.unwrap_or_default();
-        Ok(transports.iter().any(|focus| matches!(focus, RumaRtcTransport::LiveKit { .. })))
+        Ok(transports.iter().any(|transport| {
+            matches!(transport, RumaRtcTransport::LiveKit(_) | RumaRtcTransport::LegacyLiveKit(_))
+        }))
     }
 
     /// Discover the RTC transports advertised by the homeserver.
@@ -2372,6 +2379,68 @@ impl Client {
             .discover_rtc_transports()
             .await?
             .map(|transports| transports.iter().map(Into::into).collect()))
+    }
+
+    /// Obtain a JWT to authenticate with a LiveKit SFU, through the
+    /// homeserver's `/rtc/livekit/get_token` endpoint (MSC4195).
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The WebSocket URL of the LiveKit SFU to obtain a token for.
+    /// * `room_id` - The room where the `m.rtc.member` event is present.
+    /// * `slot_id` - The slot ID from the `m.rtc.member` event.
+    /// * `member_id` - The `member.id` property of the user's own
+    ///   `m.rtc.member` event.
+    /// * `server_name` - The server name of the sender of the `m.rtc.member`
+    ///   event that advertised the SFU. If `None`, the homeserver uses its own
+    ///   server name.
+    ///
+    /// Homeservers that don't implement the endpoint respond with an
+    /// `M_UNRECOGNIZED` error.
+    pub async fn rtc_livekit_get_token(
+        &self,
+        url: String,
+        room_id: String,
+        slot_id: String,
+        member_id: String,
+        server_name: Option<String>,
+    ) -> Result<String, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        let server_name = server_name.map(ServerName::parse).transpose()?;
+        let response =
+            self.inner.rtc_livekit_get_token(url, room_id, slot_id, member_id, server_name).await?;
+        Ok(response.jwt)
+    }
+
+    /// Hand the delayed leave event of a MatrixRTC session over to the
+    /// homeserver, through its `/rtc/livekit/delegate_delayed_leave` endpoint
+    /// (MSC4195).
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The WebSocket URL of the LiveKit SFU that the user has
+    ///   connected to.
+    /// * `room_id` - The room where the `m.rtc.member` event is present.
+    /// * `slot_id` - The slot ID from the `m.rtc.member` event.
+    /// * `member_id` - The `member.id` property of the `m.rtc.member` event.
+    /// * `delay_id` - The ID of the delayed `m.rtc.member` leave event to
+    ///   delegate.
+    ///
+    /// Homeservers that don't implement the endpoint respond with an
+    /// `M_UNRECOGNIZED` error.
+    pub async fn rtc_livekit_delegate_delayed_leave(
+        &self,
+        url: String,
+        room_id: String,
+        slot_id: String,
+        member_id: String,
+        delay_id: String,
+    ) -> Result<(), ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        self.inner
+            .rtc_livekit_delegate_delayed_leave(url, room_id, slot_id, member_id, delay_id)
+            .await?;
+        Ok(())
     }
 
     /// Checks if the server supports the Profiles sliding sync extension.
@@ -2750,6 +2819,65 @@ impl Client {
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait TotalUnreadNotificationsListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, count: u64);
+}
+
+/// What to do with a delayed event that hasn't been distributed to the room
+/// yet ([MSC4140]).
+///
+/// [MSC4140]: https://github.com/matrix-org/matrix-spec-proposals/pull/4140
+#[derive(Clone, Copy, Debug, uniffi::Enum)]
+pub enum DelayedEventUpdateAction {
+    /// Cancel the delayed event: it will never be sent to the room.
+    Cancel,
+    /// Restart the delay timeout, keeping the event scheduled.
+    Restart,
+    /// Send the event to the room right away.
+    Send,
+}
+
+impl From<DelayedEventUpdateAction> for UpdateAction {
+    fn from(value: DelayedEventUpdateAction) -> Self {
+        match value {
+            DelayedEventUpdateAction::Cancel => Self::Cancel,
+            DelayedEventUpdateAction::Restart => Self::Restart,
+            DelayedEventUpdateAction::Send => Self::Send,
+        }
+    }
+}
+
+#[matrix_sdk_ffi_macros::export]
+impl Client {
+    /// Cancel, restart or immediately send a previously scheduled delayed
+    /// event ([MSC4140]).
+    ///
+    /// # Arguments
+    ///
+    /// * `delay_id` - The identifier returned by [`Room::send_delayed_event`]
+    ///   or [`Room::send_delayed_state_event`].
+    ///
+    /// * `action` - What should happen to the delayed event.
+    ///
+    /// * `request_config_override` - Overrides the client's request config for
+    ///   this request. Fields that are not set keep the client's values.
+    ///
+    /// [MSC4140]: https://github.com/matrix-org/matrix-spec-proposals/pull/4140
+    /// [`Room::send_delayed_event`]: crate::room::Room::send_delayed_event
+    /// [`Room::send_delayed_state_event`]: crate::room::Room::send_delayed_state_event
+    #[uniffi::method(default(request_config_override = None))]
+    pub async fn update_delayed_event(
+        &self,
+        delay_id: String,
+        action: DelayedEventUpdateAction,
+        request_config_override: Option<RequestConfigOverride>,
+    ) -> Result<(), ClientError> {
+        let request_config = request_config_override.map(|request_config_override| {
+            request_config_override.apply_to(self.inner.request_config())
+        });
+
+        self.inner.update_delayed_event(delay_id, action.into(), request_config).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "unstable-msc4354")]
@@ -3887,6 +4015,9 @@ impl TryFrom<RumaAllowRule> for AllowRule {
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum RtcTransport {
     /// A LiveKit RTC transport.
+    ///
+    /// This covers both the `m.livekit` transport type and the legacy `livekit`
+    /// type used by implementations of earlier versions of MSC4195.
     LiveKit {
         /// The WebSocket URL of the LiveKit SFU.
         url: Option<String>,
@@ -3911,12 +4042,15 @@ pub enum RtcTransport {
 }
 
 impl From<&RumaRtcTransport> for RtcTransport {
-    // `service_url` is deprecated, but still exposed for backwards
-    // compatibility.
+    // `LegacyLiveKit` and `service_url` are deprecated, but still exposed for
+    // backwards compatibility.
     #[allow(deprecated)]
     fn from(value: &RumaRtcTransport) -> Self {
         match value {
             RumaRtcTransport::LiveKit(info) => {
+                Self::LiveKit { url: Some(info.url.clone()), service_url: info.service_url.clone() }
+            }
+            RumaRtcTransport::LegacyLiveKit(info) => {
                 Self::LiveKit { url: info.url.clone(), service_url: info.service_url.clone() }
             }
             _ => Self::Custom {
@@ -4314,7 +4448,7 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn test_rtc_transport_conversion() {
-        use ruma::api::client::rtc::RtcTransport as RumaRtcTransport;
+        use ruma::api::client::rtc::{LegacyLiveKitRtcTransport, RtcTransport as RumaRtcTransport};
         use strass::assert_let;
 
         use super::RtcTransport;
@@ -4324,6 +4458,17 @@ mod tests {
         let livekit = RumaRtcTransport::LiveKit(transport);
         assert_let!(RtcTransport::LiveKit { url, service_url } = RtcTransport::from(&livekit));
         assert_eq!(url.as_deref(), Some("wss://livekit.example.com"));
+        assert_eq!(service_url.as_deref(), Some("https://livekit-jwt.example.com"));
+
+        // The legacy `livekit` transport type is also exposed as LiveKit.
+        let legacy_livekit =
+            RumaRtcTransport::LegacyLiveKit(LegacyLiveKitRtcTransport::with_service_url(
+                "https://livekit-jwt.example.com".to_owned(),
+            ));
+        assert_let!(
+            RtcTransport::LiveKit { url, service_url } = RtcTransport::from(&legacy_livekit)
+        );
+        assert_eq!(url, None);
         assert_eq!(service_url.as_deref(), Some("https://livekit-jwt.example.com"));
 
         let custom = RumaRtcTransport::new(

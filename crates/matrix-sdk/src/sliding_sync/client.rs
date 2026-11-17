@@ -12,11 +12,11 @@ use ruma::{
     OwnedRoomId,
     api::{
         FeatureFlag, SupportedVersions,
-        client::sync::sync_events::v5::{self as http, response},
+        client::sync::sync_events::msc4186::{self as http, response},
     },
     assign,
     directory::RoomTypeFilter,
-    events::GlobalAccountDataEventType,
+    events::{GlobalAccountDataEventType, StateEventType},
     presence::PresenceState,
     uint,
 };
@@ -175,6 +175,9 @@ impl Client {
             // Only fetch the first room. The default `room_details` requests
             // no state and no timeline events.
             ranges: vec![(uint!(0), uint!(0))],
+            room_details: assign!(http::request::RoomDetails::default(), {
+                required_state: vec![(StateEventType::RoomEncryption, "".to_owned())]
+            }),
             filters: Some(assign!(http::request::ListFilters::default(), {
                 is_encrypted: Some(true),
                 is_invite: Some(false),
@@ -770,7 +773,7 @@ mod tests {
 
     #[async_test]
     async fn test_read_receipt_can_trigger_a_notable_update_reason() {
-        use ruma::api::client::sync::sync_events::v5 as http;
+        use ruma::api::client::sync::sync_events::msc4186 as http;
 
         // Given a logged-in client.
         let client = MockClientBuilder::new(None).build().await;

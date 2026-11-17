@@ -19,6 +19,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::{Arc, Mutex, atomic::AtomicU32},
 };
 
@@ -29,7 +30,7 @@ use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use matrix_sdk_base::recent_emojis::RecentEmojisContent;
 use matrix_sdk_test::{
     InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
-    SyncResponseBuilder, User, event_factory::EventFactory, test_json,
+    SyncResponseBuilder, TestDevice, User, event_factory::EventFactory, test_json,
 };
 use percent_encoding::{AsciiSet, CONTROLS};
 use ruma::{
@@ -39,9 +40,11 @@ use ruma::{
         client::{
             discovery::get_capabilities::v3::Capabilities,
             receipt::create_receipt::v3::ReceiptType,
+            retention::{RoomIdOrAllRooms, get_retention_configuration::msc1763::RetentionLimits},
             room::Visibility,
-            sync::sync_events::v5,
-            threads::get_thread_subscriptions_changes::unstable::{
+            session::login::v3::{DiscoveryInfo, HomeserverInfo, IdentityServerInfo},
+            sync::sync_events::msc4186,
+            threads::get_thread_subscriptions_changes::msc4308::{
                 ThreadSubscription, ThreadUnsubscription,
             },
             uiaa,
@@ -55,7 +58,10 @@ use ruma::{
         AnyGlobalAccountDataEventContent, AnyStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
         GlobalAccountDataEventType, MessageLikeEventType, RoomAccountDataEventType, StateEventType,
         receipt::ReceiptThread,
-        room::member::{MembershipState, RoomMemberEvent},
+        room::{
+            member::{MembershipState, RoomMemberEvent},
+            retention::RoomRetentionEventContent,
+        },
         tag::TagName,
     },
     media::Method,
@@ -81,7 +87,9 @@ pub mod encryption;
 pub mod oauth;
 
 use super::client::MockClientBuilder;
-use crate::{Client, OwnedServerName, Room, SlidingSyncBuilder, room::IncludeRelations};
+use crate::{
+    Client, OwnedServerName, Room, SlidingSyncBuilder, room::IncludeRelations, sync::SyncResponse,
+};
 
 /// Structure used to store the crypto keys uploaded to the server. They will be
 /// served back to clients when requested.
@@ -303,7 +311,7 @@ impl MatrixMockServer {
     ///     .await;
     /// # anyhow::Ok(()) });
     /// ```
-    pub async fn sync_joined_room(&self, client: &Client, room_id: &RoomId) -> Room {
+    pub async fn sync_joined_room(&self, client: &Client, room_id: impl Into<OwnedRoomId>) -> Room {
         self.sync_room(client, JoinedRoomBuilder::new(room_id)).await
     }
 
@@ -421,10 +429,14 @@ impl MatrixMockServer {
     /// );
     /// # anyhow::Ok(()) });
     /// ```
-    pub fn mock_room_join(&self, room_id: &RoomId) -> MockEndpoint<'_, JoinRoomEndpoint> {
+    pub fn mock_room_join(
+        &self,
+        room_id: impl Into<OwnedRoomId>,
+    ) -> MockEndpoint<'_, JoinRoomEndpoint> {
+        let room_id = room_id.into();
         let mock = Mock::given(method("POST"))
-            .and(path_regex(format!("^/_matrix/client/v3/rooms/{room_id}/join")));
-        self.mock_endpoint(mock, JoinRoomEndpoint { room_id: room_id.to_owned() })
+            .and(path(format!("/_matrix/client/v3/rooms/{room_id}/join")));
+        self.mock_endpoint(mock, JoinRoomEndpoint { room_id })
     }
 
     /// Creates a prebuilt mock for joining a room by ID or alias.
@@ -437,6 +449,18 @@ impl MatrixMockServer {
             percent_encoded_path(room_id_or_alias.into().as_str())
         )));
         self.mock_endpoint(mock, JoinRoomByIdOrAliasEndpoint)
+    }
+
+    /// Creates a prebuilt mock for knocking on a room.
+    pub fn mock_room_knock<'b>(
+        &self,
+        room_or_alias_id: impl Into<&'b RoomOrAliasId>,
+    ) -> MockEndpoint<'_, RoomKnockEndpoint> {
+        let mock = Mock::given(method("POST")).and(path(format!(
+            "/_matrix/client/v3/knock/{}",
+            percent_encoded_path(room_or_alias_id.into().as_str())
+        )));
+        self.mock_endpoint(mock, RoomKnockEndpoint)
     }
 
     /// Creates a prebuilt mock for sending an event in a room.
@@ -652,6 +676,18 @@ impl MatrixMockServer {
         let mock =
             Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/v3/rooms/.*/messages$"));
         self.mock_endpoint(mock, RoomMessagesEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuild mock for getting a state event.
+    pub fn mock_get_room_state_event(
+        &self,
+        event_type: &StateEventType,
+        state_key: impl fmt::Display,
+    ) -> MockEndpoint<'_, RoomStateEventEndpoint> {
+        let mock = Mock::given(method("GET")).and(path_regex(format!(
+            "^/_matrix/client/v3/rooms/.*/state/{event_type}/{state_key}$"
+        )));
+        self.mock_endpoint(mock, RoomStateEventEndpoint).expect_default_access_token()
     }
 
     /// Create a prebuilt mock for uploading media.
@@ -1538,10 +1574,23 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, MediaConfigEndpoint)
     }
 
+    /// Create a prebuilt mock for the endpoint used to get the supported legacy
+    /// login types.
+    pub fn mock_get_login_types(&self) -> MockEndpoint<'_, GetLoginTypesEndpoint> {
+        let mock = Mock::given(method("GET")).and(path("/_matrix/client/v3/login"));
+        self.mock_endpoint(mock, GetLoginTypesEndpoint)
+    }
+
     /// Create a prebuilt mock for the endpoint used to log into a session.
     pub fn mock_login(&self) -> MockEndpoint<'_, LoginEndpoint> {
         let mock = Mock::given(method("POST")).and(path("/_matrix/client/v3/login"));
         self.mock_endpoint(mock, LoginEndpoint)
+    }
+
+    /// Create a prebuilt mock for the endpoint used to register a new account.
+    pub fn mock_register(&self) -> MockEndpoint<'_, RegisterEndpoint> {
+        let mock = Mock::given(method("POST")).and(path("/_matrix/client/v3/register"));
+        self.mock_endpoint(mock, RegisterEndpoint)
     }
 
     /// Create a prebuilt mock for the endpoint used to list the devices of a
@@ -1568,7 +1617,10 @@ impl MatrixMockServer {
     pub fn mock_user_directory(&self) -> MockEndpoint<'_, UserDirectoryEndpoint> {
         let mock = Mock::given(method("POST"))
             .and(path("/_matrix/client/v3/user_directory/search"))
-            .and(body_json(&*test_json::search_users::SEARCH_USERS_REQUEST));
+            .and(body_json(json!({
+                "search_term": "test",
+                "limit": 50
+            })));
         self.mock_endpoint(mock, UserDirectoryEndpoint).expect_default_access_token()
     }
 
@@ -1857,6 +1909,63 @@ impl MatrixMockServer {
     ) -> MockEndpoint<'_, GetHomeserverCapabilitiesEndpoint> {
         let mock = Mock::given(method("GET")).and(path("/_matrix/client/v3/capabilities"));
         self.mock_endpoint(mock, GetHomeserverCapabilitiesEndpoint)
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get the message
+    /// retention configuration of the homeserver
+    /// ([MSC1763](https://github.com/matrix-org/matrix-spec-proposals/pull/1763)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use std::{collections::BTreeMap, time::Duration};
+    ///
+    /// use matrix_sdk::{
+    ///     ruma::{
+    ///         api::client::retention::{
+    ///             RoomIdOrAllRooms,
+    ///             get_retention_configuration::msc1763::{
+    ///                 LifetimeLimits, RetentionLimits,
+    ///             },
+    ///         },
+    ///         events::room::retention::RoomRetentionEventContent,
+    ///     },
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// let one_day = Duration::from_secs(24 * 60 * 60);
+    ///
+    /// mock_server
+    ///     .mock_get_retention_configuration()
+    ///     .ok(
+    ///         BTreeMap::from([(
+    ///             RoomIdOrAllRooms::AllRooms,
+    ///             RoomRetentionEventContent::new().at_most(one_day).unwrap(),
+    ///         )]),
+    ///         RetentionLimits::new(
+    ///             None,
+    ///             LifetimeLimits::from_range(..=one_day * 7),
+    ///         ),
+    ///     )
+    ///     .mock_once()
+    ///     .mount()
+    ///     .await;
+    ///
+    /// let config = client.fetch_retention_configuration().await?;
+    /// assert_eq!(config.policies.len(), 1);
+    /// assert_eq!(config.limits.max_lifetime.unwrap().max(), Some(one_day * 7));
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn mock_get_retention_configuration(
+        &self,
+    ) -> MockEndpoint<'_, GetRetentionConfigurationEndpoint> {
+        let mock = Mock::given(method("GET"))
+            .and(path("/_matrix/client/unstable/org.matrix.msc1763/retention/configuration"));
+        self.mock_endpoint(mock, GetRetentionConfigurationEndpoint).expect_default_access_token()
     }
 
     /// Create a prebuilt mock for the endpoint used to deactivate an account
@@ -2660,7 +2769,7 @@ impl<'a> MockEndpoint<'a, RoomSendEndpoint> {
     /// // A non delayed event should not be mocked by the server.
     /// assert!(response_not_mocked.is_err());
     ///
-    /// let r = delayed_message_event::unstable::Request::new(
+    /// let r = delayed_message_event::msc4140::Request::new(
     ///     room.room_id().to_owned(),
     ///     TransactionId::new(),
     ///     DelayParameters::Timeout { timeout: Duration::from_millis(500) },
@@ -2941,7 +3050,7 @@ impl<'a> MockEndpoint<'a, RoomSendStateEndpoint> {
     /// // A non delayed event should not be mocked by the server.
     /// assert!(response_not_mocked.is_err());
     ///
-    /// let r = delayed_state_event::unstable::Request::new(
+    /// let r = delayed_state_event::msc4140::Request::new(
     ///     room.room_id().to_owned(),
     ///     "".to_owned(),
     ///     DelayParameters::Timeout { timeout: Duration::from_millis(500) },
@@ -3135,9 +3244,21 @@ impl<'a> MockEndpoint<'a, SyncEndpoint> {
     /// # anyhow::Ok(()) });
     /// ```
     pub async fn ok_and_run<F: FnOnce(&mut SyncResponseBuilder)>(self, client: &Client, func: F) {
+        self.ok_and_run_with_response(client, func).await;
+    }
+
+    /// Temporarily mocks the sync with the given endpoint, runs a client
+    /// sync with it and returns the response.
+    ///
+    /// After calling this function, the sync endpoint isn't mocked anymore.
+    pub async fn ok_and_run_with_response<F: FnOnce(&mut SyncResponseBuilder)>(
+        self,
+        client: &Client,
+        func: F,
+    ) -> SyncResponse {
         let _scope = self.ok(func).mount_as_scoped().await;
 
-        let _response = client.sync_once(Default::default()).await.unwrap();
+        client.sync_once(Default::default()).await.unwrap()
     }
 }
 
@@ -3513,6 +3634,28 @@ impl Default for RoomMessagesResponseTemplate {
             chunk: Default::default(),
             state: Default::default(),
         }
+    }
+}
+
+/// A prebuilt mock for `GET
+/// /_matrix/client/v3/rooms/{roomId}/state/{eventType}/{stateKey}`.
+pub struct RoomStateEventEndpoint;
+
+impl<'a> MockEndpoint<'a, RoomStateEventEndpoint> {
+    /// Returns a successful response with the given state event.
+    pub fn ok(self, event: impl Into<Raw<AnyStateEvent>>) -> MatrixMock<'a> {
+        self.ok_json(event.into())
+    }
+
+    /// Returns an error response for a missing state event.
+    pub fn error_not_found(self) -> MatrixMock<'a> {
+        self.respond_with_code_and_json(
+            404,
+            json!({
+              "errcode": "M_NOT_FOUND",
+              "error": "State event not found."
+            }),
+        )
     }
 }
 
@@ -4139,8 +4282,8 @@ impl<'a> MockEndpoint<'a, WellKnownEndpoint> {
             },
             "m.rtc_foci": [
                 {
-                    "type": "livekit",
-                    "livekit_service_url": "https://livekit.example.com",
+                    "type": "m.livekit",
+                    "url": "wss://livekit.example.com",
                 },
             ],
         }))
@@ -4366,9 +4509,9 @@ pub struct RoomLeaveEndpoint;
 impl<'a> MockEndpoint<'a, RoomLeaveEndpoint> {
     /// Returns a successful response with some default data for the given room
     /// id.
-    pub fn ok(self, room_id: &RoomId) -> MatrixMock<'a> {
+    pub fn ok<'b>(self, room_id: impl Into<&'b RoomId>) -> MatrixMock<'a> {
         self.ok_json(json!({
-            "room_id": room_id,
+            "room_id": room_id.into(),
         }))
     }
 
@@ -4761,13 +4904,29 @@ impl<'a> MockEndpoint<'a, MediaConfigEndpoint> {
     }
 }
 
+/// A prebuilt mock for the `GET /_matrix/client/v3/login` endpoint.
+pub struct GetLoginTypesEndpoint;
+
+impl<'a> MockEndpoint<'a, GetLoginTypesEndpoint> {
+    /// Returns a successful response supporting password and SSO login.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_json(json!({
+            "flows": [
+                { "type": "m.login.password" },
+                { "type": "m.login.sso" },
+                { "type": "m.login.token" },
+            ],
+        }))
+    }
+}
+
 /// A prebuilt mock for `POST /login` requests.
 pub struct LoginEndpoint;
 
 impl<'a> MockEndpoint<'a, LoginEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::LOGIN)
+        self.ok_with(LoginResponseTemplate200::with_default_fields())
     }
 
     /// Returns a given response on POST /login requests
@@ -4827,48 +4986,32 @@ impl<'a> MockEndpoint<'a, LoginEndpoint> {
     /// }
     /// ```
     pub fn ok_with(self, response: LoginResponseTemplate200) -> MatrixMock<'a> {
-        self.ok_json(json!({
-            "access_token": response.access_token,
-            "device_id": response.device_id,
-            "user_id": response.user_id,
-            "expires_in": response.expires_in.map(|duration| { duration.as_millis() }),
-            "refresh_token": response.refresh_token,
-            "well_known": response.well_known.map(|vals| {
-                json!({
-                    "m.homeserver": {
-                        "base_url": vals.homeserver_url
-                    },
-                    "m.identity_server": vals.identity_url.map(|url| {
-                        json!({
-                            "base_url": url
-                        })
-                    })
-                })
+        self.ok_json(response)
+    }
+
+    /// Returns a `M_FORBIDDEN` error response.
+    pub fn error_forbidden(self) -> MatrixMock<'a> {
+        self.respond_with_code_and_json(
+            403,
+            json!({
+                "errcode": "M_FORBIDDEN",
+                "error": "Invalid password",
             }),
-        }))
+        )
     }
 }
 
-#[derive(Default)]
-struct LoginResponseWellKnown {
-    /// Required if well_known is used: The base URL for the homeserver for
-    /// client-server connections.
-    homeserver_url: String,
-
-    /// Required if well_known and m.identity_server are used: The base URL for
-    /// the identity server for client-server connections.
-    identity_url: Option<String>,
-}
-
 /// A response to a [`LoginEndpoint`] query with status code 200.
-#[derive(Default)]
+#[derive(Default, Serialize)]
 pub struct LoginResponseTemplate200 {
     /// Required: An access token for the account. This access token can then be
     /// used to authorize other requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
     access_token: Option<String>,
 
     /// Required: ID of the logged-in device. Will be the same as the
     /// corresponding parameter in the request, if one was specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
     device_id: Option<OwnedDeviceId>,
 
     /// The lifetime of the access token, in milliseconds. Once the access token
@@ -4876,21 +5019,29 @@ pub struct LoginResponseTemplate200 {
     /// refresh token. If no refresh token is provided, the client will need to
     /// re-log in to obtain a new access token. If not given, the client can
     /// assume that the access token will not expire.
+    #[serde(
+        rename = "expires_in_ms",
+        with = "ruma::serde::duration::opt_ms",
+        skip_serializing_if = "Option::is_none"
+    )]
     expires_in: Option<Duration>,
 
     /// A refresh token for the account. This token can be used to obtain a new
     /// access token when it expires by calling the /refresh endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
 
     /// Required: The fully-qualified Matrix ID for the account.
+    #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<OwnedUserId>,
 
     /// Optional client configuration provided by the server.
-    well_known: Option<LoginResponseWellKnown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    well_known: Option<DiscoveryInfo>,
 }
 
 impl LoginResponseTemplate200 {
-    /// Constructor for empty response
+    /// Constructor for a response with the given minimal expected fields.
     pub fn new<T1: Into<OwnedDeviceId>, T2: Into<OwnedUserId>>(
         access_token: &str,
         device_id: T1,
@@ -4900,6 +5051,17 @@ impl LoginResponseTemplate200 {
             access_token: Some(access_token.to_owned()),
             device_id: Some(device_id.into()),
             user_id: Some(user_id.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Constructor for a response with default values for the minimal expected
+    /// fields.
+    pub fn with_default_fields() -> Self {
+        Self {
+            access_token: Some("1234".to_owned()),
+            device_id: Some(TestDevice::Default.into()),
+            user_id: Some(User::Default.into()),
             ..Default::default()
         }
     }
@@ -4919,8 +5081,35 @@ impl LoginResponseTemplate200 {
     /// sets well_known which takes a homeserver_url and an optional
     /// identity_url
     pub fn well_known(mut self, homeserver_url: String, identity_url: Option<String>) -> Self {
-        self.well_known = Some(LoginResponseWellKnown { homeserver_url, identity_url });
+        let mut well_known = DiscoveryInfo::new(HomeserverInfo::new(homeserver_url));
+        well_known.identity_server = identity_url.map(IdentityServerInfo::new);
+        self.well_known = Some(well_known);
         self
+    }
+}
+
+/// A prebuilt mock for the `POST /_matrix/client/v3/register` endpoint.
+pub struct RegisterEndpoint;
+
+impl<'a> MockEndpoint<'a, RegisterEndpoint> {
+    /// Returns a successful default response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_json(json!({
+            "access_token": "1234",
+            "device_id": TestDevice::Default,
+            "user_id": User::Default,
+        }))
+    }
+
+    /// Returns a `M_FORBIDDEN` error response.
+    pub fn error_forbidden(self) -> MatrixMock<'a> {
+        self.respond_with_code_and_json(
+            403,
+            json!({
+                "errcode": "M_FORBIDDEN",
+                "error": "Invalid password",
+            }),
+        )
     }
 }
 
@@ -4930,7 +5119,24 @@ pub struct DevicesEndpoint;
 impl<'a> MockEndpoint<'a, DevicesEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::DEVICES)
+        self.ok_json(json!({
+            "devices": [
+                {
+                    "device_id": "BNYQQWUMXO",
+                    "display_name": "Client 1",
+                    "last_seen_ip": "-",
+                    "last_seen_ts": 1596117733037u64,
+                    "user_id": "@example:localhost"
+                },
+                {
+                    "device_id": "LEBKSEUSNR",
+                    "display_name": "Client 2",
+                    "last_seen_ip": "-",
+                    "last_seen_ts": 1599057006985u64,
+                    "user_id": "@example:localhost"
+                }
+            ]
+        }))
     }
 }
 
@@ -4940,7 +5146,12 @@ pub struct GetDeviceEndpoint;
 impl<'a> MockEndpoint<'a, GetDeviceEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::DEVICE)
+        self.ok_json(json!({
+            "device_id": "QBUAZIFURK",
+            "display_name": "android",
+            "last_seen_ip": "1.2.3.4",
+            "last_seen_ts": 1474491775024u64
+        }))
     }
 }
 
@@ -4960,7 +5171,16 @@ pub struct UserDirectoryEndpoint;
 impl<'a> MockEndpoint<'a, UserDirectoryEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.ok_json(&*test_json::search_users::SEARCH_USERS_RESPONSE)
+        self.ok_json(json!({
+            "limited": false,
+            "results": [
+                {
+                    "user_id": "@test:example.me",
+                    "display_name": "Test",
+                    "avatar_url": "mxc://example.me/someid"
+                }
+            ]
+        }))
     }
 }
 
@@ -4979,8 +5199,8 @@ pub struct UpgradeRoomEndpoint;
 
 impl<'a> MockEndpoint<'a, UpgradeRoomEndpoint> {
     /// Returns a successful response with desired replacement_room ID.
-    pub fn ok_with(self, new_room_id: &RoomId) -> MatrixMock<'a> {
-        self.ok_json(json!({ "replacement_room": new_room_id.as_str()}))
+    pub fn ok_with<'b>(self, new_room_id: impl Into<&'b RoomId>) -> MatrixMock<'a> {
+        self.ok_json(json!({ "replacement_room": new_room_id.into() }))
     }
 }
 
@@ -5152,6 +5372,19 @@ impl<'a> MockEndpoint<'a, JoinRoomByIdOrAliasEndpoint> {
     }
 }
 
+/// A prebuilt mock for `POST /_matrix/client/v3/knock/{roomIdOrAlias}`
+/// requests.
+pub struct RoomKnockEndpoint;
+
+impl<'a> MockEndpoint<'a, RoomKnockEndpoint> {
+    /// Returns a successful response using the given [`RoomId`].
+    pub fn ok<'b>(self, room_id: impl Into<&'b RoomId>) -> MatrixMock<'a> {
+        self.ok_json(json!({
+            "room_id": room_id.into(),
+        }))
+    }
+}
+
 #[derive(Default)]
 struct ThreadSubscriptionMatchers {
     /// Optional room id to match in the query.
@@ -5205,8 +5438,8 @@ impl<'a> MockEndpoint<'a, RoomGetThreadSubscriptionEndpoint> {
     }
 
     /// Match the request parameter against a specific room id.
-    pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
-        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
+    pub fn match_room_id(mut self, room_id: impl Into<OwnedRoomId>) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id.into());
         self
     }
     /// Match the request parameter against a specific thread root event id.
@@ -5246,8 +5479,8 @@ impl<'a> MockEndpoint<'a, RoomPutThreadSubscriptionEndpoint> {
     }
 
     /// Match the request parameter against a specific room id.
-    pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
-        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
+    pub fn match_room_id(mut self, room_id: impl Into<OwnedRoomId>) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id.into());
         self
     }
     /// Match the request parameter against a specific thread root event id.
@@ -5280,8 +5513,8 @@ impl<'a> MockEndpoint<'a, RoomDeleteThreadSubscriptionEndpoint> {
     }
 
     /// Match the request parameter against a specific room id.
-    pub fn match_room_id(mut self, room_id: OwnedRoomId) -> Self {
-        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id);
+    pub fn match_room_id(mut self, room_id: impl Into<OwnedRoomId>) -> Self {
+        self.endpoint.matchers = self.endpoint.matchers.match_room_id(room_id.into());
         self
     }
     /// Match the request parameter against a specific thread root event id.
@@ -5544,7 +5777,7 @@ pub struct SlidingSyncEndpoint;
 
 impl<'a> MockEndpoint<'a, SlidingSyncEndpoint> {
     /// Mocks the sliding sync endpoint with the given response.
-    pub fn ok(self, response: v5::Response) -> MatrixMock<'a> {
+    pub fn ok(self, response: msc4186::Response) -> MatrixMock<'a> {
         // A bit silly that we need to destructure all the fields ourselves, but
         // Response isn't serializable :'(
         self.ok_json(json!({
@@ -5564,7 +5797,7 @@ impl<'a> MockEndpoint<'a, SlidingSyncEndpoint> {
         self,
         client: &Client,
         on_builder: F,
-        response: v5::Response,
+        response: msc4186::Response,
     ) {
         let _scope = self.ok(response).mount_as_scoped().await;
 
@@ -5676,6 +5909,33 @@ impl<'a> MockEndpoint<'a, GetHomeserverCapabilitiesEndpoint> {
     }
 }
 
+/// A prebuilt mock for `GET
+/// /_matrix/client/unstable/org.matrix.msc1763/retention/configuration`.
+pub struct GetRetentionConfigurationEndpoint;
+
+impl<'a> MockEndpoint<'a, GetRetentionConfigurationEndpoint> {
+    /// Returns a successful response without any policies or limits.
+    pub fn ok_empty(self) -> MatrixMock<'a> {
+        self.ok(BTreeMap::new(), RetentionLimits::default())
+    }
+
+    /// Returns a successful response with the given policies and limits.
+    ///
+    /// `policies` maps a room ID (or all rooms) to its retention policy, and
+    /// `limits` are the limits to apply to the policies defined in
+    /// `m.room.retention` state events.
+    pub fn ok(
+        self,
+        policies: BTreeMap<RoomIdOrAllRooms, RoomRetentionEventContent>,
+        limits: RetentionLimits,
+    ) -> MatrixMock<'a> {
+        self.ok_json(json!({
+            "policies": policies,
+            "limits": limits,
+        }))
+    }
+}
+
 /// A prebuilt mock for `POST /_matrix/client/*/account/deactivate`.
 pub struct DeactivateAccountEndpoint;
 
@@ -5703,12 +5963,11 @@ impl<'a> MockEndpoint<'a, UpdatePresenceEndpoint> {
 pub struct GetRtcTransportsEndpoint;
 
 impl<'a> MockEndpoint<'a, GetRtcTransportsEndpoint> {
-    /// Returns a successful response with a single transport with a service
-    /// URL.
-    pub fn ok_with_service_url(self) -> MatrixMock<'a> {
+    /// Returns a successful response with a single `m.livekit` transport.
+    pub fn ok(self) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "rtc_transports": [
-                { "type": "livekit", "livekit_service_url": "https://livekit.example.com" }
+                { "type": "m.livekit", "url": "wss://livekit.example.com" }
             ]
         })))
     }

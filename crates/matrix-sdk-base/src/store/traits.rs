@@ -34,6 +34,12 @@ use ruma::{
                 discover_homeserver::{self, HomeserverInfo, IdentityServerInfo, TileServerInfo},
                 get_capabilities::v3::Capabilities,
             },
+            retention::{
+                RoomIdOrAllRooms,
+                get_retention_configuration::msc1763::{
+                    Response as RetentionConfigurationApiResponse, RetentionLimits,
+                },
+            },
             rtc::RtcTransport,
         },
     },
@@ -44,6 +50,7 @@ use ruma::{
         RoomAccountDataEventType, StateEventType, StaticEventContent, StaticStateEventContent,
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
+        room::retention::RoomRetentionEventContent,
     },
     profile::UserProfile,
     serde::Raw,
@@ -2285,6 +2292,33 @@ impl From<discover_homeserver::Response> for WellKnownResponse {
     }
 }
 
+/// A serialisable representation of the
+/// `get_retention_configuration::msc1763::Response`.
+///
+/// See [MSC1763](https://github.com/matrix-org/matrix-spec-proposals/pull/1763)
+/// for more info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionConfigurationResponse {
+    /// Map between a room ID (or all rooms) and their respective retention
+    /// policy.
+    pub policies: BTreeMap<RoomIdOrAllRooms, RoomRetentionEventContent>,
+
+    /// Limits to apply to policies defined by `m.room.retention` state events.
+    pub limits: RetentionLimits,
+}
+
+impl From<RetentionConfigurationApiResponse> for RetentionConfigurationResponse {
+    fn from(response: RetentionConfigurationApiResponse) -> Self {
+        Self { policies: response.policies, limits: response.limits }
+    }
+}
+
+impl From<RetentionConfigurationResponse> for RetentionConfigurationApiResponse {
+    fn from(response: RetentionConfigurationResponse) -> Self {
+        Self::new(response.policies, response.limits)
+    }
+}
+
 /// A value for key-value data that should be persisted into the store.
 #[derive(Debug, Clone)]
 pub enum StateStoreDataValue {
@@ -2330,6 +2364,10 @@ pub enum StateStoreDataValue {
 
     /// The capabilities the homeserver supports or disables.
     HomeserverCapabilities(TtlValue<Capabilities>),
+
+    /// The message retention configuration of the homeserver
+    /// ([MSC1763](https://github.com/matrix-org/matrix-spec-proposals/pull/1763)).
+    RetentionConfiguration(TtlValue<RetentionConfigurationResponse>),
 }
 
 /// Tokens to use when catching up on thread subscriptions.
@@ -2542,6 +2580,12 @@ impl StateStoreDataValue {
     pub fn into_homeserver_capabilities(self) -> Option<TtlValue<Capabilities>> {
         as_variant!(self, Self::HomeserverCapabilities)
     }
+
+    /// Get this value if it is the homeserver's message retention
+    /// configuration.
+    pub fn into_retention_configuration(self) -> Option<TtlValue<RetentionConfigurationResponse>> {
+        as_variant!(self, Self::RetentionConfiguration)
+    }
 }
 
 /// A key for key-value data.
@@ -2586,6 +2630,9 @@ pub enum StateStoreDataKey<'a> {
 
     /// A list of capabilities that the homeserver supports.
     HomeserverCapabilities,
+
+    /// The message retention configuration of the homeserver.
+    RetentionConfiguration,
 }
 
 impl StateStoreDataKey<'_> {
@@ -2635,6 +2682,10 @@ impl StateStoreDataKey<'_> {
 
     /// Key prefix to use for the homeserver's [`Capabilities`].
     pub const HOMESERVER_CAPABILITIES: &'static str = "homeserver_capabilities";
+
+    /// Key to use for the
+    /// [`RetentionConfiguration`][Self::RetentionConfiguration] variant.
+    pub const RETENTION_CONFIGURATION: &'static str = "retention_configuration";
 }
 
 /// Compare two thread subscription changes bump stamps, given a fixed room and

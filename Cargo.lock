@@ -3324,9 +3324,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -5489,7 +5489,7 @@ dependencies = [
 [[package]]
 name = "ruma"
 version = "0.17.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "assign",
  "js_int",
@@ -5507,7 +5507,7 @@ dependencies = [
 [[package]]
 name = "ruma-client-api"
 version = "0.25.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "as_variant",
  "assign",
@@ -5529,7 +5529,7 @@ dependencies = [
 [[package]]
 name = "ruma-common"
 version = "0.20.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "as_variant",
  "base64 0.23.1",
@@ -5562,7 +5562,7 @@ dependencies = [
 [[package]]
 name = "ruma-events"
 version = "0.35.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "as_variant",
  "indexmap",
@@ -5586,7 +5586,7 @@ dependencies = [
 [[package]]
 name = "ruma-federation-api"
 version = "0.16.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "http",
  "http-auth",
@@ -5606,7 +5606,7 @@ dependencies = [
 [[package]]
 name = "ruma-html"
 version = "0.9.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "as_variant",
  "html5ever",
@@ -5617,7 +5617,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.14.0"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "js_int",
  "thiserror 2.0.20",
@@ -5626,7 +5626,7 @@ dependencies = [
 [[package]]
 name = "ruma-macros"
 version = "0.20.2"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "as_variant",
  "cfg-if",
@@ -5642,7 +5642,7 @@ dependencies = [
 [[package]]
 name = "ruma-signatures"
 version = "0.22.1"
-source = "git+https://github.com/SchildiChat/ruma?rev=ce2515705#ce2515705a17f5bc7acc15b6bdeee0870228e54c"
+source = "git+https://github.com/SchildiChat/ruma?rev=577f298a7#577f298a714fa86554d1c4f6390ed123337bc1bd"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -5657,9 +5657,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator",

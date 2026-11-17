@@ -30,7 +30,6 @@ use ruma::{
         account::request_openid_token::v3::{Request as OpenIdRequest, Response as OpenIdResponse},
         delayed_events::{self, update_delayed_event::UpdateAction},
         filter::RoomEventFilter,
-        rtc::livekit::{delegate_delayed_leave, get_token},
         to_device::send_event_to_device::v3::Request as RumaToDeviceRequest,
     },
     assign,
@@ -126,12 +125,10 @@ impl MatrixDriver {
         req: RtcLivekitGetTokenRequest,
     ) -> Result<RtcLivekitGetTokenResponse> {
         let RtcLivekitGetTokenRequest { server_name, url, room_id, slot_id, member_id } = req;
-        let request =
-            assign!(get_token::v1::Request::new(url, room_id, slot_id, member_id), { server_name });
 
         self.room
             .client
-            .send(request)
+            .rtc_livekit_get_token(url, room_id, slot_id, member_id, server_name)
             .await
             .map(Into::into)
             .map_err(|error| Error::Http(Box::new(error)))
@@ -151,12 +148,10 @@ impl MatrixDriver {
     ) -> Result<RtcLivekitDelegateDelayedLeaveResponse> {
         let RtcLivekitDelegateDelayedLeaveRequest { url, room_id, slot_id, member_id, delay_id } =
             req;
-        let request =
-            delegate_delayed_leave::v1::Request::new(url, room_id, slot_id, member_id, delay_id);
 
         self.room
             .client
-            .send(request)
+            .rtc_livekit_delegate_delayed_leave(url, room_id, slot_id, member_id, delay_id)
             .await
             .map(Into::into)
             .map_err(|error| Error::Http(Box::new(error)))
@@ -273,7 +268,7 @@ impl MatrixDriver {
             ),
 
             (None, Some(delayed_event_parameters)) => {
-                let r = delayed_events::delayed_message_event::unstable::Request::new_raw(
+                let r = delayed_events::delayed_message_event::msc4140::Request::new_raw(
                     self.room.room_id().to_owned(),
                     TransactionId::new(),
                     MessageLikeEventType::from(type_str),
@@ -284,7 +279,7 @@ impl MatrixDriver {
             }
 
             (Some(key), Some(delayed_event_parameters)) => {
-                let r = delayed_events::delayed_state_event::unstable::Request::new_raw(
+                let r = delayed_events::delayed_state_event::msc4140::Request::new_raw(
                     self.room.room_id().to_owned(),
                     key,
                     StateEventType::from(type_str),
@@ -305,8 +300,8 @@ impl MatrixDriver {
         &self,
         delay_id: String,
         action: UpdateAction,
-    ) -> Result<delayed_events::update_delayed_event::unstable_v1::Response> {
-        let r = delayed_events::update_delayed_event::unstable_v1::Request::new(delay_id, action);
+    ) -> Result<delayed_events::update_delayed_event::msc4140_v1::Response> {
+        let r = delayed_events::update_delayed_event::msc4140_v1::Request::new(delay_id, action);
         self.room.client.send(r).await.map_err(|error| Error::Http(Box::new(error)))
     }
 
