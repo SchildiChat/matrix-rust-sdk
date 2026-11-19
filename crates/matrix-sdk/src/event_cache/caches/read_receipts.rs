@@ -183,6 +183,7 @@ fn stop_on_event_ids(
 // SC start
 use matrix_sdk_common::linked_chunk::Position;
 use matrix_sdk_common::serde_helpers::extract_broadcast_outside_thread;
+use ruma::events::TimelineEventType;
 // SC end
 
 trait ReadReceiptsExt {
@@ -237,7 +238,7 @@ impl ReadReceiptsExt for ReadReceipts {
         };
 
         for action in actions.iter() {
-            if !has_notify && action.should_notify() {
+            if !has_notify && action.should_notify() && sc_allow_notification(event.raw()) {
                 self.num_notifications += 1;
                 has_notify = true;
             }
@@ -730,9 +731,7 @@ fn has_gap_after_position(linked_chunk: &EventLinkedChunk, position: Position) -
 
     false
 }
-// SC end
 
-// SC
 fn is_redaction_or_redacted(event: &Raw<AnySyncTimelineEvent>) -> bool {
     #[derive(serde::Deserialize)]
     struct UnsignedContent {
@@ -750,6 +749,24 @@ fn is_redaction_or_redacted(event: &Raw<AnySyncTimelineEvent>) -> bool {
         Some(MessageLikeEventType::RoomRedaction)
     )
 }
+
+fn sc_allow_notification(event: &Raw<AnySyncTimelineEvent>) -> bool {
+    let Ok(Some(event_type)) = event.get_field::<TimelineEventType>("type") else {
+        return false;
+    };
+    match event_type {
+        TimelineEventType::RoomMessage | TimelineEventType::UnstablePollStart => {
+            !matches!(extract_relation(event), Some((RelationType::Replacement, _)))
+        }
+        TimelineEventType::Sticker
+        | TimelineEventType::CallInvite
+        | TimelineEventType::RtcNotification
+        | TimelineEventType::RoomEncrypted
+        | TimelineEventType::RoomTombstone => true,
+        _ => false,
+    }
+}
+// SC end
 
 /// Is the event worth marking a timeline as unread?
 fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool {
