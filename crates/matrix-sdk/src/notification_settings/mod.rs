@@ -205,6 +205,7 @@ impl NotificationSettings {
             RoomNotificationMode::AllMessages => {
                 vec![Action::Notify, Action::SetTweak(Tweak::Sound(SoundTweakValue::Default))]
             }
+            RoomNotificationMode::AllMessagesSilent => vec![Action::Notify], // SC
             _ => {
                 vec![]
             }
@@ -323,6 +324,7 @@ impl NotificationSettings {
                 // insert a `Room` rule which notifies
                 (RuleKind::Room, true)
             }
+            RoomNotificationMode::AllMessagesSilent => (RuleKind::Room, true), // SC
             RoomNotificationMode::MentionsAndKeywordsOnly => {
                 // insert a `Room` rule which doesn't notify
                 (RuleKind::Room, false)
@@ -344,7 +346,14 @@ impl NotificationSettings {
         // Build the command list to delete all other custom rules, with the
         // exception of the newly inserted rule.
         let mut rule_commands = RuleCommands::new(rules.ruleset);
+        // SC
+        if mode == RoomNotificationMode::AllMessagesSilent {
+            rule_commands.insert_custom_rule(NewPushRule::Room(
+                ruma::push::NewSimplePushRule::new(room_id.to_owned(), vec![Action::Notify]),
+            ))?;
+        } else { // SC wrong indention start
         rule_commands.insert_rule(new_rule_kind.clone(), room_id, notify)?;
+        } // SC wrong indention end
         for (kind, rule_id) in custom_rules {
             rule_commands.delete_rule(kind, rule_id)?;
         }
@@ -750,7 +759,7 @@ mod tests {
         ruleset.set_actions(
             RuleKind::Underride,
             PredefinedUnderrideRuleId::RoomOneToOne,
-            vec![Action::Notify],
+            vec![Action::Notify, /* SC */ Action::SetTweak(ruma::push::Tweak::Sound(ruma::push::SoundTweakValue::Default))],
         )?;
 
         let settings = NotificationSettings::new(client, ruleset);
@@ -1205,7 +1214,7 @@ mod tests {
         ruleset.set_actions(
             RuleKind::Underride,
             PredefinedUnderrideRuleId::Message,
-            vec![Action::Notify],
+            vec![Action::Notify, /* SC */ Action::SetTweak(ruma::push::Tweak::Sound(ruma::push::SoundTweakValue::Default))],
         )?;
 
         ruleset.set_actions(
@@ -1263,7 +1272,7 @@ mod tests {
         ruleset.set_actions(
             RuleKind::Underride,
             PredefinedUnderrideRuleId::RoomOneToOne,
-            vec![Action::Notify],
+            vec![Action::Notify, /* SC */ Action::SetTweak(ruma::push::Tweak::Sound(ruma::push::SoundTweakValue::Default))],
         )?;
 
         ruleset.set_actions(
@@ -1607,7 +1616,7 @@ mod tests {
         let settings = NotificationSettings::new(client, ruleset);
         assert_eq!(
             settings.get_default_room_notification_mode(IsEncrypted::No, IsOneToOne::No).await,
-            RoomNotificationMode::AllMessages
+            RoomNotificationMode::AllMessagesSilent // SC: a notify-only rule is silent
         );
 
         // After setting the default mode to `MentionsAndKeywordsOnly`

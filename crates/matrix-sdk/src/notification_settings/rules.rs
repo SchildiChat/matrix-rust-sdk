@@ -88,6 +88,10 @@ impl Rules {
         if let Some(rule) = self.ruleset.get(RuleKind::Room, room_id) {
             // if this rule contains a `Notify` action
             if rule.triggers_notification() {
+                // SC
+                if !has_sound(rule.actions()) {
+                    return Some(RoomNotificationMode::AllMessagesSilent);
+                }
                 return Some(RoomNotificationMode::AllMessages);
             }
             return Some(RoomNotificationMode::MentionsAndKeywordsOnly);
@@ -121,6 +125,10 @@ impl Rules {
             .get(RuleKind::Underride, rule_id)
             .is_some_and(|r| r.enabled() && r.triggers_notification())
         {
+            // SC
+            if !has_sound(self.ruleset.get(RuleKind::Underride, rule_id).unwrap().actions()) {
+                return RoomNotificationMode::AllMessagesSilent;
+            }
             RoomNotificationMode::AllMessages
         } else {
             // Otherwise, the mode is `MentionsAndKeywordsOnly`
@@ -277,6 +285,13 @@ impl Rules {
             }
         }
     }
+}
+
+// SC
+fn has_sound(actions: &[ruma::push::Action]) -> bool {
+    actions.iter().any(|action| {
+        matches!(action, ruma::push::Action::SetTweak(ruma::push::Tweak::Sound(_)))
+    })
 }
 
 /// Gets the `PredefinedUnderrideRuleId` for rooms corresponding to the given

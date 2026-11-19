@@ -386,6 +386,8 @@ impl TryFrom<Action> for SdkAction {
 pub enum RoomNotificationMode {
     /// Receive notifications for all messages.
     AllMessages,
+    /// SC: Receive silent notifications for all messages, unless a higher-priority rule applies.
+    AllMessagesSilent,
     /// Receive notifications for mentions and keywords only.
     MentionsAndKeywordsOnly,
     /// Do not receive any notifications.
@@ -396,6 +398,7 @@ impl From<SdkRoomNotificationMode> for RoomNotificationMode {
     fn from(value: SdkRoomNotificationMode) -> Self {
         match value {
             SdkRoomNotificationMode::AllMessages => Self::AllMessages,
+            SdkRoomNotificationMode::AllMessagesSilent => Self::AllMessagesSilent, // SC
             SdkRoomNotificationMode::MentionsAndKeywordsOnly => Self::MentionsAndKeywordsOnly,
             SdkRoomNotificationMode::Mute => Self::Mute,
         }
@@ -406,6 +409,7 @@ impl From<RoomNotificationMode> for SdkRoomNotificationMode {
     fn from(value: RoomNotificationMode) -> Self {
         match value {
             RoomNotificationMode::AllMessages => Self::AllMessages,
+            RoomNotificationMode::AllMessagesSilent => Self::AllMessagesSilent, // SC
             RoomNotificationMode::MentionsAndKeywordsOnly => Self::MentionsAndKeywordsOnly,
             RoomNotificationMode::Mute => Self::Mute,
         }

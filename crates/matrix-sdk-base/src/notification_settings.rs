@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 pub enum RoomNotificationMode {
     /// Receive notifications for all messages.
     AllMessages,
+    /// SC: Receive silent notifications for all messages, unless a higher-priority rule applies.
+    AllMessagesSilent,
     /// Receive notifications for mentions and keywords only.
     MentionsAndKeywordsOnly,
     /// Do not receive any notifications.
